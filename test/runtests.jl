@@ -47,6 +47,7 @@ const TEST_FILES = [
     "test_pkgtest.jl",
     "test_testenv.jl",
     "test_output.jl",
+    "test_editor.jl",
     "test_filters.jl",
     "test_scan.jl",
     "test_plan.jl",

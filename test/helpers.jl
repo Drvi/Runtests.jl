@@ -123,6 +123,20 @@ end
 live_worker_processes() = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
 live_worker_pids() = Set(YATFWorkers.live_worker_pids())
 
+# Whether a pid belongs to a process that is still there. Signal 0 checks for one
+# without sending anything. Not on Windows, where `kill` terminates the process.
+process_alive(pid::Integer) = ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0
+
+# Asked of the operating system rather than of YATF's own bookkeeping: none of
+# `pids` is still running. A worker takes a moment to die after the signal reaches it.
+function all_gone(pids)
+    deadline = time() + 10
+    while time() < deadline && any(process_alive, pids)
+        sleep(0.2)
+    end
+    return !any(process_alive, pids)
+end
+
 # Run states live under the depot by default, keyed by project. A test that reads
 # one back, or that must not see an earlier run's history, gets a directory of
 # its own.

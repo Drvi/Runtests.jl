@@ -306,6 +306,8 @@ mutable struct Run
     # Every process an attempt ran in: under coverage, each should leave a tracefile.
     const item_pids::Set{Int32}
     coverage::Union{Nothing, CoverageSummary}
+    # An editor's, when it asked for the run: each item's start and end go there.
+    const events::Union{Nothing, EventStream}
 end
 
 """
@@ -326,8 +328,9 @@ function execute(p::Plan, target)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"), column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
-        YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing
+        YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[]
     )
+    run.events === nothing || (run.events.run = run)
     cfg.coverage && mkpath(coverage_dir(logdir))
     # Ctrl-C caught by any task the run starts is thrown into this one, which is
     # where the run knows how to stop.
@@ -1574,6 +1577,7 @@ function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer
     st.pid[i] = Int32(pid)
     pid == 0 || @lock run.lock push!(run.item_pids, Int32(pid))
     pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
+    run.events === nothing || event_item_started(run, i, attempt, slot, pid)
     return nothing
 end
 
@@ -1829,6 +1833,7 @@ function record!(
                   item = i, attempt, seq = st.seq[i])
     @atomic run.last_finish = time()
     report_item!(run, i, state, count_done!(run, i), note)
+    run.events === nothing || event_item_finished(run, i, state, attempt, slot, note)
     return nothing
 end
 

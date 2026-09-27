@@ -291,6 +291,28 @@ function scan(
         strays::Vector{String} = String[],
         suite_names::Union{Nothing, Vector{String}} = nothing
     )
+    items, errors, rejected = scan_files(files, filter, known_setups; ntasks, strays)
+    isempty(errors) || throw(ScanFailure(errors))
+    if suite_names !== nothing
+        append!(suite_names, (it.name for it in items))
+        append!(suite_names, (r.name for r in rejected))
+    end
+    filter.line > 0 && (items = select_by_line(items, filter.line))
+    return items
+end
+
+"""
+    scan_files(files, filter, known_setups; ntasks, strays) -> (items, errors, rejected)
+
+What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
+by (file, line), every problem found sorted the same way, and the name and place
+of each item the filter left out. For a caller that shows what it can read beside
+what is broken.
+"""
+function scan_files(
+        files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
+        ntasks::Int = default_scan_tasks(), strays::Vector{String} = String[]
+    )
     nt = clamp(ntasks, 1, max(1, length(files)))
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64)) for _ in 1:nt]
     ch = Channel{String}(length(files))
@@ -309,20 +331,12 @@ function scan(
     for c in chunks
         append!(errors, c[2])
     end
-    if !isempty(errors)
-        sort!(errors; by = e -> (e.file, e.line))
-        throw(ScanFailure(errors))
-    end
     items = reduce(vcat, (c[1] for c in chunks); init = RawItem[])
     sort!(items; by = i -> (i.file, i.line))
     rejected = reduce(vcat, (c[3] for c in chunks); init = ItemName[])
-    check_unique_names(items, rejected)
-    if suite_names !== nothing
-        append!(suite_names, (it.name for it in items))
-        append!(suite_names, (r.name for r in rejected))
-    end
-    filter.line > 0 && (items = select_by_line(items, filter.line))
-    return items
+    append!(errors, duplicate_name_errors(items, rejected))
+    sort!(errors; by = e -> (e.file, e.line))
+    return items, errors, rejected
 end
 
 # Twice the threads to hide file IO; capped, because parsing is allocation-bound.
@@ -340,7 +354,7 @@ end
 
 # Over every item in the suite, selected or not: a name that is unique only
 # because this run filtered out its twin is not a unique name.
-function check_unique_names(items::Vector{RawItem}, rejected::Vector{ItemName} = ItemName[])
+function duplicate_name_errors(items::Vector{RawItem}, rejected::Vector{ItemName} = ItemName[])
     all_names = ItemName[ItemName(it.name, it.file, it.line) for it in items]
     append!(all_names, rejected)
     sort!(all_names; by = n -> (n.file, n.line))
@@ -361,6 +375,5 @@ function check_unique_names(items::Vector{RawItem}, rejected::Vector{ItemName} =
             )
         end
     end
-    isempty(errors) || throw(ScanFailure(errors))
-    return items
+    return errors
 end

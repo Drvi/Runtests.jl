@@ -139,7 +139,7 @@ YATF.runtests(tags=:fast)                # by tag
 YATF.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||`
 YATF.runtests("test/db"; tags=:fast)     # they narrow together
 YATF.runtests(dry_run=true)              # print the plan, run nothing
-YATF.runtestsf()                         # run again what did not pass last time
+YATF.runtestsf()                         # run what is failing, each item as it last ran
 YATF.chores()                            # what the suite needs tidying; fix=true tidies it
 ```
 
@@ -524,7 +524,21 @@ Then, locally, `YATF.read_run_state("run.yatf")` shows what happened, and
 `YATF.runtests(replay="run.yatf")` runs the same items with the same settings,
 profiles and seed, naming every package whose version differs from the one CI had.
 
-Later runs read the recent run states to plan (see [The plan](#the-plan)):
-`runtestsf` takes its items from the newest one. A replay happens only when
+Later runs read the recent run states to plan (see [The plan](#the-plan)), and
+`runtestsf` runs every item whose last verdict in them was not a pass. A replay happens only when
 asked: a run state lying next to the project is not a request to run differently,
 and an explicit keyword always wins.
+
+## Editors
+
+`YATF.serve(path)` lets an editor drive a package's suite: it lists the test items
+with where they are and what they declare, runs the ones asked for, reports each
+item's start and outcome as it happens — failures with their file and line — and
+cancels a run on request. It speaks one JSON object per line: commands on stdin,
+events on stdout, and everything written for people on stderr.
+
+```sh
+cd MyPackage && julia --project=test -e 'using YATF; YATF.serve()'
+```
+
+[docs/editor-protocol.md](docs/editor-protocol.md) has the commands and events.

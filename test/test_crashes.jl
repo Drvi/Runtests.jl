@@ -235,11 +235,6 @@ end
 # The checkout, for a child process that has to find the same one.
 const REPO_ROOT = dirname(@__DIR__)
 
-# Whether a pid belongs to a process that is still there. Signal 0 checks for one
-# without sending anything; the workers are the dead coordinator's children, so
-# they are reparented and reaped rather than left as zombies.
-process_alive(pid::Integer) = ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0
-
 # Windows has no signal to send: `kill` there terminates the process outright, so
 # there is no teardown to watch.
 
@@ -354,17 +349,6 @@ end
 # What the coordinator catches: an `InterruptException`, or from 1.14 the
 # `CancellationRequest` that Ctrl-C has become.
 const CAUGHT_INTERRUPT = r"CAUGHT (InterruptException|(Base\.)?CancellationRequest)$"m
-
-# Asked from outside the run, because that is where it matters: whatever the
-# coordinator got to do on its way down, no worker of its is still running. A
-# worker takes a moment to die after the signal reaches it.
-function all_gone(pids)
-    deadline = time() + 10
-    while time() < deadline && any(process_alive, pids)
-        sleep(0.2)
-    end
-    return !any(process_alive, pids)
-end
 
 Sys.iswindows() ||
 @testset "an interrupt takes the workers with it, at once" begin

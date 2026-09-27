@@ -1,0 +1,79 @@
+{
+    "name": "yatf",
+    "displayName": "YATF",
+    "description": "Run a Julia package's YATF test items from the Test Explorer",
+    "version": "0.1.0",
+    "publisher": "yatf",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "categories": [
+        "Testing"
+    ],
+    "main": "./src/extension.js",
+    "activationEvents": [
+        "workspaceContains:test/**/*_test.jl",
+        "workspaceContains:test/**/*_tests.jl"
+    ],
+    "contributes": {
+        "commands": [
+            {
+                "command": "yatf.runFailed",
+                "title": "Run Failed Tests",
+                "category": "YATF",
+                "icon": "$(run-errors)"
+            },
+            {
+                "command": "yatf.restart",
+                "title": "Restart Server",
+                "category": "YATF"
+            },
+            {
+                "command": "yatf.showLog",
+                "title": "Show Log",
+                "category": "YATF"
+            }
+        ],
+        "configuration": {
+            "title": "YATF",
+            "properties": {
+                "yatf.julia.executable": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "The `julia` that runs the server. Empty: the Julia extension's `julia.executablePath`, or `julia` on the `PATH`."
+                },
+                "yatf.julia.args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "markdownDescription": "Arguments given to `julia` first, such as `+1.12` to pick a juliaup channel."
+                },
+                "yatf.environment": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "The environment the server runs in, relative to the workspace folder; it must have YATF. Empty: `test` when `test/Project.toml` exists, the folder itself otherwise."
+                },
+                "yatf.run.options": {
+                    "type": "object",
+                    "default": {},
+                    "markdownDescription": "Settings sent with every run, such as `{\"workers\": 2}`: any of the `run` command's options in the editor protocol. Everything else comes from `test/TestItems.toml`."
+                }
+            }
+        },
+        "menus": {
+            "view/title": [
+                {
+                    "command": "yatf.runFailed",
+                    "when": "view == workbench.view.testing && yatf.active",
+                    "group": "navigation"
+                }
+            ]
+        }
+    },
+    "scripts": {
+        "test": "node --test test/*.test.js"
+    }
+}

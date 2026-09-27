@@ -869,6 +869,33 @@ function recent_runs(root::AbstractString, n::Int)
 end
 
 """
+    failing_items(root; names = nothing) -> Vector{String}
+
+The items that are failing as the recorded runs leave them, sorted: for each item,
+the last run in which it ran to a verdict decides, so running a few of one run's
+failures again does not forget the rest. A verdict other than passed or skipped —
+failed, errored, timed out, cut short by a dead worker, left running when the run
+itself died — is failing. A run that stopped before reaching an item, or while
+running it, says nothing about it, and the verdict before stands. With `names`,
+only those items, and the reading stops once each has its verdict.
+"""
+function failing_items(root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing)
+    decided = Set{String}()
+    failing = String[]
+    for (_, rs) in Iterators.reverse(recent_runs(root, KEEP_RUNS))   # newest first
+        for (i, it) in enumerate(rs.items)
+            (it.name in decided || (names !== nothing && !(it.name in names))) && continue
+            state = i <= length(rs.statuses) ? rs.statuses[i].state : UNSEEN
+            (state === UNSEEN || state === CANCELLED) && continue
+            push!(decided, it.name)
+            state === PASSED || state === SKIPPED || push!(failing, it.name)
+        end
+        names !== nothing && length(decided) == length(names) && break
+    end
+    return sort!(failing)
+end
+
+"""
     history(root) -> History
 
 Per-item durations and last-run failures, taken from the most recent runs, when
@@ -889,9 +916,9 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
             i <= length(rs.statuses) || break
             st = rs.statuses[i]
             if st.state === UNSEEN
-                # A cancelled run stopped before reaching these. They did not pass,
-                # and after a run that stopped early, what did not pass is exactly
-                # what `runtestsf` should run again.
+                # A cancelled run stopped before reaching these: the next run takes
+                # them early, as it does what failed, so it picks up where that one
+                # stopped.
                 ago == 0 && rs.cancelled && (failed[it.name] = 0)
                 continue
             end

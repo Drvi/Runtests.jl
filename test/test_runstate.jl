@@ -214,18 +214,34 @@ end
         end
     end
 
-    @testset "failures are remembered and can be re-run" begin
-        dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir, "YATF_FAULTY_DIR" => mktempdir()) do
-            pkg = fixture("Faulty.jl")
-            p, target = prepare((pkg,); workers=1, logs=:issues, name=r"^(passes|fails)$")
-            run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
-            h = history(pkg)
-            @test h.failed == Dict("fails" => 0)
-            # `runtestsf` re-runs exactly those
-            p2, _ = prepare((pkg,); workers=1, logs=:issues, name=Regex("^(fails)\$"))
-            @test [p2.items.name[i] for i in 1:nitems(p2)] == ["fails"]
+    @testset "an item is failing while the last run that ran it says so" begin
+        verdicts(a, b) = string("@testitem \"a\" begin\n    @test $a\nend\n",
+                                "@testitem \"b\" begin\n    @test $b\nend\n",
+                                "@testitem \"c\" begin\n    @test true\nend\n")
+        pkg = make_pkg("Failing", "test/t_test.jl" => verdicts(false, false))
+        file = joinpath(pkg, "test", "t_test.jl")
+        failing = YATF.Private.failing_items
+        with_runstate_dir() do _
+            @test failing(pkg) == String[]           # nothing recorded yet
+            run_states(pkg; workers = 1, logs = :issues)
+            @test failing(pkg) == ["a", "b"]
+            # `a` fixed and run alone: `b` is still failing, though the newest run
+            # did not run it.
+            write(file, verdicts(true, false))
+            run_states(pkg; workers = 1, logs = :issues, name = "a")
+            @test failing(pkg) == ["b"]
+            # A run that stopped before reaching anything says nothing about any of it.
+            p, _ = prepare((pkg,); workers = 1)
+            finish_run_state!(init_run_state(new_runstate_path(pkg), p); cancelled = true)
+            @test failing(pkg) == ["b"]
+            @test failing(pkg; names = Set(["a", "c"])) == String[]
+            # `runtestsf` runs exactly those, and then there is nothing left to run.
+            write(file, verdicts(true, true))
+            ts, out = capture_run(() -> YATF.runtestsf(pkg; workers = 1, logs = :issues))
+            @test occursin("running 1 failing item", out)
+            @test occursin("ran 1 test item", out)
+            @test failing(pkg) == String[]
+            @test_throws YATF.NoTestsError YATF.runtestsf(pkg)
         end
     end
 

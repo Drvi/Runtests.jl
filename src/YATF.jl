@@ -39,6 +39,7 @@ using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRO
     with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded
 
 include("types.jl")
+include("json.jl")
 include("macros.jl")
 include("scan.jl")
 include("config.jl")
@@ -48,6 +49,7 @@ include("report.jl")
 include("platform.jl")
 include("monitor.jl")
 include("coverage.jl")
+include("editor.jl")
 include("execute.jl")
 include("interactive.jl")
 include("debug.jl")
@@ -220,21 +222,22 @@ end
 """
     runtestsf(paths...; kwargs...)
 
-Re-run exactly the items the last run recorded as not passing.
+Run the items that are failing: those whose last verdict, in the last run that ran
+them to one, was not a pass. Each item keeps its own, so running some of one run's
+failures again does not forget the others, and a run stopped before it reached an
+item leaves that item's verdict as it was. See [`failing_items`](@ref).
 """
 function runtestsf(args...; kwargs...)
     target = resolve_target(args)
-    h = history(target.root; nruns = 1)
-    isempty(h.failed) && throw(
+    names = Set(failing_items(target.root))
+    isempty(names) && throw(
         NoTestsError(
-            "the last recorded run has no failures to retry" *
+            "no test item is failing in the recorded runs" *
                 (isempty(runstate_files(target.root)) ? " (no run state found for this project)" : "")
         )
     )
-    names = Set(keys(h.failed))
     println(
-        stdout, yatf_prefix(), "re-running ", plural(length(names), "item"),
-        " that did not pass"
+        stdout, yatf_prefix(), "running ", plural(length(names), "failing item")
     )
     return runtests(args...; name = names, kwargs...)
 end
@@ -427,6 +430,10 @@ const PRECOMPILE_SIGNATURES = (
         item_log_path("/precompile/item_", 1, 1)
         bracket("a line\nanother", "[1/2] FAIL", "\"an item\"", "@ a_test.jl:1", :red)
         fmt_seconds(0.5); plural(2, "worker"); plural(1, "process", "processes")
+
+        # What an editor asks for first: the listing, as JSON, and a command read.
+        json(list_items(dir))
+        read_json("{\"id\":1,\"command\":\"run\",\"names\":[\"precompile one\"],\"options\":{\"workers\":2}}")
     end
     rm(dir; force = true, recursive = true)
     for (f, types) in PRECOMPILE_SIGNATURES
@@ -438,7 +445,7 @@ end # module Private
 
 using Test
 using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_yatf_run,
-    activate, deactivate, is_activated, debug, setups_to_packages, chores,
+    activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 export @testitem, runtests, runtestsf, chores
@@ -452,7 +459,7 @@ for name in names(Test)
 end
 
 public current_testitem, in_testitem, in_yatf_run,
-    activate, deactivate, is_activated, debug, setups_to_packages,
+    activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 end # module YATF

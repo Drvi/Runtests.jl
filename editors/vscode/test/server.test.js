@@ -1,5 +1,5 @@
-// Against a real server: YATF from this checkout, serving a package made for the
-// test. `julia` from the PATH, or `YATF_TEST_JULIA`.
+// Against a real server: Runtests from this checkout, serving a package made for the
+// test. `julia` from the PATH, or `RUNTESTS_TEST_JULIA`.
 'use strict';
 
 const { test, before, after } = require('node:test');
@@ -7,14 +7,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { YatfServer, PROTOCOL } = require('../src/server');
+const { RuntestsServer, PROTOCOL } = require('../src/server');
 
 const REPO = path.resolve(__dirname, '..', '..', '..');
-const julia = process.env.YATF_TEST_JULIA ?? 'julia';
+const julia = process.env.RUNTESTS_TEST_JULIA ?? 'julia';
 const sep = process.platform === 'win32' ? ';' : ':';
 
 function makePackage() {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yatf-vscode-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtests-vscode-'));
     fs.writeFileSync(path.join(dir, 'Project.toml'),
         'name = "Served"\nuuid = "0b0b0b0b-0000-4000-8000-00000000cafe"\nversion = "0.1.0"\n');
     fs.mkdirSync(path.join(dir, 'src'));
@@ -32,13 +32,13 @@ const log = [];
 
 before(async () => {
     dir = makePackage();
-    server = new YatfServer({
+    server = new RuntestsServer({
         julia, juliaArgs: [], environment: REPO, root: dir, onLog: line => log.push(line),
         env: {
             ...process.env,
-            // Workers find YATFWorkers through the load path, as the Julia tests arrange.
+            // Workers find RuntestsWorkers through the load path, as the Julia tests arrange.
             JULIA_LOAD_PATH: [REPO, path.join(REPO, 'test'), ''].join(sep),
-            YATF_RUNSTATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'yatf-runs-')),
+            RUNTESTS_RUNSTATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'runtests-runs-')),
         },
     });
     const hello = await server.start();
@@ -99,7 +99,7 @@ test('a cancel stops a run at once', { timeout: 240_000 }, async () => {
 });
 
 test('a julia that cannot be started is said, and tried again next time', async () => {
-    const missing = new YatfServer({ julia: path.join(os.tmpdir(), 'no-such-julia'), environment: REPO, root: dir });
+    const missing = new RuntestsServer({ julia: path.join(os.tmpdir(), 'no-such-julia'), environment: REPO, root: dir });
     await assert.rejects(missing.start());
     assert.equal(missing.running, false);
     await assert.rejects(missing.start());

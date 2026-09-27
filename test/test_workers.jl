@@ -1,7 +1,7 @@
 # The worker protocol: the framing on its own, then real worker processes.
-using YATFWorkers: YATFWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
+using RuntestsWorkers: RuntestsWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
                     WorkerTerminatedException, RemoteException
-using YATFWorkers: ItemSpec, ItemResult, PASSED
+using RuntestsWorkers: ItemSpec, ItemResult, PASSED
 using Sockets
 
 # A connected socket pair standing in for coordinator and worker.
@@ -45,53 +45,53 @@ end
 @testset "workers" begin
     @testset "framing: round trip, exact reads, corrupt stream" begin
         a, b = socket_pair()
-        write(a, YATFWorkers.encode_message(UInt64(7), YATFWorkers.KIND_EVAL, :(1 + 1)))
-        f = YATFWorkers.read_message(b)
-        @test f.id == 7 && f.kind == YATFWorkers.KIND_EVAL && f.error === nothing
+        write(a, RuntestsWorkers.encode_message(UInt64(7), RuntestsWorkers.KIND_EVAL, :(1 + 1)))
+        f = RuntestsWorkers.read_message(b)
+        @test f.id == 7 && f.kind == RuntestsWorkers.KIND_EVAL && f.error === nothing
         @test f.payload == :(1 + 1)
         # Back-to-back messages stay separate.
-        write(a, YATFWorkers.encode_message(UInt64(8), YATFWorkers.KIND_RESULT, (1, "two")),
-                 YATFWorkers.encode_message(UInt64(9), YATFWorkers.KIND_RESULT, nothing))
-        @test YATFWorkers.read_message(b).payload == (1, "two")
-        @test YATFWorkers.read_message(b).id == 9
+        write(a, RuntestsWorkers.encode_message(UInt64(8), RuntestsWorkers.KIND_RESULT, (1, "two")),
+                 RuntestsWorkers.encode_message(UInt64(9), RuntestsWorkers.KIND_RESULT, nothing))
+        @test RuntestsWorkers.read_message(b).payload == (1, "two")
+        @test RuntestsWorkers.read_message(b).id == 9
         # A frame whose boundary is wrong is a corrupt stream, not a message.
-        bad = YATFWorkers.encode_message(UInt64(10), YATFWorkers.KIND_RESULT, 1)
+        bad = RuntestsWorkers.encode_message(UInt64(10), RuntestsWorkers.KIND_RESULT, 1)
         bad[end] ⊻= 0xff
         write(a, bad)
-        @test_throws ErrorException YATFWorkers.read_message(b)
+        @test_throws ErrorException RuntestsWorkers.read_message(b)
         close(a); close(b)
         # A connection cut mid-payload is EOF, not a short payload.
         c, d = socket_pair()
-        msg = YATFWorkers.encode_message(UInt64(11), YATFWorkers.KIND_RESULT, collect(1:100))
+        msg = RuntestsWorkers.encode_message(UInt64(11), RuntestsWorkers.KIND_RESULT, collect(1:100))
         write(c, msg[1:end-20])
         close(c)
-        @test_throws EOFError YATFWorkers.read_message(d)
+        @test_throws EOFError RuntestsWorkers.read_message(d)
         close(d)
     end
 
     @testset "a reply that cannot be serialized becomes an error string" begin
-        bytes = YATFWorkers.encode_reply(UInt64(1), YATFWorkers.KIND_RESULT, current_task())
-        f = YATFWorkers.read_message(IOBuffer(bytes))
-        @test f.id == 1 && f.kind == YATFWorkers.KIND_ERROR
+        bytes = RuntestsWorkers.encode_reply(UInt64(1), RuntestsWorkers.KIND_RESULT, current_task())
+        f = RuntestsWorkers.read_message(IOBuffer(bytes))
+        @test f.id == 1 && f.kind == RuntestsWorkers.KIND_ERROR
         @test f.payload isa String && occursin("could not serialize", f.payload)
     end
 
     @testset "a reply that cannot be deserialized is reported against its request" begin
         m = Module(:Nowhere)
         Core.eval(m, :(struct Ghost; x::Int; end))
-        bytes = YATFWorkers.encode_message(UInt64(2), YATFWorkers.KIND_RESULT, Core.eval(m, :(Ghost(1))))
-        f = YATFWorkers.read_message(IOBuffer(bytes))
-        @test f.id == 2 && f.kind == YATFWorkers.KIND_RESULT
+        bytes = RuntestsWorkers.encode_message(UInt64(2), RuntestsWorkers.KIND_RESULT, Core.eval(m, :(Ghost(1))))
+        f = RuntestsWorkers.read_message(IOBuffer(bytes))
+        @test f.id == 2 && f.kind == RuntestsWorkers.KIND_RESULT
         @test f.error !== nothing
     end
 
     @testset "with_timeout never loses a result" begin
         # A function that returns before the caller waits must not hang the caller.
         for _ in 1:50
-            @test YATFWorkers.with_timeout(() -> 42, 5) == 42
+            @test RuntestsWorkers.with_timeout(() -> 42, 5) == 42
         end
-        @test_throws ErrorException YATFWorkers.with_timeout(() -> sleep(3), 0.2)
-        err = try; YATFWorkers.with_timeout(() -> error("inner"), 5); catch e; e; end
+        @test_throws ErrorException RuntestsWorkers.with_timeout(() -> sleep(3), 0.2)
+        err = try; RuntestsWorkers.with_timeout(() -> error("inner"), 5); catch e; e; end
         @test err isa CapturedException && occursin("inner", sprint(showerror, err))
     end
 
@@ -117,7 +117,7 @@ end
             @test remote_fetch(w, :(1 + 1)) === nothing
         finally
             t = @elapsed close(w)
-            @test t < YATFWorkers.GRACEFUL_EXIT_SECONDS    # it left on its own, without being signalled
+            @test t < RuntestsWorkers.GRACEFUL_EXIT_SECONDS    # it left on its own, without being signalled
         end
         @test process_exited(w.process)
         @test w.process.exitcode == 0
@@ -128,20 +128,20 @@ end
         # The item's module outlives the item: it is bound in Main, and the methods
         # and types it defines are rooted for the life of the process. What its
         # globals refer to need not: item after item, it would pile up in the worker.
-        probes = Core.eval(Main, :(const YATF_RELEASE_PROBES = WeakRef[]))
-        shared = Core.eval(Main, :(const YATF_RELEASE_SHARED = [1, 2, 3]))
-        res = YATFWorkers.run_item(probe_spec(quote
+        probes = Core.eval(Main, :(const RUNTESTS_RELEASE_PROBES = WeakRef[]))
+        shared = Core.eval(Main, :(const RUNTESTS_RELEASE_SHARED = [1, 2, 3]))
+        res = RuntestsWorkers.run_item(probe_spec(quote
             global big = zeros(UInt8, 10^7)
-            push!(Main.YATF_RELEASE_PROBES, WeakRef(big))
+            push!(Main.RUNTESTS_RELEASE_PROBES, WeakRef(big))
             # One that cannot hold `nothing` is given an empty container instead.
             global typed_big::Vector{UInt8} = zeros(UInt8, 10^7)
-            push!(Main.YATF_RELEASE_PROBES, WeakRef(typed_big))
+            push!(Main.RUNTESTS_RELEASE_PROBES, WeakRef(typed_big))
             const kept = 1          # a constant stays, and does not stop the rest
             global typed::Int = 2   # nor does a global with no empty value
             # What an item shares with the rest of the process is dropped, not emptied:
             # the next item on the worker may need it.
-            global alias::Vector{Int} = Main.YATF_RELEASE_SHARED
-            const also = Main.YATF_RELEASE_SHARED
+            global alias::Vector{Int} = Main.RUNTESTS_RELEASE_SHARED
+            const also = Main.RUNTESTS_RELEASE_SHARED
             @test length(big) == 10^7
         end))
         @test res.state === PASSED
@@ -199,7 +199,7 @@ end
             sleep(0.5)
             t = @elapsed close(w)
             @test process_exited(w.process)
-            @test t < YATFWorkers.GRACEFUL_EXIT_SECONDS + YATFWorkers.TERM_GRACE_SECONDS + YATFWorkers.KILL_WAIT_SECONDS
+            @test t < RuntestsWorkers.GRACEFUL_EXIT_SECONDS + RuntestsWorkers.TERM_GRACE_SECONDS + RuntestsWorkers.KILL_WAIT_SECONDS
         end
     end
 
@@ -209,7 +209,7 @@ end
             with_worker(; threads="1", redirect_io=out) do w
                 remote_eval(w, :(let c = Threads.Condition(); lock(c); wait(c) end))   # a deadlock on the root task
                 sleep(0.5)
-                YATFWorkers.inspect!(w)
+                RuntestsWorkers.inspect!(w)
                 terminate!(w)
                 wait(w)
             end
@@ -234,25 +234,25 @@ end
             sleep(600)
             """)
             parent = run(`$(Base.julia_cmd()) --startup-file=no $script $pidfile`; wait=false)
-            job = YATFWorkers.worker_job(getpid(parent))
+            job = RuntestsWorkers.worker_job(getpid(parent))
             child = 0
             try
                 @test job != C_NULL
                 @test timedwait(() -> isfile(pidfile) && filesize(pidfile) > 0, 60) === :ok
                 child = parse(Int, read(pidfile, String))
                 @test alive(child)
-                YATFWorkers.end_job!(job)
+                RuntestsWorkers.end_job!(job)
                 job = C_NULL
                 @test timedwait(() -> !alive(child) && process_exited(parent), 10) === :ok
             finally
-                YATFWorkers.end_job!(job)
+                RuntestsWorkers.end_job!(job)
                 child == 0 || ccall(:uv_kill, Cint, (Cint, Cint), child, Base.SIGKILL)
                 process_running(parent) && kill(parent, Base.SIGKILL)
             end
         else
             # A process group does this elsewhere, and there is no job to end.
-            @test YATFWorkers.worker_job(getpid()) == C_NULL
-            @test YATFWorkers.end_job!(C_NULL) === nothing
+            @test RuntestsWorkers.worker_job(getpid()) == C_NULL
+            @test RuntestsWorkers.end_job!(C_NULL) === nothing
         end
     end
 
@@ -288,7 +288,7 @@ end
             # Waited for from a task of its own, so a wait that never ends fails
             # this test rather than hanging it.
             waiter = @async wait(w)
-            done = timedwait(() -> istaskdone(waiter), YATFWorkers.GRACEFUL_EXIT_SECONDS + 10) === :ok
+            done = timedwait(() -> istaskdone(waiter), RuntestsWorkers.GRACEFUL_EXIT_SECONDS + 10) === :ok
             return (; done, gone = timedwait(() -> !alive(child), 5) === :ok)
         finally
             child == 0 || ccall(:uv_kill, Cint, (Cint, Cint), child, Base.SIGKILL)
@@ -306,9 +306,9 @@ end
     end
 
     @testset "a worker nobody connects to exits on its own" begin
-        cmd = `$(Base.julia_cmd()) --startup-file=no -e $(YATFWorkers.worker_startup_code(1))`
+        cmd = `$(Base.julia_cmd()) --startup-file=no -e $(RuntestsWorkers.worker_startup_code(1))`
         proc = open(worker_child_env(cmd), "r+")
-        println(proc, "x"^YATFWorkers.COOKIE_BYTES)
+        println(proc, "x"^RuntestsWorkers.COOKIE_BYTES)
         close(proc.in)
         t = @elapsed wait(proc)
         @test proc.exitcode == 1
@@ -317,7 +317,7 @@ end
     end
 
     @testset "these tests leave no worker running" begin
-        @test @lock(YATFWorkers.LIVE_LOCK, count(Base.process_running, YATFWorkers.LIVE_PROCESSES)) == 0
+        @test @lock(RuntestsWorkers.LIVE_LOCK, count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)) == 0
     end
 end
 
@@ -326,7 +326,7 @@ end
     # The report the inspection prints is a table of file, line and function fitted
     # to that width, so eighty columns is where the part naming what ran is cut.
     before = get(ENV, "COLUMNS", nothing)
-    inside = YATFWorkers.wide_display() do
+    inside = RuntestsWorkers.wide_display() do
         (something(tryparse(Int, get(ENV, "COLUMNS", "")), 0), displaysize(stdout))
     end
     @test inside[1] >= 1000

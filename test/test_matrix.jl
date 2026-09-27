@@ -7,8 +7,8 @@
 # about real line numbers. A test that hard-codes `:14` is a test that goes wrong
 # the first time somebody adds a line above it.
 
-using YATF.Private: PASSED, FAILED, ERRORED, SKIPPED
-using YATFWorkers: YATFWorkers
+using Runtests.Private: PASSED, FAILED, ERRORED, SKIPPED
+using RuntestsWorkers: RuntestsWorkers
 
 """
     marked(source) -> (source, marks)
@@ -64,8 +64,8 @@ end
 end
 
 @testitem "matrix sees its threads" begin                # mark:threads_item
-    want = get(ENV, "YATF_EXPECT_THREADS", "")
-    if haskey(ENV, "YATF_WORKER") && !isempty(want)
+    want = get(ENV, "RUNTESTS_EXPECT_THREADS", "")
+    if haskey(ENV, "RUNTESTS_WORKER") && !isempty(want)
         @test string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)) == want
     else
         @test Threads.nthreads() >= 1
@@ -109,7 +109,7 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
     for workers in MATRIX_WORKERS, threads in MATRIX_THREADS, logs in MATRIX_LOGS
         @testset "workers=$workers threads=$(repr(threads)) logs=$logs" begin
             expected = threads == "1" ? "1,0" : "2,1"
-            (states, run, _), out = withenv("YATF_EXPECT_THREADS" => expected) do
+            (states, run, _), out = withenv("RUNTESTS_EXPECT_THREADS" => expected) do
                 capture_run() do
                     run_states(MATRIX_PKG; workers, threads, logs, monitor=false)
                 end
@@ -140,17 +140,17 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                     @test any(l -> occursin(repr(name), l) && occursin(word, l), dones)
                 end
                 # Blue while it runs, whatever the item turns out to be.
-                @test all(l -> occursin(YATF.Private.MARK_RUNNING, l), starts)
+                @test all(l -> occursin(Runtests.Private.MARK_RUNNING, l), starts)
                 for (name, state) in MATRIX_STATES
                     line = only(filter(l -> occursin(repr(name), l), dones))
-                    @test occursin(YATF.Private.state_mark(state), line)
+                    @test occursin(Runtests.Private.state_mark(state), line)
                 end
                 # ...and the glyph is the one the colour would have been.
-                @test count(l -> occursin(YATF.Private.MARK_PASSED, l), dones) ==
+                @test count(l -> occursin(Runtests.Private.MARK_PASSED, l), dones) ==
                     count(==(PASSED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATF.Private.MARK_SET_ASIDE, l), dones) ==
+                @test count(l -> occursin(Runtests.Private.MARK_SET_ASIDE, l), dones) ==
                     count(==(SKIPPED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATF.Private.MARK_FAILED, l), dones) == 5
+                @test count(l -> occursin(Runtests.Private.MARK_FAILED, l), dones) == 5
             end
 
             @testset "the name column lines the outcomes up" begin
@@ -166,7 +166,7 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                 columns = unique(first(findfirst(r"(PASS|FAIL|ERR|SKIP)", l)) for l in fitting)
                 @test length(columns) == 1
                 # ...and the width is the one the names asked for.
-                @test width == YATF.Private.name_width(collect(keys(MATRIX_STATES)))
+                @test width == Runtests.Private.name_width(collect(keys(MATRIX_STATES)))
             end
 
             @testset "a failure names the line it failed on" begin

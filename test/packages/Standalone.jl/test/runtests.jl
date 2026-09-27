@@ -1,2 +1,2 @@
-using YATF
-YATF.runtests()
+using Runtests
+Runtests.runtests()

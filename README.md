@@ -1,27 +1,35 @@
-# YATF.jl
+# Runtests.jl
 
-[![CI](https://github.com/Drvi/YATF.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Drvi/YATF.jl/actions/workflows/CI.yml)
+[![CI](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml)
 
-Yet another testing framework. YATF runs a package's tests as independent *test
-items* spread over worker processes, and plans each run from what the runs before
-it recorded: what failed last time runs first, the longest items start early, and
-the rest go in file order, so that a worker reuses the code it has already
-compiled. Every run leaves a record that is enough to run it again elsewhere.
+Runtests.jl runs a package's tests as independent *test items* spread over worker processes,
+and plans each run from what the runs before it recorded: what failed last time runs first,
+the longest items start early, and the rest go in file order, so that a worker reuses the code
+it has already compiled. Every run leaves a record that is enough to run it again elsewhere.
+
+The aim is a workflow with next to nothing to decide. Most of the time you call
+`Runtests.runtests()` to run the suite and `Runtests.runtestsf()` to run again what
+failed, and Runtests picks the rest: how many workers the machine has room for, what
+order the items run in, whose output is worth printing, and the environment the tests
+need. Every one of those choices has a keyword for when the default is wrong for you
+(see [Running tests](#running-tests)).
+
+Runtests is a vibe-coded package: its code was written with an AI coding assistant.
 
 Julia 1.12+. Beyond the standard library it needs three packages: `TestEnv` to
 build the environment tests run in, `PrecompileTools` to keep the wait before the
-first test item short, and `YATFWorkers`, the part of YATF a worker process loads.
+first test item short, and `RuntestsWorkers`, the part of Runtests a worker process loads.
 With [Debugger.jl](https://github.com/JuliaDebug/Debugger.jl) loaded, it can step
 into a test item.
 
 ## Quick start
 
-Add YATF to the package's test dependencies (`test/Project.toml`, or `[extras]`
+Add Runtests to the package's test dependencies (`test/Project.toml`, or `[extras]`
 and `[targets]` in `Project.toml`), and make `test/runtests.jl`:
 
 ```julia
-using YATF
-YATF.runtests()
+using Runtests
+Runtests.runtests()
 ```
 
 Then write test items in files named `*_test.jl` or `*_tests.jl`:
@@ -33,14 +41,14 @@ Then write test items in files named `*_test.jl` or `*_tests.jl`:
 end
 ```
 
-`Pkg.test()` runs them as usual. At the REPL, `YATF.runtests()` runs the suite of
+`Pkg.test()` runs them as usual. At the REPL, `Runtests.runtests()` runs the suite of
 the active project, building its test environment itself.
 
 ## Test files
 
 ```
 test/
-  runtests.jl          using YATF; YATF.runtests()
+  runtests.jl          using Runtests; Runtests.runtests()
   solver_test.jl       @testitem declarations, and nothing else
   sub/parser_tests.jl
   testsetups/
@@ -48,7 +56,7 @@ test/
   TestItems.toml       optional: run settings, forced ordering, sandbox profiles
 ```
 
-A test file contains only `@testitem` declarations. YATF reads test files by
+A test file contains only `@testitem` declarations. Runtests reads test files by
 parsing them, never by evaluating them, so a test file cannot run anything in the
 process that is coordinating the run.
 
@@ -113,14 +121,14 @@ end
 ```
 
 An item loads it with `using MySetups` or `import MySetups`, which is also how
-YATF knows which setups an item needs. Before any worker starts, it precompiles
+Runtests knows which setups an item needs. Before any worker starts, it precompiles
 each of them once, so that the workers do not all compile the same module at the
 same moment. A setup is precompiled like any package: its top-level code runs when
 it is compiled, and what has to happen in every process goes in its `__init__`.
 
 A setup without a project of its own has no UUID, and Julia keeps a single cache
 file for it per depot: another checkout with a setup of the same name, or a profile
-with other Julia flags, compiles over it. `YATF.setups_to_packages()` makes every
+with other Julia flags, compiles over it. `Runtests.setups_to_packages()` makes every
 setup a package, after which each checkout and each set of flags keeps its own
 cache. `Name.jl` moves to `Name/src/Name.jl`, beside a `Name/Project.toml` with a
 UUID and the packages the setup imports. In a moved setup, `@__DIR__` becomes
@@ -131,33 +139,33 @@ run it again after a setup starts importing something new.
 ## Running tests
 
 ```julia
-YATF.runtests()                          # everything under test/
-YATF.runtests("test/solver_test.jl")     # one file
-YATF.runtests("test/solver_test.jl:42")  # the item that line is inside
-YATF.runtests(name="adds numbers")       # one item; a Regex matches part of a name
-YATF.runtests(tags=:fast)                # by tag
-YATF.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||`
-YATF.runtests("test/db"; tags=:fast)     # they narrow together
-YATF.runtests(dry_run=true)              # print the plan, run nothing
-YATF.runtestsf()                         # run what is failing, each item as it last ran
-YATF.chores()                            # what the suite needs tidying; fix=true tidies it
+Runtests.runtests()                          # everything under test/
+Runtests.runtests("test/solver_test.jl")     # one file
+Runtests.runtests("test/solver_test.jl:42")  # the item that line is inside
+Runtests.runtests(name="adds numbers")       # one item; a Regex matches part of a name
+Runtests.runtests(tags=:fast)                # by tag
+Runtests.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||`
+Runtests.runtests("test/db"; tags=:fast)     # they narrow together
+Runtests.runtests(dry_run=true)              # print the plan, run nothing
+Runtests.runtestsf()                         # run what is failing, each item as it last ran
+Runtests.chores()                            # what the suite needs tidying; fix=true tidies it
 ```
 
 A tag expression is names joined with `&&` and `||`, each optionally negated with
 `!`; `&&` binds tighter, and there are no parentheses. `name` also takes several
 names, as a vector or a set.
 
-`YATF.chores()` reports what a suite needs looking after: anything a run would
+`Runtests.chores()` reports what a suite needs looking after: anything a run would
 refuse to start on, in the test items or in `TestItems.toml`; setups that are not
 packages yet, or whose imports have outgrown their `[deps]`; and this machine's
 run states older than a week, apart from the newest five, whose durations order
 the next run. Another machine's run state, a downloaded CI artifact say, is never
-deleted. `YATF.chores(fix = true)` makes the setups packages and deletes those run
+deleted. `Runtests.chores(fix = true)` makes the setups packages and deletes those run
 states; the rest needs a person. It returns `true` when nothing is left to do.
 
-A run that cannot start throws before any item runs: `YATF.ScanFailure` when test
-files cannot be read as a suite, `YATF.NoTestsError` when there is nothing to run,
-and `YATF.ConfigError` when a setting, profile or test setup cannot be used as
+A run that cannot start throws before any item runs: `Runtests.ScanFailure` when test
+files cannot be read as a suite, `Runtests.NoTestsError` when there is nothing to run,
+and `Runtests.ConfigError` when a setting, profile or test setup cannot be used as
 given.
 
 | Keyword | Meaning |
@@ -174,10 +182,10 @@ given.
 | `memory_threshold` | the share of the machine's memory in use at which the run holds off on new items; 0.9 by default |
 | `monitor` | watch memory and show the progress line; on by default |
 | `monitor_interval` | how often the progress line is printed when there is no terminal to redraw it on; 30 seconds by default, and 0 prints it five times a second |
-| `full_stacktraces` | keep YATF's own frames in a failing item's backtrace |
+| `full_stacktraces` | keep Runtests' own frames in a failing item's backtrace |
 | `full_names` | write every item's name whole, where by default one much longer than the rest is shortened to a prefix of its own (see [The plan](#the-plan)) |
-| `testset_name` | what the run's testset is called in the summary; `"YATF"` by default. Runs of several calls under one `@testset` are told apart by it |
-| `coverage` | count which lines of `src/` and `ext/` the items run, into `lcov.info` at the package's root; also `YATF_COVERAGE` (see [Coverage](#coverage)) |
+| `testset_name` | what the run's testset is called in the summary; `"Runtests"` by default. Runs of several calls under one `@testset` are told apart by it |
+| `coverage` | count which lines of `src/` and `ext/` the items run, into `lcov.info` at the package's root; also `RUNTESTS_COVERAGE` (see [Coverage](#coverage)) |
 | `seed` | where every item's random numbers start, with its name; random unless given, and printed at the start of the run |
 | `dry_run` | print the plan and run nothing |
 | `replay` | run a recorded run again (see [Run state](#run-state)) |
@@ -191,7 +199,7 @@ and stopped around it, and the run lists which items did.
 
 ### Coverage
 
-`coverage = true`, as a keyword, as `YATF_COVERAGE=true` in the environment, or
+`coverage = true`, as a keyword, as `RUNTESTS_COVERAGE=true` in the environment, or
 under `[run]` in `TestItems.toml`, has every worker count which lines of the
 package's `src/` and `ext/` run. A keyword wins over the variable, and the variable
 over the file; the run's opening block says which of them decided. At the end the
@@ -219,7 +227,7 @@ merge; nothing needs setting. To upload the merged file instead:
 ```yaml
 - uses: julia-actions/julia-runtest@v1
   env:
-    YATF_COVERAGE: true
+    RUNTESTS_COVERAGE: true
 - uses: codecov/codecov-action@v5
   with:
     files: lcov.info
@@ -227,10 +235,10 @@ merge; nothing needs setting. To upload the merged file instead:
 
 ## The plan
 
-`YATF.runtests(dry_run=true)` prints what a run would do and runs nothing:
+`Runtests.runtests(dry_run=true)` prints what a run would do and runs nothing:
 
 <pre>
-<b>┌ [YATF]</b> dry run · v0.1.0 · julia 1.13.0 · 6 test items in 2 files · 2 workers · threads 2,1
+<b>┌ [TEST]</b> dry run · v0.1.0 · julia 1.13.0 · 6 test items in 2 files · 2 workers · threads 2,1
 <b>│ </b>startup: files 0.0s · plan 0.0s
 <b>│ </b>setups: `BasicSetup`
 <b>│ </b>timeout: 1800s · retries: 0 · failfast: false · logs: issues · memory_threshold: 0.9
@@ -276,7 +284,7 @@ every name whole.
 Workers, test items and the run itself each get lines of one shape:
 
 <pre>
-<b>┌ [YATF]</b> v0.1.0 · julia 1.13.0 · 6 test items in 2 files · seed 0x0c15831ed3676a15 · 2 workers · threads 2,1
+<b>┌ [TEST]</b> v0.1.0 · julia 1.13.0 · 6 test items in 2 files · seed 0x0c15831ed3676a15 · 2 workers · threads 2,1
 <b>│ </b>env: /var/folders/…/jl_vWMrc1/Project.toml
 <b>└ </b>startup: files 0.0s · plan 0.1s · setup 1.4s
 ⚪ w0 · 12:54:36 · <b>INFO</b> · 0/6 · 0 failed · 0/2 workers · tree mem 845M (max 845M) · child max 448M · mem 89% · cpu 10.6/18 · testing 1s
@@ -308,13 +316,13 @@ An item that did not pass gets its results and captured output right after its
 The run ends with what it cost, stage by stage, followed by `Test`'s usual summary:
 
 <pre>
-<b>┌ [YATF]</b> ran 6 test items in 3.3s on 2 workers, all passed
+<b>┌ [TEST]</b> ran 6 test items in 3.3s on 2 workers, all passed
 <b>│ </b>setup   · 1.3s · tree max  422M · child max  422M · coordinator
 <b>│ </b>testing · 1.8s · tree max  1.0G · child max  452M · coordinator + 2 workers · 87% compile
 <b>│ </b>(summed resident sizes over-count pages the processes share)
 <b>│ </b>machine · 57.7G of 64.0G in use at peak
 <b>│ </b>cpu · 9% of 18 threads for this run's processes, 14% for the whole machine (averages over the run)
-<b>└ </b>run state: ~/.julia/yatf/runs/MyPackage-8db4f545/1790247276-96211.yatf
+<b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276-96211.runstate
 </pre>
 
 The memory figures cover every process the run owns: the coordinator, the workers,
@@ -387,8 +395,8 @@ use. Packages see different preferences there, so they are precompiled separatel
 ## At the REPL
 
 ```julia
-YATF.activate()        # or YATF.activate("path/to/Package")
-YATF.deactivate()
+Runtests.activate()        # or Runtests.activate("path/to/Package")
+Runtests.deactivate()
 ```
 
 `activate` puts the session where a test item's worker is: the package's test
@@ -417,15 +425,15 @@ in a file is an error here, and it runs the same way: fresh module, soft scope,
 a run around the item, so they are ignored with a warning, except that an item
 with a worker of its own keeps its `timeout` and `retries`. `tags` are ignored.
 
-With [Debugger.jl](https://github.com/JuliaDebug/Debugger.jl) loaded, `YATF.debug`
+With [Debugger.jl](https://github.com/JuliaDebug/Debugger.jl) loaded, `Runtests.debug`
 steps into one test item, here in this process:
 
 ```julia
 julia> using Debugger
 
-julia> YATF.debug()                 # the last run's most recent failure
+julia> Runtests.debug()                 # the last run's most recent failure
 
-julia> YATF.debug("adds numbers")   # seed = … to draw the random numbers a run drew
+julia> Runtests.debug("adds numbers")   # seed = … to draw the random numbers a run drew
 ```
 
 Without a name it steps into the failure the last run recorded most recently, with
@@ -443,20 +451,20 @@ a pass.
 ## Inside a test item
 
 ```julia
-import YATF               # in the item's body
-YATF.current_testitem()   # a TestItemInfo: name, file, line, attempt, profile; or nothing
-YATF.in_testitem()        # Bool, for this task and the tasks it spawns
-YATF.in_yatf_run()        # Bool, process-level, inherited by subprocesses
+import Runtests               # in the item's body
+Runtests.current_testitem()   # a TestItemInfo: name, file, line, attempt, profile; or nothing
+Runtests.in_testitem()        # Bool, for this task and the tasks it spawns
+Runtests.in_test_run()        # Bool, process-level, inherited by subprocesses
 ```
 
 These are for test infrastructure: temporary directories, fixture paths, switching
 off telemetry. Library code that changes what it does because it detects that it
-is under test stops testing the library. Loading YATF in an item costs each worker
+is under test stops testing the library. Loading Runtests in an item costs each worker
 a moment the first time.
 
 ## The environment tests run in
 
-Under `Pkg.test`, YATF uses the environment Pkg already built. Otherwise it builds
+Under `Pkg.test`, Runtests uses the environment Pkg already built. Otherwise it builds
 one with `TestEnv`, so dependencies your package declares only for testing
 (`[extras]`/`[targets]`, or `test/Project.toml`) are importable from a test item.
 Whatever environment you had active is restored when the run ends.
@@ -481,10 +489,13 @@ run again somewhere else:
 - the test environment's `Project.toml` and `Manifest.toml`.
 
 The path is printed at the end of every run. Run states live in the depot, in a
-directory per project under `yatf/runs/` named for the project, or in the directory
-`YATF_RUNSTATE_DIR` names. The 20 most recent that this machine recorded are kept, and once a project
-no longer exists, the run states this machine recorded for it are deleted too. The
-machine is the hostname, or the name `YATF_HOST` gives it.
+directory per project under `runtests/runs/` named for the project, or in the directory
+`RUNTESTS_RUNSTATE_DIR` names. The 20 most recent that this machine recorded are kept,
+and so is any older one that a failing item's last verdict is in, however many runs
+back: running one item again and again does not make `runtestsf` forget the others.
+Once a project no longer exists, the run states this machine recorded for it are
+deleted too. The
+machine is the hostname, or the name `RUNTESTS_HOST` gives it.
 One recorded elsewhere, such as a run state downloaded from CI, is never changed
 or deleted, wherever it is, and a replay deletes nothing.
 
@@ -494,34 +505,34 @@ before it, and keep a failed run's as an artifact:
 ```yaml
 - uses: actions/cache/restore@v4
   with:
-    path: ${{ runner.temp }}/yatf
-    key: yatf-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
-    restore-keys: yatf-${{ matrix.os }}-${{ matrix.version }}-
+    path: ${{ runner.temp }}/runtests
+    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+    restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-
 - uses: julia-actions/julia-runtest@v1
   env:
-    YATF_RUNSTATE_DIR: ${{ runner.temp }}/yatf
-    YATF_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
+    RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
+    RUNTESTS_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
 - uses: actions/cache/save@v4
   if: always()
   with:
-    path: ${{ runner.temp }}/yatf
-    key: yatf-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+    path: ${{ runner.temp }}/runtests
+    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
   with:
-    name: yatf-run-state-${{ matrix.os }}-${{ matrix.version }}
-    path: ${{ runner.temp }}/yatf
+    name: runtests-run-state-${{ matrix.os }}-${{ matrix.version }}
+    path: ${{ runner.temp }}/runtests
 ```
 
 A cache is written once per key, so every run saves under a key of its own, and
 `restore-keys` brings back the newest one saved before it. It is saved whether or
 not the tests passed: which items failed is what orders the next run most. A
-runner has a new hostname every run, so `YATF_HOST` names the machine: the run
+runner has a new hostname every run, so `RUNTESTS_HOST` names the machine: the run
 states the cache brings back are then this machine's, and pruned to the newest 20
 like a local directory's, where otherwise they would pile up.
 
-Then, locally, `YATF.read_run_state("run.yatf")` shows what happened, and
-`YATF.runtests(replay="run.yatf")` runs the same items with the same settings,
+Then, locally, `Runtests.read_run_state("run.runstate")` shows what happened, and
+`Runtests.runtests(replay="run.runstate")` runs the same items with the same settings,
 profiles and seed, naming every package whose version differs from the one CI had.
 
 Later runs read the recent run states to plan (see [The plan](#the-plan)), and
@@ -531,14 +542,12 @@ and an explicit keyword always wins.
 
 ## Editors
 
-`YATF.serve(path)` lets an editor drive a package's suite: it lists the test items
+`Runtests.serve(path)` lets an editor drive a package's suite: it lists the test items
 with where they are and what they declare, runs the ones asked for, reports each
 item's start and outcome as it happens — failures with their file and line — and
 cancels a run on request. It speaks one JSON object per line: commands on stdin,
 events on stdout, and everything written for people on stderr.
 
 ```sh
-cd MyPackage && julia --project=test -e 'using YATF; YATF.serve()'
+cd MyPackage && julia --project=test -e 'using Runtests; Runtests.serve()'
 ```
-
-[docs/editor-protocol.md](docs/editor-protocol.md) has the commands and events.

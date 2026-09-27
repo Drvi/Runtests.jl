@@ -49,7 +49,7 @@ Base.@kwdef struct RunConfig
     full_names::Bool = false
     # What the run's testset is called in the summary; runs of several calls under
     # one `@testset` are told apart by it.
-    testset_name::String = "YATF"
+    testset_name::String = "Runtests"
     # Workers count which lines of the package's `src/` and `ext/` run, and the run
     # merges what they counted into `lcov.info` at the package's root.
     coverage::Bool = false
@@ -174,8 +174,8 @@ function build_config(path, toml; nunits = 0, kwargs...)
     coverage, coverage_source = if get(kwargs, :coverage, nothing) !== nothing
         (kwargs[:coverage], "the `coverage` keyword")
     else
-        env_coverage = env_flag("YATF_COVERAGE")
-        env_coverage !== nothing ? (env_coverage, "`YATF_COVERAGE`") :
+        env_coverage = env_flag("RUNTESTS_COVERAGE")
+        env_coverage !== nothing ? (env_coverage, "`RUNTESTS_COVERAGE`") :
             haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
     end
     coverage isa Bool || throw(ConfigError("`coverage` must be true or false, got $(repr(coverage))"))
@@ -183,7 +183,7 @@ function build_config(path, toml; nunits = 0, kwargs...)
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
             "whose coverage was fixed when it started; use one worker or more"
     ))
-    testset_name = pick(:testset_name, "YATF")
+    testset_name = pick(:testset_name, "Runtests")
     (testset_name isa AbstractString && !isempty(testset_name)) ||
         throw(ConfigError("`testset_name` must be a non-empty string, got $(repr(testset_name))"))
 

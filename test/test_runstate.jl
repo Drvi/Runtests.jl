@@ -1,5 +1,5 @@
 using Random: Random
-using YATF.Private: init_run_state, write_status!, finish_run_state!, read_run_state, history,
+using Runtests.Private: init_run_state, write_status!, finish_run_state!, read_run_state, history,
             runstate_files, runstate_dir, prune_runstates, new_runstate_path, prepare,
             execute, plan, scan, discover, setup_modules, read_config, Filter, History,
             UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, nitems, RS_STATUS_BYTES,
@@ -11,22 +11,37 @@ function a_plan(pkg=fixture("Basic.jl"))
     return plan(items, read_config(testdir); root=pkg)
 end
 
+# The `n`th run state recorded for `pkg` in `dir`, each item `outcomes` names with its
+# state and duration: a run of the whole suite, or of only those items.
+function record_run(dir, pkg, n, outcomes; whole = false)
+    p, _ = prepare((pkg,); name = whole ? nothing : Set(keys(outcomes)), announce = false)
+    path = joinpath(dir, string(1_000_000 + n, "-1.runstate"))
+    rsf = init_run_state(path, p)
+    for i in 1:nitems(p)
+        haskey(outcomes, p.items.name[i]) || continue
+        state, elapsed = outcomes[p.items.name[i]]
+        write_status!(rsf, i, state, 1, 1; elapsed)
+    end
+    finish_run_state!(rsf)
+    return path
+end
+
 @testset "run state" begin
     @testset "by default a project's run states are the depot's own, and go with the project" begin
         depot = mktempdir()
         pushfirst!(DEPOT_PATH, depot)
         try
-            withenv("YATF_RUNSTATE_DIR" => nothing) do
+            withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
                 one_item = "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n"
                 kept, gone, foreign = make_pkg("Kept", one_item), make_pkg("Gone", one_item),
                                       make_pkg("Foreign", one_item)
                 paths = Dict(pkg => new_runstate_path(pkg) for pkg in (kept, gone, foreign))
                 for (pkg, path) in paths
                     # Not under `scratchspaces/`, which `Pkg.gc` empties of what no package registered.
-                    @test startswith(path, joinpath(depot, "yatf", "runs"))
+                    @test startswith(path, joinpath(depot, "runtests", "runs"))
                     # Named for the package, so a person can tell whose it is.
                     @test occursin(r"^[A-Za-z]+-[0-9a-f]{8}$", basename(dirname(path)))
-                    @test startswith(basename(dirname(path)), YATF.Private.project_name_of(joinpath(pkg, "Project.toml")))
+                    @test startswith(basename(dirname(path)), Runtests.Private.project_name_of(joinpath(pkg, "Project.toml")))
                     finish_run_state!(init_run_state(path, a_plan(pkg)))
                     @test read(joinpath(dirname(path), "project"), String) == abspath(pkg)
                 end
@@ -36,7 +51,7 @@ end
                 write(paths[foreign], replace(read(paths[foreign], String), here => elsewhere))
                 rm(gone; recursive = true)
                 rm(foreign; recursive = true)
-                YATF.Private.sweep_runstate_dirs()
+                Runtests.Private.sweep_runstate_dirs()
                 @test isfile(paths[kept])
                 @test !ispath(dirname(paths[gone]))
                 @test isfile(paths[foreign])        # not this machine's to delete
@@ -45,7 +60,7 @@ end
                 # directory name cannot hold everywhere is left out.
                 env = mkpath(joinpath(mktempdir(), ".my env ☃ " * "x"^40))
                 write(joinpath(env, "Project.toml"), "[deps]\n")
-                @test basename(runstate_dir(env)) == string("myenvx", "x"^26, "-", string(YATF.Private.crc32c(abspath(env)); base = 16, pad = 8))
+                @test basename(runstate_dir(env)) == string("myenvx", "x"^26, "-", string(Runtests.Private.crc32c(abspath(env)); base = 16, pad = 8))
                 # Nothing left of the name: the key alone.
                 odd = mkpath(joinpath(mktempdir(), "☃☃"))
                 @test occursin(r"^[0-9a-f]{8}$", basename(runstate_dir(odd)))
@@ -58,7 +73,7 @@ end
     @testset "round trip" begin
         p = a_plan()
         dir = mktempdir()
-        path = joinpath(dir, "run.yatf")
+        path = joinpath(dir, "run.runstate")
         rsf = init_run_state(path, p)
         write_status!(rsf, 1, PASSED, 1, 3; elapsed=1.5, compile=0.5)
         write_status!(rsf, 2, FAILED, 2, 1; elapsed=0.25)
@@ -95,7 +110,7 @@ end
         """)
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
-        path = joinpath(mktempdir(), "run.yatf")
+        path = joinpath(mktempdir(), "run.runstate")
         finish_run_state!(init_run_state(path, p))
         rs = read_run_state(path)
         prof = rs.profiles[:p]
@@ -108,12 +123,12 @@ end
 
     @testset "a truncated file never throws, at any length" begin
         p = a_plan()
-        path = joinpath(mktempdir(), "run.yatf")
+        path = joinpath(mktempdir(), "run.runstate")
         rsf = init_run_state(path, p)
         write_status!(rsf, 1, PASSED, 1, 1; elapsed=1.0)
         finish_run_state!(rsf)
         full = read(path)
-        broken = joinpath(mktempdir(), "broken.yatf")
+        broken = joinpath(mktempdir(), "broken.runstate")
         for n in 0:length(full)
             write(broken, full[1:n])
             rs = read_run_state(broken)       # must not throw, whatever n is
@@ -125,10 +140,10 @@ end
 
     @testset "a garbled file never throws" begin
         p = a_plan()
-        path = joinpath(mktempdir(), "run.yatf")
+        path = joinpath(mktempdir(), "run.runstate")
         finish_run_state!(init_run_state(path, p))
         full = read(path)
-        garbled = joinpath(mktempdir(), "garbled.yatf")
+        garbled = joinpath(mktempdir(), "garbled.runstate")
         # Seeded, so that a corruption which breaks the reader breaks every run of
         # this file rather than one in a hundred. A count is what usually does it:
         # the number some garbled bytes happen to spell, taken as a length, is an
@@ -154,13 +169,13 @@ end
         script = joinpath(dir, "run.jl")
         write(script, """
         push!(LOAD_PATH, $(repr(dirname(@__DIR__))))
-        using YATF
-        YATF.runtests($(repr(fixture("Faulty.jl"))); workers=1, logs=:issues, monitor=false,
+        using Runtests
+        Runtests.runtests($(repr(fixture("Faulty.jl"))); workers=1, logs=:issues, monitor=false,
                       name=r"^(passes|hangs)\$", timeout=600)
         """)
         child_log = joinpath(dir, "child.log")
         proc = run(pipeline(addenv(`$(Base.julia_cmd()) --startup-file=no $script`,
-                                   "YATF_RUNSTATE_DIR" => dir);
+                                   "RUNTESTS_RUNSTATE_DIR" => dir);
                             stdout=child_log, stderr=child_log); wait=false)
         # Wait until the run state shows the passing item is done, then kill. The
         # ceiling is generous because the child starts a Julia process, resolves a
@@ -170,7 +185,7 @@ end
         deadline = time() + 600
         seen = false
         while time() < deadline && !seen
-            files = filter!(endswith(".yatf"), readdir(dir; join=true))
+            files = filter!(endswith(".runstate"), readdir(dir; join=true))
             for f in files
                 rs = read_run_state(f)
                 rs === nothing && continue
@@ -183,7 +198,7 @@ end
         seen || @info "the killed-run fixture never got going; its output was:\n" *
                       (isfile(child_log) ? read(child_log, String) : "(no output)")
         @test seen
-        files = filter!(endswith(".yatf"), readdir(dir; join=true))
+        files = filter!(endswith(".runstate"), readdir(dir; join=true))
         @test !isempty(files)
         rs = read_run_state(last(sort!(files)))
         @test rs !== nothing
@@ -199,7 +214,7 @@ end
 
     @testset "history feeds the next run" begin
         dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             pkg = fixture("Basic.jl")
             p, target = prepare((pkg,); workers=1, logs=:issues)
             run = execute(p, target)
@@ -214,13 +229,27 @@ end
         end
     end
 
+    @testset "runs of a few items leave the others' timings standing" begin
+        pkg = make_pkg("Timings", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("x", "y", "z"))))
+        with_runstate_dir() do dir
+            record_run(dir, pkg, 1, Dict("x" => (PASSED, 1.0), "y" => (PASSED, 2.0), "z" => (PASSED, 3.0)); whole = true)
+            # More runs of `x` alone than `history` reads recent failures from.
+            for k in 1:(Runtests.Private.HISTORY_RUNS + 1)
+                record_run(dir, pkg, 1 + k, Dict("x" => (PASSED, 0.5)))
+            end
+            @test history(pkg).seconds == Dict("x" => 0.5, "y" => 2.0, "z" => 3.0)
+            p, _ = prepare((pkg,); announce = false)
+            @test all(>(0), p.units.est_s)
+        end
+    end
+
     @testset "an item is failing while the last run that ran it says so" begin
         verdicts(a, b) = string("@testitem \"a\" begin\n    @test $a\nend\n",
                                 "@testitem \"b\" begin\n    @test $b\nend\n",
                                 "@testitem \"c\" begin\n    @test true\nend\n")
         pkg = make_pkg("Failing", "test/t_test.jl" => verdicts(false, false))
         file = joinpath(pkg, "test", "t_test.jl")
-        failing = YATF.Private.failing_items
+        failing = Runtests.Private.failing_items
         with_runstate_dir() do _
             @test failing(pkg) == String[]           # nothing recorded yet
             run_states(pkg; workers = 1, logs = :issues)
@@ -237,11 +266,105 @@ end
             @test failing(pkg; names = Set(["a", "c"])) == String[]
             # `runtestsf` runs exactly those, and then there is nothing left to run.
             write(file, verdicts(true, true))
-            ts, out = capture_run(() -> YATF.runtestsf(pkg; workers = 1, logs = :issues))
+            ts, out = capture_run(() -> Runtests.runtestsf(pkg; workers = 1, logs = :issues))
             @test occursin("running 1 failing item", out)
             @test occursin("ran 1 test item", out)
             @test failing(pkg) == String[]
-            @test_throws YATF.NoTestsError YATF.runtestsf(pkg)
+            @test_throws Runtests.NoTestsError Runtests.runtestsf(pkg)
+        end
+    end
+
+    @testset "pruning keeps every run state an item's failure rests on" begin
+        pkg = make_pkg("Pruned", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("x", "y", "z", "w"))))
+        failing = Runtests.Private.failing_items
+        # The `n`th run recorded here, each item it ran with the verdict given.
+        function recorded(dir, n, verdicts)
+            p, _ = prepare((pkg,); name = Set(keys(verdicts)), announce = false)
+            path = joinpath(dir, string(1_000_000 + n, "-1.runstate"))
+            rsf = init_run_state(path, p)
+            for i in 1:nitems(p)
+                write_status!(rsf, i, verdicts[p.items.name[i]], 1, 1; elapsed = 0.1)
+            end
+            finish_run_state!(rsf)
+            return path
+        end
+        with_runstate_dir() do dir
+            # A run that fails two items, then one of them run alone 25 times until
+            # it passes: the other's failure is only in the first run.
+            full = recorded(dir, 1, Dict("x" => FAILED, "y" => FAILED, "z" => PASSED))
+            alone = [recorded(dir, 1 + k, Dict("x" => k < 25 ? FAILED : PASSED)) for k in 1:25]
+            @test failing(pkg) == ["y"]
+            prune_runstates(pkg)
+            left = runstate_files(pkg)
+            @test full in left
+            @test issubset(alone[(end - 19):end], left)      # the newest 20, as ever
+            @test !any(in(left), alone[1:5])                  # the rest had nothing to keep
+            @test failing(pkg) == ["y"]
+        end
+        with_runstate_dir() do dir
+            # A pass that stands in front of an older failure: without it, the old
+            # failure would count again.
+            full = recorded(dir, 1, Dict("x" => FAILED, "y" => FAILED))
+            fixed = recorded(dir, 2, Dict("x" => PASSED))
+            others = [recorded(dir, 2 + k, Dict("w" => PASSED)) for k in 1:24]
+            prune_runstates(pkg)
+            left = runstate_files(pkg)
+            @test full in left && fixed in left
+            @test !any(in(left), others[1:4])
+            @test failing(pkg) == ["y"]
+        end
+    end
+
+    @testset "an item the suite no longer has is not failing, and holds no run state back" begin
+        items(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
+        pkg = make_pkg("Renamed", "test/t_test.jl" => items("x", "y"))
+        failing = Runtests.Private.failing_items
+        with_runstate_dir() do dir
+            failed = record_run(dir, pkg, 1, Dict("x" => (FAILED, 1.0), "y" => (PASSED, 1.0)); whole = true)
+            @test failing(pkg) == ["x"]
+            # `x` renamed to `z`. A run of some of the items does not say what the
+            # suite has, so `x` stays failing.
+            write(joinpath(pkg, "test", "t_test.jl"), items("y", "z"))
+            record_run(dir, pkg, 2, Dict("y" => (PASSED, 1.0)))
+            @test failing(pkg) == ["x"]
+            # A run of the whole suite does: `x` is gone.
+            record_run(dir, pkg, 3, Dict("y" => (PASSED, 1.0), "z" => (PASSED, 1.0)); whole = true)
+            @test failing(pkg) == String[]
+            @test failing(pkg; names = Set(["x", "y"])) == String[]
+            # Nor is the run state `x` failed in kept for it.
+            for k in 1:20
+                record_run(dir, pkg, 3 + k, Dict("y" => (PASSED, 1.0)))
+            end
+            prune_runstates(pkg)
+            @test !(failed in runstate_files(pkg))
+            @test length(runstate_files(pkg)) == 20
+        end
+    end
+
+    @testset "runtestsf runs the failing items the suite still has" begin
+        suite(a, b) = string("@testitem \"a\" begin\n    @test $a\nend\n", "@testitem \"$b\" begin\n    @test $(b == "b2")\nend\n")
+        pkg = make_pkg("RenamedFailure", "test/t_test.jl" => suite(false, "b"))
+        failing = Runtests.Private.failing_items
+        with_runstate_dir() do _
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+            @test failing(pkg) == ["a", "b"]
+            # `a` fixed, and `b` renamed to `b2`: only `a` is there to run.
+            write(joinpath(pkg, "test", "t_test.jl"), suite(true, "b2"))
+            _, out = capture_run(() -> Runtests.runtestsf(pkg; workers = 0, logs = :issues, monitor = false))
+            @test occursin("running 1 failing item", out)
+            @test occursin("ran 1 test item", out)
+            # `b` is still on record, but not what the suite has, so nothing is left to run.
+            @test failing(pkg) == ["b"]
+            err = try
+                Runtests.runtestsf(pkg; workers = 0)
+            catch e
+                e
+            end
+            @test err isa Runtests.NoTestsError
+            @test occursin("no test item is failing", sprint(showerror, err))
+            # A run of the whole suite takes `b` off the record.
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+            @test failing(pkg) == String[]
         end
     end
 
@@ -264,10 +387,10 @@ end
 
     @testset "old run states are pruned" begin
         dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             p = a_plan()
             for i in 1:25
-                path = joinpath(dir, string(1000000 + i, "-1.yatf"))
+                path = joinpath(dir, string(1000000 + i, "-1.runstate"))
                 finish_run_state!(init_run_state(path, p))
             end
             @test length(runstate_files(p.root)) == 25
@@ -278,17 +401,17 @@ end
 
     @testset "a run state recorded on another machine is never pruned" begin
         dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             p = a_plan()
             for i in 1:25
-                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.yatf")), p))
+                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.runstate")), p))
             end
             # A CI artifact downloaded among them, older than any: the same file, but
             # recorded on another machine. Rewritten byte for byte, so it stays valid.
             here = gethostname()
             elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
-            artifact = joinpath(dir, "999999-1.yatf")
-            write(artifact, replace(read(joinpath(dir, "1000001-1.yatf"), String), here => elsewhere))
+            artifact = joinpath(dir, "999999-1.runstate")
+            write(artifact, replace(read(joinpath(dir, "1000001-1.runstate"), String), here => elsewhere))
             @test read_run_state(artifact).meta["host"] == elsewhere
             before = read(artifact)
             prune_runstates(p.root, 20)
@@ -297,20 +420,20 @@ end
         end
     end
 
-    @testset "YATF_HOST names the machine, so a CI cache is pruned like a local directory" begin
+    @testset "RUNTESTS_HOST names the machine, so a CI cache is pruned like a local directory" begin
         dir = mktempdir()
         p = a_plan()
-        withenv("YATF_RUNSTATE_DIR" => dir, "YATF_HOST" => "ci-linux") do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir, "RUNTESTS_HOST" => "ci-linux") do
             for i in 1:25
-                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.yatf")), p))
+                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.runstate")), p))
             end
-            @test read_run_state(joinpath(dir, "1000001-1.yatf")).meta["host"] == "ci-linux"
+            @test read_run_state(joinpath(dir, "1000001-1.runstate")).meta["host"] == "ci-linux"
             # Recorded under the name this runner has too, whatever its hostname: its own.
             prune_runstates(p.root, 20)
             @test length(runstate_files(p.root)) == 20
         end
         # Under another name, those twenty are another machine's.
-        withenv("YATF_RUNSTATE_DIR" => dir, "YATF_HOST" => "ci-macos") do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir, "RUNTESTS_HOST" => "ci-macos") do
             prune_runstates(p.root, 5)
             @test length(runstate_files(p.root)) == 20
         end
@@ -323,27 +446,27 @@ end
             recorded = only(runstate_files(pkg))
             # The oldest of as many as are kept: the run a replay adds would push it out.
             stamp = parse(Int, first(split(basename(recorded), '-')))
-            for k in 1:(YATF.Private.KEEP_RUNS - 1)
-                cp(recorded, joinpath(dir, string(stamp + k, "-1.yatf")))
+            for k in 1:(Runtests.Private.KEEP_RUNS - 1)
+                cp(recorded, joinpath(dir, string(stamp + k, "-1.runstate")))
             end
             before = Dict(f => read(f) for f in runstate_files(pkg))
             capture_run(() -> run_states(pkg; workers=0, logs=:issues, monitor=false, replay=recorded))
             @test all(f -> isfile(f) && read(f) == before[f], keys(before))
-            @test length(runstate_files(pkg)) == YATF.Private.KEEP_RUNS + 1
+            @test length(runstate_files(pkg)) == Runtests.Private.KEEP_RUNS + 1
         end
     end
 
     @testset "a new run state never takes an existing file's name" begin
         dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             # Whichever second the name is made in, a file already has it.
             now_ = round(Int, time())
-            taken = [joinpath(dir, string(now_ + k, "-", getpid(), ".yatf")) for k in 0:3]
+            taken = [joinpath(dir, string(now_ + k, "-", getpid(), ".runstate")) for k in 0:3]
             foreach(f -> write(f, "someone else's"), taken)
             path = new_runstate_path(dir)
-            @test !ispath(path) && endswith(path, ".yatf")
+            @test !ispath(path) && endswith(path, ".runstate")
             # ...and it sorts after the file whose name it would have had.
-            had = joinpath(dir, first(split(basename(path), '_')) * ".yatf")
+            had = joinpath(dir, first(split(basename(path), '_')) * ".runstate")
             @test had in taken && sort([path, had]) == [had, path]
             @test all(f -> read(f, String) == "someone else's", taken)
         end
@@ -399,7 +522,7 @@ end
         write(joinpath(dir, ".git", "HEAD"), sha * "\n")
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
-        path = joinpath(mktempdir(), "run.yatf")
+        path = joinpath(mktempdir(), "run.runstate")
         finish_run_state!(init_run_state(path, p))
         @test read_run_state(path).meta["revision"] == sha
     end
@@ -413,12 +536,12 @@ end
         )
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
-        path = joinpath(mktempdir(), "run.yatf")
+        path = joinpath(mktempdir(), "run.runstate")
         finish_run_state!(init_run_state(path, p))
 
         # The same suite after the profile was dropped from its configuration.
         write(joinpath(dir, "test", "TestItems.toml"), "")
-        @test_throws YATF.ConfigError prepare((dir,))
+        @test_throws Runtests.ConfigError prepare((dir,))
 
         (p2, _), out = capture_run() do
             prepare((dir,); replay=path)
@@ -426,11 +549,11 @@ end
         prof = only(x for x in p2.profiles if x.name === :p)
         @test prof.julia_args == ["--check-bounds=yes"]
         @test prof.threads == "3"
-        @test occursin("replaying run.yatf", out)
+        @test occursin("replaying run.runstate", out)
 
         # A run state that cannot be read is an error, not a silent fallback to
         # whatever this checkout happens to say.
-        @test_throws YATF.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.yatf"))
+        @test_throws Runtests.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.runstate"))
     end
 
     @testset "a run records where it ran, how it was asked for, and what each worker did" begin
@@ -477,7 +600,7 @@ end
             with_journal() do jdir
                 pkg = make_pkg("Replayable", "test/r_test.jl" => """
                 @testitem "draws" begin
-                    write(joinpath(ENV["YATF_JOURNAL"], string(time_ns())), string(rand(UInt64)))
+                    write(joinpath(ENV["RUNTESTS_JOURNAL"], string(time_ns())), string(rand(UInt64)))
                     @test true
                 end
                 """)
@@ -500,7 +623,7 @@ end
     end
 
     @testset "a manifest is read as package versions" begin
-        m = YATF.Private.manifest_versions("""
+        m = Runtests.Private.manifest_versions("""
         manifest_format = "2.0"
         [[deps.Foo]]
         uuid = "7876af07-990d-54b4-ab0e-23690620f79a"

@@ -1,4 +1,4 @@
-using YATF.Private: PASSED, ERRORED, TIMEDOUT, merge_coverage, function_body_lines, print_coverage
+using Runtests.Private: PASSED, ERRORED, TIMEDOUT, merge_coverage, function_body_lines, print_coverage
 
 # What the run's closing block says about coverage. The block is the report's, which
 # `run_states` does not make: the lost-worker run has an item that times out, and

@@ -1,9 +1,9 @@
 {
-    "name": "yatf",
-    "displayName": "YATF",
-    "description": "Run a Julia package's YATF test items from the Test Explorer",
+    "name": "runtests",
+    "displayName": "Runtests",
+    "description": "Run a Julia package's Runtests test items from the Test Explorer",
     "version": "0.1.0",
-    "publisher": "yatf",
+    "publisher": "runtests",
     "license": "MIT",
     "engines": {
         "vscode": "^1.90.0"
@@ -19,31 +19,31 @@
     "contributes": {
         "commands": [
             {
-                "command": "yatf.runFailed",
+                "command": "runtests.runFailed",
                 "title": "Run Failed Tests",
-                "category": "YATF",
+                "category": "Runtests",
                 "icon": "$(run-errors)"
             },
             {
-                "command": "yatf.restart",
+                "command": "runtests.restart",
                 "title": "Restart Server",
-                "category": "YATF"
+                "category": "Runtests"
             },
             {
-                "command": "yatf.showLog",
+                "command": "runtests.showLog",
                 "title": "Show Log",
-                "category": "YATF"
+                "category": "Runtests"
             }
         ],
         "configuration": {
-            "title": "YATF",
+            "title": "Runtests",
             "properties": {
-                "yatf.julia.executable": {
+                "runtests.julia.executable": {
                     "type": "string",
                     "default": "",
                     "markdownDescription": "The `julia` that runs the server. Empty: the Julia extension's `julia.executablePath`, or `julia` on the `PATH`."
                 },
-                "yatf.julia.args": {
+                "runtests.julia.args": {
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -51,12 +51,12 @@
                     "default": [],
                     "markdownDescription": "Arguments given to `julia` first, such as `+1.12` to pick a juliaup channel."
                 },
-                "yatf.environment": {
+                "runtests.environment": {
                     "type": "string",
                     "default": "",
-                    "markdownDescription": "The environment the server runs in, relative to the workspace folder; it must have YATF. Empty: `test` when `test/Project.toml` exists, the folder itself otherwise."
+                    "markdownDescription": "The environment the server runs in, relative to the workspace folder; it must have Runtests. Empty: `test` when `test/Project.toml` exists, the folder itself otherwise."
                 },
-                "yatf.run.options": {
+                "runtests.run.options": {
                     "type": "object",
                     "default": {},
                     "markdownDescription": "Settings sent with every run, such as `{\"workers\": 2}`: any of the `run` command's options in the editor protocol. Everything else comes from `test/TestItems.toml`."
@@ -66,8 +66,8 @@
         "menus": {
             "view/title": [
                 {
-                    "command": "yatf.runFailed",
-                    "when": "view == workbench.view.testing && yatf.active",
+                    "command": "runtests.runFailed",
+                    "when": "view == workbench.view.testing && runtests.active",
                     "group": "navigation"
                 }
             ]

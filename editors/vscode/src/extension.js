@@ -1,4 +1,4 @@
-// The Test Explorer side: one YATF server per workspace folder with a test suite,
+// The Test Explorer side: one Runtests server per workspace folder with a test suite,
 // its items as a tree of files, runs as test runs. What is decided without VS Code
 // is in `model.js`, and the protocol is in `server.js`.
 'use strict';
@@ -6,14 +6,14 @@
 const vscode = require('vscode');
 const fs = require('node:fs');
 const path = require('node:path');
-const { YatfServer } = require('./server');
+const { RuntestsServer } = require('./server');
 const model = require('./model');
 
 /** @param {vscode.ExtensionContext} context */
 function activate(context) {
-    const log = vscode.window.createOutputChannel('YATF');
-    const ctrl = vscode.tests.createTestController('yatf', 'YATF');
-    const diagnostics = vscode.languages.createDiagnosticCollection('yatf');
+    const log = vscode.window.createOutputChannel('Runtests');
+    const ctrl = vscode.tests.createTestController('runtests', 'Runtests');
+    const diagnostics = vscode.languages.createDiagnosticCollection('runtests');
     context.subscriptions.push(log, ctrl, diagnostics);
 
     /** @type {Map<string, Suite>} workspace folder uri -> its suite */
@@ -30,8 +30,8 @@ function activate(context) {
         if (listed) for (const s of suites.values()) s.refresh();
     }
 
-    // The toolbar's YATF buttons show only in a workspace with a suite.
-    const announce = () => vscode.commands.executeCommand('setContext', 'yatf.active', suites.size > 0);
+    // The toolbar's Runtests buttons show only in a workspace with a suite.
+    const announce = () => vscode.commands.executeCommand('setContext', 'runtests.active', suites.size > 0);
 
     async function addFolder(folder) {
         const found = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, 'test/**/{*_test.jl,*_tests.jl}'), null, 1);
@@ -69,18 +69,18 @@ function activate(context) {
     }, true);
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('yatf.restart', async () => {
+        vscode.commands.registerCommand('runtests.restart', async () => {
             await Promise.all([...suites.values()].map(s => s.restart()));
         }),
-        vscode.commands.registerCommand('yatf.showLog', () => log.show()),
+        vscode.commands.registerCommand('runtests.showLog', () => log.show()),
         // What is failing — each item as the last run that ran it left it, here, in a
         // terminal or on CI — run like any other selection, so it shows in the Test
         // Results like one.
-        vscode.commands.registerCommand('yatf.runFailed', async () => {
+        vscode.commands.registerCommand('runtests.runFailed', async () => {
             const items = [];
             for (const s of suites.values()) items.push(...await s.failedItems());
             if (items.length === 0) {
-                vscode.window.showInformationMessage('YATF: no test item is failing');
+                vscode.window.showInformationMessage('Runtests: no test item is failing');
                 return;
             }
             const source = new vscode.CancellationTokenSource();
@@ -155,14 +155,14 @@ class Suite {
 
     ensureServer() {
         if (this.server?.running) return this.server;
-        const config = vscode.workspace.getConfiguration('yatf', this.folder);
+        const config = vscode.workspace.getConfiguration('runtests', this.folder);
         const julia = config.get('julia.executable') || vscode.workspace.getConfiguration('julia').get('executablePath') || 'julia';
         const environment = config.get('environment')
             ? path.resolve(this.root, config.get('environment'))
             : fs.existsSync(path.join(this.root, 'test', 'Project.toml')) ? path.join(this.root, 'test') : this.root;
-        this.server = new YatfServer({
+        this.server = new RuntestsServer({
             julia, juliaArgs: config.get('julia.args') ?? [], environment, root: this.root,
-            // What YATF writes for people: into the output of the run in progress,
+            // What Runtests writes for people: into the output of the run in progress,
             // shown in a terminal, and into the log.
             onLog: line => {
                 this.log.appendLine(model.plain(line));
@@ -179,7 +179,7 @@ class Suite {
             listing = await this.ensureServer().list();
         } catch (err) {
             this.log.appendLine(`[${this.folder.name}] could not list the test items: ${err.message}`);
-            vscode.window.showErrorMessage(`YATF: could not list the test items of ${this.folder.name}: ${err.message}`, 'Show Log')
+            vscode.window.showErrorMessage(`Runtests: could not list the test items of ${this.folder.name}: ${err.message}`, 'Show Log')
                 .then(choice => choice && this.log.show());
             return;
         }
@@ -217,7 +217,7 @@ class Suite {
         for (const e of listing.errors) {
             const line = Math.max(e.line - 1, 0);
             const d = new vscode.Diagnostic(new vscode.Range(line, 0, line, 1000), e.message, vscode.DiagnosticSeverity.Error);
-            d.source = 'YATF';
+            d.source = 'Runtests';
             if (!byFile.has(e.file)) byFile.set(e.file, []);
             byFile.get(e.file).push(d);
         }
@@ -266,7 +266,7 @@ class Suite {
 
     async runOnServer(names, run, token, targets) {
         const server = this.ensureServer();
-        const options = vscode.workspace.getConfiguration('yatf', this.folder).get('run.options') ?? {};
+        const options = vscode.workspace.getConfiguration('runtests', this.folder).get('run.options') ?? {};
         // Stopped from wherever it was started, and from the run's own Stop.
         const cancels = [token.onCancellationRequested(() => server.cancel()),
             run.token.onCancellationRequested(() => server.cancel())];
@@ -293,9 +293,9 @@ class Suite {
             if (end.event === 'error' || end.event === 'exit' || end.state === 'error') {
                 // What had an outcome keeps it; the rest could not run.
                 const text = end.event === 'error' ? end.message : end.event === 'exit' ? end.error.message :
-                    'the run stopped with an error; see the YATF log';
+                    'the run stopped with an error; see the Runtests log';
                 for (const t of targets) if (!settled.has(t.label)) run.errored(t, new vscode.TestMessage(text));
-                run.appendOutput(model.crlf(`YATF: ${text}\n`));
+                run.appendOutput(model.crlf(`Runtests: ${text}\n`));
             } else {
                 for (const n of end.not_run ?? []) {
                     const t = this.byName.get(n);

@@ -1,4 +1,4 @@
-using YATF.Private: prepare, init_run_state, finish_run_state!, read_run_state, runstate_files,
+using Runtests.Private: prepare, init_run_state, finish_run_state!, read_run_state, runstate_files,
                     stale_runstates, STALE_RUN_DAYS, HISTORY_RUNS
 
 # Sets a file's modification time `days` back.
@@ -19,7 +19,7 @@ declared(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n
 function recorded_runs(dir, pkg, n; days, after = 0)
     p, _ = prepare((pkg,); announce = false)
     return map(1:n) do i
-        path = joinpath(dir, string(1_000_000 + after + i, "-1.yatf"))
+        path = joinpath(dir, string(1_000_000 + after + i, "-1.runstate"))
         finish_run_state!(init_run_state(path, p))
         age!(path, days)
         path
@@ -30,8 +30,8 @@ end
     @testset "a suite in order has nothing to do" begin
         dir = make_pkg("Tidy", "test/a_test.jl" => declared("one", "two"),
                        "test/TestItems.toml" => "[order]\nfirst = [\"two\"]\n")
-        withenv("YATF_RUNSTATE_DIR" => mktempdir()) do
-            ok, out = capture_run(() -> YATF.chores(dir))
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            ok, out = capture_run(() -> Runtests.chores(dir))
             @test ok
             @test occursin("test items: 2 in 1 file, all valid", out)
             @test occursin("config: $(joinpath("test", "TestItems.toml")), valid", out)
@@ -46,27 +46,27 @@ end
                        "test/testsetups/Helpers.jl" => "module Helpers\nusing Random\nend\n")
         setups = joinpath(dir, "test", "testsetups")
         runs = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => runs) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
             # Two more than the newest few that always stay, all of them old.
             recorded = recorded_runs(runs, dir, HISTORY_RUNS + 2; days = STALE_RUN_DAYS + 3)
-            ok, out = capture_run(() -> YATF.chores(dir))
+            ok, out = capture_run(() -> Runtests.chores(dir))
             @test !ok
             @test occursin("chores, checking only", out)
             @test occursin("setups: 1 of 1 to change:", out)
             @test occursin("`Helpers`: would move to $(joinpath("Helpers", "src", "Helpers.jl"))", out)
             @test occursin("2 of this machine's older than $STALE_RUN_DAYS days to delete (the newest $HISTORY_RUNS naming a test item stay)", out)
-            @test occursin("to do: 3, which `YATF.chores(fix = true)` does", out)
+            @test occursin("to do: 3, which `Runtests.chores(fix = true)` does", out)
             @test isfile(joinpath(setups, "Helpers.jl"))
             @test runstate_files(dir) == recorded
 
-            ok, out = capture_run(() -> YATF.chores(dir; fix = true))
+            ok, out = capture_run(() -> Runtests.chores(dir; fix = true))
             @test ok
             @test occursin("`Helpers`: moved to", out)
             @test occursin("└ done: 3", out)
             @test isfile(joinpath(setups, "Helpers", "Project.toml"))
             @test runstate_files(dir) == recorded[3:end]
 
-            ok, out = capture_run(() -> YATF.chores(dir))
+            ok, out = capture_run(() -> Runtests.chores(dir))
             @test ok
             @test occursin("setups: 1, all up to date", out)
             @test occursin("└ nothing to do", out)
@@ -76,7 +76,7 @@ end
     @testset "only this machine's old run states go, never the newest few" begin
         dir = make_pkg("OldRuns", "test/a_test.jl" => declared("one"))
         runs = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => runs) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
             old = STALE_RUN_DAYS + 3
             recorded = recorded_runs(runs, dir, HISTORY_RUNS + 4; days = old)
             # Among the oldest: one recorded on another machine, one that cannot be
@@ -94,7 +94,7 @@ end
     @testset "the newest few stay only if they name a test item" begin
         dir = make_pkg("Renamed", "test/a_test.jl" => declared("one"))
         runs = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => runs) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
             old = STALE_RUN_DAYS + 3
             current = recorded_runs(runs, dir, HISTORY_RUNS + 1; days = old)
             # The newest runs are of items the suite no longer has.
@@ -105,10 +105,30 @@ end
             # Items that could not be read name nothing to go by: the newest few stay.
             @test stale_runstates(dir) == current[1:3]
 
-            ok, out = capture_run(() -> YATF.chores(dir; fix = true))
+            ok, out = capture_run(() -> Runtests.chores(dir; fix = true))
             @test ok
             @test occursin("3 of this machine's older than $STALE_RUN_DAYS days deleted (the newest $HISTORY_RUNS naming a test item stay)", out)
             @test runstate_files(dir) == current[2:end]
+        end
+    end
+
+    @testset "an old run state a failing item's verdict is in is never stale" begin
+        dir = make_pkg("OldFailure", "test/a_test.jl" => declared("one", "two"))
+        runs = mktempdir()
+        withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
+            old = STALE_RUN_DAYS + 3
+            # The oldest run failed `two`; every run since ran only `one`.
+            p, _ = prepare((dir,); announce = false)
+            first_ = joinpath(runs, "1000000-1.runstate")
+            rsf = init_run_state(first_, p)
+            for i in 1:Runtests.Private.nitems(p)
+                Runtests.Private.write_status!(rsf, i, p.items.name[i] == "two" ? Runtests.Private.FAILED : Runtests.Private.PASSED, 1, 1)
+            end
+            finish_run_state!(rsf)
+            age!(first_, old)
+            recorded_runs(runs, dir, HISTORY_RUNS + 2; days = old)
+            @test !(first_ in stale_runstates(dir, Set(["one", "two"])))
+            @test Runtests.Private.failing_items(dir) == ["two"]
         end
     end
 
@@ -116,9 +136,9 @@ end
         # A test file that does not parse, beside settings with a key they do not take.
         dir = make_pkg("Broken", "test/a_test.jl" => "@testitem \"open\" begin\n",
                        "test/TestItems.toml" => "[run]\nworkerz = 2\n")
-        withenv("YATF_RUNSTATE_DIR" => mktempdir()) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
             before = read(joinpath(dir, "test", "a_test.jl"), String)
-            ok, out = capture_run(() -> YATF.chores(dir; fix = true))
+            ok, out = capture_run(() -> Runtests.chores(dir; fix = true))
             @test !ok
             @test occursin("test items: 1 problem:", out)
             @test occursin("a_test.jl:", out)
@@ -129,8 +149,8 @@ end
         # Settings that name an item the suite does not have.
         dir = make_pkg("Misnamed", "test/a_test.jl" => declared("one"),
                        "test/TestItems.toml" => "[order]\nfirst = [\"onw\"]\n")
-        withenv("YATF_RUNSTATE_DIR" => mktempdir()) do
-            ok, out = capture_run(() -> YATF.chores(dir))
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            ok, out = capture_run(() -> Runtests.chores(dir))
             @test !ok
             @test occursin("config: [order] of TestItems.toml names test items that do not exist:", out)
             @test occursin("onw", out)

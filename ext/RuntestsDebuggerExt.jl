@@ -1,8 +1,8 @@
 """
-The debugger behind `YATF.debug`. A separate module so that Debugger.jl is loaded by
+The debugger behind `Runtests.debug`. A separate module so that Debugger.jl is loaded by
 a session that asks to step through a test item, and by no test run.
 """
-module YATFDebuggerExt
+module RuntestsDebuggerExt
 
 using Debugger: Debugger
 

@@ -1,3 +1,3 @@
 module Faulty
-marker(name) = joinpath(get(ENV, "YATF_FAULTY_DIR", tempdir()), "yatf_" * name)
+marker(name) = joinpath(get(ENV, "RUNTESTS_FAULTY_DIR", tempdir()), "runtests_" * name)
 end

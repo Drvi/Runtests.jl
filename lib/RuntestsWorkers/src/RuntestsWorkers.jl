@@ -1,14 +1,14 @@
 """
-    YATFWorkers
+    RuntestsWorkers
 
-The part of YATF that runs inside a worker process: the protocol between the
+The part of Runtests that runs inside a worker process: the protocol between the
 coordinator and a worker, the types that cross it, and `run_item`. A worker loads
 this package alone, never the scanner, the planner, the monitor or `Pkg`.
 
-Test code reaches this package through YATF: `YATF.current_testitem()`,
-`YATF.in_testitem()` and `YATF.in_yatf_run()` are defined here.
+Test code reaches this package through Runtests: `Runtests.current_testitem()`,
+`Runtests.in_testitem()` and `Runtests.in_test_run()` are defined here.
 """
-module YATFWorkers
+module RuntestsWorkers
 
 using Base.ScopedValues: ScopedValue, with
 using Logging: Logging, ConsoleLogger, with_logger
@@ -106,4 +106,4 @@ const PRECOMPILE_SIGNATURES = (
     end
 end
 
-end # module YATFWorkers
+end # module RuntestsWorkers

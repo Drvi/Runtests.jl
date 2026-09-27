@@ -503,7 +503,7 @@ function terminate!(w::Worker, from::Symbol=:manual, cause::Exception=WorkerTerm
         if !wait_exit(w.process, TERM_GRACE_SECONDS)
             signal!(w.pid, w.process, Base.SIGKILL)
             wait_exit(w.process, KILL_WAIT_SECONDS) ||
-                @error "YATF: worker $(w.pid) is still alive $(KILL_WAIT_SECONDS)s after SIGKILL; giving up on it"
+                @error "Runtests: worker $(w.pid) is still alive $(KILL_WAIT_SECONDS)s after SIGKILL; giving up on it"
         end
     end
     untrack!(w.process)
@@ -530,7 +530,7 @@ function watch_and_terminate!(w::Worker, ev::Threads.Event)
         w.on_exit(w)
     catch e
         is_interrupt(e) && return forward_interrupt(e)
-        @error "YATF: recording the exit of worker $(w.pid) failed" exception = (e, catch_backtrace())
+        @error "Runtests: recording the exit of worker $(w.pid) failed" exception = (e, catch_backtrace())
     end
     return nothing
 end
@@ -600,9 +600,9 @@ function Base.wait(w::Worker)
     return nothing
 end
 
-# A worker loads this package by UUID rather than by name. `using YATFWorkers` at
+# A worker loads this package by UUID rather than by name. `using RuntestsWorkers` at
 # the top level of the worker's `Main` needs the package in the active project's
-# `[deps]`, and in a user's test environment it is only a dependency of YATF;
+# `[deps]`, and in a user's test environment it is only a dependency of Runtests;
 # `Base.require` on the `PkgId` finds it through the manifest either way.
 const PKGID = Base.PkgId(@__MODULE__)
 
@@ -610,8 +610,8 @@ const PKGID = Base.PkgId(@__MODULE__)
 const PATHSEP = Sys.iswindows() ? ";" : ":"
 
 worker_startup_code(connect_timeout::Real) = string(
-    "YATFWorkers = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"YATFWorkers\")); ",
-    "YATFWorkers.startworker(", connect_timeout, ")")
+    "RuntestsWorkers = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"RuntestsWorkers\")); ",
+    "RuntestsWorkers.startworker(", connect_timeout, ")")
 
 """
     Worker(; julia_args, threads, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit)
@@ -706,7 +706,7 @@ end
 function read_port(proc::Base.Process, io::IO, pid::Integer, fn)
     while !eof(proc)
         line = readline(proc)
-        m = match(r"yatfworker:(\d+)", line)
+        m = match(r"runtestsworker:(\d+)", line)
         m === nothing || return parse(Int, m.captures[1])
         isempty(line) || (fn(io, pid, line); flush(io))
     end
@@ -765,7 +765,7 @@ function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process, ev::T
             is_interrupt(e) && (forward_interrupt(e); continue)
             # Without a relay the worker blocks as soon as the pipe fills, so it
             # cannot be kept.
-            @error "YATF: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
+            @error "Runtests: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
             terminate!(w, :output_error, e)
             return nothing
         end
@@ -817,7 +817,7 @@ function process_responses(w::Worker, ev::Threads.Event)
         elseif e isa EOFError || e isa Base.IOError
             terminate!(w, w.closing ? :close : :connection_lost)   # the coordinator closed it, or the worker died
         else
-            @error "YATF: protocol error with worker $(w.pid); terminating it" exception=(e, catch_backtrace())
+            @error "Runtests: protocol error with worker $(w.pid); terminating it" exception=(e, catch_backtrace())
             terminate!(w, :protocol_error, e)
         end
     end
@@ -891,12 +891,12 @@ function startworker(connect_timeout::Real)
     redirect_stderr(stdout)   # one ordered stream for the coordinator to relay
     install_inspection_hook()
     port, server = listenany(Sockets.localhost, UInt16(rand(10000:50000)))
-    println(stdout, "yatfworker:", port)
+    println(stdout, "runtestsworker:", port)
     flush(stdout)
     # A coordinator that dies between spawning this process and connecting to it
     # would otherwise leave it waiting forever.
     deadline = Timer(connect_timeout) do _
-        println(stdout, "YATF worker: no coordinator connected within $(connect_timeout)s; exiting")
+        println(stdout, "Runtests worker: no coordinator connected within $(connect_timeout)s; exiting")
         exit(1)
     end
     sock = accept(server)
@@ -906,13 +906,13 @@ function startworker(connect_timeout::Real)
     presented = read!(sock, Vector{UInt8}(undef, COOKIE_BYTES))
     close(deadline)
     if presented != codeunits(cookie)
-        println(stdout, "YATF worker: the connection did not present this worker's cookie; exiting")
+        println(stdout, "Runtests worker: the connection did not present this worker's cookie; exiting")
         exit(1)
     end
     try
         serve_requests(sock)
     catch e
-        println(stdout, "YATF worker: protocol error; exiting")
+        println(stdout, "Runtests worker: protocol error; exiting")
         showerror(stdout, e, catch_backtrace())
         println(stdout)
         exit(1)
@@ -943,7 +943,7 @@ function install_inspection_hook()
             wide_display(report)
         end
     catch e
-        println(stdout, "YATF worker: task backtraces on timeout are unavailable: ", sprint(showerror, e))
+        println(stdout, "Runtests worker: task backtraces on timeout are unavailable: ", sprint(showerror, e))
     end
     return nothing
 end

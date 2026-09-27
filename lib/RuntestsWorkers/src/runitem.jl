@@ -62,7 +62,7 @@ end
 """
     TestItemInfo
 
-What `YATF.current_testitem()` returns inside a running test item.
+What `Runtests.current_testitem()` returns inside a running test item.
 """
 struct TestItemInfo
     name    :: String
@@ -82,7 +82,7 @@ The test item this task is running inside, or `nothing`.
 The value is dynamically scoped, so tasks spawned by the test item see it and a
 task created before the item started — a long-lived service started in a
 profile's `init` expression, say — does not. For that case, and for subprocesses,
-use [`in_yatf_run`](@ref).
+use [`in_test_run`](@ref).
 
 This is a hook for test infrastructure: temporary directories, fixture paths,
 switching off telemetry. Library code that changes what it does because it
@@ -98,12 +98,12 @@ Whether this task is running inside a test item. See [`current_testitem`](@ref).
 in_testitem() = CURRENT_TESTITEM[] !== nothing
 
 """
-    in_yatf_run() -> Bool
+    in_test_run() -> Bool
 
-Whether this process was started by a YATF run. Unlike [`in_testitem`](@ref) this
+Whether this process was started by a Runtests run. Unlike [`in_testitem`](@ref) this
 is process-level: it is visible to every task and inherited by subprocesses.
 """
-in_yatf_run() = haskey(ENV, "YATF_RUN_ID")
+in_test_run() = haskey(ENV, "RUNTESTS_RUN_ID")
 
 # `f()`, with what it cost put in `stats` even when it throws: an item that errors
 # took time too, and that time is what the next run schedules it by. Compilation
@@ -157,7 +157,7 @@ run_item(spec::ItemSpec; printing::Bool=false, enter=nothing) =
 # the coordinator, which draws the RUN and DONE lines from them. On stdout rather
 # than with the result because the item's own output travels there, and the DONE
 # line must come after all of it.
-const RECORD_MARK = "\x1eYATF "
+const RECORD_MARK = "\x1eRuntests "
 record_run(spec::ItemSpec) = string(RECORD_MARK, "RUN ", spec.index, " ", spec.attempt)
 record_done(spec::ItemSpec, r::ItemResult) = string(
     RECORD_MARK, "DONE ", spec.index, " ", spec.attempt, " ", UInt8(r.state), " ",
@@ -322,7 +322,7 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     stats = Ref(PerfStats())
     # The `Test` this package already has, bound in the module rather than found by
     # name: `@test` works whether or not the test environment declares `Test`, and a
-    # worker does not load YATF, the whole coordinator, to reach it.
+    # worker does not load Runtests, the whole coordinator, to reach it.
     prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
     isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
     modsym = gensym(modname)
@@ -553,7 +553,7 @@ function with_testset(f, ts::Test.AbstractTestSet)
             Test.pop_testset()
         end
     end
-    error("YATF cannot tell how this Julia's Test stdlib tracks the active testset; " *
+    error("Runtests cannot tell how this Julia's Test stdlib tracks the active testset; " *
           "this build of Test is not supported")
 end
 
@@ -611,7 +611,7 @@ const IOS_LINE_BUFFERED = Cint(1001)
 # setting for this, and a stream that refuses it is still a working capture.
 function line_buffered!(io::IOStream)
     ccall(:ios_bufmode, Cint, (Ptr{Cvoid}, Cint), io.ios, IOS_LINE_BUFFERED) == 0 ||
-        @warn "YATF worker: captured output is block-buffered; a crash may lose its last lines" maxlog = 1
+        @warn "Runtests worker: captured output is block-buffered; a crash may lose its last lines" maxlog = 1
     return io
 end
 

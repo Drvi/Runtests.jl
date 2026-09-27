@@ -2,7 +2,7 @@
 # every file parses, no two items share a name, and there is no Julia file sitting
 # under `test/` that the run would otherwise pass over in silence.
 
-using YATF.Private: walk_test_dir, discover, ScanFailure, prepare, runtests, NoTestsError
+using Runtests.Private: walk_test_dir, discover, ScanFailure, prepare, runtests, NoTestsError
 
 const GOOD = """
 @testitem "runs" begin
@@ -27,7 +27,7 @@ end
             "Walked",
             "test/a_test.jl" => GOOD,
             "test/sub/b_tests.jl" => "",
-            "test/runtests.jl" => "using YATF; runtests()\n",
+            "test/runtests.jl" => "using Runtests; runtests()\n",
             "test/helpers.jl" => "# shared code someone forgot to move\n",
             "test/sub/more.jl" => "# and another\n",
             "test/testsetups/Setup.jl" => "module Setup end\n",
@@ -59,8 +59,8 @@ end
         dir = make_pkg(
             "Nested",
             "test/a_test.jl" => GOOD,
-            "test/runtests.jl" => "using YATF; runtests()\n",
-            "test/sub/runtests.jl" => "using YATF; runtests()\n",
+            "test/runtests.jl" => "using Runtests; runtests()\n",
+            "test/sub/runtests.jl" => "using Runtests; runtests()\n",
         )
         msg = gate_errors(dir)
         @test occursin(joinpath("sub", "runtests.jl"), msg)
@@ -121,7 +121,7 @@ end
         dir = make_pkg(
             "Clean",
             "test/a_test.jl" => GOOD,
-            "test/runtests.jl" => "using YATF; runtests()\n",
+            "test/runtests.jl" => "using Runtests; runtests()\n",
             "test/testsetups/Setup.jl" => "module Setup end\n",
             "test/TestItems.toml" => "[run]\nworkers = 1\n",
         )

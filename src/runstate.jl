@@ -23,7 +23,7 @@
 
 using CRC32c: crc32c
 
-const RS_MAGIC = 0x59415446   # "YATF"
+const RS_MAGIC = 0x544e5552   # "RUNT" on disk
 const RS_VERSION = UInt32(6)
 # 40 bytes of counts and times, then eight section offsets; the rest is room to
 # add a field without moving every section.
@@ -211,7 +211,7 @@ run_setting(cfg::RunConfig, key::Symbol) =
 # ran in. Anything that looks like a credential stays out: the file is meant to be
 # passed around.
 function environment_variables()
-    keep(k) = startswith(k, "JULIA_") || startswith(k, "YATF_") || k == "CI" ||
+    keep(k) = startswith(k, "JULIA_") || startswith(k, "RUNTESTS_") || k == "CI" ||
         k in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
               "GITHUB_WORKFLOW", "GITHUB_JOB", "RUNNER_OS", "RUNNER_ARCH")
     secret(k) = occursin(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|KEY"i, k)
@@ -227,7 +227,7 @@ function run_meta(p::Plan)
     manifest = isempty(env) ? nothing : Base.project_file_manifest_path(env)
     meta = Pair{String, String}[
         "julia" => string(VERSION), "julia_commit" => Base.GIT_VERSION_INFO.commit,
-        "yatf" => string(pkgversion(@__MODULE__)), "yatf_revision" => project_revision(pkgdir(@__MODULE__)),
+        "runtests" => string(pkgversion(@__MODULE__)), "runtests_revision" => project_revision(pkgdir(@__MODULE__)),
         "host" => run_host(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
         "memory_bytes" => string(Sys.total_memory()),
         "coordinator_threads" => string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
@@ -372,7 +372,7 @@ function update!(f, rsf::Union{Nothing, RunStateFile}, at::Integer)
         flush(rsf.io)
     catch e
         is_interrupt(e) && rethrow()
-        @warn "YATF: could not write the run state" exception = e maxlog = 1
+        @warn "Runtests: could not write the run state" exception = e maxlog = 1
     end
     return nothing
 end
@@ -585,8 +585,8 @@ function read_run_state(path::AbstractString)
         # Any exception, not a list of expected ones: the caller has a run to finish
         # and no use for a file it cannot read. Reader bugs still surface, because
         # the round-trip tests assert on what a written file reads back as.
-        # `JULIA_DEBUG=YATF` shows what went wrong.
-        @debug "YATF: could not read run state $(path)" exception = (e, catch_backtrace())
+        # `JULIA_DEBUG=Runtests` shows what went wrong.
+        @debug "Runtests: could not read run state $(path)" exception = (e, catch_backtrace())
         return nothing
     end
 end
@@ -675,13 +675,13 @@ expr_text(ex::Expr) = string(normalize_block(ex))
 # not pass, what each worker did before it ended, and how to run it again.
 function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     m(k) = get(rs.meta, k, "")
-    println(io, "YATF run state ", rs.path, rs.complete ? "" : " (incomplete: the run did not finish)")
+    println(io, "Runtests run state ", rs.path, rs.complete ? "" : " (incomplete: the run did not finish)")
     took = rs.end_unix > rs.start_unix ? string(", took ", fmt_seconds(rs.end_unix - rs.start_unix)) : ""
     println(io, "  started ", Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix), took, rs.cancelled ? ", cancelled" : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
-        " · YATF ", m("yatf"), isempty(m("yatf_revision")) ? "" : string(" (", first(m("yatf_revision"), 10), ")"))
+        " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
     println(io, "  seed ", m("seed"), " · workers ", m("workers"), " · threads ", m("threads"), " · timeout ", m("timeout"),
         "s · retries ", m("retries"), isempty(m("selection")) ? "" : string(" · selected ", m("selection")))
     isempty(m("environment_manifest")) || println(io, "  environment recorded: ",
@@ -707,7 +707,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
         println(io, "    worker ", d.slot, " pid ", d.pid, " at ", fmt_seconds(d.t0), ": ", worker_end_text(d.ended_by),
             " (", how, ") · had run ", length(ran), isempty(ran) ? "" : string(": ", join(repr.(last(ran, 5)), ", "), length(ran) > 5 ? ", …" : ""))
     end
-    print(io, "  run it again with YATF.runtests(replay = ", repr(rs.path), ")")
+    print(io, "  run it again with Runtests.runtests(replay = ", repr(rs.path), ")")
 end
 
 ### Where run states live ##################################################
@@ -716,20 +716,20 @@ end
     run_host() -> String
 
 The machine a run state is recorded as coming from, and whose run states are this
-machine's to prune: `\$YATF_HOST` when set, otherwise the hostname. A CI runner has
+machine's to prune: `\$RUNTESTS_HOST` when set, otherwise the hostname. A CI runner has
 a new hostname every run, so run states restored from one run's cache into the next
 would count as another machine's and never be pruned; naming the machine keeps them
 this machine's.
 """
 function run_host()
-    host = get(ENV, "YATF_HOST", "")
+    host = get(ENV, "RUNTESTS_HOST", "")
     return isempty(host) ? gethostname() : host
 end
 
 """
     runstate_dir(root) -> String
 
-`\$YATF_RUNSTATE_DIR` when set, otherwise a directory of the depot's own keyed by
+`\$RUNTESTS_RUNSTATE_DIR` when set, otherwise a directory of the depot's own keyed by
 the project path, so nothing lands in the repository, and named for the project as
 well, so a person can tell which is whose. Not under `scratchspaces/`:
 `Pkg.gc`, which `Pkg` also runs after its own operations, deletes every directory
@@ -737,7 +737,7 @@ there that no package has registered, and with it the history that orders the
 next run. The path is printed at the end of a run so CI can upload it.
 """
 function runstate_dir(root::AbstractString)
-    dir = get(ENV, "YATF_RUNSTATE_DIR", "")
+    dir = get(ENV, "RUNTESTS_RUNSTATE_DIR", "")
     isempty(dir) || return dir
     key = string(crc32c(abspath(root)); base = 16, pad = 8)
     label = dir_label(root)
@@ -756,9 +756,9 @@ function dir_label(root::AbstractString)
     return first(lstrip(==('.'), kept), 32)
 end
 
-# Where each project's directory of run states goes, when `YATF_RUNSTATE_DIR` does
+# Where each project's directory of run states goes, when `RUNTESTS_RUNSTATE_DIR` does
 # not say. Read as the run starts: the depot is the session's, not the build's.
-runstate_root() = joinpath(first(DEPOT_PATH), "yatf", "runs")
+runstate_root() = joinpath(first(DEPOT_PATH), "runtests", "runs")
 
 # Beside a project's run states in the default location: the project's path, which
 # tells `sweep_runstate_dirs` whether the project is still there.
@@ -769,17 +769,17 @@ const PROJECT_MARK = "project"
 # takes a suffix instead, one that sorts after it.
 function new_runstate_path(root::AbstractString)
     dir = runstate_dir(root)
-    if isempty(get(ENV, "YATF_RUNSTATE_DIR", ""))
+    if isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", ""))
         mkpath(dir)
         mark = joinpath(dir, PROJECT_MARK)
         isfile(mark) || write(mark, abspath(root))
     end
     stem = string(round(Int, time()), "-", getpid())
-    path = joinpath(dir, stem * ".yatf")
+    path = joinpath(dir, stem * ".runstate")
     n = 1
     while ispath(path)
         n += 1
-        path = joinpath(dir, string(stem, "_", n, ".yatf"))
+        path = joinpath(dir, string(stem, "_", n, ".runstate"))
     end
     return path
 end
@@ -787,36 +787,109 @@ end
 function runstate_files(root::AbstractString)
     dir = runstate_dir(root)
     isdir(dir) || return String[]
-    files = filter!(endswith(".yatf"), readdir(dir; join = true))
+    files = filter!(endswith(".runstate"), readdir(dir; join = true))
     return sort!(files)   # names start with a unix timestamp, so this is oldest-first
 end
 
 const KEEP_RUNS = 20
 
-# How many of the newest run states `history` reads durations and failures from.
+# How many of the newest run states `history` reads recent failures from.
 const HISTORY_RUNS = 5
 
 # Whether a run state is this project's. The default directory holds one project's
-# runs; one set by `YATF_RUNSTATE_DIR` can hold several.
+# runs; one set by `RUNTESTS_RUNSTATE_DIR` can hold several.
 of_project(rs::RunStateRecord, project::AbstractString) = get(rs.meta, "project_id", "") == project
 
-# Only the run states this machine recorded for this project are pruned, and the
-# newest `keep` of them stay. One recorded elsewhere, a CI artifact downloaded into
-# the directory say, one of another project, and one that cannot be read are never
-# deleted: nothing shows they are ours.
+# Only the run states this machine recorded for this project are pruned: the newest
+# `keep` of them stay, and of the rest each that can go without changing which
+# items are failing goes (`removable_runs`). One recorded elsewhere, a CI artifact
+# downloaded into the directory say, one of another project, and one that cannot be
+# read are never deleted: nothing shows they are ours.
 function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
-    here, project = run_host(), project_id(root)
-    ours = filter(runstate_files(root)) do f
-        rs = read_run_state(f)
-        rs !== nothing && get(rs.meta, "host", "") == here && of_project(rs, project)
-    end
-    for f in ours[1:max(0, length(ours) - keep)]
+    here = run_host()
+    runs = project_runs(root)
+    ours = [f for (f, rs) in runs if get(rs.meta, "host", "") == here]
+    for f in removable_runs(runs, ours[1:max(0, length(ours) - keep)])
         try
             rm(f; force = true)
         catch
         end
     end
     return nothing
+end
+
+# This project's run states that can be read, oldest first, each with its file.
+function project_runs(root::AbstractString)
+    project = project_id(root)
+    runs = Pair{String, RunStateRecord}[]
+    for f in runstate_files(root)
+        rs = read_run_state(f)
+        (rs === nothing || !of_project(rs, project)) && continue
+        push!(runs, f => rs)
+    end
+    return runs
+end
+
+# Item `i`'s verdict in a run: `true` when it did not pass, `false` when it passed or
+# was skipped, and `nothing` when the run got none — it stopped before the item ran,
+# or while it ran.
+function verdict(rs::RunStateRecord, i::Integer)
+    state = i <= length(rs.statuses) ? rs.statuses[i].state : UNSEEN
+    (state === UNSEEN || state === CANCELLED) && return nothing
+    return !(state === PASSED || state === SKIPPED)
+end
+
+# Whether a run was of the whole suite, and so lists every item the suite had: one
+# missing from it had been renamed or deleted, and is no longer failing.
+whole_suite(rs::RunStateRecord) = !rs.dry_run && get(rs.meta, "selection", nothing) == ""
+
+"""
+    removable_runs(runs, candidates) -> Vector{String}
+
+Of `candidates`, files among `runs` (every run state of the project, oldest first),
+those that can be deleted without changing which items are failing (see
+[`failing_items`](@ref)). A run state stays while it holds an item's last verdict and
+the verdict the item would fall back to without it reads differently: its last
+failure, or a pass that keeps an older failure from counting again. A run of the
+whole suite gives every item it did not find a verdict of its own, not failing.
+Taken oldest first, so a run state is judged by what is left once the older ones
+have gone.
+"""
+function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates)
+    known = Set{String}(it.name for (_, rs) in runs for it in rs.items)
+    verdicts = [Dict{String, Bool}() for _ in runs]   # per run: item => failing
+    holders = Dict{String, Vector{Int}}()             # per item: the runs left with a verdict, oldest first
+    for (k, (_, rs)) in enumerate(runs)
+        for (i, it) in enumerate(rs.items)
+            v = verdict(rs, i)
+            v === nothing || (verdicts[k][it.name] = v)
+        end
+        if whole_suite(rs)
+            found = Set(it.name for it in rs.items)
+            for name in known
+                name in found || (verdicts[k][name] = false)
+            end
+        end
+        for name in keys(verdicts[k])
+            push!(get!(holders, name, Int[]), k)
+        end
+    end
+    index = Dict(f => k for (k, (f, _)) in enumerate(runs))
+    out = String[]
+    for f in candidates
+        k = index[f]
+        keeps = any(verdicts[k]) do (name, failing)
+            h = holders[name]
+            last(h) == k || return false                  # a newer run has the item's verdict
+            (length(h) >= 2 && verdicts[h[end - 1]][name]) != failing
+        end
+        keeps && continue
+        push!(out, f)
+        for name in keys(verdicts[k])
+            filter!(!=(k), holders[name])
+        end
+    end
+    return out
 end
 
 """
@@ -836,7 +909,7 @@ function sweep_runstate_dirs(base::AbstractString = runstate_root())
         try
             isfile(mark) || continue
             ispath(strip(read(mark, String))) && continue
-            for f in filter!(endswith(".yatf"), readdir(dir; join = true))
+            for f in filter!(endswith(".runstate"), readdir(dir; join = true))
                 rs = read_run_state(f)
                 rs !== nothing && get(rs.meta, "host", "") == here && rm(f; force = true)
             end
@@ -851,10 +924,9 @@ end
 """
     recent_runs(root, n) -> Vector{Pair{String, RunStateRecord}}
 
-The newest `n` runs that `history` reads, oldest first, each with its file: this
-project's, readable, and not dry runs, which ran nothing. Read from the newest back,
-so the files of other projects in a shared directory are passed over rather than
-counted.
+The newest `n` runs, oldest first, each with its file: this project's, readable,
+and not dry runs, which ran nothing. Read from the newest back, so the files of
+other projects in a shared directory are passed over rather than counted.
 """
 function recent_runs(root::AbstractString, n::Int)
     project = project_id(root)
@@ -876,19 +948,32 @@ the last run in which it ran to a verdict decides, so running a few of one run's
 failures again does not forget the rest. A verdict other than passed or skipped —
 failed, errored, timed out, cut short by a dead worker, left running when the run
 itself died — is failing. A run that stopped before reaching an item, or while
-running it, says nothing about it, and the verdict before stands. With `names`,
-only those items, and the reading stops once each has its verdict.
+running it, says nothing about it, and the verdict before stands. An item that a
+newer run of the whole suite did not find was renamed or deleted, and is not
+failing whatever older runs say. With `names`, only those items, and the reading
+stops once each has its verdict.
 """
 function failing_items(root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing)
+    project = project_id(root)
     decided = Set{String}()
     failing = String[]
-    for (_, rs) in Iterators.reverse(recent_runs(root, KEEP_RUNS))   # newest first
+    alive = nothing   # the items every newer run of the whole suite found
+    # Newest first, as far back as it takes: pruning keeps every run state an
+    # item's failure rests on, however many runs ago.
+    for f in Iterators.reverse(runstate_files(root))
+        rs = read_run_state(f)
+        (rs === nothing || rs.dry_run || !of_project(rs, project)) && continue
         for (i, it) in enumerate(rs.items)
             (it.name in decided || (names !== nothing && !(it.name in names))) && continue
-            state = i <= length(rs.statuses) ? rs.statuses[i].state : UNSEEN
-            (state === UNSEEN || state === CANCELLED) && continue
+            v = verdict(rs, i)
+            v === nothing && continue
             push!(decided, it.name)
-            state === PASSED || state === SKIPPED || push!(failing, it.name)
+            v && (alive === nothing || it.name in alive) && push!(failing, it.name)
+        end
+        if whole_suite(rs)
+            found = Set(it.name for it in rs.items)
+            alive = alive === nothing ? found : intersect!(alive, found)
+            names === nothing || union!(decided, setdiff(names, alive))
         end
         names !== nothing && length(decided) == length(names) && break
     end
@@ -896,19 +981,29 @@ function failing_items(root::AbstractString; names::Union{Nothing, AbstractSet{S
 end
 
 """
-    history(root) -> History
+    history(root; nruns = HISTORY_RUNS) -> History
 
-Per-item durations and last-run failures, taken from the most recent runs, when
-the newest of them started, and what a fresh worker cost in them. Only items that
-actually ran contribute; a name that has never been seen simply has no estimate and
-is scheduled as if it were new.
+Per-item durations from every run state kept, each item's newest, so that runs of a
+few items leave the others' standing. Last-run failures, when the newest run
+started, and what a fresh worker cost, from the most recent `nruns`. Only items
+that actually ran contribute; a name that has never been seen simply has no
+estimate and is scheduled as if it were new.
 """
 function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
+    runs = RunStateRecord[rs for (_, rs) in project_runs(root) if !rs.dry_run]
+    isempty(runs) && return History()
     seconds = Dict{String, Float64}()
+    # Oldest first, so a newer duration overwrites an older one.
+    for rs in runs
+        for (i, it) in enumerate(rs.items)
+            i <= length(rs.statuses) || break
+            st = rs.statuses[i]
+            st.state === UNSEEN || st.elapsed <= 0 || (seconds[it.name] = Float64(st.elapsed))
+        end
+    end
     failed = Dict{String, Int}()
     since = 0.0
-    recent = last.(recent_runs(root, nruns))
-    isempty(recent) && return History()
+    recent = runs[max(1, end - nruns + 1):end]
     for (k, rs) in enumerate(recent)
         ago = length(recent) - k
         since = rs.start_unix
@@ -922,7 +1017,6 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
                 ago == 0 && rs.cancelled && (failed[it.name] = 0)
                 continue
             end
-            st.elapsed > 0 && (seconds[it.name] = Float64(st.elapsed))
             # Runs are read oldest first, so a newer failure overwrites an older one.
             is_non_pass(st.state) && (failed[it.name] = ago)
         end

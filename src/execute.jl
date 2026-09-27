@@ -16,7 +16,7 @@ using Base: SIGKILL
 mutable struct Slot
     const id::SlotIdx
     profile::Profile
-    @atomic worker::Union{Nothing, YATFWorkers.Worker}
+    @atomic worker::Union{Nothing, RuntestsWorkers.Worker}
     started_at::Float64      # when this slot's current process came up
     worker_items::Int        # items the current process has run, for its EXIT line
     @atomic current::ItemIdx      # the item this slot is running, 0 when idle
@@ -104,7 +104,7 @@ Claim(kind::Symbol) = Claim(kind, UnitIdx(0), Int32(0))
 function next!(q::Queues, cursor::Vector{UnitIdx}, i::Integer)
     u = cursor[i]
     cursor[i] += UnitIdx(1)
-    q.claimed[u] && error("YATF internal error: unit $u was handed out twice")
+    q.claimed[u] && error("Runtests internal error: unit $u was handed out twice")
     q.claimed[u] = true
     return Claim(:unit, u, Int32(0))
 end
@@ -233,7 +233,7 @@ function wait_while_paused(q::Queues, slot::Slot)
     end
     if is_paused(q) && !is_cancelled(q) && time() >= deadline
         set_paused!(q, false)
-        @warn "YATF: memory has stayed tight for $(round(Int, MAX_BACKPRESSURE_SECONDS))s; " *
+        @warn "Runtests: memory has stayed tight for $(round(Int, MAX_BACKPRESSURE_SECONDS))s; " *
             "continuing rather than stalling the run" maxlog = 1
     end
     return nothing
@@ -300,7 +300,7 @@ mutable struct Run
     # The tasks running items, for the watchdog to interrupt.
     const tasks::Vector{Task}
     # Workers `kill_workers!` took from their slots, for `shutdown!` to wait for.
-    const killed::Vector{YATFWorkers.Worker}
+    const killed::Vector{RuntestsWorkers.Worker}
     # Guards `tasks`, `killed` and `item_pids`, which other tasks use as well.
     const lock::ReentrantLock
     # Every process an attempt ran in: under coverage, each should leave a tracefile.
@@ -322,20 +322,20 @@ function execute(p::Plan, target)
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
-    logdir = mktempdir(; prefix = "yatf_")
+    logdir = mktempdir(; prefix = "runtests_")
     names, column = item_names(p, name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)))
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"), column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
-        YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[]
+        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[]
     )
     run.events === nothing || (run.events.run = run)
     cfg.coverage && mkpath(coverage_dir(logdir))
     # Ctrl-C caught by any task the run starts is thrown into this one, which is
     # where the run knows how to stop.
-    outer = @atomic YATFWorkers.INTERRUPT_TARGET.task
-    @atomic YATFWorkers.INTERRUPT_TARGET.task = current_task()
+    outer = @atomic RuntestsWorkers.INTERRUPT_TARGET.task
+    @atomic RuntestsWorkers.INTERRUPT_TARGET.task = current_task()
     # The slots, then the monitor: its task walks `run.slots` from another thread,
     # so the vector is complete before that task exists, and is never resized.
     for s in 1:nslots(p)
@@ -357,7 +357,7 @@ function execute(p::Plan, target)
         # Wherever the run stopped: a throw before the first item would otherwise
         # leave the monitor running and the error printed over its line.
         shielded(() -> stop_monitor!(run.monitor))
-        @atomic YATFWorkers.INTERRUPT_TARGET.task = outer
+        @atomic RuntestsWorkers.INTERRUPT_TARGET.task = outer
     end
 end
 
@@ -563,7 +563,7 @@ function check_replayed_environment(run::Run)
         h == t || push!(diffs, string(name, ": ", t, " when recorded, ", h, " here"))
     end
     isempty(diffs) && return say(run, "the environment matches the one the run state was recorded in")
-    @warn "YATF: the environment differs from the one the run state was recorded in:\n" *
+    @warn "Runtests: the environment differs from the one the run state was recorded in:\n" *
         join(("  " * d for d in first(diffs, 40)), "\n") * (length(diffs) > 40 ? "\n  …" : "")
     return nothing
 end
@@ -594,7 +594,7 @@ function open_runstate(p::Plan, start::Float64)
     try
         return init_run_state(new_runstate_path(p.root), p; start)
     catch e
-        @warn "YATF: could not open a run state file; continuing without one" exception = e
+        @warn "Runtests: could not open a run state file; continuing without one" exception = e
         return nothing
     end
 end
@@ -620,7 +620,7 @@ function warn_sandboxed_workers(p::Plan)
         needs_worker(p, u) && append!(names, (p.items.name[i] for i in p.units.span[u]))
     end
     isempty(names) && return nothing
-    @warn "YATF: workers=0, but these items ask for a sandbox that this process cannot " *
+    @warn "Runtests: workers=0, but these items ask for a sandbox that this process cannot " *
         "provide, so each one gets a worker of its own that is torn down afterwards:\n" *
         join(("  " * repr(n) for n in names), "\n")
     return nothing
@@ -675,7 +675,7 @@ end
 function profile_project(prof::Profile, env)
     (env === nothing || isempty(prof.preferences)) && return nothing
     root = dirname(env)
-    dir = joinpath(root, string("yatf_profile_", prof.name))
+    dir = joinpath(root, string("runtests_profile_", prof.name))
     mkpath(dir)
     copy_env_files(dir, root)
     own = joinpath(root, "LocalPreferences.toml")
@@ -759,7 +759,7 @@ function cache_flags_for(julia_args::Cmd)
     )
     f = split(out)
     T = Base.CacheFlags
-    length(f) == fieldcount(T) || error("YATF: could not read the cache flags of `julia $julia_args`: $out")
+    length(f) == fieldcount(T) || error("Runtests: could not read the cache flags of `julia $julia_args`: $out")
     return T((parse(fieldtype(T, i), f[i]) for i in 1:fieldcount(T))...)
 end
 
@@ -812,7 +812,7 @@ function profile_flags(prof::Profile)
         isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(Cmd(prof.julia_args))
     catch e
         is_interrupt(e) && rethrow()
-        @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
+        @warn "Runtests: could not read the cache flags of profile `$(prof.name)`; its \
                workers will compile what they need themselves" exception = e
         nothing
     end
@@ -834,7 +834,7 @@ function precompile_configs(run::Run, configs, project, what::AbstractString)
         end
     catch e
         is_interrupt(e) && rethrow()
-        @warn "YATF: could not precompile the test environment for $what; its workers \
+        @warn "Runtests: could not precompile the test environment for $what; its workers \
                will compile what they need themselves" exception = e
     finally
         Base.set_active_project(original)
@@ -901,7 +901,7 @@ function run_on_workers(run::Run, target)
                     run_slot(run, s, target)
                 catch e
                     if is_interrupt(e)
-                        YATFWorkers.forward_interrupt(e)
+                        RuntestsWorkers.forward_interrupt(e)
                         cancel!(run.queues)
                         record_stopped_item!(run, s)
                         rethrow()
@@ -909,7 +909,7 @@ function run_on_workers(run::Run, target)
                     # This slot is finished, not the run: its units stay in its
                     # queue for the others to steal, so one bad item does not stop
                     # a suite.
-                    @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
+                    @error "Runtests: worker slot $(s.id) stopped; its remaining items are " *
                         "left for the other workers" exception = (e, catch_backtrace())
                 end
             end
@@ -957,7 +957,7 @@ function check_finished(run::Run)
     left = [run.plan.items.name[i] for i in 1:nitems(run.plan) if st.state[i] === UNSEEN || st.state[i] === RUNNING]
     isempty(left) && return nothing
     q = run.queues
-    @error "YATF internal error: $(length(left)) test items have no outcome, though the run was not stopped" items = left head = q.head tail = q.tail from = q.from to = q.to slot_pools = q.pool pending = q.pending unclaimed_units = findall(!, q.claimed)
+    @error "Runtests internal error: $(length(left)) test items have no outcome, though the run was not stopped" items = left head = q.head tail = q.tail from = q.from to = q.to slot_pools = q.pool pending = q.pending unclaimed_units = findall(!, q.claimed)
     return nothing
 end
 
@@ -994,7 +994,7 @@ is.
 function interrupt_slots!(tasks)
     # These interrupts are the run's own. A slot hands back only the user's, and
     # handing these back would cut short the run's wait for its slots.
-    @atomic YATFWorkers.INTERRUPT_TARGET.task = nothing
+    @atomic RuntestsWorkers.INTERRUPT_TARGET.task = nothing
     for t in tasks
         (t === current_task() || istaskdone(t)) && continue
         try
@@ -1073,9 +1073,9 @@ function watch(run::Run, timer::Timer, limit::Real)
         catch e
             e isa EOFError && break   # the timer was closed, so the run is over
             if is_interrupt(e)
-                YATFWorkers.forward_interrupt(e)
+                RuntestsWorkers.forward_interrupt(e)
             else
-                @error "YATF: the stall watchdog stopped" exception = (e, catch_backtrace())
+                @error "Runtests: the stall watchdog stopped" exception = (e, catch_backtrace())
                 break
             end
         end
@@ -1140,7 +1140,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     for attempt in 1:(WORKER_START_RETRIES + 1)
         began = time()
         w = try
-            YATFWorkers.Worker(;
+            RuntestsWorkers.Worker(;
                 julia_args = run.plan.cfg.coverage ?
                     [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.logdir))] : prof.julia_args,
                 threads = prof.threads,
@@ -1181,10 +1181,10 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             return w
         catch e
             # The process is up; it is the `init` expression that failed or hung.
-            YATFWorkers.terminate!(w, :init_failed)
+            RuntestsWorkers.terminate!(w, :init_failed)
             wait(w)
             is_interrupt(e) && rethrow()
-            if e isa YATFWorkers.RemoteException || e isa TimeoutException
+            if e isa RuntestsWorkers.RemoteException || e isa TimeoutException
                 # The expression itself is at fault: another process would only
                 # fail the same way. A timeout already names the expression it
                 # timed out on, so only a remote error needs saying what failed.
@@ -1194,7 +1194,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                         "the `init` expression of profile `", prof.name, "` failed: ",
                         sprint(showerror, e)
                     )
-                throw(ErrorException("YATF: " * what))
+                throw(ErrorException("Runtests: " * what))
             end
             last_err = e   # the worker died while running it: retried like a start failure
             attempt <= WORKER_START_RETRIES && sleep(1)
@@ -1205,7 +1205,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     cancel!(run.queues)
     throw(
         ErrorException(
-            "YATF: could not start a worker for profile `$(prof.name)` " *
+            "Runtests: could not start a worker for profile `$(prof.name)` " *
                 "after $(WORKER_START_RETRIES + 1) attempts: " * sprint(showerror, last_err)
         )
     )
@@ -1284,14 +1284,14 @@ end
 # rather than inherited: a `JULIA_PROJECT` the caller happened to have set would
 # otherwise win over the test environment this run just built.
 function worker_env(run_id, slot_id, project, prof::Profile)
-    env = ["YATF_RUN_ID" => string(run_id), "YATF_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(LOAD_PATH, PATHSEP)]
+    env = ["RUNTESTS_RUN_ID" => string(run_id), "RUNTESTS_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(LOAD_PATH, PATHSEP)]
     project === nothing || push!(env, "JULIA_PROJECT" => project)
     return append!(env, prof.env)
 end
 
 # Every worker's end is recorded once, by the task that sees its process exit,
 # whichever way it went: closed by the run, killed, or dead on its own.
-function worker_ended!(run::Run, slot::Integer, w::YATFWorkers.Worker)
+function worker_ended!(run::Run, slot::Integer, w::RuntestsWorkers.Worker)
     t = time() - run.t0
     p = w.process
     append_event!(run.runstate, EVENT_WORKER_DOWN, worker_end_code(w.ended_by), slot, w.pid, t, t;
@@ -1299,11 +1299,11 @@ function worker_ended!(run::Run, slot::Integer, w::YATFWorkers.Worker)
     return nothing
 end
 
-function init_worker!(run::Run, slot::Slot, w::YATFWorkers.Worker)
+function init_worker!(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
     init = slot.profile.init
     isempty(init.args) && return nothing
     timeout = run.plan.cfg.init_timeout_s
-    fut = YATFWorkers.remote_eval(w, Expr(:block, init.args...))
+    fut = RuntestsWorkers.remote_eval(w, Expr(:block, init.args...))
     fetch_within(
         fut, timeout,
         TimeoutException(timeout, "the `init` expression of profile `$(slot.profile.name)`", "", "init_timeout")
@@ -1321,11 +1321,11 @@ function stop_worker!(run::Run, slot::Slot, why::AbstractString = "")
         close(w)
     catch e
         is_interrupt(e) && rethrow()
-        @error "YATF: could not stop worker $(w.pid)" exception = (e, catch_backtrace())
+        @error "Runtests: could not stop worker $(w.pid)" exception = (e, catch_backtrace())
     end
     p = w.process
     status = !process_exited(p) ? " · still running" :
-        p.exitcode == 0 && p.termsignal == 0 ? "" : string(" · ", YATFWorkers.exit_description(p))
+        p.exitcode == 0 && p.termsignal == 0 ? "" : string(" · ", RuntestsWorkers.exit_description(p))
     print_worker_line(
         run, slot.id, "EXIT", string(
             "pid ", w.pid, " · ", plural(ran, "item"), " · ", fmt_seconds(alive), status,
@@ -1338,8 +1338,8 @@ end
 # How a worker that was not asked to stop came to an end: its exit status, and
 # what memory looked like when it was last seen, which is most of what an OOM kill
 # leaves behind.
-function died_how(run::Run, slot::Slot, w::YATFWorkers.Worker)
-    how = YATFWorkers.exit_description(w.process)
+function died_how(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
+    how = RuntestsWorkers.exit_description(w.process)
     by = w.ended_by
     alone = by === :connection_lost || by === :process_exit
     if alone && w.process.termsignal == 9
@@ -1363,7 +1363,7 @@ const LIVE_RUN = Ref{Any}(nothing)
 # that kills leftover workers before it puts the report ahead of that: the report
 # stops the workers itself, and says why.
 const ensure_exit_report = OncePerProcess{Nothing}() do
-    YATFWorkers.ensure_cleanup_hook()
+    RuntestsWorkers.ensure_cleanup_hook()
     atexit(report_unfinished_run)
     nothing
 end
@@ -1390,7 +1390,7 @@ function report_unfinished_run()
             w = slot.worker
             w === nothing && continue
             @atomic slot.worker = nothing
-            YATFWorkers.kill!(w)
+            RuntestsWorkers.kill!(w)
         end
         # Told to stop, not waited for: `stop_monitor!` takes the printer and waits
         # for the monitor's task, and a task frozen by the exit holding either
@@ -1428,7 +1428,7 @@ function kill_workers!(run::Run, why::AbstractString = "interrupted")
         @lock run.lock push!(run.killed, w)
         @atomic slot.worker = nothing
         live += 1
-        YATFWorkers.kill!(w)
+        RuntestsWorkers.kill!(w)
     end
     live == 0 || say(run, why, "; killed ", plural(live, "worker"))
     return nothing
@@ -1641,13 +1641,13 @@ end
 # The item, then the profile's `test_end`: two requests to one process, each
 # against its own limit, so a `test_end` that hangs is not reported as an item that
 # hung. Most profiles have no `test_end` and send one request.
-function dispatch(run::Run, w::YATFWorkers.Worker, spec::ItemSpec, timeout::Int, slot::Slot)
-    fut = YATFWorkers.remote_run(w, spec)
+function dispatch(run::Run, w::RuntestsWorkers.Worker, spec::ItemSpec, timeout::Int, slot::Slot)
+    fut = RuntestsWorkers.remote_run(w, spec)
     res = fetch_within(fut, timeout, TimeoutException(timeout, "test item", spec.name, timeout_setting(run.plan, spec.index)))::ItemResult
     test_end = slot.profile.test_end
     (isempty(test_end.args) || res.state === SKIPPED) && return res
     seconds = run.plan.cfg.test_end_timeout_s
-    endfut = YATFWorkers.remote_end(w, spec, test_end)
+    endfut = RuntestsWorkers.remote_end(w, spec, test_end)
     endres = try
         fetch_within(
             endfut, seconds,
@@ -1688,7 +1688,7 @@ severity(s::ItemState) = s === ERRORED ? 2 : s === FAILED ? 1 : 0
 # dispatch. A reply that arrived first is buffered, and `fetch` returns a buffered
 # value even from a closed channel, so a reply racing its deadline wins.
 function fetch_within(fut, seconds::Real, on_timeout::Exception)
-    timer = YATFWorkers.after(seconds) do
+    timer = RuntestsWorkers.after(seconds) do
         close(fut.value, on_timeout)
     end
     try
@@ -1710,12 +1710,12 @@ function handle_dispatch_failure!(
         ended = time()   # the item held its worker until here; inspecting it is ours
         if w !== nothing
             print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
-            YATFWorkers.inspect!(w)   # where was it: every thread's and task's backtrace, into the item's log
+            RuntestsWorkers.inspect!(w)   # where was it: every thread's and task's backtrace, into the item's log
             # `wait` below joins the task relaying this worker's output, so
             # everything the process says on its way down has been filed by the
             # time the item is reported.
             @atomic slot.dying_log = item_log_path(run.logprefix, i, attempt)
-            YATFWorkers.terminate!(w, :timeout)
+            RuntestsWorkers.terminate!(w, :timeout)
             wait(w)   # a replacement must not overlap the process it replaces
             flush_dying_log!(slot)
         end
@@ -1749,7 +1749,7 @@ function handle_dispatch_failure!(
             record_error!(
                 run, i, slot, attempt, ERRORED,
                 string(
-                    e isa YATFWorkers.WorkerTerminatedException ?
+                    e isa RuntestsWorkers.WorkerTerminatedException ?
                         string("the worker running this item died: ", how) : sprint(showerror, e),
                     " · ", retry_note(attempt, max_attempts, false)
                 );
@@ -1809,10 +1809,10 @@ dead worker, a chain cut short — and `testset` then holds a single error sayin
 """
 function record!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
-        testset::Test.AbstractTestSet, stats::YATFWorkers.PerfStats, synthetic::Bool,
+        testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool,
         note::AbstractString; ended::Float64 = time()
     )
-    (state === UNSEEN || state === RUNNING) && error("YATF internal error: item $i recorded as $state")
+    (state === UNSEEN || state === RUNNING) && error("Runtests internal error: item $i recorded as $state")
     st = run.statuses
     set_state!(run, i, state)
     st.synthetic[i] = synthetic
@@ -1850,7 +1850,7 @@ function record_result!(
 end
 
 record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString; ended::Float64 = time()) =
-    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), YATFWorkers.PerfStats(), true, msg; ended)
+    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), RuntestsWorkers.PerfStats(), true, msg; ended)
 
 # The testset of an outcome the run decided: one error saying why, at the item's
 # own line, so the summary and the verdict count it like any other error.
@@ -1867,7 +1867,7 @@ function count_done!(run::Run, i::ItemIdx)
     run.statuses.counted[i] && return @atomic run.ndone
     run.statuses.counted[i] = true
     n = @atomic run.ndone += 1
-    n <= nitems(run.plan) || error("YATF internal error: $n items counted as finished, of $(nitems(run.plan))")
+    n <= nitems(run.plan) || error("Runtests internal error: $n items counted as finished, of $(nitems(run.plan))")
     return n
 end
 
@@ -1895,7 +1895,7 @@ function mark_remaining_broken!(run::Run, u::UnitIdx, attempt::Int8)
         )
         # Slot 0: in this attempt the item never ran anywhere.
         record!(
-            run, i, SlotIdx(0), attempt, BROKEN_CHAIN, ts, YATFWorkers.PerfStats(), true,
+            run, i, SlotIdx(0), attempt, BROKEN_CHAIN, ts, RuntestsWorkers.PerfStats(), true,
             "the worker running this chain died before this item ran"
         )
     end
@@ -1908,7 +1908,7 @@ function run_in_process(run::Run, target)
     p = run.plan
     @lock run.lock push!(run.tasks, current_task())
     isempty(p.profiles[1].init.args) ||
-        @warn "YATF: the profile's `init` expression is evaluated in this process (workers=0)"
+        @warn "Runtests: the profile's `init` expression is evaluated in this process (workers=0)"
     Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
     slot = run.slots[1]
     # Every unit, not just the one slot's queue: a pool that would have had a
@@ -1932,4 +1932,4 @@ end
 # replies are. Nothing here can be timed out: there is no second process to kill.
 with_test_end(res::ItemResult, spec::ItemSpec, test_end::Expr) =
     isempty(test_end.args) || res.state === SKIPPED ? res :
-    merge_test_end(res, YATFWorkers.run_test_end(spec, test_end))
+    merge_test_end(res, RuntestsWorkers.run_test_end(spec, test_end))

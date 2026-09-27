@@ -38,10 +38,10 @@ function plan_block(p::Plan, order)
                         "as if every item took as long, since no durations are recorded yet")
         end
     end
-    return bracket(body, "[YATF]", head, "", :white)
+    return bracket(body, "[TEST]", head, "", :white)
 end
 
-# The opening words of a run's header and of a dry run's: which YATF and Julia, how
+# The opening words of a run's header and of a dry run's: which Runtests and Julia, how
 # much work, and on how many processes.
 function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UInt64} = nothing)
     print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
@@ -318,13 +318,13 @@ end
 ### Run output #############################################################
 
 """
-    yatf_prefix(io=stdout) -> String
+    label_prefix(io=stdout) -> String
 
-The prefix everything YATF says about a run starts with, indented by
+The prefix everything Runtests says about a run starts with, indented by
 [`GUTTER`](@ref) so that it lines up with the text inside a bracket.
 """
-yatf_prefix(io::IO = stdout) =
-    GUTTER * sprint(x -> printstyled(x, "[YATF] "; bold = true); context = :color => get(io, :color, false)::Bool)
+label_prefix(io::IO = stdout) =
+    GUTTER * sprint(x -> printstyled(x, "[TEST] "; bold = true); context = :color => get(io, :color, false)::Bool)
 
 # What a bracket's `┌ `, `│ ` and `└ ` occupy, as blanks.
 const GUTTER = "  "
@@ -454,7 +454,7 @@ end
 styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool)
 
 # A line the run says about itself.
-say(run, parts...) = printline(run, string(yatf_prefix(), parts...))
+say(run, parts...) = printline(run, string(label_prefix(), parts...))
 
 print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
     print_line_head(io, MARK_WORKER, slot_id, clock_now())
@@ -498,13 +498,13 @@ outcome(r::ItemResult) = (; r.state, r.stats.elapsed_ns, r.stats.compile_ns, r.s
 """
     parse_record(line) -> Union{Nothing, NamedTuple}
 
-A worker's record of an item starting or finishing (`YATFWorkers.record_run`,
+A worker's record of an item starting or finishing (`RuntestsWorkers.record_run`,
 `record_done`) as `(; i, attempt, how)`, with `how === nothing` for a start; or
 `nothing` for any other line.
 """
 function parse_record(line::AbstractString)
-    startswith(line, YATFWorkers.RECORD_MARK) || return nothing
-    word, rest... = split(SubString(line, ncodeunits(YATFWorkers.RECORD_MARK) + 1), ' ')
+    startswith(line, RuntestsWorkers.RECORD_MARK) || return nothing
+    word, rest... = split(SubString(line, ncodeunits(RuntestsWorkers.RECORD_MARK) + 1), ' ')
     n = map(x -> tryparse(Int, x), rest)
     any(isnothing, n) && return nothing
     word == "RUN" && length(n) == 2 && return (; i = n[1], attempt = n[2], how = nothing)
@@ -525,7 +525,7 @@ end
 """
     print_run_header(run)
 
-What the call does not show: which YATF and Julia, how much work, how many
+What the call does not show: which Runtests and Julia, how much work, how many
 processes with what given to them, and the environment it resolved to.
 """
 function print_run_header(run)
@@ -537,20 +537,20 @@ function print_run_header(run)
         print_profiles(io, p)
         print_coverage_setting(io, p.cfg)
     end
-    print_yatf_block(run, head, body)
+    print_label_block(run, head, body)
     return nothing
 end
 
 """
-    print_yatf_block(run, head, body)
+    print_label_block(run, head, body)
 
-Something YATF says that runs to more than one line, drawn in a bracket so that it
+Something Runtests says that runs to more than one line, drawn in a bracket so that it
 reads as one block among the workers' output. With nothing under its first line it
 is printed as the plain line it is.
 """
-function print_yatf_block(run, head::AbstractString, body::AbstractString)
+function print_label_block(run, head::AbstractString, body::AbstractString)
     isempty(strip(body)) && return say(run, head)
-    return printline(run, bracket(body, "[YATF]", head, "", :white))
+    return printline(run, bracket(body, "[TEST]", head, "", :white))
 end
 
 """
@@ -635,7 +635,7 @@ function print_conclusion(run, ended::Symbol = :finished)
             println(io)
         end
     end
-    print_yatf_block(run, head, body)
+    print_label_block(run, head, body)
     return nothing
 end
 
@@ -789,7 +789,7 @@ function record_unrun!(root::Test.AbstractTestSet, run)
     isempty(idxs) && return nothing
     shown = join((repr(p.items.name[i]) for i in Iterators.take(idxs, 5)), ", ")
     why = is_cancelled(run.queues) ? "did not run because the run stopped early" :
-        "have no outcome, though the run was not stopped (a YATF bug, logged above)"
+        "have no outcome, though the run was not stopped (a Runtests bug, logged above)"
     msg = string(length(idxs), " of ", plural(nitems(p), "test item"), " ", why, ": ", shown, length(idxs) > 5 ? ", …" : "")
     # The conclusion block above says the same thing in the run's own words; this
     # record exists so the verdict is wrong when the run was.

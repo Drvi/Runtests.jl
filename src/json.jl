@@ -1,6 +1,6 @@
 # JSON, as far as the editor protocol needs it: a writer for every value it sends,
 # and a strict reader for the commands it receives. Written here rather than taken
-# from a package because YATF is loaded into the test environment of the package it
+# from a package because Runtests is loaded into the test environment of the package it
 # tests, where a JSON dependency of its own would constrain that package's choice of
 # version.
 

@@ -60,7 +60,7 @@ jobs:
           # once did. With two, the 4-thread Linux and Windows runners were about
           # half busy and the 3-thread macOS ones 70-95%; the summary's `cpu:` line
           # says how busy a run kept its runner.
-          YATF_TEST_JOBS: ${{ matrix.jobs }}
+          RUNTESTS_TEST_JOBS: ${{ matrix.jobs }}
           # Every test-file child is started with the thread count of the process
           # that starts it, so this is what each file in flight gets.
           JULIA_NUM_THREADS: 2

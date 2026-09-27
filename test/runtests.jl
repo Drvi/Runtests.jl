@@ -1,12 +1,12 @@
-# YATF's own tests use plain Test.jl, not YATF: a test framework that can only be
+# Runtests' own tests use plain Test.jl, not Runtests: a test framework that can only be
 # tested by itself cannot be trusted at the moment it is broken. For the same
-# reason the files are run in plain subprocesses rather than on YATF's own worker
+# reason the files are run in plain subprocesses rather than on Runtests' own worker
 # pool — a bug in the transport would stop the suite from running instead of
 # telling you which test it broke.
 #
 #     julia --project=test test/runtests.jl                    every file, in parallel
 #     julia --project=test test/runtests.jl test_scan.jl       one file, in this process
-#     YATF_TEST_JOBS=1 julia --project=test test/runtests.jl   every file, in this process
+#     RUNTESTS_TEST_JOBS=1 julia --project=test test/runtests.jl   every file, in this process
 #
 # `test/` is a project in the package's workspace, with the test-only dependencies,
 # and `Pkg.test()` runs in it too.
@@ -15,9 +15,9 @@
 # what it built.
 
 using Test
-using YATF
+using Runtests
 
-# A worker finds YATFWorkers through the load path it is given, and `@` there means
+# A worker finds RuntestsWorkers through the load path it is given, and `@` there means
 # the worker's own project, which is a fixture's. `Pkg.test` puts this environment
 # on the path by name; a run started with `--project=test` has to do it here.
 let env = dirname(Base.active_project())
@@ -64,7 +64,7 @@ const TEST_FILES = [
 # quarter of the suite, so more processes only add memory. Each of these starts
 # worker processes of its own; the run ends with each file's peak memory, and the
 # suite's, to choose from.
-default_jobs() = something(tryparse(Int, get(ENV, "YATF_TEST_JOBS", "")), 4)
+default_jobs() = something(tryparse(Int, get(ENV, "RUNTESTS_TEST_JOBS", "")), 4)
 
 """
     run_file(file)
@@ -87,11 +87,11 @@ print_environment() = println(
 if !isempty(ARGS)
     # A child, or someone running one file by hand. The hook makes the signal a
     # hung file is sent print every task's backtrace, which is where it is stuck.
-    YATFWorkers.install_inspection_hook()
+    RuntestsWorkers.install_inspection_hook()
     foreach(run_file, ARGS)
 elseif default_jobs() <= 1
     print_environment()
-    @testset "YATF" begin
+    @testset "Runtests" begin
         for file in TEST_FILES
             println(stdout, "[tests] running ", file)
             run_file(file)

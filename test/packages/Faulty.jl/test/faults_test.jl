@@ -67,13 +67,13 @@ end
 end
 
 @testitem "knows it is in a test item" tags=[:scope] begin
-    using YATF
-    info = YATF.current_testitem()
+    using Runtests
+    info = Runtests.current_testitem()
     @test info !== nothing
     @test info.name == "knows it is in a test item"
-    @test YATF.in_testitem()
-    @test YATF.in_yatf_run()
-    @test fetch(Threads.@spawn YATF.in_testitem())   # spawned tasks inherit the scope
+    @test Runtests.in_testitem()
+    @test Runtests.in_test_run()
+    @test fetch(Threads.@spawn Runtests.in_testitem())   # spawned tasks inherit the scope
 end
 
 @testitem "survives two dead workers" tags=[:abort] retries=2 begin

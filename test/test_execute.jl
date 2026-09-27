@@ -1,4 +1,4 @@
-using YATF.Private: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
+using Runtests.Private: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
             SKIPPED, BROKEN_CHAIN, CANCELLED, ConfigError, nitems, is_non_pass
 using Logging: Logging
 using Random: Random
@@ -14,10 +14,10 @@ const BASICPKG = fixture("Basic.jl")
     with_journal() do jdir
         pkg = make_pkg("Seeded", "test/s_test.jl" => """
         @testitem "one" begin
-            write(joinpath(ENV["YATF_JOURNAL"], "one-" * string(time_ns())), string(rand(UInt64)))
+            write(joinpath(ENV["RUNTESTS_JOURNAL"], "one-" * string(time_ns())), string(rand(UInt64)))
         end
         @testitem "two" begin
-            write(joinpath(ENV["YATF_JOURNAL"], "two-" * string(time_ns())), string(rand(UInt64)))
+            write(joinpath(ENV["RUNTESTS_JOURNAL"], "two-" * string(time_ns())), string(rand(UInt64)))
         end
         """)
         Random.seed!(42); expected = rand(UInt64); Random.seed!(42)
@@ -39,14 +39,14 @@ end
         end
     end
 
-    @testset "an item on a worker has `Test` without the worker loading YATF" begin
-        # Whatever a worker loads beyond YATFWorkers is paid for by the first item
-        # it runs, and YATF brings `Pkg` and `TestEnv` with it.
+    @testset "an item on a worker has `Test` without the worker loading Runtests" begin
+        # Whatever a worker loads beyond RuntestsWorkers is paid for by the first item
+        # it runs, and Runtests brings `Pkg` and `TestEnv` with it.
         pkg = make_pkg("Lean", "test/l_test.jl" => """
         @testitem "lean" begin
             @test Test isa Module
             loaded(uuid, name) = Base.root_module_exists(Base.PkgId(Base.UUID(uuid), name))
-            @test !loaded("632efd68-cd41-4e05-bd25-b86dc2150078", "YATF")
+            @test !loaded("632efd68-cd41-4e05-bd25-b86dc2150078", "Runtests")
             @test !loaded("44cfe95a-1eb2-52ea-b672-e2afdf69b78f", "Pkg")
         end
         """)
@@ -64,7 +64,7 @@ end
         p2, target2 = prepare((FAULTY,); workers=1, tags=:fail, logs=:issues)
         run2 = execute(p2, target2)
         threw = try
-            YATF.Private.without_enclosing_testset(() -> report(run2))
+            Runtests.Private.without_enclosing_testset(() -> report(run2))
             false
         catch e
             e isa Test.TestSetException
@@ -79,12 +79,12 @@ end
         # that failure is its own and not this file's.
         outer = failing = passing = nothing
         err = try
-            YATF.Private.without_enclosing_testset() do
+            Runtests.Private.without_enclosing_testset() do
                 @testset "both runs" begin
                     outer = Test.get_testset()
-                    failing = YATF.runtests(FAULTY; workers=1, tags=:fail, logs=:issues, monitor=false,
+                    failing = Runtests.runtests(FAULTY; workers=1, tags=:fail, logs=:issues, monitor=false,
                                             testset_name="faulty")
-                    passing = YATF.runtests(BASICPKG; workers=1, logs=:issues, monitor=false,
+                    passing = Runtests.runtests(BASICPKG; workers=1, logs=:issues, monitor=false,
                                             testset_name="basic")
                 end
             end
@@ -96,34 +96,34 @@ end
         # Each run's testset, told apart by the names the calls gave them.
         @test outer.results[1] === failing.testset && outer.results[2] === passing.testset
         @test [ts.description for ts in outer.results] == ["faulty", "basic"]
-        @test !isempty(YATF.Private.collect_failures(failing.testset))
-        @test isempty(YATF.Private.collect_failures(passing.testset))
+        @test !isempty(Runtests.Private.collect_failures(failing.testset))
+        @test isempty(Runtests.Private.collect_failures(passing.testset))
         @test Test.get_test_counts(outer).cumulative_passes >= 6   # one or more from each of Basic's items
     end
 
     @testset "what runtests returns prints as one line, and is a testset like any other" begin
-        ts = YATF.runtests(BASICPKG; workers=1, logs=:issues, monitor=false, testset_name="basic")
-        @test ts isa YATF.RunTestSet && ts isa Test.AbstractTestSet
+        ts = Runtests.runtests(BASICPKG; workers=1, logs=:issues, monitor=false, testset_name="basic")
+        @test ts isa Runtests.RunTestSet && ts isa Test.AbstractTestSet
         shown = sprint(show, MIME"text/plain"(), ts)
         @test occursin(r"^\"basic\" testset: \d+ passed · \S+$", shown)
         @test ts.description == "basic"                    # its fields read through
         @test Test.get_test_counts(ts).cumulative_passes >= 6
         # The type a `@testset` makes, with another inside it.
-        made = YATF.Private.without_enclosing_testset() do
-            @testset YATF.RunTestSet "made" begin
+        made = Runtests.Private.without_enclosing_testset() do
+            @testset Runtests.RunTestSet "made" begin
                 @test true
                 @testset "inner" begin
                     @test true
                 end
             end
         end
-        @test made isa YATF.RunTestSet
+        @test made isa Runtests.RunTestSet
         counts = Test.get_test_counts(made)
         @test counts.passes == 1 && counts.cumulative_passes == 1
         @test only(made.results) isa Test.DefaultTestSet   # the only kind a tree holds
         # A failure in it throws at the top, as any testset's does.
-        @test_throws Test.TestSetException YATF.Private.without_enclosing_testset() do
-            @testset YATF.RunTestSet "failing" begin
+        @test_throws Test.TestSetException Runtests.Private.without_enclosing_testset() do
+            @testset Runtests.RunTestSet "failing" begin
                 @test false
             end
         end
@@ -134,7 +134,7 @@ end
     end
 
     @testset "a dry run prints the plan and returns nothing" begin
-        returned, out = capture_run(() -> YATF.runtests(BASICPKG; dry_run=true))
+        returned, out = capture_run(() -> Runtests.runtests(BASICPKG; dry_run=true))
         @test returned === nothing
         @test occursin("uses setup", out)
     end
@@ -177,7 +177,7 @@ end
             @test states["fails"] === FAILED
             # The status line's count: the attempts that errored are not failures.
             @test run.nonpass == count(is_non_pass, run.statuses.state) == 1
-            @test parse(Int, read(joinpath(dir, "yatf_abort_count"), String)) == 3
+            @test parse(Int, read(joinpath(dir, "runtests_abort_count"), String)) == 3
         end
     end
 
@@ -187,7 +187,7 @@ end
             @test states["chain start kills the worker"] === ERRORED
             @test states["chain rest must not run"] === BROKEN_CHAIN
             # not skipped quietly and not run on a fresh worker: it did not run
-            @test !isfile(joinpath(dir, "yatf_must_not_run"))
+            @test !isfile(joinpath(dir, "runtests_must_not_run"))
         end
     end
 
@@ -195,7 +195,7 @@ end
         with_marker_dir() do dir
             states, run, _ = run_states(FAULTY; workers=1, tags=[:retry], logs=:issues)
             @test states["passes on the second try"] === PASSED
-            @test isfile(joinpath(dir, "yatf_retry"))
+            @test isfile(joinpath(dir, "runtests_retry"))
             @test run.nonpass == count(is_non_pass, run.statuses.state) == 0
         end
         # An item's own `retries` wins over the run default, in both directions.
@@ -216,7 +216,7 @@ end
         with_marker_dir() do dir
             states, _, _ = run_states(FAULTY; workers=0, tags=[:retry], logs=:issues)
             @test states["passes on the second try"] === PASSED
-            @test parse(Int, read(joinpath(dir, "yatf_retry"), String) |> length |> string) >= 1
+            @test parse(Int, read(joinpath(dir, "runtests_retry"), String) |> length |> string) >= 1
         end
     end
 
@@ -224,7 +224,7 @@ end
         p, target = prepare((FAULTY,); workers=1, logs=:issues, monitor=false, name="errors")
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
-        trimmed = sprint(show, first(YATF.Private.collect_failures(run.statuses.testsets[1])))
+        trimmed = sprint(show, first(Runtests.Private.collect_failures(run.statuses.testsets[1])))
         @test occursin("faults_test.jl", trimmed)        # the item's own frame is kept
         @test !occursin("runitem.jl", trimmed)           # the framework's are not
         @test !occursin("serve_requests", trimmed)
@@ -233,7 +233,7 @@ end
                               full_stacktraces=true)
         run2 = execute(p2, target2)
         rm(run2.logdir; force=true, recursive=true)
-        full = sprint(show, first(YATF.Private.collect_failures(run2.statuses.testsets[1])))
+        full = sprint(show, first(Runtests.Private.collect_failures(run2.statuses.testsets[1])))
         @test occursin("runitem.jl", full)               # kept when asked for
         @test length(split(full, '\n')) > length(split(trimmed, '\n'))
     end
@@ -269,7 +269,7 @@ end
         """)
         function reports(; kw...)
             _, run, p = run_states(dir; logs=:issues, monitor=false, kw...)
-            return Dict(p.items.name[i] => sprint(show, only(YATF.Private.collect_failures(run.statuses.testsets[i])))
+            return Dict(p.items.name[i] => sprint(show, only(Runtests.Private.collect_failures(run.statuses.testsets[i])))
                         for i in 1:nitems(p))
         end
         # A worker's frames lie beneath the item's; with no workers, this process's do.
@@ -350,7 +350,7 @@ end
             @test count("· RUN ", out) == 1
             @test count("· DONE ", out) == 1
             # What a worker writes about an item is data for the coordinator.
-            @test !occursin(YATFWorkers.RECORD_MARK, out)
+            @test !occursin(RuntestsWorkers.RECORD_MARK, out)
         end
     end
 
@@ -365,14 +365,14 @@ end
             @testitem "bounded" sandbox=:bounds begin
                 @test Base.JLOptions().check_bounds == 1          # what it asked for
                 @test Main.FROM_PROFILE_INIT == 7                 # and its profile's init
-                @test getpid() != parse(Int, ENV["YATF_SOLO_PID"])
+                @test getpid() != parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             @testitem "alone" sandbox=true begin
-                @test getpid() != parse(Int, ENV["YATF_SOLO_PID"])
+                @test getpid() != parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             @testitem "ordinary" begin
                 @test Base.JLOptions().check_bounds == 0
-                @test getpid() == parse(Int, ENV["YATF_SOLO_PID"])
+                @test getpid() == parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             """,
             "test/TestItems.toml" =>
@@ -382,7 +382,7 @@ end
         before = live_worker_processes()
         out = Ref("")
         logs = Test.collect_test_logs() do
-            withenv("YATF_SOLO_PID" => string(getpid())) do
+            withenv("RUNTESTS_SOLO_PID" => string(getpid())) do
                 (states, _, _), printed = capture_run() do
                     run_states(dir; workers=0, logs=:issues, monitor=false)
                 end

@@ -1,4 +1,4 @@
-# The editor protocol: a YATF process an editor drives over its standard streams.
+# The editor protocol: a Runtests process an editor drives over its standard streams.
 # Commands arrive on stdin and events leave on stdout, one JSON object per line;
 # everything written for people — the run's own lines, `Pkg`, what items print —
 # goes to stderr, so nothing but events reaches the stream. What each command and
@@ -176,7 +176,7 @@ function serve(path::AbstractString = "."; input::IO = stdin, output::IO = stdou
         redirect_stdout(stderr)
     end
     s = Session(target.root, EventStream(output), nothing, false, "")
-    emit(s.stream, "hello"; protocol = PROTOCOL_VERSION, yatf = string(pkgversion(@__MODULE__)),
+    emit(s.stream, "hello"; protocol = PROTOCOL_VERSION, runtests = string(pkgversion(@__MODULE__)),
          julia = string(VERSION), pid = getpid(), root = target.root)
     try
         while !eof(input)
@@ -294,7 +294,7 @@ end
 function run_for_editor(s::Session, id, p::Plan, target)
     # This task is where a cancel is thrown, from its first moment: `execute` makes
     # it the target too, and puts back what it found here when it is done.
-    @atomic YATFWorkers.INTERRUPT_TARGET.task = current_task()
+    @atomic RuntestsWorkers.INTERRUPT_TARGET.task = current_task()
     run, ended = nothing, "finished"
     try
         s.cancelled && throw(InterruptException())
@@ -305,7 +305,7 @@ function run_for_editor(s::Session, id, p::Plan, target)
         ended = is_interrupt(e) ? "cancelled" : e isa RunStalled ? "stalled" : "error"
         ended == "error" && say_failure(s.stream, id, e)
     finally
-        @atomic YATFWorkers.INTERRUPT_TARGET.task = nothing
+        @atomic RuntestsWorkers.INTERRUPT_TARGET.task = nothing
     end
     run === nothing || (s.logdir = run.logdir)
     emit_run_finished(s.stream, id, run, ended)
@@ -337,6 +337,6 @@ function cancel_run!(s::Session, id)
     end
     # Thrown into the run's task as Ctrl-C would be, which stops the run and takes
     # its workers with it; a task that has yet to start sees the flag instead.
-    YATFWorkers.forward_interrupt(InterruptException()) || (s.cancelled = true)
+    RuntestsWorkers.forward_interrupt(InterruptException()) || (s.cancelled = true)
     return nothing
 end

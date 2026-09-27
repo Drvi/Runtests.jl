@@ -1,4 +1,4 @@
-using YATF.Private: plan, scan, discover, setup_modules, read_config, Filter, History, ConfigError,
+using Runtests.Private: plan, scan, discover, setup_modules, read_config, Filter, History, ConfigError,
             ScanFailure, nslots, nitems, NO_CHAIN, print_plan, RawItem, USE_RUN_DEFAULT,
             DEFAULT_PROFILE, ItemIdx
 using Random: Xoshiro
@@ -69,7 +69,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test occursin("do not exist", sprint(showerror, err))
         @test occursin("did you mean", sprint(showerror, err))   # near-match suggestion
         # ...but a filtered run must not fail just because the pinned item was filtered out
-        @test plan(items, cfg; root=dir, strict_order=false) isa YATF.Private.Plan
+        @test plan(items, cfg; root=dir, strict_order=false) isa Runtests.Private.Plan
     end
 
     @testset "an unknown sandbox profile is an error naming the items" begin
@@ -156,7 +156,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # Over a quarter of a slot's share, but a matter of seconds: not long.
         p = plan_dir(dir; history=History(Dict("a1" => 2.0), Dict{String,Int}(), 0.0))
         @test isempty(only(p.pools).head)
-        @test p.units.why[p.items.unit[findfirst(==("a1"), p.items.name)]] === YATF.Private.IN_FILE_ORDER
+        @test p.units.why[p.items.unit[findfirst(==("a1"), p.items.name)]] === Runtests.Private.IN_FILE_ORDER
         # A sandboxed unit goes before any of them: its process is fresh anyway.
         write(joinpath(dir, "test", "c_test.jl"), items("c1") * "@testitem \"alone\" sandbox=true begin\n    @test true\nend\n")
         @test first(dispatch_order(plan_dir(dir; history=h))) == "alone"
@@ -173,17 +173,17 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         p = plan_dir(make_pkg("Claims", "test/a_test.jl" => items("a1", "a2", "a3", "a4", "a5", "a6"),
                               "test/b_test.jl" => items("b1", "b2"),
                               "test/TestItems.toml" => "[order]\nfirst = [\"b2\"]\nlast = [\"a1\"]\n"))
-        q = YATF.Private.Queues(p)
-        next(s) = (c = YATF.Private.claim!(q, s); c.kind === :unit ? p.items.name[first(p.units.span[c.unit])] : c.kind)
+        q = Runtests.Private.Queues(p)
+        next(s) = (c = Runtests.Private.claim!(q, s); c.kind === :unit ? p.items.name[first(p.units.span[c.unit])] : c.kind)
         @test [next(2), next(2), next(1)] == ["b2", "b1", "a2"]
         @test next(2) == "a5"                                   # the second half of a3–a6
         @test [next(1), next(1), next(1)] == ["a3", "a4", "a6"] # then the one unit slot 2 had left
         @test [next(2), next(2)] == ["a1", :done]
         # A cursor pointing at a unit already handed out is a scheduling bug, stopped
         # rather than run twice.
-        q2 = YATF.Private.Queues(p)
+        q2 = Runtests.Private.Queues(p)
         q2.claimed[q2.head[1]] = true
-        @test_throws ErrorException YATF.Private.claim!(q2, 1)
+        @test_throws ErrorException Runtests.Private.claim!(q2, 1)
     end
 
     declared(names...; opts = "") = join(("@testitem \"$n\" $opts begin\n    @test true\nend\n" for n in names))
@@ -212,13 +212,13 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             wrong = String[]
             for seed in 1:200
                 rng = Xoshiro(seed)
-                q = YATF.Private.Queues(p)
+                q = Runtests.Private.Queues(p)
                 serves = copy(p.slot_pool)      # the pool each slot's process was started for
                 handed = zeros(Int, length(p.units))
                 live = collect(1:nslots(p))
                 while !isempty(live)
                     s = rand(rng, live)
-                    c = YATF.Private.claim!(q, s)
+                    c = Runtests.Private.claim!(q, s)
                     if c.kind === :done
                         filter!(!=(s), live)
                     elseif c.kind === :rebind
@@ -251,8 +251,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         )
         second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
         known = History(second, Dict{String, Int}(), 0.0)
-        Q, claim!, cold_cost, ColdCost = YATF.Private.Queues, YATF.Private.claim!, YATF.Private.cold_cost,
-            YATF.Private.ColdCost
+        Q, claim!, cold_cost, ColdCost = Runtests.Private.Queues, Runtests.Private.claim!, Runtests.Private.cold_cost,
+            Runtests.Private.ColdCost
         profile_of(p, c) = p.profiles[p.units.profile[c.unit]].name
         pool_named(p, name) = findfirst(k -> p.profiles[k.profile].name === name, p.pools)
         tiny_slot(p) = findfirst(==(pool_named(p, :tiny)), p.slot_pool)
@@ -347,7 +347,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # The dry run predicts the same: `tiny`'s slot goes on with default units, and
         # does not when earlier runs say a fresh worker costs more than it would save.
         p = plan_dir(solo; workers = 3, history = known)
-        on_tiny(p) = [p.items.name[i] for (_, w, i) in YATF.Private.run_order(p).items if w == tiny_slot(p)]
+        on_tiny(p) = [p.items.name[i] for (_, w, i) in Runtests.Private.run_order(p).items if w == tiny_slot(p)]
         @test first(on_tiny(p)) == "p1"
         @test length(on_tiny(p)) > 1 && all(startswith("a"), on_tiny(p)[2:end])
         costly = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(20.0, 0.0)))
@@ -355,7 +355,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # A slot that moves is charged the fresh worker before its first unit there:
         # `p1`'s second, then a second and a half.
         p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(1.0, 0.5)))
-        starts = [t for (t, w, i) in YATF.Private.run_order(p).items if w == tiny_slot(p)]
+        starts = [t for (t, w, i) in Runtests.Private.run_order(p).items if w == tiny_slot(p)]
         @test starts[1:2] ≈ [0.0, 2.5]
     end
 
@@ -373,14 +373,14 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # together they take six, and so go before a single item of four.
         p = plan_dir(dir; history = History(seconds(4.0), Dict{String, Int}(), 0.0))
         @test p.units.est_s[unit(p, "c1")] == 6.0
-        @test p.units.why[unit(p, "c1")] === YATF.Private.LONG
+        @test p.units.why[unit(p, "c1")] === Runtests.Private.LONG
         @test dispatch_order(p)[1:4] == ["c1", "c2", "c3", "solo"]
         # ...and after a single item of ten.
         p = plan_dir(dir; history = History(seconds(10.0), Dict{String, Int}(), 0.0))
         @test dispatch_order(p)[1:4] == ["solo", "c1", "c2", "c3"]
         # A link that failed last time takes the whole chain ahead of it.
         p = plan_dir(dir; history = History(seconds(10.0), Dict("c3" => 0), 0.0))
-        @test p.units.why[unit(p, "c1")] === YATF.Private.RECENT
+        @test p.units.why[unit(p, "c1")] === Runtests.Private.RECENT
         @test dispatch_order(p)[1:4] == ["c1", "c2", "c3", "solo"]
     end
 
@@ -427,7 +427,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # separator.
         tags_at = column(header, "tags")
         longest = maximum(l -> length(match(r"test[/\\]\S+:\d+", l).match), rows)   # `\` on Windows
-        @test tags_at == column(header, "at ") + longest + length(YATF.Private.FIELD)
+        @test tags_at == column(header, "at ") + longest + length(Runtests.Private.FIELD)
         # Every row's separators fall where the header's do, up to where the row ends.
         dots = findall(==('·'), collect(header))
         @test all(l -> all(d -> d > length(l) || collect(l)[d] == '·', dots), rows)
@@ -454,7 +454,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         names = ["short one", "short two",
                  "a long name about parsing dates carefully", "a long name about parsing times carefully",
                  "zebra crossings are long and winding roads", "long name (with parens) and more words"]
-        cells = YATF.Private.shown_names(names, 20)
+        cells = Runtests.Private.shown_names(names, 20)
         shown = Dict(zip(names, cells))
         # One that fits is as it is, after the column the shortened ones have an `r` in.
         @test shown["short one"] == " \"short one\""
@@ -472,10 +472,10 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             @test occursin(rx, n) && count(m -> occursin(rx, m), names) == 1
         end
         # All the names fit: nothing changes, and there is no column for an `r`.
-        @test YATF.Private.shown_names(["short one", "short two"], 20) == ["\"short one\"", "\"short two\""]
+        @test Runtests.Private.shown_names(["short one", "short two"], 20) == ["\"short one\"", "\"short two\""]
         # No prefix is a name's own when another name begins with all of it: it stays
         # whole, and the other is picked out by the character after it.
-        @test YATF.Private.shown_names(["a name that is long", "a name that is long, and longer"], 12) ==
+        @test Runtests.Private.shown_names(["a name that is long", "a name that is long, and longer"], 12) ==
             [" \"a name that is long\"", "r\"^a name that is long,\""]
     end
 
@@ -484,14 +484,14 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         other = "a long name about parsing dates carelessly"
         # Among the names shown, a short prefix would do; the suite has another name
         # that shares most of it, so the prefix runs to where the two part.
-        @test YATF.Private.shown_names([shown, "short"], 20) == ["r\"^a long name about\"", " \"short\""]
-        @test YATF.Private.shown_names([shown, "short"], 20; among = [shown, "short", other]) ==
+        @test Runtests.Private.shown_names([shown, "short"], 20) == ["r\"^a long name about\"", " \"short\""]
+        @test Runtests.Private.shown_names([shown, "short"], 20; among = [shown, "short", other]) ==
             ["r\"^a long name about parsing dates caref\"", " \"short\""]
         # A dry run of part of the suite: the item left out still has a name.
         items = join((string("@testitem ", repr(n), " begin\n    @test true\nend\n")
                       for n in ["one", "two", "three", shown, other]), "\n")
         dir = make_pkg("Apart", "test/a_test.jl" => items)
-        p, _ = YATF.Private.prepare((dir,); name=Set(["one", "two", "three", shown]), workers=1,
+        p, _ = Runtests.Private.prepare((dir,); name=Set(["one", "two", "three", shown]), workers=1,
                             logs=:issues, announce=false)
         row = only(filter(l -> occursin("r\"^", l), split(sprint(print_plan, p), '\n')))
         rx = eval(Meta.parse(match(r"r\"\^.*?[^\\]\"", row).match))
@@ -503,7 +503,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         items = join((string("@testitem ", repr(n), " begin\n    @test true\nend\n")
                       for n in ["one", "two", "three", long, long * " too"]), "\n")
         dir = make_pkg("Quoted", "test/q_test.jl" => items)
-        p, _ = YATF.Private.prepare((dir,); workers=2, logs=:issues, announce=false)
+        p, _ = Runtests.Private.prepare((dir,); workers=2, logs=:issues, announce=false)
         rows = filter(l -> occursin("_test.jl:", l), split(sprint(print_plan, p), '\n'))
         quote_at(l) = length(l[1:prevind(l, findfirst('"', l))]) + 1
         @test length(unique(quote_at.(rows))) == 1
@@ -516,14 +516,14 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                       for n in ["one", "two", "three", long]), "\n")
         dir = make_pkg("Whole", "test/w_test.jl" => items)
         rows(; kw...) = filter(l -> occursin("_test.jl:", l), split(sprint(print_plan,
-            first(YATF.Private.prepare((dir,); workers=1, logs=:issues, announce=false, kw...))), '\n'))
+            first(Runtests.Private.prepare((dir,); workers=1, logs=:issues, announce=false, kw...))), '\n'))
         @test any(l -> occursin("r\"^an i", l), rows())
         @test any(l -> occursin(repr(long), l), rows(full_names=true))
         @test !any(l -> occursin("r\"^", l), rows(full_names=true))
     end
 
     @testset "the dry run says why an item goes where it does" begin
-        whys(p) = Dict(p.items.name[i] => YATF.Private.why_text(p, p.items.unit[i]) for i in 1:nitems(p))
+        whys(p) = Dict(p.items.name[i] => Runtests.Private.why_text(p, p.items.unit[i]) for i in 1:nitems(p))
         # From the recorded runs: one item failed in the newest, one three runs back,
         # and one took far longer than the rest.
         h = History(Dict("uses setup" => 100.0, "add works" => 0.1, "mul works" => 0.1),
@@ -550,7 +550,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             end
             """,
             "test/TestItems.toml" => "[order]\nlast = [\"last of all\"]\n")
-        p, _ = YATF.Private.prepare((dir,); workers=2, logs=:issues, announce=false)
+        p, _ = Runtests.Private.prepare((dir,); workers=2, logs=:issues, announce=false)
         w = whys(p)
         @test w["in its own process"] == "sandbox"
         @test w["last of all"] == "[order] last"
@@ -572,7 +572,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         function why_column(history)
             p = plan_dir(dir; history)
             return Dict(p.items.name[i] => (i == first(p.units.span[p.items.unit[i]]) ?
-                                            YATF.Private.why_text(p, p.items.unit[i]) : "")
+                                            Runtests.Private.why_text(p, p.items.unit[i]) : "")
                         for i in 1:nitems(p))
         end
         w = why_column(History(seconds, Dict("c3" => 0), 0.0))
@@ -606,7 +606,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             write(toml, "[order]\nlast = [$(repr(only(listed)))]\n")
             p = plan_dir(dir; workers = 1)
             @test dispatch_order(p) == order
-            @test p.units.why[p.items.unit[findfirst(==(only(listed)), p.items.name)]] === YATF.Private.PINNED_LAST
+            @test p.units.why[p.items.unit[findfirst(==(only(listed)), p.items.name)]] === Runtests.Private.PINNED_LAST
         end
         # Pinned by the member listed first, as `first` is.
         write(toml, "[order]\nlast = [\"two\", \"three\"]\n")

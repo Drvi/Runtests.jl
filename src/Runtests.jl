@@ -1,24 +1,24 @@
 """
-    YATF
+    Runtests
 
 Run a package's tests as independent test items across worker processes.
 
-    YATF.runtests()                      # every test item under test/
-    YATF.runtests("test/solver_test.jl") # one file
-    YATF.runtests(name="adds numbers")   # one item
-    YATF.runtests(dry_run=true)          # print the plan, run nothing
+    Runtests.runtests()                      # every test item under test/
+    Runtests.runtests("test/solver_test.jl") # one file
+    Runtests.runtests(name="adds numbers")   # one item
+    Runtests.runtests(dry_run=true)          # print the plan, run nothing
 
 Test files live under `test/` and are named `*_test.jl` or `*_tests.jl`. They
 contain `@testitem` declarations and nothing else. Shared setup code goes in
 `test/testsetups/` as ordinary modules, which test items load with `using`.
 """
-module YATF
+module Runtests
 
 """
-    YATF.Private
+    Runtests.Private
 
-Everything but the public API, which `YATF` takes from here by name. `YATF.<tab>`
-offers every name `YATF` itself defines, and the public API is what it should offer.
+Everything but the public API, which `Runtests` takes from here by name. `Runtests.<tab>`
+offers every name `Runtests` itself defines, and the public API is what it should offer.
 """
 module Private
 
@@ -33,9 +33,9 @@ using TOML: TOML
 
 # The worker side is a package of its own, so a worker loads the protocol and the
 # item runner and nothing else.
-using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
+using RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
-    current_testitem, in_testitem, in_yatf_run, run_item,
+    current_testitem, in_testitem, in_test_run, run_item,
     with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded
 
 include("types.jl")
@@ -65,7 +65,7 @@ environment is used.
 `paths` narrow what is read: a directory, a test file, or `file.jl:42` to select
 the item that line is inside.
 
-Returns the run's testset, a [`RunTestSet`](@ref) named `testset_name` (`"YATF"`
+Returns the run's testset, a [`RunTestSet`](@ref) named `testset_name` (`"Runtests"`
 unless given), holding one testset per test file. Inside an enclosing `@testset`
 it is recorded there, so the runs of several calls add up under one, told apart by
 their names. Outside any, an item that did not pass makes the call throw, which is
@@ -88,7 +88,7 @@ given, and printed at the start of the run).
 Output: `logs` (`:issues`, `:batched`, `:eager`), `verbose`,
 `monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
 `src/` and `ext/` the workers run, merged into `lcov.info` at the package's root;
-also `YATF_COVERAGE`, which a keyword overrides and which overrides the file).
+also `RUNTESTS_COVERAGE`, which a keyword overrides and which overrides the file).
 
 State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
 downloaded from CI, say) and runs it again: the same items, settings, profiles
@@ -129,7 +129,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     setups = setup_modules(target.testdir)
     # Printed directly: there is no printer yet, and nothing else writes this early.
     announce && println(
-        stdout, yatf_prefix(), "reading test files under ",
+        stdout, label_prefix(), "reading test files under ",
         relpath_or_path(target.testdir, target.root),
         is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
@@ -151,7 +151,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     items = scan(files, filter, setups; strays, suite_names)
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
     announce && println(
-        stdout, yatf_prefix(), "found ", plural(length(items), "test item"), " in ",
+        stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
         plural(length(unique(i -> i.file, items)), "file"),
         length(files) == length(unique(i -> i.file, items)) ? "" :
             string(" of ", length(files), " searched"),
@@ -176,13 +176,13 @@ end
 function read_replay(path::String, target)
     rs = read_run_state(path)
     rs === nothing && throw(ConfigError(
-        "could not read a run state from $path: it is missing, damaged, or written by another version of YATF"
+        "could not read a run state from $path: it is missing, damaged, or written by another version of Runtests"
     ))
     id, here = get(rs.meta, "project_id", ""), project_id(target.root)
     id == here || throw(ConfigError("$path records a run of project $(repr(id)), not of this one ($(repr(here)))"))
     m(k) = get(rs.meta, k, "")
     println(
-        stdout, yatf_prefix(), "replaying ", basename(path), ": ", plural(length(rs.items), "test item"),
+        stdout, label_prefix(), "replaying ", basename(path), ": ", plural(length(rs.items), "test item"),
         " · seed ", m("seed"), " · recorded with julia ", m("julia"), " on ", m("machine"),
         isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
     )
@@ -225,11 +225,12 @@ end
 Run the items that are failing: those whose last verdict, in the last run that ran
 them to one, was not a pass. Each item keeps its own, so running some of one run's
 failures again does not forget the others, and a run stopped before it reached an
-item leaves that item's verdict as it was. See [`failing_items`](@ref).
+item leaves that item's verdict as it was. Only items the suite still has run: one
+renamed or deleted since it failed has nothing to run. See [`failing_items`](@ref).
 """
 function runtestsf(args...; kwargs...)
     target = resolve_target(args)
-    names = Set(failing_items(target.root))
+    names = Set(failing_items(target.root; names = suite_item_names(target)))
     isempty(names) && throw(
         NoTestsError(
             "no test item is failing in the recorded runs" *
@@ -237,9 +238,18 @@ function runtestsf(args...; kwargs...)
         )
     )
     println(
-        stdout, yatf_prefix(), "running ", plural(length(names), "failing item")
+        stdout, label_prefix(), "running ", plural(length(names), "failing item")
     )
     return runtests(args...; name = names, kwargs...)
+end
+
+# Every item's name in the suite, read as a run reads it: a suite that does not
+# parse throws here as it would there.
+function suite_item_names(target)
+    files, strays = walk_test_dir(target.testdir)
+    names = String[]
+    scan(files, Filter(), setup_modules(target.testdir); strays, suite_names = names)
+    return Set(names)
 end
 
 """
@@ -261,7 +271,7 @@ function resolve_target(args)
     length(args) == 1 && args[1] isa Module && return target_from_dir(_pkgdir(args[1]))
     paths = String[]; line = Int32(0)
     for a in args
-        a isa AbstractString || throw(ArgumentError("YATF.runtests takes paths or a module, got $(repr(a))"))
+        a isa AbstractString || throw(ArgumentError("Runtests.runtests takes paths or a module, got $(repr(a))"))
         path, ln = split_line_suffix(String(a))
         ln == 0 || (line == 0 || throw(ArgumentError("only one `file.jl:line` target is allowed")); line = ln)
         push!(paths, abspath(path))
@@ -276,7 +286,7 @@ function resolve_target(args)
         rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && continue
         startswith(path, t.testdir) || throw(
             ArgumentError(
-                "$(path) is not under $(t.testdir); YATF only reads test files from `test/`"
+                "$(path) is not under $(t.testdir); Runtests only reads test files from `test/`"
             )
         )
         isdir(path) || is_test_file(path) || throw(
@@ -405,7 +415,7 @@ const PRECOMPILE_SIGNATURES = (
 
         # The run state, written before the first item starts and read by the run
         # after this one.
-        statepath = joinpath(dir, "precompile.yatf")
+        statepath = joinpath(dir, "precompile.runstate")
         rsf = init_run_state(statepath, p)
         write_status!(rsf, 1, RUNNING, 1, 1)
         write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1, compile = 0.05)
@@ -413,7 +423,7 @@ const PRECOMPILE_SIGNATURES = (
         write_memory!(rsf, MemStats())
         finish_run_state!(rsf)
         read_run_state(statepath)
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             history(dir)
         end
 
@@ -426,7 +436,7 @@ const PRECOMPILE_SIGNATURES = (
         print_int(buf, 42, 4)
         item_line(1, 1, 2, "\"an item\"", 12, 1, 1, "a_test.jl:1")
         item_line(1, 1, 2, "\"an item\"", 12, 2, 2, (; state = PASSED, elapsed_ns = 1, compile_ns = 0, maxrss = 1))
-        parse_record(string(YATFWorkers.RECORD_MARK, "DONE 1 1 2 3 4 5"))
+        parse_record(string(RuntestsWorkers.RECORD_MARK, "DONE 1 1 2 3 4 5"))
         item_log_path("/precompile/item_", 1, 1)
         bracket("a line\nanother", "[1/2] FAIL", "\"an item\"", "@ a_test.jl:1", :red)
         fmt_seconds(0.5); plural(2, "worker"); plural(1, "process", "processes")
@@ -437,20 +447,20 @@ const PRECOMPILE_SIGNATURES = (
     end
     rm(dir; force = true, recursive = true)
     for (f, types) in PRECOMPILE_SIGNATURES
-        YATFWorkers.precompile_or_throw(f, types)
+        RuntestsWorkers.precompile_or_throw(f, types)
     end
 end
 
 end # module Private
 
 using Test
-using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_yatf_run,
+using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 export @testitem, runtests, runtestsf, chores
 
-# Re-exported, so `using YATF` alone gives a script or the REPL `@test`, `@testset`
+# Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test
 # item's body does not need them: it is handed `Test` directly.
 export Test
@@ -458,8 +468,8 @@ for name in names(Test)
     startswith(string(name), "@") && @eval export $name
 end
 
-public current_testitem, in_testitem, in_yatf_run,
+public current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
-end # module YATF
+end # module Runtests

@@ -1,9 +1,9 @@
-# Stepping into a test item: `YATF.debug`, and the Debugger.jl extension behind it.
+# Stepping into a test item: `Runtests.debug`, and the Debugger.jl extension behind it.
 # The item's body becomes a function the debugger enters, and what cannot be part
 # of a function runs first. Most of this is checked with a stand-in for the
 # debugger that calls the function; the last testset drives the real one.
 
-using YATF.Private: FAILED, ERRORED, ConfigError, NoTestsError
+using Runtests.Private: FAILED, ERRORED, ConfigError, NoTestsError
 using REPL: REPL, Terminals
 
 const STEPPED = make_pkg(
@@ -50,13 +50,13 @@ const STEPPED = make_pkg(
     end
 
     @testitem "draws and fails" begin
-        write(ENV["YATF_DRAW"], string(rand(UInt64)))
+        write(ENV["RUNTESTS_DRAW"], string(rand(UInt64)))
         @test false
     end
 
     @testitem "profiled" sandbox=:flagged timeout=30 begin
-        @test ENV["YATF_FROM_PROFILE"] == "env"
-        @test Main.YATF_FROM_INIT == 7
+        @test ENV["RUNTESTS_FROM_PROFILE"] == "env"
+        @test Main.RUNTESTS_FROM_INIT == 7
     end
 
     @testitem "imports and submodules" begin
@@ -90,9 +90,9 @@ const STEPPED = make_pkg(
     "test/TestItems.toml" => """
     [profiles.flagged]
     julia_args = ["--check-bounds=yes"]
-    env = { YATF_FROM_PROFILE = "env" }
-    init = "YATF_FROM_INIT = 7"
-    test_end = "write(ENV[\\"YATF_END\\"], \\"ran\\")"
+    env = { RUNTESTS_FROM_PROFILE = "env" }
+    init = "RUNTESTS_FROM_INIT = 7"
+    test_end = "write(ENV[\\"RUNTESTS_END\\"], \\"ran\\")"
     """,
 )
 const STEPPED_FILE = joinpath(STEPPED, "test", "s_test.jl")
@@ -104,8 +104,8 @@ call(body) = body()
 
 @testset "debugging a test item" begin
     @testset "without Debugger loaded, it says what it needs" begin
-        @test Base.get_extension(YATF, :YATFDebuggerExt) === nothing
-        for call_debug in (() -> YATF.debug("declares and tests"), () -> YATF.debug())
+        @test Base.get_extension(Runtests, :RuntestsDebuggerExt) === nothing
+        for call_debug in (() -> Runtests.debug("declares and tests"), () -> Runtests.debug())
             err = try
                 call_debug()
             catch e
@@ -119,7 +119,7 @@ call(body) = body()
     with_activated(STEPPED) do _
         @testset "the body is a function, and what cannot be part of one runs first" begin
             entered = Ref{Any}(nothing)
-            ts = YATF.Private.debug_item("declares and tests", nothing) do body
+            ts = Runtests.Private.debug_item("declares and tests", nothing) do body
                 entered[] = only(methods(body))
                 body()
             end
@@ -136,31 +136,31 @@ call(body) = body()
             # `using` inside an `if`, and a Base function extended under the name an
             # `import` gave it, which is a method on `Base.show` and not a local
             # function that `print` would never call.
-            ts = YATF.Private.debug_item(call, "imports and submodules", nothing)
+            ts = Runtests.Private.debug_item(call, "imports and submodules", nothing)
             @test ts.n_passed == 4
             @test isempty(ts.results)
         end
 
         @testset "a failure and an error are the item's, at the test file's lines" begin
-            ts = YATF.Private.debug_item(call, "fails", nothing)
-            @test YATFWorkers.state_of(ts) === FAILED
+            ts = Runtests.Private.debug_item(call, "fails", nothing)
+            @test RuntestsWorkers.state_of(ts) === FAILED
             @test only(ts.results).source.line == line_of("@test x == 42")
-            ts = YATF.Private.debug_item(call, "throws", nothing)
-            @test YATFWorkers.state_of(ts) === ERRORED
+            ts = Runtests.Private.debug_item(call, "throws", nothing)
+            @test RuntestsWorkers.state_of(ts) === ERRORED
             @test occursin("thrown from the item", sprint(show, only(ts.results)))
         end
 
         @testset "an item left before it finished is not a pass" begin
             # A debugger that is quit returns without the body having run to its end.
-            ts = YATF.Private.debug_item(body -> nothing, "declares and tests", nothing)
-            @test YATFWorkers.state_of(ts) === ERRORED
+            ts = Runtests.Private.debug_item(body -> nothing, "declares and tests", nothing)
+            @test RuntestsWorkers.state_of(ts) === ERRORED
             @test occursin("left before it finished", sprint(show, only(ts.results)))
         end
 
         @testset "a skipped item is not entered" begin
             entered = Ref(false)
             _, out = capture_run() do
-                YATF.Private.debug_item(body -> (entered[] = true; body()), "skipped", nothing)
+                Runtests.Private.debug_item(body -> (entered[] = true; body()), "skipped", nothing)
             end
             @test !entered[]
             @test any(l -> occursin("· DONE ·", l) && occursin("SKIP", l), eachsplit(out, '\n'))
@@ -169,17 +169,17 @@ call(body) = body()
         @testset "with a run's seed, the item draws what it drew in that run" begin
             mktempdir() do tmp
                 draw = joinpath(tmp, "draw")
-                drawn(f) = withenv(() -> (f(); read(draw, String)), "YATF_DRAW" => draw)
-                debugged = drawn(() -> YATF.Private.debug_item(call, "draws and fails", 7))
+                drawn(f) = withenv(() -> (f(); read(draw, String)), "RUNTESTS_DRAW" => draw)
+                debugged = drawn(() -> Runtests.Private.debug_item(call, "draws and fails", 7))
                 ran = drawn(() -> run_states(STEPPED; workers=0, seed=7, name="draws and fails", logs=:issues, monitor=false))
                 @test debugged == ran
-                @test drawn(() -> YATF.Private.debug_item(call, "draws and fails", 8)) != ran
+                @test drawn(() -> Runtests.Private.debug_item(call, "draws and fails", 8)) != ran
             end
         end
 
         @testset "without a name, it is the last run's most recent failure, with the run's seed" begin
             debug_last() = try
-                YATF.Private.debug_item(call, nothing, nothing)
+                Runtests.Private.debug_item(call, nothing, nothing)
             catch e
                 e
             end
@@ -202,11 +202,11 @@ call(body) = body()
                 # Stepped into with the seed of the run it failed in, an item draws the
                 # random numbers it drew there.
                 mktempdir() do tmp
-                    withenv("YATF_DRAW" => joinpath(tmp, "draw")) do
+                    withenv("RUNTESTS_DRAW" => joinpath(tmp, "draw")) do
                         run_states(STEPPED; workers=0, seed=7, name="draws and fails", logs=:issues, monitor=false)
-                        ran = read(ENV["YATF_DRAW"], String)
+                        ran = read(ENV["RUNTESTS_DRAW"], String)
                         _, out = capture_run(debug_last)
-                        @test read(ENV["YATF_DRAW"], String) == ran
+                        @test read(ENV["RUNTESTS_DRAW"], String) == ran
                         @test occursin("the run's seed 0x0000000000000007", out)
                     end
                 end
@@ -223,8 +223,8 @@ call(body) = body()
         @testset "a profile's env, init and test_end apply, and what cannot is said" begin
             mktempdir() do tmp
                 marker = joinpath(tmp, "end")
-                ts, out = withenv("YATF_END" => marker) do
-                    capture_run(() -> YATF.Private.debug_item(call, "profiled", nothing))
+                ts, out = withenv("RUNTESTS_END" => marker) do
+                    capture_run(() -> Runtests.Private.debug_item(call, "profiled", nothing))
                 end
                 @test ts.n_passed == 2
                 @test isempty(ts.results)
@@ -233,13 +233,13 @@ call(body) = body()
                 # scheduler, are listed; what was applied is not.
                 @test occursin("`--check-bounds=yes` of profile `flagged`", out)
                 @test occursin("timeout=30", out)
-                @test !occursin("YATF_FROM_PROFILE", out)
+                @test !occursin("RUNTESTS_FROM_PROFILE", out)
             end
         end
 
         @testset "a name that is not an item's suggests the ones it is part of" begin
             err = try
-                YATF.Private.debug_item(call, "declares", nothing)
+                Runtests.Private.debug_item(call, "declares", nothing)
             catch e
                 e
             end
@@ -288,10 +288,10 @@ end
 using Debugger
 
 @testset "with Debugger, the item is stepped through in its test file" begin
-    @test Base.get_extension(YATF, :YATFDebuggerExt) !== nothing
+    @test Base.get_extension(Runtests, :RuntestsDebuggerExt) !== nothing
     with_activated(STEPPED) do _
         (ts, drawn), out = capture_run() do
-            typed_into_debugger(() -> YATF.debug("declares and tests"; seed=7), "n\rn\rc\r")
+            typed_into_debugger(() -> Runtests.debug("declares and tests"; seed=7), "n\rn\rc\r")
         end
         @test ts.n_passed == 5
         @test isempty(ts.results)
@@ -304,9 +304,9 @@ using Debugger
 
         # The input ends after one step: the item did not finish, and says so.
         (ts, _), _ = capture_run() do
-            typed_into_debugger(() -> YATF.debug("declares and tests"), "n\r")
+            typed_into_debugger(() -> Runtests.debug("declares and tests"), "n\r")
         end
-        @test YATFWorkers.state_of(ts) === ERRORED
+        @test RuntestsWorkers.state_of(ts) === ERRORED
         @test occursin("left before it finished", sprint(show, only(ts.results)))
 
         # Without a name: the failure the last run recorded, continued to its end,
@@ -314,9 +314,9 @@ using Debugger
         with_runstate_dir() do _
             run_states(STEPPED; workers=0, name="fails", logs=:issues, monitor=false)
             (ts, _), out = capture_run() do
-                typed_into_debugger(() -> YATF.debug(), "c\r")
+                typed_into_debugger(() -> Runtests.debug(), "c\r")
             end
-            @test YATFWorkers.state_of(ts) === FAILED
+            @test RuntestsWorkers.state_of(ts) === FAILED
             @test occursin("debugging \"fails\" in this process · the last run's most recent failure", out)
         end
     end

@@ -3,13 +3,13 @@
 # chain, at a fixed point in the queue — and a suite normally uses more than one
 # of them at once.
 
-using YATF.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
+using Runtests.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
 
 # A chain member that takes long enough for an overlap to show, and records when it
 # ended as well as when it started; `before` runs first.
 chain_link(name; chain::Symbol, before="") = journal_item(name; opts="chain=:$chain", body=before * """
     sleep(0.2)
-    open(joinpath(ENV["YATF_JOURNAL"], string(time_ns(), "-", getpid(), "-end")), "w") do io
+    open(joinpath(ENV["RUNTESTS_JOURNAL"], string(time_ns(), "-", getpid(), "-end")), "w") do io
         println(io, $(repr(name * " end")), "\\t", getpid(), "\\t", time())
     end
     @test true
@@ -152,7 +152,7 @@ end
             marker = joinpath(work, "count")
             dir = make_pkg("AloneRetries", "test/t_test.jl" => journal_item(
                 "flaky alone"; opts="sandbox=true retries=2", body="""
-                k = let p = ENV["YATF_CRASH_MARKER"]
+                k = let p = ENV["RUNTESTS_CRASH_MARKER"]
                     n = isfile(p) ? parse(Int, read(p, String)) : 0
                     write(p, string(n + 1))
                     n
@@ -161,7 +161,7 @@ end
                 @test k == 2
                 """
             ))
-            rows = withenv("YATF_CRASH_MARKER" => marker) do
+            rows = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 with_journal() do path
                     states, run, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
                     @test states["flaky alone"] === PASSED
@@ -180,7 +180,7 @@ end
             dir = make_pkg("ChainRetry", "test/t_test.jl" => string(
                 journal_item("link one"; opts="chain=:c"),
                 journal_item("link two"; opts="chain=:c timeout=2 retries=1", body="""
-                    k = let p = ENV["YATF_CRASH_MARKER"]
+                    k = let p = ENV["RUNTESTS_CRASH_MARKER"]
                         n = isfile(p) ? parse(Int, read(p, String)) : 0
                         write(p, string(n + 1))
                         n
@@ -190,7 +190,7 @@ end
                     """),
                 journal_item("link three"; opts="chain=:c"),
             ))
-            rows = withenv("YATF_CRASH_MARKER" => marker) do
+            rows = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 with_journal() do path
                     states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
                     @test all(==(PASSED), values(states))

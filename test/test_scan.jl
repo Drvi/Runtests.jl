@@ -1,4 +1,4 @@
-using YATF.Private: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
+using Runtests.Private: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
             is_test_file, NO_CHAIN, DEFAULT_PROFILE,
             USE_RUN_DEFAULT, select_by_line
 
@@ -90,7 +90,7 @@ end
         """
         a, _ = scan_source(src)
         @test a isa Vector && length(a) == 1
-        @test !isdefined(Main, :__yatf_scan_side_effect__)
+        @test !isdefined(Main, :__runtests_scan_side_effect__)
     end
 
     @testset "errors are collected, not thrown one at a time" begin
@@ -192,9 +192,9 @@ end
         script = joinpath(dir, "scan.jl")
         write(script, """
         push!(LOAD_PATH, $(repr(dirname(@__DIR__))))
-        using YATF
-        files = YATF.Private.discover($(repr(dir)))
-        counts = [length(YATF.Private.scan(files, YATF.Private.Filter(), Dict{Symbol,String}(); ntasks=16)) for _ in 1:10]
+        using Runtests
+        files = Runtests.Private.discover($(repr(dir)))
+        counts = [length(Runtests.Private.scan(files, Runtests.Private.Filter(), Dict{Symbol,String}(); ntasks=16)) for _ in 1:10]
         println(join(unique(counts), ","))
         """)
         out = read(ignorestatus(`$(Base.julia_cmd()) --startup-file=no -t4 $script`), String)

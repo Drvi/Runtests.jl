@@ -1,10 +1,10 @@
-# Test items outside a run: `YATF.activate`, and a `@testitem` pasted into a REPL.
+# Test items outside a run: `Runtests.activate`, and a `@testitem` pasted into a REPL.
 #
 # A pasted item is read by the scanner's parser, run by the worker's evaluator and
 # surrounded by the run's environment, so it behaves as it does under `runtests`.
 
 # What `activate` changed, for `deactivate` to undo: `(; project, setups, target)`,
-# or `nothing` when YATF has not touched the session.
+# or `nothing` when Runtests has not touched the session.
 const ACTIVATION = Ref{Any}(nothing)
 
 """
@@ -18,9 +18,9 @@ test-only dependencies work at the REPL. Returns the environment's path;
 function activate(args...)
     ACTIVATION[] === nothing || throw(
         ConfigError(
-            "YATF is already active in this session (" *
+            "Runtests is already active in this session (" *
                 something(Base.active_project(), "no project") *
-                "); call `YATF.deactivate()` first"
+                "); call `Runtests.deactivate()` first"
         )
     )
     target = resolve_target(args)
@@ -36,7 +36,7 @@ function activate(args...)
     ACTIVATION[] = (project = previous, setups = pushed ? setups : nothing, target = target)
     active = something(Base.active_project(), "")
     println(
-        stdout, yatf_prefix(), "activated ", relpath_or_path(active, target.root),
+        stdout, label_prefix(), "activated ", relpath_or_path(active, target.root),
         pushed ? string(" · setups from ", relpath_or_path(setups, target.root)) : ""
     )
     return active
@@ -46,7 +46,7 @@ end
     deactivate()
 
 Undo [`activate`](@ref): restore the environment that was active and take the
-setups back off `LOAD_PATH`. Does nothing if YATF is not active.
+setups back off `LOAD_PATH`. Does nothing if Runtests is not active.
 """
 function deactivate()
     state = ACTIVATION[]
@@ -57,7 +57,7 @@ function deactivate()
         i === nothing || deleteat!(LOAD_PATH, i)
     end
     Base.set_active_project(state.project)
-    println(stdout, yatf_prefix(), "deactivated")
+    println(stdout, label_prefix(), "deactivated")
     return nothing
 end
 
@@ -129,7 +129,7 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
     end
     isempty(given) && return nothing
     # Once per item, not once per session: `maxlog` counts by message id.
-    @warn "YATF: running `$(item.name)` here, so these are ignored: " * join(given, ", ") maxlog = 1 _id = (:yatf_ignored, item.name)
+    @warn "Runtests: running `$(item.name)` here, so these are ignored: " * join(given, ", ") maxlog = 1 _id = (:runtests_ignored, item.name)
     return nothing
 end
 
@@ -168,7 +168,7 @@ end
 function sandbox_worker(prof, target, redirect_fn)
     env = Base.active_project()
     project = something(profile_project(prof, env), Some(env))
-    return YATFWorkers.Worker(;
+    return RuntestsWorkers.Worker(;
         julia_args = prof.julia_args, threads = prof.threads,
         extra_env = worker_env("repl", 1, project, prof),
         dir = target === nothing ? pwd() : target.root,
@@ -190,21 +190,21 @@ function run_sandboxed(item::RawItem, target)
         w = sandbox_worker(prof, target, relay)
         try
             isempty(prof.init.args) ||
-                fetch(YATFWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
+                fetch(RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
             spec = interactive_spec(item, target, attempt, seed)
-            fut = YATFWorkers.remote_run(w, spec)
+            fut = RuntestsWorkers.remote_run(w, spec)
             result = (
                 timeout === nothing ? fetch(fut) :
                 fetch_within(fut, timeout, TimeoutException(timeout, "test item", item.name, "its own timeout=$timeout"))
             )::ItemResult
             # What the profile's `test_end` records counts, as it does in a run.
             if !isempty(prof.test_end.args) && result.state !== SKIPPED
-                result = merge_test_end(result, fetch(YATFWorkers.remote_end(w, spec, prof.test_end))::ItemResult)
+                result = merge_test_end(result, fetch(RuntestsWorkers.remote_end(w, spec, prof.test_end))::ItemResult)
             end
-            (result.state === YATFWorkers.PASSED || attempt == attempts) && break
+            (result.state === RuntestsWorkers.PASSED || attempt == attempts) && break
         catch e
             e isa TimeoutException || rethrow()
-            YATFWorkers.terminate!(w, :timeout)
+            RuntestsWorkers.terminate!(w, :timeout)
             attempt == attempts && rethrow()
         finally
             close(w)
@@ -241,7 +241,7 @@ function print_interactive_result(result::ItemResult)
         Test.print_test_results(result.testset)
     catch
         # A `Test` that prints its summary some other way is not worth failing over.
-        println(stdout, yatf_prefix(), short_state(result.state))
+        println(stdout, label_prefix(), short_state(result.state))
     end
     return nothing
 end

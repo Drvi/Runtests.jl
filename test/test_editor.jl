@@ -1,7 +1,7 @@
 # The editor protocol: the JSON it speaks, the listing, and a session driven over
 # streams the way an editor drives one, in this process and in a process of its own.
 
-using YATF.Private: write_json, read_json, json, list_items, PROTOCOL_VERSION
+using Runtests.Private: write_json, read_json, json, list_items, PROTOCOL_VERSION
 
 # A server in this process, over two streams, with its events arriving on a channel.
 struct EditorSession
@@ -13,7 +13,7 @@ end
 
 function open_session(dir)
     input, output = Base.BufferStream(), Base.BufferStream()
-    task = @async YATF.serve(dir; input, output)
+    task = @async Runtests.serve(dir; input, output)
     events = Channel{Any}(Inf)
     @async begin
         for line in eachline(output)
@@ -245,9 +245,9 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         dir = make_pkg("Streamed", "test/a_test.jl" => item("talks", "println(\"from the item\")\n    @info \"logged\"\n    @test true") *
                                                        item("fails", "@test false"))
         root = dirname(@__DIR__)
-        cmd = setenv(`$(Base.julia_cmd()) --project=$root --startup-file=no -e "using YATF; YATF.serve(ARGS[1])" $dir`,
+        cmd = setenv(`$(Base.julia_cmd()) --project=$root --startup-file=no -e "using Runtests; Runtests.serve(ARGS[1])" $dir`,
                      "JULIA_LOAD_PATH" => join([root, joinpath(root, "test"), ""], Sys.iswindows() ? ';' : ':'),
-                     "YATF_RUNSTATE_DIR" => mktempdir())
+                     "RUNTESTS_RUNSTATE_DIR" => mktempdir())
         err = Base.BufferStream()
         proc = open(pipeline(cmd; stderr = err), "r+")
         lines = String[]

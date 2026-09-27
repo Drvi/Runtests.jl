@@ -1,8 +1,8 @@
 # Shared machinery for the tests that run a whole suite: building a throwaway
 # package, running it, and reading back what happened and what was printed.
 
-using YATF.Private: prepare, execute, report, nitems
-using YATFWorkers: YATFWorkers
+using Runtests.Private: prepare, execute, report, nitems
+using RuntestsWorkers: RuntestsWorkers
 
 # Fixture packages are written to a tempdir rather than checked in when their
 # content is the thing under test: a profile, a broken layout, an item that has to
@@ -35,15 +35,15 @@ function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractS
     return dir
 end
 
-# `YATF.activate(pkg)` for the length of `f`, leaving the session as it found it:
+# `Runtests.activate(pkg)` for the length of `f`, leaving the session as it found it:
 # activating changes the active project and LOAD_PATH, and a test that leaked
 # either would take the rest of the file with it.
 function with_activated(f, pkg)
     project, load_path = Base.active_project(), copy(LOAD_PATH)
     try
-        f(YATF.activate(pkg))
+        f(Runtests.activate(pkg))
     finally
-        YATF.is_activated() && YATF.deactivate()
+        Runtests.is_activated() && Runtests.deactivate()
         Base.set_active_project(project)
         copy!(LOAD_PATH, load_path)
     end
@@ -87,7 +87,7 @@ end
 # The runner shows a child's output only when its file fails, so there each
 # captured output is echoed: an assertion about it fails next to what it read.
 function echo_captured(output::AbstractString)
-    get(ENV, "YATF_TEST_ECHO", "") == "1" || return nothing
+    get(ENV, "RUNTESTS_TEST_ECHO", "") == "1" || return nothing
     ts = Test.get_testset()
     println(stdout, "┄┄┄┄ output captured in ", repr(ts isa Test.DefaultTestSet ? ts.description : "?"), " ┄┄┄┄")
     print(stdout, output)
@@ -102,7 +102,7 @@ end
 function with_marker_dir(f)
     dir = mktempdir()
     try
-        withenv("YATF_FAULTY_DIR" => dir) do
+        withenv("RUNTESTS_FAULTY_DIR" => dir) do
             f(dir)
         end
     finally
@@ -110,7 +110,7 @@ function with_marker_dir(f)
     end
 end
 
-marker_dir() = ENV["YATF_FAULTY_DIR"]
+marker_dir() = ENV["RUNTESTS_FAULTY_DIR"]
 
 # How many times a fixture has reached a marker, and one more.
 function bump_marker(dir::AbstractString, name::AbstractString)
@@ -120,14 +120,14 @@ function bump_marker(dir::AbstractString, name::AbstractString)
     return n
 end
 
-live_worker_processes() = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
-live_worker_pids() = Set(YATFWorkers.live_worker_pids())
+live_worker_processes() = @lock RuntestsWorkers.LIVE_LOCK count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)
+live_worker_pids() = Set(RuntestsWorkers.live_worker_pids())
 
 # Whether a pid belongs to a process that is still there. Signal 0 checks for one
 # without sending anything. Not on Windows, where `kill` terminates the process.
 process_alive(pid::Integer) = ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0
 
-# Asked of the operating system rather than of YATF's own bookkeeping: none of
+# Asked of the operating system rather than of Runtests' own bookkeeping: none of
 # `pids` is still running. A worker takes a moment to die after the signal reaches it.
 function all_gone(pids)
     deadline = time() + 10
@@ -143,7 +143,7 @@ end
 function with_runstate_dir(f)
     dir = mktempdir()
     try
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             f(dir)
         end
     finally
@@ -161,7 +161,7 @@ end
 function journal_item(name::AbstractString; opts::AbstractString="", body::AbstractString="@test true")
     return """
     @testitem $(repr(name)) $opts begin
-        let dir = ENV["YATF_JOURNAL"], now = time()
+        let dir = ENV["RUNTESTS_JOURNAL"], now = time()
             open(joinpath(dir, string(time_ns(), "-", getpid())), "w") do io
                 println(io, $(repr(name)), "\\t", getpid(), "\\t", now)
             end
@@ -195,7 +195,7 @@ end
 function with_journal(f)
     dir = mktempdir()
     try
-        withenv("YATF_JOURNAL" => dir) do
+        withenv("RUNTESTS_JOURNAL" => dir) do
             f(dir)
         end
     finally
@@ -215,7 +215,7 @@ When the move never comes, the first item to give up leaves a marker that
 releases the rest, so a broken run costs `seconds` once rather than once per item.
 """
 started_elsewhere(names; seconds::Real=60) = """
-    let dir = ENV["YATF_JOURNAL"], names = $(repr(collect(String, names))), deadline = time() + $seconds
+    let dir = ENV["RUNTESTS_JOURNAL"], names = $(repr(collect(String, names))), deadline = time() + $seconds
         gave_up = joinpath(dir, "gave-up")
         moved() = any(readdir(dir; join=true)) do f
             r = split(strip(read(f, String)), '\\t')

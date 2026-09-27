@@ -3,13 +3,13 @@
 # profile's `test_end` expression. None of those may lose the run, and each has to
 # say which of the three it was.
 
-using YATF.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
+using Runtests.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
 
 # An expression that kills the process where it stands the first `n` times it is
 # reached, counting in a file. Written as a TOML literal string, which passes the
 # Julia source through untouched.
 crash_until(marker, n) = string(
-    "init_or_end = 'let p = ENV[\"YATF_CRASH_MARKER\"]; ",
+    "init_or_end = 'let p = ENV[\"RUNTESTS_CRASH_MARKER\"]; ",
     "k = isfile(p) ? parse(Int, read(p, String)) : 0; write(p, string(k + 1)); ",
     "k < ", n, " && ccall(:abort, Cvoid, ()); end'"
 )
@@ -65,7 +65,7 @@ end
             marker = joinpath(work, "count")
             dir = make_pkg("FlakyInit", "test/t_test.jl" => ONE_ITEM,
                            "test/TestItems.toml" => init_crashes(marker, 2))
-            states, _, _ = withenv("YATF_CRASH_MARKER" => marker) do
+            states, _, _ = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 run_states(dir; workers=1, logs=:issues, monitor=false)
             end
             @test states["the item"] === PASSED
@@ -80,7 +80,7 @@ end
             marker = joinpath(work, "count")
             dir = make_pkg("DeadInit", "test/t_test.jl" => ONE_ITEM,
                            "test/TestItems.toml" => init_crashes(marker, 99))
-            (states, _, _), out = withenv("YATF_CRASH_MARKER" => marker) do
+            (states, _, _), out = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 capture_run() do
                     run_states(dir; workers=1, logs=:issues, monitor=false)
                 end
@@ -98,7 +98,7 @@ end
             marker = joinpath(work, "count")
             dir = make_pkg("DeadEnd", "test/t_test.jl" => ONE_ITEM,
                            "test/TestItems.toml" => end_crashes(marker, 99))
-            (states, run, _), out = withenv("YATF_CRASH_MARKER" => marker) do
+            (states, run, _), out = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 capture_run() do
                     run_states(dir; workers=1, logs=:issues, monitor=false, retries=1)
                 end
@@ -122,7 +122,7 @@ end
                 @test true
             end
             """, "test/TestItems.toml" => end_crashes(marker, 1))
-            states, _, _ = withenv("YATF_CRASH_MARKER" => marker) do
+            states, _, _ = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 run_states(dir; workers=1, logs=:issues, monitor=false)
             end
             # One of them lost its worker; the other ran on the replacement.
@@ -202,7 +202,7 @@ end
         try
             dir = make_pkg("NoRunState", "test/t_test.jl" => ONE_ITEM)
             # Said through the run's own printer, like every record raised during a run.
-            (states, run, _), out = withenv("YATF_RUNSTATE_DIR" => joinpath(blocker, "runs")) do
+            (states, run, _), out = withenv("RUNTESTS_RUNSTATE_DIR" => joinpath(blocker, "runs")) do
                 capture_run(() -> run_states(dir; workers=0, logs=:issues, monitor=false))
             end
             @test occursin("could not open a run state", out)
@@ -256,7 +256,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     # Julia 1.12 on macOS can come up ignoring SIGINT: its signal thread sets it to
     # SIG_IGN, racing the handler the main thread installs, and when it lands second
     # the runtime drops every Ctrl-C before any Julia code sees it (fixed in 1.13 by
-    # JuliaLang/julia#62471). Looked at before YATF is loaded, so nothing of YATF's
+    # JuliaLang/julia#62471). Looked at before Runtests is loaded, so nothing of Runtests'
     # can be what set it.
     let act = zeros(UInt8, 256)   # a `struct sigaction`, whose first field is the handler
         ccall(:sigaction, Cint, (Cint, Ptr{Cvoid}, Ptr{UInt8}), 2, C_NULL, act) == 0 || error("sigaction")
@@ -264,7 +264,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     end
     # A script exits on SIGINT unless told otherwise; a REPL raises it.
     $(repl ? "Base.exit_on_sigint(false)" : "")
-    using YATF
+    using Runtests
     include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
     const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "packages")
     fixture(name) = joinpath(FIXTURES, name)
@@ -281,11 +281,11 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     try
         run_states(dir; workers=$items, logs=:issues, monitor=$monitor)
     catch e
-        YATFWorkers.shielded(() -> println(stderr, "CAUGHT \$(typeof(e))"))
+        RuntestsWorkers.shielded(() -> println(stderr, "CAUGHT \$(typeof(e))"))
     end
-    YATFWorkers.shielded() do
+    RuntestsWorkers.shielded() do
         sleep(0.5)
-        alive = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
+        alive = @lock RuntestsWorkers.LIVE_LOCK count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)
         println(stderr, "ALIVE \$alive")
     end
     """
@@ -356,7 +356,7 @@ Sys.iswindows() ||
     # waiting for the item each slot has in flight, which here sleeps for ten
     # minutes. A real interrupt comes long after the stall watchdog first looked:
     # it has to reach the run whatever has run by then.
-    r = interrupted_run(; items = 4, delay = YATF.Private.STALL_CHECK_S + 1)
+    r = interrupted_run(; items = 4, delay = Runtests.Private.STALL_CHECK_S + 1)
     @test r.got_running
     # Generously above the second it takes, and far below the ten minutes an item
     # here sleeps for: what is checked is that it does not wait for them.

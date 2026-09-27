@@ -30,10 +30,10 @@ end
 # The extension's entry point. Debugger.jl is a weak dependency, loaded by a session
 # that wants to step through an item and by nothing else.
 function debugger_entry()
-    ext = Base.get_extension(Base.moduleroot(@__MODULE__), :YATFDebuggerExt)
+    ext = Base.get_extension(Base.moduleroot(@__MODULE__), :RuntestsDebuggerExt)
     ext === nothing && throw(
         ConfigError(
-            "YATF.debug steps through the item with Debugger.jl, which is not loaded: " *
+            "Runtests.debug steps through the item with Debugger.jl, which is not loaded: " *
                 "`using Debugger` first, after `] add Debugger` if it is not installed"
         )
     )
@@ -45,7 +45,7 @@ end
 function debug_item(enter, name::Union{Nothing, String}, seed::Union{Nothing, Integer})
     target = interactive_target()
     target === nothing &&
-        throw(ConfigError("YATF.debug looks for test items in a package, and there is no package here"))
+        throw(ConfigError("Runtests.debug looks for test items in a package, and there is no package here"))
     failure = name === nothing ? last_failure(target) : nothing
     item = find_item(target, failure === nothing ? name : failure.name)
     # The profile a run would give the item, `[profiles.default]` included.
@@ -92,7 +92,7 @@ function last_failure(target)
     isempty(runs) && throw(
         NoTestsError(
             "no run of this project is recorded, so there is no failure to step into; " *
-                "run its tests first, or name an item: `YATF.debug(\"name\")`"
+                "run its tests first, or name an item: `Runtests.debug(\"name\")`"
         )
     )
     rs = last(only(runs))
@@ -100,7 +100,7 @@ function last_failure(target)
     isempty(failed) && throw(
         NoTestsError(
             "the last recorded run of this project had no failures to step into; " *
-                "name an item instead: `YATF.debug(\"name\")`"
+                "name an item instead: `Runtests.debug(\"name\")`"
         )
     )
     sort!(failed; by = i -> rs.statuses[i].start_off + rs.statuses[i].elapsed, rev = true)
@@ -147,9 +147,9 @@ function print_debug_header(item::RawItem, prof::Profile, seed::UInt64, failure,
     ignored = debug_ignored(item, prof)
     isempty(ignored) || push!(body, string("ignored here: ", join(ignored, " · ")))
     if isempty(body)
-        println(stdout, yatf_prefix(), head)
+        println(stdout, label_prefix(), head)
     else
-        print(stdout, bracket(join(body, "\n"), "[YATF]", head, "", :white))
+        print(stdout, bracket(join(body, "\n"), "[TEST]", head, "", :white))
     end
     flush(stdout)
     return nothing

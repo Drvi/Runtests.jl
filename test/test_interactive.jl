@@ -1,11 +1,11 @@
-# Test items outside a run: `YATF.activate`, and a `@testitem` evaluated rather
+# Test items outside a run: `Runtests.activate`, and a `@testitem` evaluated rather
 # than scanned. What these check is that the two agree with a real run — same
 # parser, same evaluator, same environment — because an item that behaves one way
 # when pasted and another when scheduled is worse than one that cannot be pasted.
 
-using YATF.Private: activate, deactivate, is_activated, ScanFailure, ConfigError,
+using Runtests.Private: activate, deactivate, is_activated, ScanFailure, ConfigError,
             collect_failures, PASSED, FAILED, SKIPPED, ERRORED
-using YATFWorkers: state_of
+using RuntestsWorkers: state_of
 using Logging: Logging
 
 const DEPS = fixture("TestDeps.jl")
@@ -13,8 +13,8 @@ const DEPS = fixture("TestDeps.jl")
 @testset "interactive" begin
     @testset "every exported name has help at the REPL" begin
         # A comment between a docstring and its definition detaches the docstring.
-        for name in names(YATF)
-            @test Base.Docs.hasdoc(YATF, name)
+        for name in names(Runtests)
+            @test Base.Docs.hasdoc(Runtests, name)
         end
     end
 
@@ -196,10 +196,10 @@ const DEPS = fixture("TestDeps.jl")
 
     @testset "sandbox=true really uses another process" begin
         with_activated(DEPS) do _
-            ts, _ = withenv("YATF_REPL_PID" => string(getpid())) do
+            ts, _ = withenv("RUNTESTS_REPL_PID" => string(getpid())) do
                 capture_run() do
                     @testitem "pasted sandbox" sandbox=true begin
-                        @test getpid() != parse(Int, ENV["YATF_REPL_PID"])
+                        @test getpid() != parse(Int, ENV["RUNTESTS_REPL_PID"])
                     end
                 end
             end
@@ -230,11 +230,11 @@ const DEPS = fixture("TestDeps.jl")
     # do the same: the default profile from TestItems.toml, a profile's preferences,
     # its `test_end`'s verdict.
     @testset "sandbox=true runs under [profiles.default]" begin
-        dir = make_pkg("PastedDefault", "test/TestItems.toml" => "[profiles.default.env]\nYATF_PASTED_FLAG = \"configured\"\n")
+        dir = make_pkg("PastedDefault", "test/TestItems.toml" => "[profiles.default.env]\nRUNTESTS_PASTED_FLAG = \"configured\"\n")
         with_activated(dir) do _
             ts, _ = capture_run() do
                 @testitem "pasted default profile" sandbox=true begin
-                    @test get(ENV, "YATF_PASTED_FLAG", "unset") == "configured"
+                    @test get(ENV, "RUNTESTS_PASTED_FLAG", "unset") == "configured"
                 end
             end
             @test state_of(ts) === PASSED
@@ -244,7 +244,7 @@ const DEPS = fixture("TestDeps.jl")
     @testset "a pasted profile's preferences reach its worker" begin
         dir = make_pkg("PastedPrefs", "test/prefs.toml" => "[PastedPrefs]\nmode = \"fast\"\n",
                        "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"prefs.toml\"\n")
-        uuid = YATF.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["uuid"]
+        uuid = Runtests.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["uuid"]
         with_activated(dir) do _
             ts, _ = capture_run() do
                 Core.eval(Main, :(@testitem "pasted preferences" sandbox=:tuned begin
@@ -268,7 +268,7 @@ const DEPS = fixture("TestDeps.jl")
                     @test true
                 end
             end
-            @test state_of(failed) === YATF.Private.FAILED
+            @test state_of(failed) === Runtests.Private.FAILED
             @test length(collect_failures(failed)) == 1
             @test isempty(collect_failures(skipped))   # the hook's `@test false` never ran
         end
@@ -309,7 +309,7 @@ end
     # a worker, which is exactly what those two need.
 
     @testset "the warning covers only what a sandbox cannot supply" begin
-        ignored(sandboxed) = [k for (k, _) in YATF.Private.repl_ignored(sandboxed)]
+        ignored(sandboxed) = [k for (k, _) in Runtests.Private.repl_ignored(sandboxed)]
         @test :timeout in ignored(false)
         @test :retries in ignored(false)
         @test :timeout ∉ ignored(true)
@@ -327,9 +327,9 @@ end
         with_activated(DEPS) do _
         with_marker_dir() do work
             marker = joinpath(work, "count")
-            withenv("YATF_CRASH_MARKER" => marker) do
+            withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 ex = :(@testitem "paste retries" timeout=3 retries=1 sandbox=true begin
-                    k = let p = ENV["YATF_CRASH_MARKER"]
+                    k = let p = ENV["RUNTESTS_CRASH_MARKER"]
                         n = isfile(p) ? parse(Int, read(p, String)) : 0
                         write(p, string(n + 1))
                         n
@@ -349,12 +349,12 @@ end
     @testset "a retry knows it is one, and draws the numbers the first attempt drew" begin
         with_activated(DEPS) do _
             log = tempname()
-            withenv("YATF_ATTEMPTS" => log) do
+            withenv("RUNTESTS_ATTEMPTS" => log) do
                 ts, _ = capture_run() do
-                    # The fixture's workers load YATFWorkers, not YATF.
+                    # The fixture's workers load RuntestsWorkers, not Runtests.
                     @testitem "paste attempts" retries=1 sandbox=true begin
-                        attempt = Main.YATFWorkers.current_testitem().attempt
-                        open(io -> println(io, attempt, " ", rand(UInt64)), ENV["YATF_ATTEMPTS"], "a")
+                        attempt = Main.RuntestsWorkers.current_testitem().attempt
+                        open(io -> println(io, attempt, " ", rand(UInt64)), ENV["RUNTESTS_ATTEMPTS"], "a")
                         @test attempt == 2
                     end
                 end
@@ -372,7 +372,7 @@ end
                 sleep(30)
                 @test true
             end)
-            @test_throws YATF.Private.TimeoutException Core.eval(Main, ex)
+            @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
         end
     end
 end

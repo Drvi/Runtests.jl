@@ -275,7 +275,7 @@ function start_monitor!(m::Monitor)
         ensure_checked!()
     catch e
         is_interrupt(e) && rethrow()
-        @warn "YATF: per-process memory accounting is unavailable here" exception = e maxlog = 1
+        @warn "Runtests: per-process memory accounting is unavailable here" exception = e maxlog = 1
     end
     # A task keeps the logger of the scope that started it, and the monitor starts
     # before the run's own is in place: its warnings go through `printline` whoever
@@ -289,9 +289,9 @@ function start_monitor!(m::Monitor)
             catch e
                 # Ctrl-C, when this was the task its thread last ran: the run is
                 # stopping, and needs no monitor to do it.
-                is_interrupt(e) && return YATFWorkers.forward_interrupt(e)
+                is_interrupt(e) && return RuntestsWorkers.forward_interrupt(e)
                 @atomic m.enabled = false
-                @warn "YATF: the resource monitor stopped; the run continues without it" exception = e
+                @warn "Runtests: the resource monitor stopped; the run continues without it" exception = e
             end
         end
     end
@@ -333,7 +333,7 @@ end
 # found from there, because they spend the same memory budget.
 function tree_roots(::Monitor)
     roots = Int32[Int32(getpid())]
-    append!(roots, YATFWorkers.live_worker_pids())
+    append!(roots, RuntestsWorkers.live_worker_pids())
     return roots
 end
 
@@ -980,7 +980,7 @@ function guard!(m::Monitor)
         m.over_since = now
         set_paused!(run.queues, true)
         m.stats.guard_actions += 1
-        @warn "YATF: memory is at $(round(Int, 100 * pressure))% of the machine; holding off on new " *
+        @warn "Runtests: memory is at $(round(Int, 100 * pressure))% of the machine; holding off on new " *
             "test items until it is below $(round(Int, 100 * release))%, for " *
             "$(round(Int, MAX_BACKPRESSURE_SECONDS))s at most"
         return nothing
@@ -998,7 +998,7 @@ function guard!(m::Monitor)
             w = @atomic slot.worker
             (w === nothing || (@atomic slot.current) != 0) && continue   # do not disturb a running item
             try
-                YATFWorkers.remote_eval(w, :(GC.gc(true)))
+                RuntestsWorkers.remote_eval(w, :(GC.gc(true)))
             catch e
                 is_interrupt(e) && rethrow()
             end

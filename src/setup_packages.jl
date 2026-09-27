@@ -35,7 +35,7 @@ function setups_to_packages(args...)
     dir = joinpath(target.testdir, TESTSETUPS_DIR)
     modules = setup_modules(target.testdir)
     if isempty(modules)
-        println(stdout, yatf_prefix(), "no setups in ", relpath_or_path(dir, target.root))
+        println(stdout, label_prefix(), "no setups in ", relpath_or_path(dir, target.root))
         return nothing
     end
     plans = plan_setup_packages(target, dir, modules)
@@ -164,7 +164,7 @@ function print_setup_packages(io::IO, plans::Vector{SetupPackage}, dir::String, 
     body = styled() do s
         print_setup_changes(s, plans, dir; done = true)
     end
-    print(io, bracket(body, "[YATF]", head, "", :white))
+    print(io, bracket(body, "[TEST]", head, "", :white))
     return nothing
 end
 

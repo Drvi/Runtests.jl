@@ -5,7 +5,7 @@
 
 Declare an independently runnable group of tests.
 
-`YATF.runtests()` finds test items by parsing test files and runs each body in a
+`Runtests.runtests()` finds test items by parsing test files and runs each body in a
 fresh module on a worker process. Evaluating the macro itself — pasting an item
 into the REPL, or `include`ing its file — runs that one item the same way in this
 session, or on a worker of its own when it is sandboxed.

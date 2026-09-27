@@ -18,8 +18,9 @@ without a person:
 - run states: this machine's, modified more than $(STALE_RUN_DAYS) days ago, are
   deleted, except the newest $(HISTORY_RUNS) that name any of the suite's test items,
   however old: their durations order the next run. A run that names none of them
-  orders nothing and is not among those kept. One recorded elsewhere, a CI artifact
-  say, is never deleted.
+  orders nothing and is not among those kept. Neither is deleted one that holds what
+  makes an item failing, which `runtestsf` would lose. One recorded elsewhere, a CI
+  artifact say, is never deleted.
 
 Returns whether nothing is left to do: `true` when the check finds nothing, or when
 `fix = true` found nothing it could not do. `path` finds the package as it does for
@@ -37,14 +38,14 @@ function chores(args...; fix::Bool = false)
         todo += chore_runstates!(io, target, fix, names)
         if problems > 0
             print(io, "to fix by hand: ", problems)
-            todo > 0 && !fix && print(io, " · the rest `YATF.chores(fix = true)` does")
+            todo > 0 && !fix && print(io, " · the rest `Runtests.chores(fix = true)` does")
         elseif todo > 0
-            print(io, fix ? "done: $todo" : "to do: $todo, which `YATF.chores(fix = true)` does")
+            print(io, fix ? "done: $todo" : "to do: $todo, which `Runtests.chores(fix = true)` does")
         else
             print(io, "nothing to do")
         end
     end
-    print(stdout, bracket(body, "[YATF]", fix ? "chores" : "chores, checking only", "", :white))
+    print(stdout, bracket(body, "[TEST]", fix ? "chores" : "chores, checking only", "", :white))
     return problems == 0 && (fix || todo == 0)
 end
 
@@ -146,23 +147,23 @@ end
 The run states `chores(fix = true)` deletes, oldest first: this machine's, for this
 project, modified more than `STALE_RUN_DAYS` ago, and not among the newest
 `HISTORY_RUNS` that `history` could read and that name any of `names`, the suite's
-test items. Without `names` the newest `HISTORY_RUNS` stay whatever they name. One
-recorded elsewhere, one of another project, and one that cannot be read are never
-among them: nothing shows they are this machine's to delete.
+test items, and not one a failing item's verdict rests on (`removable_runs`).
+Without `names` the newest `HISTORY_RUNS` stay whatever they name. One recorded
+elsewhere, one of another project, and one that cannot be read are never among them:
+nothing shows they are this machine's to delete.
 """
 function stale_runstates(root::AbstractString, names::Union{Nothing, AbstractSet{String}} = nothing)
-    here, project = run_host(), project_id(root)
+    here = run_host()
     cutoff = time() - STALE_RUN_DAYS * 86400
+    runs = project_runs(root)
     stale = String[]
     kept = 0
-    for f in Iterators.reverse(runstate_files(root))
-        rs = read_run_state(f)
-        (rs === nothing || !of_project(rs, project)) && continue
+    for (f, rs) in Iterators.reverse(runs)
         if kept < HISTORY_RUNS && !rs.dry_run && (names === nothing || any(it -> it.name in names, rs.items))
             kept += 1
         elseif mtime(f) < cutoff && get(rs.meta, "host", "") == here
             push!(stale, f)
         end
     end
-    return reverse!(stale)
+    return removable_runs(runs, reverse!(stale))
 end

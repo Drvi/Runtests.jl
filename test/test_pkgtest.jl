@@ -1,11 +1,11 @@
 # The documented entry point, end to end: a package whose `test/runtests.jl` is
-# `using YATF; YATF.runtests()`, run the way a user runs it and the way `Pkg.test`
-# runs it. The test environment deliberately declares only YATF — not `Test` —
+# `using Runtests; Runtests.runtests()`, run the way a user runs it and the way `Pkg.test`
+# runs it. The test environment deliberately declares only Runtests — not `Test` —
 # because a test item's `@test` has to work without it.
 using Pkg: Pkg
 
 @testset "Pkg.test entry point" begin
-    yatf_root = dirname(@__DIR__)
+    runtests_root = dirname(@__DIR__)
     work = mktempdir()
     pkg = joinpath(work, "Standalone.jl")
     cp(fixture("Standalone.jl"), pkg)
@@ -14,14 +14,14 @@ using Pkg: Pkg
 
     io = IOBuffer()
     Pkg.activate(testenv; io)
-    Pkg.develop([Pkg.PackageSpec(path=yatf_root), Pkg.PackageSpec(path=pkg)]; io)
+    Pkg.develop([Pkg.PackageSpec(path=runtests_root), Pkg.PackageSpec(path=pkg)]; io)
     deps = sort!(collect(keys(Pkg.project().dependencies)))
     Pkg.activate(; temp=true, io)
-    @test deps == ["Standalone", "YATF"]     # no Test, on purpose
+    @test deps == ["Runtests", "Standalone"]     # no Test, on purpose
 
     function run_script(cmd, logname)
         out = joinpath(work, logname)
-        ok = success(pipeline(ignorestatus(addenv(cmd, "YATF_RUNSTATE_DIR" => runs,
+        ok = success(pipeline(ignorestatus(addenv(cmd, "RUNTESTS_RUNSTATE_DIR" => runs,
                                                   "JULIA_LOAD_PATH" => nothing));
                               stdout=out, stderr=out))
         log = read(out, String)

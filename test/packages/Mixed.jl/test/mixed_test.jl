@@ -26,8 +26,8 @@ end
 @testitem "mixed sees its threads" begin
     # A worker is started with the thread count the run asked for. In-process
     # there is no second process, so the count is the caller's own.
-    want = get(ENV, "YATF_EXPECT_THREADS", "")
-    if haskey(ENV, "YATF_WORKER") && !isempty(want)
+    want = get(ENV, "RUNTESTS_EXPECT_THREADS", "")
+    if haskey(ENV, "RUNTESTS_WORKER") && !isempty(want)
         @test string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)) == want
     else
         @test Threads.nthreads() >= 1

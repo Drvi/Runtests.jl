@@ -1,6 +1,6 @@
 # Running the test files in parallel, one plain subprocess each.
 #
-# Plain subprocesses rather than YATF's own worker pool: a bug in the transport
+# Plain subprocesses rather than Runtests' own worker pool: a bug in the transport
 # would stop the suite from running instead of telling you which test it broke.
 # What crosses between parent and child is a stream of output and an exit status,
 # which is the least a child can get wrong.
@@ -49,7 +49,7 @@ function cpu_times()
 end
 
 function sample!(log::MemoryLog)
-    used, total = YATF.Private.Platform.machine_memory()
+    used, total = Runtests.Private.Platform.machine_memory()
     @lock log.lock begin
         log.total = total
         log.machine = max(log.machine, used)
@@ -57,10 +57,10 @@ function sample!(log::MemoryLog)
             used > get(log.machine_while, file, 0) && (log.machine_while[file] = used)
         end
         # Without per-process figures there is only the machine to go by.
-        YATF.Private.Platform.PER_PROCESS_OK[] || return nothing
+        Runtests.Private.Platform.PER_PROCESS_OK[] || return nothing
         suite = Int64(0)
         for (pid, file) in log.pids
-            tree = sum((max(YATF.Private.Platform.process_rss(p), 0) for p in YATF.Private.Platform.process_tree([pid])); init = Int64(0))
+            tree = sum((max(Runtests.Private.Platform.process_rss(p), 0) for p in Runtests.Private.Platform.process_tree([pid])); init = Int64(0))
             suite += tree
             tree > get(log.peak, file, 0) && (log.peak[file] = tree)
         end
@@ -77,12 +77,12 @@ percent(used, total) = total > 0 ? string(round(Int, 100 * used / total), "%") :
 # What a file's line says about memory: its own peak, and how full the machine got
 # while it ran.
 memory_text(log::MemoryLog, file) = @lock log.lock string(
-    "peak ", YATF.Private.fmt_bytes(get(log.peak, file, 0)),
+    "peak ", Runtests.Private.fmt_bytes(get(log.peak, file, 0)),
     " · machine ", percent(get(log.machine_while, file, 0), log.total)
 )
 
 # The environment a child needs to be this process with one file in it: the same
-# load path (YATF's own checkout is on it under `Pkg.test`), the same depot, and
+# load path (Runtests' own checkout is on it under `Pkg.test`), the same depot, and
 # the same project.
 function child_command(runner::AbstractString, file::AbstractString)
     pathsep = Sys.iswindows() ? ";" : ":"
@@ -99,17 +99,17 @@ function child_command(runner::AbstractString, file::AbstractString)
         "JULIA_DEPOT_PATH" => join(DEPOT_PATH, pathsep),
         # A child's output is shown only when its file fails, so it can afford to
         # print everything it captured along the way.
-        "YATF_TEST_ECHO" => "1",
+        "RUNTESTS_TEST_ECHO" => "1",
     )
 end
 
 # How long one file may take before it counts as hung. The slowest takes about a
 # minute here and a few on a CI runner. A hung one would otherwise hold the job
 # until the job's own timeout and show nothing, its output still in a log file.
-const FILE_LIMIT_SECONDS = something(tryparse(Int, get(ENV, "YATF_TEST_FILE_TIMEOUT", "")), 15 * 60)
+const FILE_LIMIT_SECONDS = something(tryparse(Int, get(ENV, "RUNTESTS_TEST_FILE_TIMEOUT", "")), 15 * 60)
 
 # A hung file is asked where its tasks are before it is killed: the child installed
-# YATF's inspection hook, so the signal prints every task's backtrace into its log,
+# Runtests' inspection hook, so the signal prints every task's backtrace into its log,
 # and SIGTERM then prints every thread's. Windows has neither and is just killed.
 function stop_hung(proc::Base.Process)
     exited(seconds) = timedwait(() -> process_exited(proc), seconds; pollint = 0.2) === :ok
@@ -117,7 +117,7 @@ function stop_hung(proc::Base.Process)
         kill(proc, sig)
     catch
     end
-    sig = YATFWorkers.INSPECT_SIGNAL
+    sig = RuntestsWorkers.INSPECT_SIGNAL
     # The report is a backtrace per task and a one-second profile: printed well within this.
     sig === nothing || (signal(sig); exited(3.0))
     process_exited(proc) || (signal(Base.SIGTERM); exited(5.0))
@@ -164,7 +164,7 @@ function run_file_in_subprocess(
     seconds = time() - t0
     output = isfile(log) ? read(log, String) : ""
     rm(log; force = true)
-    status = hung ? string("hung: still running after the ", round(Int, limit), "s limit (YATF_TEST_FILE_TIMEOUT)") : exit_status(proc)
+    status = hung ? string("hung: still running after the ", round(Int, limit), "s limit (RUNTESTS_TEST_FILE_TIMEOUT)") : exit_status(proc)
     return FileResult(file, isempty(status), status, seconds, output)
 end
 
@@ -176,7 +176,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
     close(queue)
     printer = ReentrantLock()
     memory = MemoryLog()
-    YATF.Private.Platform.ensure_checked!()
+    Runtests.Private.Platform.ensure_checked!()
     sampler = Threads.@spawn while !(@atomic memory.done)
         sample!(memory)
         sleep(0.5)
@@ -226,11 +226,11 @@ end
 function report_files(results::Vector{FileResult}; memory::Union{Nothing, MemoryLog} = nothing, jobs::Int = 0)
     failed = filter(r -> !r.ok, results)
     println("\n", "="^78)
-    printstyled(stdout, "YATF test files\n"; bold = true)
+    printstyled(stdout, "Runtests test files\n"; bold = true)
     for r in sort(results; by = r -> -r.seconds)
         printstyled(
             stdout, "  ", rpad(r.file, 24), lpad(round(r.seconds; digits = 1), 7), "s  ",
-            memory === nothing ? "" : string(lpad(YATF.Private.fmt_bytes(peak_of(memory, r.file)), 6), "  "),
+            memory === nothing ? "" : string(lpad(Runtests.Private.fmt_bytes(peak_of(memory, r.file)), 6), "  "),
             r.ok ? "passed" : "FAILED (" * r.status * ")", "\n";
             color = r.ok ? :green : :red
         )
@@ -241,24 +241,24 @@ function report_files(results::Vector{FileResult}; memory::Union{Nothing, Memory
     # Each file's own detail is above, in its own block. What this adds is which
     # blocks to go and read, so a CI log's last line names them.
     error(
-        "YATF: ", length(failed), " of ", length(results), " test files failed: ",
+        "Runtests: ", length(failed), " of ", length(results), " test files failed: ",
         join((string(r.file, " (", r.status, ")") for r in failed), ", ")
     )
 end
 
-# What the files needed, to choose `YATF_TEST_JOBS` from: the largest one, and all
+# What the files needed, to choose `RUNTESTS_TEST_JOBS` from: the largest one, and all
 # that were running at once at the suite's peak, against what the machine had; and
 # how busy its CPUs were, since memory to spare is no use to a machine without time.
 function print_memory(memory::MemoryLog, jobs::Int)
     largest = isempty(memory.peak) ? nothing : argmax(memory.peak)
     parts = String[]
     memory.suite > 0 && push!(parts, string(
-        "the files peaked at ", YATF.Private.fmt_bytes(memory.suite), " together, with ",
+        "the files peaked at ", Runtests.Private.fmt_bytes(memory.suite), " together, with ",
         memory.suite_files, " of ", jobs, " running"))
     largest === nothing || push!(parts, string(
-        "the largest alone at ", YATF.Private.fmt_bytes(memory.peak[largest]), " (", largest, ")"))
+        "the largest alone at ", Runtests.Private.fmt_bytes(memory.peak[largest]), " (", largest, ")"))
     memory.total > 0 && push!(parts, string(
-        "the machine at ", YATF.Private.fmt_bytes(memory.machine), " of ", YATF.Private.fmt_bytes(memory.total),
+        "the machine at ", Runtests.Private.fmt_bytes(memory.machine), " of ", Runtests.Private.fmt_bytes(memory.total),
         " (", percent(memory.machine, memory.total), ")"))
     isempty(parts) || println("  memory: ", join(parts, " · "))
     memory.suite > 0 && println("  (a file's figure is its process and its workers, summed: shared pages count twice)")

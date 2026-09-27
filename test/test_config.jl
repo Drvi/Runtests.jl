@@ -1,4 +1,4 @@
-using YATF.Private: read_config, ConfigError, Profile, DEFAULT_PROFILE, auto_workers
+using Runtests.Private: read_config, ConfigError, Profile, DEFAULT_PROFILE, auto_workers
 
 function with_toml(f, contents::AbstractString)
     dir = mktempdir()
@@ -14,7 +14,7 @@ end
         @test cfg.retries == 0
         @test cfg.memory_threshold == 0.9
         @test !cfg.full_names   # a name too long for its column is shortened
-        @test cfg.testset_name == "YATF"
+        @test cfg.testset_name == "Runtests"
         @test haskey(cfg.profiles, DEFAULT_PROFILE)
         @test isempty(cfg.order_first) && isempty(cfg.order_last)
     end
@@ -64,8 +64,8 @@ end
         end
     end
 
-    @testset "coverage comes from the keyword, then YATF_COVERAGE, then the file, and says which" begin
-        withenv("YATF_COVERAGE" => nothing) do
+    @testset "coverage comes from the keyword, then RUNTESTS_COVERAGE, then the file, and says which" begin
+        withenv("RUNTESTS_COVERAGE" => nothing) do
             cfg = read_config(mktempdir())
             @test !cfg.coverage && cfg.coverage_source == ""          # the default says nothing
             with_toml("[run]\ncoverage = true\n") do dir
@@ -73,22 +73,22 @@ end
                 @test cfg.coverage && endswith(cfg.coverage_source, "TestItems.toml")
                 # `nothing` is no choice: the file's stands.
                 @test read_config(dir; coverage = nothing).coverage
-                withenv("YATF_COVERAGE" => "false") do
+                withenv("RUNTESTS_COVERAGE" => "false") do
                     cfg = read_config(dir)
-                    @test !cfg.coverage && cfg.coverage_source == "`YATF_COVERAGE`"
+                    @test !cfg.coverage && cfg.coverage_source == "`RUNTESTS_COVERAGE`"
                     @test !read_config(dir; coverage = nothing).coverage
                     cfg = read_config(dir; coverage = true)
                     @test cfg.coverage && cfg.coverage_source == "the `coverage` keyword"
                 end
             end
-            withenv("YATF_COVERAGE" => "yes") do
+            withenv("RUNTESTS_COVERAGE" => "yes") do
                 @test read_config(mktempdir()).coverage
                 @test !read_config(mktempdir(); coverage = false).coverage
             end
-            withenv("YATF_COVERAGE" => "maybe") do
+            withenv("RUNTESTS_COVERAGE" => "maybe") do
                 err = try; read_config(mktempdir()); catch e; e; end
                 @test err isa ConfigError
-                @test occursin("`YATF_COVERAGE` must be true or false", sprint(showerror, err))
+                @test occursin("`RUNTESTS_COVERAGE` must be true or false", sprint(showerror, err))
                 # The keyword decides, so the variable is not read, and cannot fail.
                 @test !read_config(mktempdir(); coverage = false).coverage
             end
@@ -184,11 +184,11 @@ end
     # One worker prints as it goes; several would interleave more than a reader can
     # follow, so only the items with something wrong say anything. `:batched` is
     # never chosen for you.
-    @test YATF.Private.default_logs(1, true) === :eager
-    @test YATF.Private.default_logs(0, true) === :eager
-    @test YATF.Private.default_logs(2, true) === :issues
-    @test YATF.Private.default_logs(8, true) === :issues
+    @test Runtests.Private.default_logs(1, true) === :eager
+    @test Runtests.Private.default_logs(0, true) === :eager
+    @test Runtests.Private.default_logs(2, true) === :issues
+    @test Runtests.Private.default_logs(8, true) === :issues
     # Nothing is watching a non-interactive run as it goes.
-    @test YATF.Private.default_logs(1, false) === :issues
-    @test YATF.Private.default_logs(8, false) === :issues
+    @test Runtests.Private.default_logs(1, false) === :issues
+    @test Runtests.Private.default_logs(8, false) === :issues
 end

@@ -2,7 +2,7 @@
 # LOAD_PATH. That is the whole mechanism, and it is what lets a setup use anything
 # the package declares for testing — including another setup.
 
-using YATF.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, setup_modules, TOML
+using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, setup_modules, TOML
 
 @testset "test setups" begin
     @testset "a setup may use any of the package's test-time dependencies" begin
@@ -156,7 +156,7 @@ end
     @testset "each setup moves into a package of its own, and items load it as before" begin
         dir = convertible()
         setups = joinpath(dir, "test", "testsetups")
-        _, out = capture_run(() -> YATF.setups_to_packages(dir))
+        _, out = capture_run(() -> Runtests.setups_to_packages(dir))
         for name in ("Helpers", "Uses")
             @test isfile(joinpath(setups, name, "src", name * ".jl"))
             @test !ispath(joinpath(setups, name * ".jl"))
@@ -195,7 +195,7 @@ end
             out
         )
         # A package, and so a cache filed under its UUID.
-        YATF.Private.with_load_path(setups) do
+        Runtests.Private.with_load_path(setups) do
             @test Base.identify_package("Helpers") == Base.PkgId(Base.UUID(helpers["uuid"]), "Helpers")
         end
         for workers in (0, 1)
@@ -207,11 +207,11 @@ end
     @testset "run again, it adds what a setup has come to import and changes nothing else" begin
         dir = convertible()
         setups = joinpath(dir, "test", "testsetups")
-        capture_run(() -> YATF.setups_to_packages(dir))
+        capture_run(() -> Runtests.setups_to_packages(dir))
         project = joinpath(setups, "Uses", "Project.toml")
         helpers = read(joinpath(setups, "Helpers", "Project.toml"), String)
         before = read(project, String)
-        _, out = capture_run(() -> YATF.setups_to_packages(dir))
+        _, out = capture_run(() -> Runtests.setups_to_packages(dir))
         @test read(project, String) == before
         @test occursin("`Uses`:    up to date", out)
         # A dependency added by hand stays, and an import added since is added.
@@ -220,7 +220,7 @@ end
         toml = TOML.parsefile(project)
         toml["deps"]["Logging"] = stdlib_uuid("Logging")
         open(io -> TOML.print(io, toml), project, "w")
-        _, out = capture_run(() -> YATF.setups_to_packages(dir))
+        _, out = capture_run(() -> Runtests.setups_to_packages(dir))
         after = TOML.parsefile(project)
         @test after["uuid"] == toml["uuid"]
         @test after["deps"] == merge(toml["deps"], Dict("Test" => stdlib_uuid("Test")))
@@ -248,7 +248,7 @@ end
         listing() = sort([relpath(joinpath(d, f), setups) for (d, _, fs) in walkdir(setups) for f in fs])
         before = listing()
         err = try
-            YATF.setups_to_packages(dir)
+            Runtests.setups_to_packages(dir)
             nothing
         catch e
             e
@@ -269,7 +269,7 @@ end
     end
 
     @testset "a moved setup's `@__DIR__` becomes `pkgdir`, however it is written" begin
-        relocated(code) = first(YATF.Private.relocate(code, Meta.parseall(code), "S", "MyPkg"))
+        relocated(code) = first(Runtests.Private.relocate(code, Meta.parseall(code), "S", "MyPkg"))
         # By the name the setup already gives the package.
         @test relocated("module S\nimport MyPkg as P\nconst D = @__DIR__\nend\n") ==
               "module S\nimport MyPkg as P\nconst D = pkgdir(P, \"test\", \"testsetups\")\nend\n"
@@ -290,15 +290,15 @@ end
                 "module S p = @__DIR__ end\n" => "module S; import MyPkg; p = pkgdir(MyPkg, \"test\", \"testsetups\") end\n",
             )
             @test relocated(code) == expected
-            yatf = replace(code, "S" => "Setup")
+            runtests = replace(code, "S" => "Setup")
             m = Module()
-            Core.eval(m, Meta.parseall(first(YATF.Private.relocate(yatf, Meta.parseall(yatf), "Setup", "YATF"))))
-            @test Core.eval(m, :(Setup.p)) == pkgdir(YATF, "test", "testsetups")
+            Core.eval(m, Meta.parseall(first(Runtests.Private.relocate(runtests, Meta.parseall(runtests), "Setup", "Runtests"))))
+            @test Core.eval(m, :(Setup.p)) == pkgdir(Runtests, "test", "testsetups")
         end
     end
 
     @testset "a relative include is found however it is spaced" begin
-        hazards(code) = last(YATF.Private.relocate(code, Meta.parseall(code), "S", "MyPkg"))
+        hazards(code) = last(Runtests.Private.relocate(code, Meta.parseall(code), "S", "MyPkg"))
         for call in ("include(\"helper.jl\")", "include( \"helper.jl\")", "include(\n    \"helper.jl\",\n)")
             @test length(hazards("module S\n$call\nend\n")) == 1
         end
@@ -320,12 +320,12 @@ end
         end
         f() = @eval using O
         """)
-        @test YATF.Private.imported_roots(ex) == Set([:A, :B, :D, :G, :I, :L, :M, :N, :O])
+        @test Runtests.Private.imported_roots(ex) == Set([:A, :B, :D, :G, :I, :L, :M, :N, :O])
     end
 
     @testset "a package without setups is left as it is" begin
         dir = make_pkg("NoSetups")
-        _, out = capture_run(() -> YATF.setups_to_packages(dir))
+        _, out = capture_run(() -> Runtests.setups_to_packages(dir))
         @test occursin("no setups in $(joinpath("test", "testsetups"))", out)
         @test !ispath(joinpath(dir, "test", "testsetups"))
     end
@@ -376,7 +376,7 @@ end
         @test isfile(joinpath(proj, "Manifest.toml"))
         @test occursin("fast", read(joinpath(proj, "LocalPreferences.toml"), String))
         # Every package that manifest names is findable from where it now sits.
-        for entries in values(YATF.Private.TOML.parsefile(joinpath(proj, "Manifest.toml"))["deps"])
+        for entries in values(Runtests.Private.TOML.parsefile(joinpath(proj, "Manifest.toml"))["deps"])
             for entry in entries
                 haskey(entry, "path") && @test isdir(joinpath(proj, entry["path"]))
             end
@@ -425,11 +425,11 @@ end
         path = "."
         version = "0.4.0"
         """)
-        dir = joinpath(env, "yatf_profile_tuned")
+        dir = joinpath(env, "runtests_profile_tuned")
         mkpath(dir)
-        YATF.Private.copy_env_files(dir, env)
+        Runtests.Private.copy_env_files(dir, env)
 
-        manifest = YATF.Private.TOML.parsefile(joinpath(dir, "Manifest.toml"))
+        manifest = Runtests.Private.TOML.parsefile(joinpath(dir, "Manifest.toml"))
         paths = Dict(name => only(entries)["path"] for (name, entries) in manifest["deps"])
         @test realpath(paths["Outside"]) == realpath(outside)
         @test realpath(paths["Inside"]) == realpath(inside)
@@ -448,7 +448,7 @@ end
         @test only(manifest["deps"]["Inside"])["uuid"] ==
             "11111111-0000-4000-8000-000000000002"
         # A `[sources]` path is read relative to the project file, so it moves too.
-        sources = YATF.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["sources"]
+        sources = Runtests.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["sources"]
         @test realpath(sources["Outside"]["path"]) == realpath(outside)
     end
 
@@ -458,6 +458,6 @@ end
             @test true
         end
         """, "test/TestItems.toml" => "[profiles.p]\npreferences = \"nope.toml\"\n")
-        @test_throws YATF.ConfigError YATF.Private.prepare((dir,); workers=1, monitor=false)
+        @test_throws Runtests.ConfigError Runtests.Private.prepare((dir,); workers=1, monitor=false)
     end
 end

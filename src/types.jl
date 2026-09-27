@@ -58,7 +58,7 @@ end
 
 function Base.showerror(io::IO, e::ScanFailure)
     n = length(e.errors)
-    println(io, "YATF found ", n, n == 1 ? " problem" : " problems", " while reading test files:")
+    println(io, "Runtests found ", n, n == 1 ? " problem" : " problems", " while reading test files:")
     for err in e.errors
         println(io, "  ", err)
     end
@@ -74,7 +74,7 @@ or no failures left to re-run. `msg` says which.
 struct NoTestsError <: Exception
     msg::String
 end
-Base.showerror(io::IO, e::NoTestsError) = print(io, "YATF: ", e.msg)
+Base.showerror(io::IO, e::NoTestsError) = print(io, "Runtests: ", e.msg)
 
 """
     ConfigError
@@ -86,7 +86,7 @@ precompile. `msg` says what and where.
 struct ConfigError <: Exception
     msg::String
 end
-Base.showerror(io::IO, e::ConfigError) = print(io, "YATF: ", e.msg)
+Base.showerror(io::IO, e::ConfigError) = print(io, "Runtests: ", e.msg)
 
 """
     RunStalled
@@ -99,7 +99,7 @@ struct RunStalled <: Exception
     limit::Float64
 end
 Base.showerror(io::IO, e::RunStalled) = print(
-    io, "YATF: no test item finished in ", fmt_seconds(e.limit),
+    io, "Runtests: no test item finished in ", fmt_seconds(e.limit),
     ", longer than one attempt at any of them may take, so the run was stopped as hung; ",
     "the items that were running are recorded as timed out"
 )

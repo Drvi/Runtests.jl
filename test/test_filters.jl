@@ -2,7 +2,7 @@
 # and none of them may quietly change what the items that do run mean — a chain is
 # still a chain, and forced order still holds over whatever survived.
 
-using YATF.Private: PASSED, prepare, nitems, NoTestsError
+using Runtests.Private: PASSED, prepare, nitems, NoTestsError
 
 const SUITE = string(
     """
@@ -97,8 +97,8 @@ filtered(paths...; kwargs...) =
     end
 
     @testset "a module stands for its package's directory" begin
-        @test YATF.Private.resolve_target((YATF,)).root == pkgdir(YATF)
-        @test_throws r"could not find a directory for module" YATF.Private.resolve_target((Module(:Loose),))
+        @test Runtests.Private.resolve_target((Runtests,)).root == pkgdir(Runtests)
+        @test_throws r"could not find a directory for module" Runtests.Private.resolve_target((Module(:Loose),))
     end
 
     @testset "name, tags and path narrow together" begin

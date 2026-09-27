@@ -1,12 +1,12 @@
-using YATF.Private: prepare, execute, report, Monitor, MemStats, start_monitor!, stop_monitor!,
+using Runtests.Private: prepare, execute, report, Monitor, MemStats, start_monitor!, stop_monitor!,
             set_phase!, PHASE_SETUP, PHASE_TEST, PHASE_REPORT,
             phase_stats, phase_peak, phase_seconds, MemStats, RunPhase,
             status_line, print_status_line,
             status_update!, print_memory_summary, fmt_bytes, print_bytes, print_1dp,
             print_int, nitems
 using Base.ScopedValues: with
-using YATF.Private: printline, with_status_line_off
-using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memory,
+using Runtests.Private: printline, with_status_line_off
+using Runtests.Private.Platform: process_rss, child_pids, process_tree, machine_memory,
                      platform_selfcheck!, ensure_checked!, PER_PROCESS_OK, cpu_ticks, process_cpu_seconds
 
 @testset "platform bindings" begin
@@ -79,7 +79,7 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
     end
 
     @testset "a process tree is walked from its roots, however the children are listed" begin
-        P = YATF.Private.Platform
+        P = Runtests.Private.Platform
         # `pid => parent`, as a Windows snapshot lists them: 1 has a line of
         # descendants six deep, 8 is 1's other child, 20 and 21 name each other (a
         # parent's pid reused by its own child's child), 0 names itself, as the
@@ -104,12 +104,12 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
         # Windows would read the wrong bytes.
         if Sys.WORD_SIZE == 64
             offset(T, f) = fieldoffset(T, findfirst(==(f), fieldnames(T)))
-            E = YATF.Private.Platform.ProcessEntry32W
+            E = Runtests.Private.Platform.ProcessEntry32W
             @test sizeof(E) == 568
             @test offset(E, :pid) == 8
             @test offset(E, :parent_pid) == 32
             @test offset(E, :exe_file) == 44
-            B, J = YATFWorkers.JobBasicLimits, YATFWorkers.JobExtendedLimits
+            B, J = RuntestsWorkers.JobBasicLimits, RuntestsWorkers.JobExtendedLimits
             @test sizeof(B) == 64
             @test offset(B, :limit_flags) == 16
             @test offset(B, :scheduling_class) == 60
@@ -120,12 +120,12 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
     end
 
     Sys.iswindows() && @testset "every process is listed with its parent" begin
-        ps = YATF.Private.Platform.process_parents_windows()
+        ps = Runtests.Private.Platform.process_parents_windows()
         @test any(p -> first(p) == getpid(), ps)
         proc = run(`$(Base.julia_cmd()[1]) -e "sleep(30)"`; wait=false)
         try
             child = Int32(Libc.getpid(proc))
-            @test (child => Int32(getpid())) in YATF.Private.Platform.process_parents_windows()
+            @test (child => Int32(getpid())) in Runtests.Private.Platform.process_parents_windows()
         finally
             kill(proc, Base.SIGKILL)
         end
@@ -204,8 +204,8 @@ end
     end
 
     @testset "how busy the run kept the CPUs, and the machine" begin
-        R, F = YATF.Private.CpuReading, YATF.Private.FIELD
-        line(a, b) = sprint(io -> YATF.Private.print_cpu(io, a, b))
+        R, F = Runtests.Private.CpuReading, Runtests.Private.FIELD
+        line(a, b) = sprint(io -> Runtests.Private.print_cpu(io, a, b))
         # Ten seconds on four threads: the machine busy for 30 of the 40
         # thread-seconds, the run's processes for 12 of them.
         a = R(1_000, 10_000, 4, 5.0, 100.0)
@@ -241,7 +241,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         line = status_line(run.monitor)
-        @test startswith(line, YATF.Private.MARK_INFO * " w0" * YATF.Private.FIELD)
+        @test startswith(line, Runtests.Private.MARK_INFO * " w0" * Runtests.Private.FIELD)
         @test occursin("INFO", line)
         @test occursin("/", line)             # done/total
         @test occursin("failed", line)
@@ -254,16 +254,16 @@ end
         # as a record.
         m = run.monitor
         s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
-        if YATF.Private.Platform.PER_PROCESS_OK[] && s.total_rss > 0
+        if Runtests.Private.Platform.PER_PROCESS_OK[] && s.total_rss > 0
             @test occursin(
-                "tree mem " * sprint(io -> print_bytes(io, s.total_rss, YATF.Private.TOTAL_WIDTH)), line
+                "tree mem " * sprint(io -> print_bytes(io, s.total_rss, Runtests.Private.TOTAL_WIDTH)), line
             )
             @test occursin(
                 "(max " * sprint(io -> print_bytes(io, m.stats.peak_total_bytes)) * ")",
                 line
             )
             @test occursin(
-                "child max " * sprint(io -> print_bytes(io, m.stats.peak_single_bytes, YATF.Private.TOTAL_WIDTH)),
+                "child max " * sprint(io -> print_bytes(io, m.stats.peak_single_bytes, Runtests.Private.TOTAL_WIDTH)),
                 line
             )
             # A sum is at least its largest term, so the same holds of the peaks,
@@ -289,7 +289,7 @@ end
 
         # The list of running items is refilled in place rather than rebuilt.
         before = run.monitor.running
-        YATF.Private.running_items!(run.monitor)
+        Runtests.Private.running_items!(run.monitor)
         @test run.monitor.running === before
     end
 
@@ -302,11 +302,11 @@ end
         # Erase, the line, then the status line again — assembled whole, because
         # three separate writes are what makes a busy run flicker.
         @test startswith(out, "\r\e[2K" * "a line of output" * "\n")
-        @test occursin("\r\e[2K" * YATF.Private.MARK_INFO, out)
+        @test occursin("\r\e[2K" * Runtests.Private.MARK_INFO, out)
         @test endswith(out, status_line(m))
         # A line that already ends in a newline does not get a second one.
         out2 = String(take!(copy(status_update!(m, "ends in a newline\n"))))
-        @test occursin("ends in a newline\n\r\e[2K" * YATF.Private.MARK_INFO, out2)
+        @test occursin("ends in a newline\n\r\e[2K" * Runtests.Private.MARK_INFO, out2)
         @test !occursin("\n\n", out2)
     end
 
@@ -363,7 +363,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         @test run.monitor === nothing
-        @test all(==(YATF.Private.PASSED), run.statuses.state)
+        @test all(==(Runtests.Private.PASSED), run.statuses.state)
         @test stop_monitor!(nothing) === nothing     # stopping a monitor there isn't is fine
     end
 
@@ -375,22 +375,22 @@ end
 
         # Upward through a mark is worth saying; sitting above it is not, and
         # neither is drifting back down.
-        @test YATF.Private.crossed_memory_mark!(m, 50.0, 1000.0) == 0
-        @test YATF.Private.crossed_memory_mark!(m, 91.0, 1000.0) == 90
-        @test YATF.Private.crossed_memory_mark!(m, 93.0, 1000.0) == 0     # still between marks
-        @test YATF.Private.crossed_memory_mark!(m, 97.5, 1000.0) == 97    # the highest of 95, 96, 97
-        @test YATF.Private.crossed_memory_mark!(m, 99.5, 1000.0) == 99
-        @test YATF.Private.crossed_memory_mark!(m, 80.0, 1000.0) == 0
+        @test Runtests.Private.crossed_memory_mark!(m, 50.0, 1000.0) == 0
+        @test Runtests.Private.crossed_memory_mark!(m, 91.0, 1000.0) == 90
+        @test Runtests.Private.crossed_memory_mark!(m, 93.0, 1000.0) == 0     # still between marks
+        @test Runtests.Private.crossed_memory_mark!(m, 97.5, 1000.0) == 97    # the highest of 95, 96, 97
+        @test Runtests.Private.crossed_memory_mark!(m, 99.5, 1000.0) == 99
+        @test Runtests.Private.crossed_memory_mark!(m, 80.0, 1000.0) == 0
 
         # Crossing the same mark again says nothing until it has been quiet a
         # while, so a machine breathing across a boundary does not narrate.
-        @test YATF.Private.crossed_memory_mark!(m, 96.5, 1010.0) == 0
-        @test YATF.Private.crossed_memory_mark!(m, 80.0, 1010.0) == 0
-        @test YATF.Private.crossed_memory_mark!(m, 96.5, 1000.0 + YATF.Private.MEMORY_MARK_QUIET + 1) == 96
+        @test Runtests.Private.crossed_memory_mark!(m, 96.5, 1010.0) == 0
+        @test Runtests.Private.crossed_memory_mark!(m, 80.0, 1010.0) == 0
+        @test Runtests.Private.crossed_memory_mark!(m, 96.5, 1000.0 + Runtests.Private.MEMORY_MARK_QUIET + 1) == 96
 
         # Every mark the run is told to watch is one it can report.
-        @test YATF.Private.MEMORY_MARKS == (90, 95, 96, 97, 98, 99)
-        @test length(m.mark_said) == length(YATF.Private.MEMORY_MARKS)
+        @test Runtests.Private.MEMORY_MARKS == (90, 95, 96, 97, 98, 99)
+        @test length(m.mark_said) == length(Runtests.Private.MEMORY_MARKS)
     end
 
     @testset "the memory guard holds work back, then collects, then restarts, then lets go" begin
@@ -402,40 +402,40 @@ end
         m = Monitor(run)
         limit = p.cfg.memory_threshold
         function reading(pressure)
-            m.samples[1] = YATF.Private.Sample(
+            m.samples[1] = Runtests.Private.Sample(
                 1.0f0, PHASE_TEST, Int16(1), Int16(0), 0, 0, Int32(0),
                 round(Int64, pressure * 2^30), Int64(2^30), 0.0f0
             )
             m.ring_head = 1
         end
         reading(limit / 2)
-        YATF.Private.guard!(m)
-        @test !YATF.Private.is_paused(run.queues)
+        Runtests.Private.guard!(m)
+        @test !Runtests.Private.is_paused(run.queues)
         reading(min(1.0, limit + 0.02))
-        release = round(Int, 100 * (limit - YATF.Private.GUARD_HYSTERESIS))
-        @test_logs (:warn, Regex("holding off on new test items until it is below $release%")) YATF.Private.guard!(m)
-        @test YATF.Private.is_paused(run.queues)
+        release = round(Int, 100 * (limit - Runtests.Private.GUARD_HYSTERESIS))
+        @test_logs (:warn, Regex("holding off on new test items until it is below $release%")) Runtests.Private.guard!(m)
+        @test Runtests.Private.is_paused(run.queues)
         # Dipping under the threshold is not enough to let go: a machine hovering on
         # it would take and release the hold at every sample.
-        reading(limit - YATF.Private.GUARD_HYSTERESIS / 2)
-        @test_logs YATF.Private.guard!(m)
-        @test YATF.Private.is_paused(run.queues)
+        reading(limit - Runtests.Private.GUARD_HYSTERESIS / 2)
+        @test_logs Runtests.Private.guard!(m)
+        @test Runtests.Private.is_paused(run.queues)
         @test m.stats.guard_actions == 1
         reading(min(1.0, limit + 0.02))
         # Still over once holding back has had its chance: collect.
-        m.over_since = time() - YATF.Private.GUARD_BACKPRESSURE_SECONDS - 1
-        YATF.Private.guard!(m)
+        m.over_since = time() - Runtests.Private.GUARD_BACKPRESSURE_SECONDS - 1
+        Runtests.Private.guard!(m)
         @test m.stats.guard_actions == 2
         # Still over after that: restart a worker, and not again within the minute.
-        m.over_since = time() - YATF.Private.GUARD_GC_SECONDS - 1
-        YATF.Private.guard!(m)
+        m.over_since = time() - Runtests.Private.GUARD_GC_SECONDS - 1
+        Runtests.Private.guard!(m)
         @test m.stats.guard_actions == 3
-        YATF.Private.guard!(m)
+        Runtests.Private.guard!(m)
         @test m.stats.guard_actions == 3
         # Well below it, the hold ends, and the run says so.
         reading(limit / 2)
-        _, out = capture_run(() -> YATF.Private.guard!(m))
-        @test !YATF.Private.is_paused(run.queues)
+        _, out = capture_run(() -> Runtests.Private.guard!(m))
+        @test !Runtests.Private.is_paused(run.queues)
         @test occursin("memory is down to $(round(Int, 50 * limit))%; no longer holding off on new test items", out)
     end
 
@@ -459,11 +459,11 @@ end
             while !isfile(ready) && !istaskdone(task) && time() < deadline
                 sleep(0.05)
             end
-            YATF.Private.recycle_biggest_worker!(Monitor(YATF.Private.LIVE_RUN[]))
+            Runtests.Private.recycle_biggest_worker!(Monitor(Runtests.Private.LIVE_RUN[]))
             fetch(task)
         end
-        @test states["holds the worker"] === YATF.Private.PASSED
-        @test states["runs after"] === YATF.Private.PASSED
+        @test states["holds the worker"] === Runtests.Private.PASSED
+        @test states["runs after"] === Runtests.Private.PASSED
         pid(name) = run.statuses.pid[findfirst(==(name), p.items.name)]
         @test pid("holds the worker") != pid("runs after")
         @test occursin("restarting w1 (pid $(pid("holds the worker"))", out)
@@ -482,7 +482,7 @@ end
         # The glyph is still there — it is how a line is read at a glance — but
         # there is no worker to number.
         @test all(item_lines) do l
-            any(m -> startswith(l, m * " "), (YATF.Private.MARK_RUNNING, YATF.Private.MARK_PASSED, YATF.Private.MARK_FAILED, YATF.Private.MARK_SET_ASIDE, YATF.Private.MARK_ITEM, YATF.Private.MARK_WORKER))
+            any(m -> startswith(l, m * " "), (Runtests.Private.MARK_RUNNING, Runtests.Private.MARK_PASSED, Runtests.Private.MARK_FAILED, Runtests.Private.MARK_SET_ASIDE, Runtests.Private.MARK_ITEM, Runtests.Private.MARK_WORKER))
         end
         @test !any(l -> occursin(r" w\d+ · ", l), item_lines)
 
@@ -490,7 +490,7 @@ end
         # lands inside a two-second run depends on how busy the machine is, and
         # what is being checked here is the shape of one, not its timing.
         info = status_line(run.monitor)
-        @test startswith(info, YATF.Private.MARK_INFO * " ")
+        @test startswith(info, Runtests.Private.MARK_INFO * " ")
         @test !occursin("w0", info)
         @test !occursin("workers", info)
         # One process, so one memory figure and its peak, not three names for it.
@@ -502,15 +502,15 @@ end
         # ...and the same in the summary.
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
-        @test !occursin("across all YATF processes", summary)
+        @test !occursin("across all Runtests processes", summary)
         @test !occursin("largest single process", summary)
     end
 
     @testset "a count is pluralised correctly even when adding an s would not" begin
-        @test YATF.Private.plural(1, "worker") == "1 worker"
-        @test YATF.Private.plural(2, "worker") == "2 workers"
-        @test YATF.Private.plural(1, "process", "processes") == "1 process"
-        @test YATF.Private.plural(2, "process", "processes") == "2 processes"
+        @test Runtests.Private.plural(1, "worker") == "1 worker"
+        @test Runtests.Private.plural(2, "worker") == "2 workers"
+        @test Runtests.Private.plural(1, "process", "processes") == "1 process"
+        @test Runtests.Private.plural(2, "process", "processes") == "2 processes"
     end
 
     @testset "a dead worker's memory is its own" begin
@@ -519,9 +519,9 @@ end
         rm(run.logdir; force=true, recursive=true)
         m = run.monitor
         r = @atomic m.reading
-        @atomic m.reading = YATF.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
+        @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
                                                  [Int64(3) << 30], Int32[4242])
-        note(pid) = YATF.Private.memory_note(m, 1, pid)
+        note(pid) = Runtests.Private.memory_note(m, 1, pid)
         @test occursin("peak rss $(fmt_bytes(Int64(3) << 30))", note(4242))
         # A worker that died before a sample saw it is not given the peak of the
         # one before it in the slot.
@@ -556,11 +556,11 @@ end
             ps.peak_total = 0; ps.peak_single = 0; ps.nprocs_at_peak = 0; ps.starts = 0
         end
         sample(phase, total, largest, n, workers = 0) =
-            YATF.Private.Sample(1.0f0, phase, Int16(n), Int16(workers), Int64(total), Int64(largest),
+            Runtests.Private.Sample(1.0f0, phase, Int16(n), Int16(workers), Int64(total), Int64(largest),
                         Int32(1), Int64(0), Int64(0), 1.0f0)
-        YATF.Private.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
-        YATF.Private.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8))
-        YATF.Private.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4))
+        Runtests.Private.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4))
         @test phase_peak(st, PHASE_SETUP) == 800
         @test phase_peak(st, PHASE_TEST) == 3000        # the larger of the two
         @test phase_stats(st, PHASE_TEST).peak_single == 900
@@ -569,10 +569,10 @@ end
         # different moment and does not contribute its count to this one.
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
         @test phase_stats(st, PHASE_TEST).workers_at_peak == 8
-        YATF.Private.update_stats!(m, sample(PHASE_TEST, 2500, 400, 40, 8))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 2500, 400, 40, 8))
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
         # ...and a larger total brings its own counts with it.
-        YATF.Private.update_stats!(m, sample(PHASE_TEST, 4000, 400, 3, 2))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 4000, 400, 3, 2))
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 3
         @test phase_stats(st, PHASE_TEST).workers_at_peak == 2
         # A stage that saw no sample keeps nothing from the others.
@@ -580,7 +580,7 @@ end
     end
 
     @testset "a stage's processes are the coordinator, its workers and what they spawned" begin
-        text(n, workers) = YATF.Private.procs_text(YATF.Private.PhaseStats(; nprocs_at_peak = n, workers_at_peak = workers))
+        text(n, workers) = Runtests.Private.procs_text(Runtests.Private.PhaseStats(; nprocs_at_peak = n, workers_at_peak = workers))
         @test text(12, 8) == "coordinator + 8 workers + 3 spawned"
         @test text(9, 8) == "coordinator + 8 workers"
         @test text(2, 1) == "coordinator + 1 worker"
@@ -617,7 +617,7 @@ end
 
         # The single run-wide peak it used to lead with is gone: the stages say it.
         @test !occursin("largest single process", summary)
-        @test !occursin("across all YATF processes", summary)
+        @test !occursin("across all Runtests processes", summary)
         @test !occursin("by phase", summary)
         # The caveat about shared pages survives, once.
         @test count("over-count", summary) == 1
@@ -665,8 +665,8 @@ end
         # A sample of its own: a short run on a busy machine can finish between
         # two of the monitor's, and what is under test here is the shape of the
         # line, not whether one happened to land.
-        YATF.Private.update_stats!(run.monitor,
-            YATF.Private.Sample(1.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(500_000_000), Int64(500_000_000),
+        Runtests.Private.update_stats!(run.monitor,
+            Runtests.Private.Sample(1.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(500_000_000), Int64(500_000_000),
                         Int32(getpid()), Int64(0), Int64(0), 1.0f0))
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
@@ -728,12 +728,12 @@ end
 
     @testset "the run state records the memory summary" begin
         dir = mktempdir()
-        withenv("YATF_RUNSTATE_DIR" => dir) do
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
             run = execute(p, target)
             rm(run.logdir; force=true, recursive=true)
-            @test !isempty(YATF.Private.runstate_files(p.root))
-            @test YATF.Private.read_run_state(last(YATF.Private.runstate_files(p.root))) !== nothing
+            @test !isempty(Runtests.Private.runstate_files(p.root))
+            @test Runtests.Private.read_run_state(last(Runtests.Private.runstate_files(p.root))) !== nothing
         end
     end
 end
@@ -744,17 +744,17 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         m = run.monitor
-        @test YATF.Private.with_status_line_off(m) do
+        @test Runtests.Private.with_status_line_off(m) do
             m.quiet
         end
         @test !m.quiet
-        @test_throws ErrorException YATF.Private.with_status_line_off(m) do
+        @test_throws ErrorException Runtests.Private.with_status_line_off(m) do
             error("boom")
         end
         @test !m.quiet
         # No monitor at all is the common case in these tests, and the body still
         # runs and still returns what it returned.
-        @test YATF.Private.with_status_line_off(nothing) do
+        @test Runtests.Private.with_status_line_off(nothing) do
             :ran
         end === :ran
     end
@@ -768,7 +768,7 @@ end
         rm(run.logdir; force=true, recursive=true)
         plain(s) = replace(s, r"\e\[[0-9;?]*[a-zA-Z]" => "")
         drawn(cols) = withenv("COLUMNS" => string(cols)) do
-            with(YATF.Private.TTY_OVERRIDE => true) do
+            with(Runtests.Private.TTY_OVERRIDE => true) do
                 run.monitor = Monitor(run)
                 @test run.monitor.columns == cols
                 out = String(take!(copy(status_update!(run.monitor, "x"))))
@@ -787,15 +787,15 @@ end
 
         # In colour: the escape codes take no columns and are kept or cut whole, and
         # a line cut inside a colour still ends by resetting it.
-        fits(s, cols) = YATF.Private.bytes_within(codeunits(s), 1, ncodeunits(s), cols)
+        fits(s, cols) = Runtests.Private.bytes_within(codeunits(s), 1, ncodeunits(s), cols)
         @test fits("abcdef", 4) == 4
         @test fits("\e[32mabcdef\e[0m", 4) == ncodeunits("\e[32mabcd")
         @test fits("\e[1;32mab\e[0mcdef", 4) == ncodeunits("\e[1;32mab\e[0mcd")
         @test fits("ab\e[32m", 4) == ncodeunits("ab\e[32m")
-        m = withenv(() -> with(() -> Monitor(run), YATF.Private.TTY_OVERRIDE => true), "COLUMNS" => "4")
+        m = withenv(() -> with(() -> Monitor(run), Runtests.Private.TTY_OVERRIDE => true), "COLUMNS" => "4")
         truncate(m.linebuf, 0)
         print(m.linebuf, "\e[32mabcdef\e[0m")
-        YATF.Private.clip_status!(m, 0)
+        Runtests.Private.clip_status!(m, 0)
         @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
     end
 
@@ -816,7 +816,7 @@ end
         end
         """)
         thrown, out = capture_run() do
-            with(YATF.Private.TTY_OVERRIDE => true) do
+            with(Runtests.Private.TTY_OVERRIDE => true) do
                 try
                     p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
                     execute(p, target)
@@ -826,7 +826,7 @@ end
                 end
             end
         end
-        @test thrown isa YATF.ConfigError
+        @test thrown isa Runtests.ConfigError
         @test occursin("failed to precompile", sprint(showerror, thrown))
         # Taking the monitor down erases what it had drawn, so the last thing on
         # the terminal is the erase and not half a status line.
@@ -842,7 +842,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         _, out = capture_run() do
-            with(YATF.Private.TTY_OVERRIDE => true) do
+            with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
                 # Every machine has more than a thousandth of its memory in use, so
                 # the first sample warns.
@@ -851,7 +851,7 @@ end
                 stop_monitor!(m)
             end
         end
-        at = findfirst("Warning: YATF: memory is at", out)
+        at = findfirst("Warning: Runtests: memory is at", out)
         @test at !== nothing
         if at !== nothing
             # What is on the warning's row before it: the status line was drawn
@@ -870,7 +870,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         _, out = capture_run() do
-            with(YATF.Private.TTY_OVERRIDE => true) do
+            with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
                 start_monitor!(m)
                 timedwait(() -> m.last_print > 0, 30.0)   # the line is up
@@ -899,7 +899,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         _, out = capture_run() do
-            with(YATF.Private.TTY_OVERRIDE => true) do
+            with(Runtests.Private.TTY_OVERRIDE => true) do
                 # Not started: the sampling task would draw on its own clock, and
                 # what is under test is what the printing path does.
                 run.monitor = Monitor(run)
@@ -916,7 +916,7 @@ end
         # inside the withdrawal writes the line and stops there.
         after_outside = out[findfirst("OUTSIDE", out).stop:findfirst("INSIDE", out).start]
         after_inside = out[findfirst("INSIDE", out).stop:end]
-        @test occursin(YATF.Private.MARK_INFO, after_outside)
-        @test !occursin(YATF.Private.MARK_INFO, after_inside)
+        @test occursin(Runtests.Private.MARK_INFO, after_outside)
+        @test !occursin(Runtests.Private.MARK_INFO, after_inside)
     end
 end

@@ -7,7 +7,7 @@ const vscode = require('vscode');
 const assert = require('node:assert/strict');
 
 async function run() {
-    const ext = vscode.extensions.getExtension('yatf.yatf');
+    const ext = vscode.extensions.getExtension('runtests.runtests');
     const api = await ext.activate();
     await api.refresh();
     const ctrl = api.controller;
@@ -52,7 +52,7 @@ async function run() {
     assert.match(messages[0].message, /x == 2/);
     assert.equal(said.has('tagged'), false);
 
-    // The run's output is what YATF wrote, in colour, a line per terminal line.
+    // The run's output is what Runtests wrote, in colour, a line per terminal line.
     const plain = output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
     assert.match(plain, /DONE .*"fails".*FAIL/);
     assert.match(plain, /ran 2 test items/);
@@ -63,7 +63,7 @@ async function run() {
     // run that ran it left it, so a run of another item in between changes nothing.
     await api.runProfile.runHandler(new vscode.TestRunRequest([items[0]]), source.token);
     said.clear();
-    await vscode.commands.executeCommand('yatf.runFailed');
+    await vscode.commands.executeCommand('runtests.runFailed');
     assert.deepEqual([...said.keys()], ['fails']);
 }
 

@@ -1,4 +1,4 @@
-// A YATF server: the Julia process `YATF.serve` runs, and the protocol spoken with
+// A Runtests server: the Julia process `Runtests.serve` runs, and the protocol spoken with
 // it — one JSON object per line, commands in, events out, everything written for
 // people on stderr. No VS Code here, so it is tested against a real server.
 'use strict';
@@ -9,13 +9,13 @@ const { EventEmitter } = require('node:events');
 
 const PROTOCOL = 1;
 
-class YatfServer extends EventEmitter {
+class RuntestsServer extends EventEmitter {
     /**
      * @param {{julia: string, juliaArgs?: string[], environment: string, root: string,
      *          env?: NodeJS.ProcessEnv, onLog?: (line: string) => void}} options
      *   `julia` and `juliaArgs` start Julia (`juliaArgs` go first, so `+1.12` works
      *   for juliaup); `environment` is the project it runs in, which must have
-     *   YATF; `root` the package whose suite it serves.
+     *   Runtests; `root` the package whose suite it serves.
      */
     constructor(options) {
         super();
@@ -35,7 +35,7 @@ class YatfServer extends EventEmitter {
         const o = this.options;
         // In colour: what it writes for people is shown in a terminal, which renders it.
         const args = [...(o.juliaArgs ?? []), `--project=${o.environment}`, '--startup-file=no', '--color=yes',
-            '-e', 'using YATF; YATF.serve(ARGS[1])', o.root];
+            '-e', 'using Runtests; Runtests.serve(ARGS[1])', o.root];
         this.onLog(`starting: ${o.julia} ${args.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
         const proc = spawn(o.julia, args, { cwd: o.root, env: o.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
         this.proc = proc;
@@ -43,7 +43,7 @@ class YatfServer extends EventEmitter {
             this.once('hello', resolve);
             proc.once('error', reject);                   // no such julia, say
             proc.once('exit', (code, signal) =>
-                reject(new Error(`the YATF server exited before it was ready (${signal ?? `code ${code}`}); see its log`)));
+                reject(new Error(`the Runtests server exited before it was ready (${signal ?? `code ${code}`}); see its log`)));
         });
         // A process that could not be started never exits, so it is forgotten here,
         // and the next `start` tries again.
@@ -56,7 +56,7 @@ class YatfServer extends EventEmitter {
         proc.on('exit', (code, signal) => {
             this.proc = null;
             this.hello = null;
-            const gone = new Error(`the YATF server exited (${signal ?? `code ${code}`})`);
+            const gone = new Error(`the Runtests server exited (${signal ?? `code ${code}`})`);
             for (const handler of this.pending.values()) handler({ event: 'exit', error: gone });
             this.pending.clear();
             this.emit('exit', code, signal);
@@ -86,7 +86,7 @@ class YatfServer extends EventEmitter {
     }
 
     send(command) {
-        if (!this.proc) throw new Error('the YATF server is not running');
+        if (!this.proc) throw new Error('the Runtests server is not running');
         this.proc.stdin.write(JSON.stringify(command) + '\n');
     }
 
@@ -147,4 +147,4 @@ class YatfServer extends EventEmitter {
     }
 }
 
-module.exports = { YatfServer, PROTOCOL };
+module.exports = { RuntestsServer, PROTOCOL };

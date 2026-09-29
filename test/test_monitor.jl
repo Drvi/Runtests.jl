@@ -9,6 +9,15 @@ using Runtests.Private: printline, with_status_line_off
 using Runtests.Private.Platform: process_rss, child_pids, process_tree, machine_memory,
                      platform_selfcheck!, ensure_checked!, PER_PROCESS_OK, cpu_ticks, process_cpu_seconds
 
+# `n` MiB of old garbage: it lived through collections, so only a full one frees it,
+# and a run allocates too little to set one off. Made here rather than in the test
+# body, whose frame could keep it reachable.
+@noinline function leave_old_garbage(n)
+    kept = [fill(UInt8(1), 2^20) for _ in 1:n]
+    GC.gc(false); GC.gc(false)
+    return length(kept)
+end
+
 @testset "platform bindings" begin
     @testset "self-check" begin
         # Either the vendored accessors agree with an independent source, or they
@@ -469,6 +478,15 @@ end
         @test occursin("restarting w1 (pid $(pid("holds the worker"))", out)
         @test occursin("once its item is done", out)
         @test occursin(Regex("EXIT · pid $(pid("holds the worker")) · 1 item · .* · restarted by the memory guard"), out)
+    end
+
+    @testset "a run with workers frees what the session left behind while they start" begin
+        pkg = make_pkg("SessionGarbage", "test/t_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
+        capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))   # compiled, environment cached
+        leave_old_garbage(256)
+        before = Base.gc_live_bytes()
+        capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))
+        @test Base.gc_live_bytes() < before - 128 * 2^20
     end
 
     @testset "a run with no workers does not talk about workers" begin

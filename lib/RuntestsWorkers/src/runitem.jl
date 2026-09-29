@@ -173,10 +173,9 @@ item, and the coordinator times it against a limit of its own.
 """
 function run_test_end(spec::ItemSpec, test_end::Expr)
     ts = Test.DefaultTestSet(string(spec.name, " test_end"))
-    stats = PerfStats()
-    in_item(spec) do
+    stats = in_item(spec) do
         try
-            stats = eval_block!(ts, spec, test_end, string(spec.name, " test_end"))
+            eval_block!(ts, spec, test_end, string(spec.name, " test_end"))
         finally
             finish_testset!(ts)
         end

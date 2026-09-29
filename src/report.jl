@@ -357,7 +357,6 @@ const TIME_WIDTH = 5           # "99.9s"
 
 # One unit each, always: a column that switches between ms and s, or MiB and GiB,
 # cannot be compared down the page at a glance.
-fmt_secs(s::Real) = string(round(s; digits = 1), "s")
 fmt_gib(b::Real) = string(round(b / 2^30; digits = 1), " GiB")
 
 # Four columns for the common outcomes; the rare ones are spelled out and may push
@@ -426,7 +425,22 @@ function name_width(names; columns::Integer = 0)
     return min(wanted, budget)
 end
 
-clock_now() = Libc.strftime("%H:%M:%S", time())
+# The wall clock as lines write it, formatted once a second: `strftime` builds a
+# string per call, and there are two lines for every item. Lines come from several
+# tasks, so the second and its text are swapped in as one atomic reference.
+mutable struct ClockText
+    @atomic now::Pair{Int, String}
+end
+const CLOCK_TEXT = ClockText(-1 => "")
+
+function clock_now()
+    sec = floor(Int, time())
+    last = @atomic CLOCK_TEXT.now
+    first(last) == sec && return last.second
+    text = Libc.strftime("%H:%M:%S", sec)
+    @atomic CLOCK_TEXT.now = sec => text
+    return text
+end
 
 # The start every line shares: glyph, the worker it is about (none in a run
 # without workers), and the time. The clock is passed in because the status line,
@@ -438,7 +452,26 @@ function print_line_head(io::IO, mark::AbstractString, slot_id, clock::AbstractS
     return nothing
 end
 
-print_word(io::IO, word::AbstractString) = (print_bold(io, rpad(word, WORKER_STATE_WIDTH)); print(io, FIELD))
+function print_word(io::IO, word::AbstractString)
+    bold = get(io, :color, false)::Bool
+    bold && print(io, "\e[1m")
+    print(io, word)
+    pad_to(io, WORKER_STATE_WIDTH, textwidth(word))
+    bold && print(io, "\e[22m")
+    print(io, FIELD)
+    return nothing
+end
+
+# `text` padded to `width` in `color`, byte for byte as `printstyled` writes it,
+# without the closure and the padded copy it builds: two lines per item use it.
+function print_colored(io::IO, text::AbstractString, width::Integer, color::Symbol)
+    on = get(io, :color, false)::Bool
+    on && print(io, Base.text_colors[color])
+    print(io, text)
+    pad_to(io, width, textwidth(text))
+    on && color !== :default && print(io, Base.text_colors[:default])
+    return nothing
+end
 
 # `printstyled` builds a closure and a padded string per call, and the status line
 # is redrawn after every line the run prints.
@@ -450,8 +483,11 @@ function print_bold(io::IO, text::AbstractString)
     return nothing
 end
 
-# Text built for printing, in colour when the run's own output is.
-styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool)
+# Text built for printing, in colour when the run's own output is, in a buffer that
+# starts at a printed line's size, colour codes included, so that a line does not
+# grow it several times over.
+const LINE_BYTES = 160
+styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool, sizehint = LINE_BYTES)
 
 # A line the run says about itself.
 say(run, parts...) = printline(run, string(label_prefix(), parts...))
@@ -475,18 +511,24 @@ item_line(slot_id, i, total, shown, width, attempt, attempts, how) = styled() do
     done = !(how isa AbstractString)
     print_line_head(io, done ? state_mark(how.state) : MARK_RUNNING, slot_id, clock_now())
     print_word(io, done ? "DONE" : "RUN")
-    total > 0 && print(io, lpad(i, ndigits(total)), "/", total, FIELD)
+    if total > 0
+        print_int(io, i, ndigits(total)); write(io, UInt8('/')); print_int(io, total); print(io, FIELD)
+    end
     # A name longer than the column pushes the rest out rather than being cut: the
     # name is what identifies the item, and a shortened one still does.
     print(io, shown)
     pad_to(io, width, textwidth(shown))
-    attempt > 1 && print(io, FIELD, "retry ", attempt - 1, " of ", max(attempts - 1, 1))
+    if attempt > 1
+        print(io, FIELD, "retry "); print_int(io, attempt - 1); print(io, " of "); print_int(io, max(attempts - 1, 1))
+    end
     print(io, FIELD)
     if done
         pct = how.elapsed_ns > 0 ? round(Int, 100 * how.compile_ns / how.elapsed_ns) : 0
-        printstyled(io, rpad(short_state(how.state), STATE_WIDTH); color = state_color(how.state))
-        print(io, FIELD, lpad(fmt_secs(how.elapsed_ns / 1.0e9), TIME_WIDTH), " (", lpad(pct, 2), "% compile)")
-        print(io, FIELD, "maxrss ", fmt_gib(how.maxrss))
+        print_colored(io, short_state(how.state), STATE_WIDTH, state_color(how.state))
+        # Rounded to a tenth, as `fmt_gib` rounds, then written without a string.
+        print(io, FIELD); print_1dp(io, round(how.elapsed_ns / 1.0e9; digits = 1), TIME_WIDTH - 1)
+        print(io, "s ("); print_int(io, pct, 2); print(io, "% compile)")
+        print(io, FIELD, "maxrss "); print_1dp(io, round(how.maxrss / 2^30; digits = 1)); print(io, " GiB")
     else
         print(io, "at ")
         print_bold(io, how)
@@ -504,11 +546,28 @@ A worker's record of an item starting or finishing (`RuntestsWorkers.record_run`
 """
 function parse_record(line::AbstractString)
     startswith(line, RuntestsWorkers.RECORD_MARK) || return nothing
-    word, rest... = split(SubString(line, ncodeunits(RuntestsWorkers.RECORD_MARK) + 1), ' ')
-    n = map(x -> tryparse(Int, x), rest)
-    any(isnothing, n) && return nothing
-    word == "RUN" && length(n) == 2 && return (; i = n[1], attempt = n[2], how = nothing)
-    (word == "DONE" && length(n) == 6 && 0 <= n[3] <= Int(CANCELLED)) || return nothing
+    # Cut at each space by position and parsed into a tuple, which allocates
+    # nothing: two of these arrive for every item.
+    stop = ncodeunits(line)
+    lo = ncodeunits(RuntestsWorkers.RECORD_MARK) + 1
+    word = :other
+    n, k = (0, 0, 0, 0, 0, 0), -1   # k: the numbers read, after the word
+    while true
+        sp = something(findnext(' ', line, lo), stop + 1)
+        field = SubString(line, lo, prevind(line, sp))
+        if k < 0
+            word = field == "RUN" ? :run : field == "DONE" ? :done : :other
+        else
+            v = tryparse(Int, field)
+            (v === nothing || k == length(n)) && return nothing
+            n = Base.setindex(n, v, k + 1)
+        end
+        k += 1
+        sp > stop && break
+        lo = sp + 1
+    end
+    word === :run && k == 2 && return (; i = n[1], attempt = n[2], how = nothing)
+    (word === :done && k == 6 && 0 <= n[3] <= Int(CANCELLED)) || return nothing
     return (; i = n[1], attempt = n[2], how = (; state = ItemState(n[3]), elapsed_ns = n[4], compile_ns = n[5], maxrss = n[6]))
 end
 

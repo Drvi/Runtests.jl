@@ -89,7 +89,10 @@ function scan_file!(
         return
     end
     line = Int32(0)
-    for a in Meta.parseall(src; filename = path).args
+    # By index: iterating the untyped statements would box every step.
+    statements = Meta.parseall(src; filename = path).args
+    for k in eachindex(statements)
+        a = statements[k]
         if a isa LineNumberNode
             line = Int32(a.line)
         elseif a isa Expr && a.head in (:error, :incomplete)
@@ -105,7 +108,9 @@ end
 
 ### Header parsing #########################################################
 
-function handle_statement!(items, errors, names, ex, path, line, filter, known_setups)
+# One method whatever the statement is, so that the call is direct, not a dispatch
+# that boxes every argument once per item.
+function handle_statement!(items, errors, names, @nospecialize(ex), path, line, filter, known_setups)
     if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
         what = ex isa Expr && ex.head === :macrocall ? string(ex.args[1]) : summary(ex)
         push!(
@@ -138,24 +143,21 @@ function keyword_bit(key::Symbol)
 end
 
 function parse_testitem(ex::Expr, path, line, errors, known_setups)
-    err(msg) = (push!(errors, ScanError(path, line, msg)); nothing)
     # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
-    lo > hi && return err("`@testitem` needs a name and a body")
-    if ex.args[lo] isa LineNumberNode
-        line = Int32(ex.args[lo].line)
-        lo += 1
-    end
-    lo > hi && return err("`@testitem` needs a name and a body")
+    numbered = lo <= hi && ex.args[lo] isa LineNumberNode
+    at = numbered ? Int32((ex.args[lo]::LineNumberNode).line) : Int32(line)
+    numbered && (lo += 1)
+    lo > hi && return scan_error!(errors, path, at, "`@testitem` needs a name and a body")
     name = ex.args[lo]
-    name isa String || return err("`@testitem` needs a string literal name, got `$(_show(name))`")
-    isempty(strip(name)) && return err("`@testitem` name must not be blank")
-    hi - lo >= 1 || return err("`@testitem $(repr(name))` has no `begin ... end` body")
+    name isa String || return scan_error!(errors, path, at, "`@testitem` needs a string literal name, got `$(_show(name))`")
+    isempty(strip(name)) && return scan_error!(errors, path, at, "`@testitem` name must not be blank")
+    hi - lo >= 1 || return scan_error!(errors, path, at, "`@testitem $(repr(name))` has no `begin ... end` body")
     body = ex.args[hi]
     (body isa Expr && body.head === :block) ||
-        return err("`@testitem $(repr(name))` must end with a `begin ... end` body")
+        return scan_error!(errors, path, at, "`@testitem $(repr(name))` must end with a `begin ... end` body")
 
-    tags = Symbol[]; setups = Symbol[]
+    tags = nothing; setups = Symbol[]
     timeout = USE_RUN_DEFAULT; retries = USE_RUN_DEFAULT
     failfast = Int8(-1); chain = NO_CHAIN; profile = DEFAULT_PROFILE
     exclusive = false; skip = false
@@ -163,39 +165,38 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
     for k in (lo + 1):(hi - 1)
         kw = ex.args[k]
         if !(kw isa Expr && kw.head === :(=) && kw.args[1] isa Symbol)
-            return err("`@testitem $(repr(name))`: expected `key=value`, got `$(_show(kw))`")
+            return scan_error!(errors, path, at, "`@testitem $(repr(name))`: expected `key=value`, got `$(_show(kw))`")
         end
         key, val = kw.args[1], kw.args[2]
         bit = keyword_bit(key)
         if bit != 0
-            seen & bit == 0 || return err("`@testitem $(repr(name))`: `$key` given twice")
+            seen & bit == 0 || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `$key` given twice")
             seen |= bit
         end
         if key === :skip
             # The one keyword that may be an expression: it runs on the worker.
             skip = val isa QuoteNode ? val.value : val
         elseif key === :tags
-            v = literal(val)
-            (v isa Vector && all(x -> x isa Symbol, v)) ||
-                return err("`@testitem $(repr(name))`: `tags` must be a vector of symbols, got `$(_show(val))`")
-            tags = Symbol[x for x in v]
+            tags = symbol_list(val)
+            tags === nothing &&
+                return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `tags` must be a vector of symbols, got `$(_show(val))`")
         elseif key === :timeout
             v = literal(val)
             (v isa Real && 0 < v <= MAX_TIMEOUT_S) ||
-                return err("`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got `$(_show(val))`")
+                return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got `$(_show(val))`")
             timeout = Int32(ceil(v))
         elseif key === :retries
             v = literal(val)
             (v isa Integer && 0 <= v <= MAX_RETRIES) ||
-                return err("`@testitem $(repr(name))`: `retries` must be an integer from 0 to $MAX_RETRIES, got `$(_show(val))`")
+                return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `retries` must be an integer from 0 to $MAX_RETRIES, got `$(_show(val))`")
             retries = Int32(v)
         elseif key === :failfast
             v = literal(val)
-            v isa Bool || return err("`@testitem $(repr(name))`: `failfast` must be `true` or `false`, got `$(_show(val))`")
+            v isa Bool || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `failfast` must be `true` or `false`, got `$(_show(val))`")
             failfast = Int8(v)
         elseif key === :chain
             v = literal(val)
-            v isa Symbol || return err("`@testitem $(repr(name))`: `chain` must be a symbol, got `$(_show(val))`")
+            v isa Symbol || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `chain` must be a symbol, got `$(_show(val))`")
             chain = v
         elseif key === :sandbox
             v = literal(val)
@@ -204,24 +205,24 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
             elseif v isa Symbol
                 profile = v
             else
-                return err("`@testitem $(repr(name))`: `sandbox` must be `true` or a profile name, got `$(_show(val))`")
+                return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `sandbox` must be `true` or a profile name, got `$(_show(val))`")
             end
         else
-            return err(
+            return scan_error!(errors, path, at, 
                 "`@testitem $(repr(name))`: unknown keyword `$key`; " *
                     "known keywords are tags, timeout, retries, skip, failfast, chain, sandbox"
             )
         end
     end
     if exclusive && chain !== NO_CHAIN
-        return err(
+        return scan_error!(errors, path, at, 
             "`@testitem $(repr(name))`: `sandbox=true` means alone in a process and " *
                 "`chain=:$chain` means together with its chain, so they cannot be combined"
         )
     end
     collect_setups!(setups, body, known_setups)
     return RawItem(
-        name, path, line, tags, unique!(setups), body, skip,
+        name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
         timeout, retries, failfast, chain, profile, exclusive
     )
 end
@@ -252,6 +253,25 @@ function literal(@nospecialize(v))
 end
 
 _show(@nospecialize(x)) = x isa NotALiteral ? "?" : sprint(show, x; context = :limit => true)
+
+# `tags = [:a, :b]`, or the same as a tuple, as the symbols it names; `nothing` for
+# anything else. Read straight into its vector, where `literal` would build an
+# untyped one first: most items have tags.
+function symbol_list(@nospecialize(v))
+    (v isa Expr && (v.head === :vect || v.head === :tuple)) || return nothing
+    args = (v::Expr).args
+    out = Vector{Symbol}(undef, length(args))
+    for k in eachindex(args)
+        a = args[k]
+        (a isa QuoteNode && a.value isa Symbol) || return nothing
+        out[k] = a.value::Symbol
+    end
+    return out
+end
+
+# A problem with the item at `path:line`, recorded; `nothing`, for `parse_testitem`
+# to return.
+scan_error!(errors, path, line, msg) = (push!(errors, ScanError(path, line, msg)); nothing)
 
 function collect_setups!(out::Vector{Symbol}, @nospecialize(ex), known)
     ex isa Expr || return out
@@ -339,8 +359,10 @@ function scan_files(
     return items, errors, rejected
 end
 
-# Twice the threads to hide file IO; capped, because parsing is allocation-bound.
-default_scan_tasks() = clamp(2 * Threads.nthreads(), 1, 16)
+# Twice the threads, to keep each busy while another task reads its file. Capped,
+# since parsing is allocation-bound; at 18 threads, 16, 18 and 36 tasks took the
+# same time within noise.
+default_scan_tasks() = clamp(2 * Threads.nthreads(), 1, 36)
 
 # `runtests("file.jl:42")` means the item that line is inside: the last one that
 # starts at or before it.

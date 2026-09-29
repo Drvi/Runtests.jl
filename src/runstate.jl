@@ -13,6 +13,8 @@
 #   profiles    name, julia args, threads, env, init, test_end, preferences path and content
 #   units       n_units x 16 B: item span, profile, exclusive, chain
 #   items       n_items x 16 B: name, file, line, unit
+#   environment the test environment's Manifest.toml, zlib-compressed: its length,
+#               the compressed length, then the compressed bytes
 #   statuses    n_items x 32 B, fixed stride, overwritten in place
 #   memory      fixed block, rewritten whenever a peak is set
 #   events      32 B each, appended: every attempt, and every worker's start and end
@@ -20,12 +22,17 @@
 # After the run starts only the statuses, the memory block, the events and the
 # header's flags and end time are written, which keeps a crash from corrupting
 # anything else; a reader drops a torn last event.
+#
+# The manifest is most of a file's bytes, and only a replay reads it, so it is
+# stored compressed and inflated only when asked for (`recorded_manifest`): the
+# reads that plan every run pay nothing for it.
 
 using CRC32c: crc32c
+using Zlib_jll: libz
 
 const RS_MAGIC = 0x544e5552   # "RUNT" on disk
-const RS_VERSION = UInt32(6)
-# 40 bytes of counts and times, then eight section offsets; the rest is room to
+const RS_VERSION = UInt32(7)
+# 40 bytes of counts and times, then nine section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
 const RS_STATUS_BYTES = 32
@@ -65,6 +72,30 @@ function read_record(io::IO, ::Type{T}) where {T}
     return ref[]
 end
 
+# zlib's one-call compression, at its default level: level 9 makes a manifest under
+# 1% smaller and takes over half as long again.
+function zlib_compress(data::Vector{UInt8})
+    out = Vector{UInt8}(undef, ccall((:compressBound, libz), Culong, (Culong,), length(data)))
+    n = Ref{Culong}(length(out))
+    rc = ccall((:compress2, libz), Cint, (Ptr{UInt8}, Ref{Culong}, Ptr{UInt8}, Culong, Cint),
+               out, n, data, length(data), 6)
+    rc == 0 || error("zlib could not compress $(length(data)) bytes (error $rc)")
+    return resize!(out, n[])
+end
+
+# `len` is the length `data` inflates to, as recorded beside it. deflate expands at
+# most 1032-fold, so a length claiming more is garbled, and is refused before it
+# sizes an allocation.
+function zlib_uncompress(data::Vector{UInt8}, len::Integer)
+    len <= 1032 * length(data) || error("$(length(data)) compressed bytes cannot inflate to $len")
+    out = Vector{UInt8}(undef, len)
+    n = Ref{Culong}(len)
+    rc = ccall((:uncompress, libz), Cint, (Ptr{UInt8}, Ref{Culong}, Ptr{UInt8}, Culong),
+               out, n, data, length(data))
+    (rc == 0 && n[] == len) || error("zlib could not inflate $(length(data)) bytes to $len (error $rc)")
+    return out
+end
+
 # The header as it sits on disk: counts and times, then where each section starts.
 # The flags and the end time are rewritten in place when the run finishes, at the
 # offsets this layout gives them.
@@ -86,6 +117,7 @@ struct Header
     off_status::UInt32
     off_memory::UInt32
     off_events::UInt32
+    off_environment::UInt32
 end
 @assert sizeof(Header) <= RS_HEADER_BYTES
 
@@ -224,7 +256,6 @@ end
 function run_meta(p::Plan)
     cfg = p.cfg
     env = something(Base.active_project(), "")
-    manifest = isempty(env) ? nothing : Base.project_file_manifest_path(env)
     meta = Pair{String, String}[
         "julia" => string(VERSION), "julia_commit" => Base.GIT_VERSION_INFO.commit,
         "runtests" => string(pkgversion(@__MODULE__)), "runtests_revision" => project_revision(pkgdir(@__MODULE__)),
@@ -235,13 +266,18 @@ function run_meta(p::Plan)
         "project_id" => project_id(p.root), "revision" => project_revision(p.root),
         "selection" => p.selection,
         "environment" => env, "environment_project" => read_text(env),
-        "environment_manifest" => read_text(manifest),
     ]
     for key in RUN_KEYS
         push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     return meta
+end
+
+# The active environment's manifest, which the file keeps in a section of its own.
+function environment_manifest()
+    env = Base.active_project()
+    return env === nothing ? "" : read_text(Base.project_file_manifest_path(env))
 end
 
 """
@@ -313,23 +349,29 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     strbuf = IOBuffer()
     write_strings(strbuf, strings)
 
+    manifest = Vector{UInt8}(environment_manifest())
+    packed = isempty(manifest) ? UInt8[] : zlib_compress(manifest)
+    environment = IOBuffer()
+    write(environment, UInt32(length(manifest)), UInt32(length(packed)), packed)
+
     off_strings = UInt32(RS_HEADER_BYTES)
     off_meta = off_strings + UInt32(strbuf.size)
     off_profiles = off_meta + UInt32(meta.size)
     off_units = off_profiles + UInt32(profiles.size)
     off_items = off_units + UInt32(units.size)
-    off_status = off_items + UInt32(items.size)
+    off_environment = off_items + UInt32(items.size)
+    off_status = off_environment + UInt32(environment.size)
     off_memory = off_status + UInt32(RS_STATUS_BYTES * nitems(p))
     off_events = off_memory + UInt32(RS_MEMORY_BYTES)
 
     write_record(io, Ref(Header(
         RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), nitems(p), length(p.units),
         length(p.profiles), 0, start, 0.0, off_strings, off_meta, off_profiles, off_units,
-        off_items, off_status, off_memory, off_events
+        off_items, off_status, off_memory, off_events, off_environment
     )))
     write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
     write(io, take!(strbuf)); write(io, take!(meta)); write(io, take!(profiles))
-    write(io, take!(units)); write(io, take!(items))
+    write(io, take!(units)); write(io, take!(items)); write(io, take!(environment))
     blank = Ref{StatusRecord}()
     for _ in 1:nitems(p)
         write_status_record(
@@ -484,6 +526,8 @@ struct RunStateRecord
     meta::Dict{String, String}
     profiles::Dict{Symbol, Profile}
     preferences::Dict{Symbol, String}   # profile name => its preferences file's content, as recorded
+    manifest_bytes::Int                 # the recorded manifest's length, inflated
+    manifest_zlib::Vector{UInt8}        # the manifest as stored; see `recorded_manifest`
     units::Vector{RunStateUnit}
     items::Vector{RunStateItem}
     statuses::Vector{RunStateStatus}
@@ -515,7 +559,7 @@ function read_run_state(path::AbstractString)
         n_items = bounded(h.n_items, total)
 
         seek(io, Int(h.off_strings))
-        strings = read_strings(io, total)
+        strings = read_strings(io, bytes)
         seek(io, Int(h.off_meta))
         meta = Dict{String, String}()
         for _ in 1:bounded(read(io, UInt32), total)
@@ -527,9 +571,13 @@ function read_run_state(path::AbstractString)
         profiles, preferences = read_profiles_section(io, strings)
 
         seek(io, Int(h.off_units))
+        # A `Symbol` per chain name, not per unit: nearly every unit has the same one.
+        chains = Dict{UInt32, Symbol}()
         units = map(1:bounded(read(io, UInt32), total)) do _
             r = read_record(io, UnitRecord)
-            RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, Symbol(lookup(strings, r.chain)))
+            chain = get(chains, r.chain, nothing)
+            chain === nothing && (chain = chains[r.chain] = Symbol(lookup(strings, r.chain)))
+            RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, chain)
         end
 
         seek(io, Int(h.off_items))
@@ -538,7 +586,12 @@ function read_run_state(path::AbstractString)
             RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit))
         end
 
-        statuses = RunStateStatus[]
+        # Kept as stored: inflating it is for whoever asks for it.
+        seek(io, Int(h.off_environment))
+        manifest_bytes = Int(read(io, UInt32))
+        manifest_zlib = read(io, bounded(read(io, UInt32), total))
+
+        statuses = sizehint!(RunStateStatus[], n_items)
         truncated = false
         for i in 1:n_items
             at = Int(h.off_status) + (i - 1) * RS_STATUS_BYTES
@@ -562,8 +615,8 @@ function read_run_state(path::AbstractString)
                 setup_peak_mb = 0.0f0, test_peak_mb = 0.0f0, nprocs_peak = Int32(0))
         end
 
-        events = RunStateEvent[]
         at = Int(h.off_events)
+        events = sizehint!(RunStateEvent[], max(0, total - at) ÷ RS_EVENT_BYTES)
         while at + RS_EVENT_BYTES <= total
             seek(io, at)
             e = read_record(io, EventRecord)
@@ -577,8 +630,8 @@ function read_run_state(path::AbstractString)
         return RunStateRecord(
             String(path), h.version, h.flags & RS_FLAG_COMPLETE != 0,
             h.flags & RS_FLAG_DRY_RUN != 0, h.flags & RS_FLAG_CANCELLED != 0,
-            h.start_unix, h.end_unix, meta, profiles, preferences, units, items, statuses,
-            memory, events, truncated
+            h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
+            units, items, statuses, memory, events, truncated
         )
     catch e
         is_interrupt(e) && rethrow()
@@ -588,6 +641,23 @@ function read_run_state(path::AbstractString)
         # `JULIA_DEBUG=Runtests` shows what went wrong.
         @debug "Runtests: could not read run state $(path)" exception = (e, catch_backtrace())
         return nothing
+    end
+end
+
+"""
+    recorded_manifest(rs) -> String
+
+The test environment's `Manifest.toml` as the run recorded it: `""` when it
+recorded none, or when the stored copy does not inflate to what it should.
+"""
+function recorded_manifest(rs::RunStateRecord)
+    rs.manifest_bytes == 0 && return ""
+    try
+        return String(zlib_uncompress(rs.manifest_zlib, rs.manifest_bytes))
+    catch e
+        is_interrupt(e) && rethrow()
+        @debug "Runtests: the manifest recorded in $(rs.path) is unreadable" exception = e
+        return ""
     end
 end
 
@@ -608,13 +678,18 @@ pushes, or a comprehension sized up front, does not stop at the end of the file.
 """
 bounded(n::Integer, limit::Integer) = min(Int(n), Int(limit))
 
-function read_strings(io::IO, total::Integer)
+# The string table at `io`'s position, `io` reading `bytes`. Each string is copied
+# straight out of `bytes`, once; the check before it keeps the copy inside them.
+function read_strings(io::IOBuffer, bytes::Vector{UInt8})
+    total = length(bytes)
     n = bounded(read(io, UInt32), total)
-    out = String[]
+    out = sizehint!(String[], n)
     for _ in 1:n
         len = Int(read(io, UInt32))
-        (position(io) + len > total) && break
-        push!(out, String(read(io, len)))
+        at = position(io)
+        at + len > total && break
+        push!(out, GC.@preserve bytes unsafe_string(pointer(bytes, at + 1), len))
+        skip(io, len)
     end
     return out
 end
@@ -669,7 +744,12 @@ function normalize_block(ex::Expr)
     return out
 end
 
-expr_text(ex::Expr) = string(normalize_block(ex))
+# An empty block is stored as no text, which `parse_block` reads back without
+# parsing: most profiles have no `init` or `test_end`, and every read would parse both.
+function expr_text(ex::Expr)
+    out = normalize_block(ex)
+    return out isa Expr && out.head === :block && isempty(out.args) ? "" : string(out)
+end
 
 # What someone who was handed the file needs first: where and how it ran, what did
 # not pass, what each worker did before it ended, and how to run it again.
@@ -684,8 +764,9 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
     println(io, "  seed ", m("seed"), " · workers ", m("workers"), " · threads ", m("threads"), " · timeout ", m("timeout"),
         "s · retries ", m("retries"), isempty(m("selection")) ? "" : string(" · selected ", m("selection")))
-    isempty(m("environment_manifest")) || println(io, "  environment recorded: ",
-        count(l -> startswith(l, "[[deps."), eachline(IOBuffer(m("environment_manifest")))), " packages in its manifest")
+    manifest = recorded_manifest(rs)
+    isempty(manifest) || println(io, "  environment recorded: ",
+        count(l -> startswith(l, "[[deps."), eachline(IOBuffer(manifest))), " packages in its manifest")
     states = [s.state for s in rs.statuses]
     passed = count(==(PASSED), states)
     tally = [passed > 0 ? ["$passed passed"] : String[]; state_tally(states)]
@@ -764,17 +845,21 @@ runstate_root() = joinpath(first(DEPOT_PATH), "runtests", "runs")
 # tells `sweep_runstate_dirs` whether the project is still there.
 const PROJECT_MARK = "project"
 
-# Named for when the run started, so that names sort oldest first. A file already
-# there, a run state downloaded from CI say, is never written over: the new name
-# takes a suffix instead, one that sorts after it.
-function new_runstate_path(root::AbstractString)
+# Named for the microsecond the run started, in 16 digits (enough until the year
+# 2286), so that names sort oldest first: one process starts its runs one after
+# another, milliseconds apart at the least, so its names never tie. The pid tells
+# apart processes that start in the same microsecond, which leaves nothing to
+# order. The wall clock, not `time_ns`, which restarts with the machine. A file
+# already there, a run state downloaded from CI say, is never written over: the new
+# name takes a suffix instead.
+function new_runstate_path(root::AbstractString; start_us::Integer = wall_microseconds())
     dir = runstate_dir(root)
     if isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", ""))
         mkpath(dir)
         mark = joinpath(dir, PROJECT_MARK)
         isfile(mark) || write(mark, abspath(root))
     end
-    stem = string(round(Int, time()), "-", getpid())
+    stem = string(lpad(start_us, 16, '0'), "-", getpid())
     path = joinpath(dir, stem * ".runstate")
     n = 1
     while ispath(path)
@@ -783,6 +868,8 @@ function new_runstate_path(root::AbstractString)
     end
     return path
 end
+
+wall_microseconds() = (tv = Libc.TimeVal(); tv.sec * 1_000_000 + tv.usec)
 
 function runstate_files(root::AbstractString)
     dir = runstate_dir(root)
@@ -819,6 +906,8 @@ function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
 end
 
 # This project's run states that can be read, oldest first, each with its file.
+# Ordered by when each run started, as the file records it, not by its name: a run
+# state from elsewhere, renamed as it was downloaded say, counts from when it ran.
 function project_runs(root::AbstractString)
     project = project_id(root)
     runs = Pair{String, RunStateRecord}[]
@@ -827,8 +916,22 @@ function project_runs(root::AbstractString)
         (rs === nothing || !of_project(rs, project)) && continue
         push!(runs, f => rs)
     end
-    return runs
+    return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
 end
+
+# `project_runs`, with `base` among them, when there is one, wherever its file is:
+# the run state a replay names.
+function runs_with(root::AbstractString, base::Union{Nothing, RunStateRecord})
+    runs = project_runs(root)
+    (base === nothing || any(((f, _),) -> samefile(f, base.path), runs)) && return runs
+    push!(runs, base.path => base)
+    return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
+end
+
+# Of `runs`, the ones whose verdicts count: from the base run on, when there is one.
+# What ran before it says how long items take, not whether they pass.
+since_base(runs, base::Union{Nothing, RunStateRecord}) =
+    base === nothing ? runs : filter(((_, rs),) -> rs.start_unix >= base.start_unix, runs)
 
 # Item `i`'s verdict in a run: `true` when it did not pass, `false` when it passed or
 # was skipped, and `nothing` when the run got none — it stopped before the item ran,
@@ -871,7 +974,7 @@ function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates)
             end
         end
         for name in keys(verdicts[k])
-            push!(get!(holders, name, Int[]), k)
+            push!(get!(Vector{Int}, holders, name), k)
         end
     end
     index = Dict(f => k for (k, (f, _)) in enumerate(runs))
@@ -925,23 +1028,16 @@ end
     recent_runs(root, n) -> Vector{Pair{String, RunStateRecord}}
 
 The newest `n` runs, oldest first, each with its file: this project's, readable,
-and not dry runs, which ran nothing. Read from the newest back, so the files of
-other projects in a shared directory are passed over rather than counted.
+and not dry runs, which ran nothing. The files of other projects in a shared
+directory are passed over rather than counted.
 """
 function recent_runs(root::AbstractString, n::Int)
-    project = project_id(root)
-    runs = Pair{String, RunStateRecord}[]
-    for f in Iterators.reverse(runstate_files(root))
-        length(runs) >= n && break
-        rs = read_run_state(f)
-        (rs === nothing || rs.dry_run || !of_project(rs, project)) && continue
-        push!(runs, f => rs)
-    end
-    return reverse!(runs)
+    runs = filter!(((_, rs),) -> !rs.dry_run, project_runs(root))
+    return runs[max(1, end - n + 1):end]
 end
 
 """
-    failing_items(root; names = nothing) -> Vector{String}
+    failing_items(root; names = nothing, base = nothing) -> Vector{String}
 
 The items that are failing as the recorded runs leave them, sorted: for each item,
 the last run in which it ran to a verdict decides, so running a few of one run's
@@ -951,18 +1047,20 @@ itself died — is failing. A run that stopped before reaching an item, or while
 running it, says nothing about it, and the verdict before stands. An item that a
 newer run of the whole suite did not find was renamed or deleted, and is not
 failing whatever older runs say. With `names`, only those items, and the reading
-stops once each has its verdict.
+stops once each has its verdict. With `base`, the run state a replay names, the
+verdicts are its own and those of the runs that started after it.
 """
-function failing_items(root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing)
-    project = project_id(root)
+function failing_items(
+        root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing,
+        base::Union{Nothing, RunStateRecord} = nothing
+    )
     decided = Set{String}()
     failing = String[]
     alive = nothing   # the items every newer run of the whole suite found
     # Newest first, as far back as it takes: pruning keeps every run state an
     # item's failure rests on, however many runs ago.
-    for f in Iterators.reverse(runstate_files(root))
-        rs = read_run_state(f)
-        (rs === nothing || rs.dry_run || !of_project(rs, project)) && continue
+    for (_, rs) in Iterators.reverse(since_base(runs_with(root, base), base))
+        rs.dry_run && continue
         for (i, it) in enumerate(rs.items)
             (it.name in decided || (names !== nothing && !(it.name in names))) && continue
             v = verdict(rs, i)
@@ -981,16 +1079,19 @@ function failing_items(root::AbstractString; names::Union{Nothing, AbstractSet{S
 end
 
 """
-    history(root; nruns = HISTORY_RUNS) -> History
+    history(root; nruns = HISTORY_RUNS, base = nothing) -> History
 
 Per-item durations from every run state kept, each item's newest, so that runs of a
 few items leave the others' standing. Last-run failures, when the newest run
-started, and what a fresh worker cost, from the most recent `nruns`. Only items
-that actually ran contribute; a name that has never been seen simply has no
-estimate and is scheduled as if it were new.
+started, and what a fresh worker cost, from the most recent `nruns`. With `base`,
+the run state a replay names, those come from it and the runs after it only; the
+durations still come from every run. Only items that actually ran contribute; a
+name that has never been seen simply has no estimate and is scheduled as if it
+were new.
 """
-function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
-    runs = RunStateRecord[rs for (_, rs) in project_runs(root) if !rs.dry_run]
+function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{Nothing, RunStateRecord} = nothing)
+    everything = filter!(((_, rs),) -> !rs.dry_run, runs_with(root, base))
+    runs = last.(everything)
     isempty(runs) && return History()
     seconds = Dict{String, Float64}()
     # Oldest first, so a newer duration overwrites an older one.
@@ -1003,7 +1104,8 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
     end
     failed = Dict{String, Int}()
     since = 0.0
-    recent = runs[max(1, end - nruns + 1):end]
+    counted = last.(since_base(everything, base))
+    recent = counted[max(1, end - nruns + 1):end]
     for (k, rs) in enumerate(recent)
         ago = length(recent) - k
         since = rs.start_unix

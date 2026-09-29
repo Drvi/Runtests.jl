@@ -132,6 +132,23 @@ end
         @test length(err.errors) == 2
     end
 
+    @testset "an item, and a keyword it gets wrong, are at the line of its @testitem" begin
+        items, _ = scan_source("""
+        @testitem "first" begin
+            @test true
+        end
+
+        # A comment between them.
+        @testitem "second" tags=[:a] begin
+            @test true
+        end
+        @testitem "third" begin @test true end
+        """)
+        @test [it.line for it in items] == [1, 6, 9]
+        bad, _ = scan_source("\n\n@testitem \"x\" retries=-1 begin\n    @test true\nend\n")
+        @test bad isa ScanFailure && only(bad.errors).line == 3
+    end
+
     @testset "syntax errors are located" begin
         a, path = scan_source("""@testitem "a" begin\n   x = (1 +\nend\n""")
         @test a isa ScanFailure

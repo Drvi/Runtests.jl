@@ -117,7 +117,7 @@ end
 # A table of the configuration, holding only the keys it may hold. `label` is how
 # a message names it.
 function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple, label = key)
-    t = get(parent, key, Dict{String, Any}())
+    t = get(Dict{String, Any}, parent, key)
     t isa AbstractDict || throw(ConfigError("[$label] of $(relpath_or_path(path)) must be a table"))
     check_keys(path, t, allowed, label)
     return t
@@ -199,8 +199,8 @@ function build_config(path, toml; nunits = 0, kwargs...)
         testset_name = String(testset_name), coverage, coverage_source,
         monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
-        order_first = String[string(x) for x in get(order, "first", String[])],
-        order_last = String[string(x) for x in get(order, "last", String[])],
+        order_first = String[string(x) for x in get(Vector{String}, order, "first")],
+        order_last = String[string(x) for x in get(Vector{String}, order, "last")],
         seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed)
     )
 end
@@ -223,15 +223,15 @@ default_logs(workers::Integer, interactive::Bool = isinteractive()) =
 
 function read_profiles(path, toml, default_threads::String)
     profiles = Dict{Symbol, Profile}()
-    tbl = get(toml, "profiles", Dict{String, Any}())
+    tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
     # Numbered in a `ProfileIdx`, `default` among them.
     length(tbl) < typemax(ProfileIdx) ||
         throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $(typemax(ProfileIdx) - 1) fit"))
     for name in keys(tbl)
         p = section(path, tbl, name, PROFILE_KEYS, "profiles.$name")
-        args = String[string(a) for a in get(p, "julia_args", String[])]
-        env = Pair{String, String}[string(k) => string(v) for (k, v) in get(p, "env", Dict{String, Any}())]
+        args = String[string(a) for a in get(Vector{String}, p, "julia_args")]
+        env = Pair{String, String}[string(k) => string(v) for (k, v) in get(Dict{String, Any}, p, "env")]
         sort!(env; by = first)
         profiles[Symbol(name)] = Profile(
             Symbol(name), args,

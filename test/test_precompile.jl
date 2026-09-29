@@ -188,4 +188,28 @@ end
         end
         @test !occursin("precompiling the test environment", out)
     end
+
+    @testset "a run whose test environment is ready leaves the depot's manifest usage log alone" begin
+        # Every `Pkg` context rewrites the whole log and records its environment in
+        # it: a run that made one would add its temporary test environment each
+        # time, and pay for rewriting a log that only grows.
+        dir = make_pkg("UsageLog", "test/t_test.jl" => """
+        @testitem "plain" begin
+            @test true
+        end
+        """)
+        capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))   # the environment, built and cached
+        # `Pkg` writes its logs to the first depot; this one starts empty.
+        depot = mktempdir()
+        pushfirst!(DEPOT_PATH, depot)
+        try
+            capture_run() do
+                states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
+                @test all(==(PASSED), values(states))
+            end
+        finally
+            first(DEPOT_PATH) == depot && popfirst!(DEPOT_PATH)
+        end
+        @test !ispath(joinpath(depot, "logs", "manifest_usage.toml"))
+    end
 end

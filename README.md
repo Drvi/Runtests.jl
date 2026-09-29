@@ -493,11 +493,14 @@ directory per project under `runtests/runs/` named for the project, or in the di
 `RUNTESTS_RUNSTATE_DIR` names. The 20 most recent that this machine recorded are kept,
 and so is any older one that a failing item's last verdict is in, however many runs
 back: running one item again and again does not make `runtestsf` forget the others.
-Once a project no longer exists, the run states this machine recorded for it are
+An item that a run of the whole suite no longer finds was renamed or deleted: it is
+not failing from then on, and keeps no run state. Once a project no longer exists, the run states this machine recorded for it are
 deleted too. The
 machine is the hostname, or the name `RUNTESTS_HOST` gives it.
 One recorded elsewhere, such as a run state downloaded from CI, is never changed
-or deleted, wherever it is, and a replay deletes nothing.
+or deleted, wherever it is, and a replay deletes nothing. Run states count in the
+order they started, as each records it, so a downloaded one counts from when it
+ran, whatever it is named.
 
 On CI, cache them from one run to the next, so each run is ordered by the ones
 before it, and keep a failed run's as an artifact:
@@ -534,9 +537,13 @@ like a local directory's, where otherwise they would pile up.
 Then, locally, `Runtests.read_run_state("run.runstate")` shows what happened, and
 `Runtests.runtests(replay="run.runstate")` runs the same items with the same settings,
 profiles and seed, naming every package whose version differs from the one CI had.
+`Runtests.runtestsf(replay="run.runstate")` runs what is failing counted from that run:
+its verdicts and those of the runs after it, the runs before it giving only how long
+items take. A run pointed at a run state never deletes it.
 
-Later runs read the recent run states to plan (see [The plan](#the-plan)), and
-`runtestsf` runs every item whose last verdict in them was not a pass. A replay happens only when
+Later runs read the run states to plan (see [The plan](#the-plan)), taking each item's
+duration from the newest run that ran it, and `runtestsf` runs every item the suite
+has whose last verdict in them was not a pass. A replay happens only when
 asked: a run state lying next to the project is not a request to run differently,
 and an explicit keyword always wins.
 

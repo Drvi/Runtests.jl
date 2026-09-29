@@ -578,7 +578,7 @@ function manifest_versions(text::AbstractString)
     catch
         return out
     end
-    for (name, entries) in get(toml, "deps", Dict{String, Any}())
+    for (name, entries) in get(Dict{String, Any}, toml, "deps")
         entries isa AbstractVector || continue
         for entry in entries
             entry isa AbstractDict || continue
@@ -818,19 +818,19 @@ function profile_flags(prof::Profile)
     end
 end
 
-# One `Pkg.precompile` in `project`. Work brought forward, not work that has to
-# succeed: a worker that finds nothing cached still compiles what it needs, one
-# process at a time. `Pkg` draws its own progress by moving the cursor, so ours
-# comes down while it does.
+# One precompilation of `project`'s dependencies. Work brought forward, not work that
+# has to succeed: a worker that finds nothing cached still compiles what it needs, one
+# process at a time. The precompiler draws its own progress by moving the cursor, so
+# ours comes down while it does. Base's, as `Pkg.precompile` calls it, without the
+# `Pkg` context that call builds: making one rewrites the depot's whole manifest
+# usage log, most of the step's cost when there is nothing to compile, and records
+# the temporary test environment in it.
 function precompile_configs(run::Run, configs, project, what::AbstractString)
     original = Base.active_project()
     try
         with_status_line_off(run.monitor) do
             Base.set_active_project(project)
-            Pkg.precompile(
-                Pkg.Types.Context(), Pkg.Types.PackageSpec[];
-                configs, warn_loaded = false, already_instantiated = true, io = stdout
-            )
+            Base.Precompilation.precompilepkgs(String[]; configs, warn_loaded = false, io = stdout)
         end
     catch e
         is_interrupt(e) && rethrow()
@@ -917,6 +917,14 @@ function run_on_workers(run::Run, target)
     end
     @lock run.lock append!(run.tasks, tasks)
     try
+        # The garbage the calling session left behind, freed once the workers are
+        # starting. Each slot runs until it first waits, which is once its worker's
+        # process has been launched; this task runs again after all of them, while
+        # those processes boot, which takes longer than the collection. Otherwise
+        # that garbage stays resident for the whole run beside the workers, and
+        # nothing collects it: a run allocates too little here to trigger it.
+        yield()
+        GC.gc(true)
         foreach(wait, tasks)
     catch e
         # Ctrl-C lands in whichever task was running, this one included. Stop

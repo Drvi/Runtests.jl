@@ -162,7 +162,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
     rs === nothing || (cfg = replayed_config(cfg, rs))
     p = plan(
-        items, cfg; history = history(target.root), root = target.root,
+        items, cfg; history = history(target.root; base = rs), root = target.root,
         strict_order = is_full_run(filter, target),
         selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
@@ -173,7 +173,7 @@ end
 
 # `replay`: a run state (one downloaded from CI, say) to run again. Only when asked:
 # a run state lying next to the project is not a request to run differently.
-function read_replay(path::String, target)
+function read_replay(path::String, target; announce::Bool = true)
     rs = read_run_state(path)
     rs === nothing && throw(ConfigError(
         "could not read a run state from $path: it is missing, damaged, or written by another version of Runtests"
@@ -181,7 +181,7 @@ function read_replay(path::String, target)
     id, here = get(rs.meta, "project_id", ""), project_id(target.root)
     id == here || throw(ConfigError("$path records a run of project $(repr(id)), not of this one ($(repr(here)))"))
     m(k) = get(rs.meta, k, "")
-    println(
+    announce && println(
         stdout, label_prefix(), "replaying ", basename(path), ": ", plural(length(rs.items), "test item"),
         " · seed ", m("seed"), " · recorded with julia ", m("julia"), " on ", m("machine"),
         isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
@@ -215,7 +215,7 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord)
         profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path)
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; profiles, replayed_manifest = get(rs.meta, "environment_manifest", ""),
+    return RunConfig(; merge(fields, (; profiles, replayed_manifest = recorded_manifest(rs),
                                         replayed_from = rs.path))...)
 end
 
@@ -226,11 +226,14 @@ Run the items that are failing: those whose last verdict, in the last run that r
 them to one, was not a pass. Each item keeps its own, so running some of one run's
 failures again does not forget the others, and a run stopped before it reached an
 item leaves that item's verdict as it was. Only items the suite still has run: one
-renamed or deleted since it failed has nothing to run. See [`failing_items`](@ref).
+renamed or deleted since it failed has nothing to run. With `replay`, the verdicts
+are that run's and those of the runs that started after it. See
+[`failing_items`](@ref).
 """
-function runtestsf(args...; kwargs...)
+function runtestsf(args...; replay = nothing, kwargs...)
     target = resolve_target(args)
-    names = Set(failing_items(target.root; names = suite_item_names(target)))
+    base = replay === nothing ? nothing : read_replay(String(replay), target; announce = false)
+    names = Set(failing_items(target.root; names = suite_item_names(target), base))
     isempty(names) && throw(
         NoTestsError(
             "no test item is failing in the recorded runs" *
@@ -240,7 +243,7 @@ function runtestsf(args...; kwargs...)
     println(
         stdout, label_prefix(), "running ", plural(length(names), "failing item")
     )
-    return runtests(args...; name = names, kwargs...)
+    return runtests(args...; name = names, replay, kwargs...)
 end
 
 # Every item's name in the suite, read as a run reads it: a suite that does not

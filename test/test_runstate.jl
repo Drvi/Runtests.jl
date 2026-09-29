@@ -94,6 +94,30 @@ end
         @test rs.statuses[2].attempt == 2
         @test rs.statuses[3].state === UNSEEN
         @test haskey(rs.profiles, :default)
+        # A profile without `init` or `test_end` reads back without them.
+        @test rs.profiles[:default].init == Expr(:block) && rs.profiles[:default].test_end == Expr(:block)
+    end
+
+    @testset "the manifest is stored compressed, and a damaged copy costs only the manifest" begin
+        p = a_plan()
+        path = joinpath(mktempdir(), "run.runstate")
+        rsf = init_run_state(path, p)
+        write_status!(rsf, 1, PASSED, 1, 1; elapsed=1.0)
+        finish_run_state!(rsf)
+        manifest = Runtests.Private.environment_manifest()
+        @test !isempty(manifest)
+        rs = read_run_state(path)
+        @test Runtests.Private.recorded_manifest(rs) == manifest
+        @test rs.manifest_bytes == sizeof(manifest)
+        @test length(rs.manifest_zlib) < sizeof(manifest)
+        # One byte of the stored copy changed: the rest of the file reads as before.
+        bytes = read(path)
+        at = Runtests.Private.read_record(IOBuffer(bytes), Runtests.Private.Header).off_environment + 8 + 10
+        bytes[at + 1] = ~bytes[at + 1]
+        write(path, bytes)
+        rs = read_run_state(path)
+        @test rs.statuses[1].state === PASSED
+        @test Runtests.Private.recorded_manifest(rs) == ""
     end
 
     @testset "profiles survive the round trip, expressions and all" begin
@@ -315,6 +339,40 @@ end
         end
     end
 
+    @testset "a failing suite's own pruning keeps the run state a failing item's last verdict is in" begin
+        pkg = make_pkg("KeepsFailure", "test/t_test.jl" => """
+        @testitem "passes" begin
+            @test true
+        end
+        @testitem "fails" begin
+            @test false
+        end
+        @testitem "keeps failing" begin
+            @test false
+        end
+        """)
+        keep = Runtests.Private.KEEP_RUNS
+        failing = Runtests.Private.failing_items
+        with_runstate_dir() do _
+            # The whole suite once: the only run of `fails` there will be.
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+            first_run = only(runstate_files(pkg))
+            # Then more failing runs of another item than pruning keeps, each pruning
+            # as it ends, as every run does.
+            for _ in 1:(keep + 3)
+                capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, name = "keeps failing"))
+            end
+            left = runstate_files(pkg)
+            @test first_run in left
+            # The newest runs, and that one: each newer failure of `keeps failing`
+            # stands in for the one before, so those do not pile up.
+            @test length(left) == keep + 1
+            @test failing(pkg) == ["fails", "keeps failing"]
+            _, out = capture_run(() -> Runtests.runtestsf(pkg; dry_run = true))
+            @test occursin("running 2 failing items", out)
+        end
+    end
+
     @testset "an item the suite no longer has is not failing, and holds no run state back" begin
         items(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
         pkg = make_pkg("Renamed", "test/t_test.jl" => items("x", "y"))
@@ -420,6 +478,34 @@ end
         end
     end
 
+    @testset "a run state from elsewhere counts from when it ran, whatever its name" begin
+        suite(a) = "@testitem \"a\" begin\n    @test $a\nend\n@testitem \"b\" begin\n    @test false\nend\n"
+        pkg = make_pkg("Downloaded", "test/t_test.jl" => suite(false))
+        failing = Runtests.Private.failing_items
+        run_a() = capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, name = "a"))
+        with_runstate_dir() do dir
+            # A run on CI, in which `a` and `b` fail, downloaded under a name of its
+            # own: one that sorts after every name a run here gets.
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+            recorded = only(runstate_files(pkg))
+            here = gethostname()
+            elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
+            ci = joinpath(dir, "run.runstate")
+            write(ci, replace(read(recorded, String), here => elsewhere))
+            rm(recorded)
+            before = read(ci)
+            # `a` fixed and run alone here, after the CI run: only `b` is failing.
+            write(joinpath(pkg, "test", "t_test.jl"), suite(true))
+            run_a()
+            @test failing(pkg) == ["b"]
+            # And so it stays through more runs here than are kept, each pruning,
+            # none of them touching the CI run's file.
+            foreach(_ -> run_a(), 1:(Runtests.Private.KEEP_RUNS + 2))
+            @test read(ci) == before
+            @test failing(pkg) == ["b"]
+        end
+    end
+
     @testset "RUNTESTS_HOST names the machine, so a CI cache is pruned like a local directory" begin
         dir = mktempdir()
         p = a_plan()
@@ -456,19 +542,71 @@ end
         end
     end
 
+    @testset "the run state a replay names is the base for what is failing, and is never deleted" begin
+        suite(failing...) = join(("@testitem \"$n\" begin\n    @test $(!(n in failing))\nend\n" for n in ("a", "b", "c", "d")))
+        pkg = make_pkg("ReplayBase", "test/t_test.jl" => suite("a", "d"))
+        file = joinpath(pkg, "test", "t_test.jl")
+        failing = Runtests.Private.failing_items
+        run_once(; kwargs...) = capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, kwargs...))
+        with_runstate_dir() do dir
+            # An older run of the whole suite, in which `a` and `d` fail.
+            run_once()
+            # The base: `a` fixed, `b` and `c` failing, `d` not run. Renamed, and this
+            # machine's: pruning takes it for one of its own.
+            write(file, suite("b", "c"))
+            run_once(; name = Set(["a", "b", "c"]))
+            base = joinpath(dir, "base.runstate")
+            mv(last(runstate_files(pkg)), base)
+            # A newer run: `c` fixed.
+            write(file, suite("b"))
+            run_once(; name = "c")
+            rs = read_run_state(base)
+            # Without the base, the older run's failure of `d` still counts.
+            @test failing(pkg) == ["b", "d"]
+            @test failing(pkg; base = rs) == ["b"]
+            h = history(pkg; base = rs)
+            @test !haskey(h.failed, "d") && !haskey(h.failed, "a")
+            @test haskey(h.seconds, "d")     # how long it took, from the older run
+            _, out = capture_run(() -> Runtests.runtestsf(pkg; replay = base, dry_run = true))
+            @test occursin("running 1 failing item", out)
+            # More replays of what it ran than pruning keeps, `b` failing in each. They
+            # hold every verdict it did, so pruning as a run without it does would
+            # take it; pointed at, it is never deleted.
+            before = read(base)
+            foreach(_ -> run_once(; replay = base, name = Set(["a", "b", "c"])), 1:(Runtests.Private.KEEP_RUNS + 2))
+            @test isfile(base) && read(base) == before
+            @test base in Runtests.Private.removable_runs(Runtests.Private.project_runs(pkg), [base])
+            @test failing(pkg; base = rs) == ["b"]
+        end
+    end
+
     @testset "a new run state never takes an existing file's name" begin
         dir = mktempdir()
         withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
-            # Whichever second the name is made in, a file already has it.
-            now_ = round(Int, time())
-            taken = [joinpath(dir, string(now_ + k, "-", getpid(), ".runstate")) for k in 0:3]
-            foreach(f -> write(f, "someone else's"), taken)
-            path = new_runstate_path(dir)
-            @test !ispath(path) && endswith(path, ".runstate")
-            # ...and it sorts after the file whose name it would have had.
-            had = joinpath(dir, first(split(basename(path), '_')) * ".runstate")
-            @test had in taken && sort([path, had]) == [had, path]
-            @test all(f -> read(f, String) == "someone else's", taken)
+            # A file already has the name a run starting in this microsecond gets.
+            start_us = Runtests.Private.wall_microseconds()
+            taken = new_runstate_path(dir; start_us)
+            write(taken, "someone else's")
+            path = new_runstate_path(dir; start_us)
+            @test path != taken && !ispath(path) && endswith(path, ".runstate")
+            @test read(taken, String) == "someone else's"
+        end
+    end
+
+    @testset "run states started within one second sort in the order they started" begin
+        pkg = make_pkg("QuickRuns", "test/t_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
+        failing = Runtests.Private.failing_items
+        with_runstate_dir() do _
+            p, _ = prepare((pkg,); announce = false)
+            # Far more than ten within a second, `x` failing in all but the last.
+            for k in 1:30
+                rsf = init_run_state(new_runstate_path(pkg), p)
+                write_status!(rsf, 1, k < 30 ? FAILED : PASSED, 1, 1; elapsed = 0.1)
+                finish_run_state!(rsf)
+            end
+            starts = [read_run_state(f).start_unix for f in runstate_files(pkg)]
+            @test length(starts) == 30 && issorted(starts)
+            @test failing(pkg) == String[]
         end
     end
     @testset "the commit is read straight out of .git" begin
@@ -573,7 +711,7 @@ end
             rs = read_run_state(only(readdir(dir; join=true)))
             @test rs.meta["seed"] == "0x0000000000001234"
             @test (rs.meta["workers"], rs.meta["machine"], rs.meta["julia"]) == ("1", Sys.MACHINE, string(VERSION))
-            @test occursin("[[deps.", rs.meta["environment_manifest"])
+            @test occursin("[[deps.", Runtests.Private.recorded_manifest(rs))
             @test occursin("Recorded", rs.meta["environment_project"])
             up, down = only(e for e in rs.events if e.kind === :worker_up), only(e for e in rs.events if e.kind === :worker_down)
             @test down.ended_by === :close && down.pid == up.pid

@@ -114,7 +114,7 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
                 "the test environment nor the standard library provides"
         )
         toml = tomls[name]
-        have = get(toml, "deps", Dict{String, Any}())
+        have = get(Dict{String, Any}, toml, "deps")
         for (n, u) in deps
             haskey(have, n) && Base.UUID(have[n]) != u &&
                 push!(problems, "$(shown(project)): lists `$n` as $(have[n]); it is $u")
@@ -205,15 +205,15 @@ function test_env_packages(target)
     haskey(root, "uuid") && (out[root["name"]] = Base.UUID(root["uuid"]))
     testproj = joinpath(target.testdir, "Project.toml")
     if isfile(testproj)
-        for (n, u) in get(TOML.parsefile(testproj), "deps", Dict{String, Any}())
+        for (n, u) in get(Dict{String, Any}, TOML.parsefile(testproj), "deps")
             out[n] = Base.UUID(u)
         end
     else
-        for (n, u) in get(root, "deps", Dict{String, Any}())
+        for (n, u) in get(Dict{String, Any}, root, "deps")
             out[n] = Base.UUID(u)
         end
-        test = get(get(root, "targets", Dict{String, Any}()), "test", String[])
-        for section in ("extras", "weakdeps"), (n, u) in get(root, section, Dict{String, Any}())
+        test = get(Vector{String}, get(Dict{String, Any}, root, "targets"), "test")
+        for section in ("extras", "weakdeps"), (n, u) in get(Dict{String, Any}, root, section)
             n in test && (out[n] = Base.UUID(u))
         end
     end

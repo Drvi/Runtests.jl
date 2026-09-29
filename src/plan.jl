@@ -188,7 +188,7 @@ function validate_profiles(raw, cfg)
     bad = Dict{Symbol, Vector{RawItem}}()
     for it in raw
         it.profile === DEFAULT_PROFILE && continue
-        haskey(cfg.profiles, it.profile) || push!(get!(bad, it.profile, RawItem[]), it)
+        haskey(cfg.profiles, it.profile) || push!(get!(Vector{RawItem}, bad, it.profile), it)
     end
     isempty(bad) && return
     known = sort!(string.(collect(keys(cfg.profiles))))
@@ -227,7 +227,7 @@ function check_order_conflicts(raw, cfg)
     end
     chains = Dict{Symbol, Vector{String}}()
     for it in raw
-        it.chain === NO_CHAIN || push!(get!(chains, it.chain, String[]), it.name)
+        it.chain === NO_CHAIN || push!(get!(Vector{String}, chains, it.chain), it.name)
     end
     for (chain, members) in sort!(collect(chains); by = first)
         f = [m for m in members if m in first_]
@@ -295,7 +295,7 @@ function build_units(raw::Vector{RawItem}, profile_idx, history::History)
         if it.chain === NO_CHAIN
             push!(units, draft([it], it.exclusive, NO_CHAIN))
         else
-            push!(get!(chains, it.chain, RawItem[]), it)
+            push!(get!(Vector{RawItem}, chains, it.chain), it)
         end
     end
     errors = ScanError[]
@@ -434,8 +434,8 @@ function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{
     m = length(body)
     guess = typical_estimate(est[body])
     cum = cumsum([e > 0 ? e : guess for e in est[body]])
-    at = [j for j in 1:(m - 1) if file[body[j]] != file[body[j + 1]]]
-    isempty(at) && (at = collect(1:(m - 1)))
+    between_files = [j for j in 1:(m - 1) if file[body[j]] != file[body[j + 1]]]
+    at = isempty(between_files) ? collect(1:(m - 1)) : between_files
     cuts = [isempty(at) ? m : at[argmin(abs.(cum[at] .- k * cum[end] / n))] for k in 1:(n - 1)]
     edges = [0; cuts; m]
     return [body[(edges[k] + 1):edges[k + 1]] for k in 1:n]

@@ -261,7 +261,7 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
         emit_error(s.stream, "`names` is a list of test item names, got $(json(names))"; id)
         return nothing
     end
-    options = get(cmd, "options", Dict{String, Any}())
+    options = get(Dict{String, Any}, cmd, "options")
     if !(options isa Dict{String, Any})
         emit_error(s.stream, "`options` is an object, got $(json(options))"; id)
         return nothing

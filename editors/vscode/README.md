@@ -17,10 +17,9 @@ CI, did not pass it. Each item keeps its own verdict, so running one of several
 failures leaves the others failing. VS Code's own *Rerun Failed Tests* knows only the
 runs of this window.
 
-It starts a Runtests server per workspace folder with a test suite (`Runtests.serve`,
-[the editor protocol](../../docs/editor-protocol.md)) and speaks to it over its
-standard streams. Everything the server writes for people is also in the **Runtests**
-output channel, runs or not.
+It starts a Runtests server per workspace folder with a test suite (`Runtests.serve`)
+and speaks to it over its standard streams, one JSON object per line. Everything the
+server writes for people is also in the **Runtests** output channel, runs or not.
 
 ## Trying it
 
@@ -46,6 +45,7 @@ The package's test environment must have Runtests: the server runs in
 | `runtests.julia.args` | arguments given to `julia` first, such as `["+1.12"]` for a juliaup channel |
 | `runtests.environment` | the environment the server runs in, relative to the folder |
 | `runtests.run.options` | settings sent with every run, such as `{"workers": 2}` |
+| `runtests.config` | a config file read in place of `test/TestItems.toml`, relative to the folder, for listing and every run; **Runtests: Restart Server** after changing it |
 
 Everything else a run takes comes from `test/TestItems.toml`, as it does for
 `Runtests.runtests()`.
@@ -53,12 +53,11 @@ Everything else a run takes comes from `test/TestItems.toml`, as it does for
 Commands: **Runtests: Run Failed Tests**, **Runtests: Restart Server** (after changing the
 settings above, or Runtests itself) and **Runtests: Show Log**.
 
-## What it does not do yet
+## What it does not do
 
-No debugging and no coverage view. The
-Julia extension finds `@testitem`s too and shows them in a tree of its own, run by
-its own runner; items with Runtests' keywords (`timeout`, `retries`, `chain`, `sandbox`,
-`failfast`) are errors there. `issues/editor-protocol.md` has the details.
+No debugging and no coverage view. The Julia extension finds `@testitem`s too and
+shows them in a tree of its own, run by its own runner; items with Runtests' keywords
+(`timeout`, `retries`, `chain`, `sandbox`, `failfast`) are errors there.
 
 ## Tests
 

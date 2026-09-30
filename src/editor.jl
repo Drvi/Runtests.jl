@@ -92,29 +92,30 @@ end
 ### Listing #################################################################
 
 """
-    list_items(root) -> NamedTuple
+    list_items(root; config = nothing) -> NamedTuple
 
 Every test item of the package at `root`, as the scanner reads it; every problem
 that would stop a run: a file that does not parse, a name used twice, a setting
-`test/TestItems.toml` does not accept; and the items that are failing — whose last
-verdict was not a pass — which [`runtestsf`](@ref) would run. Items come from the files that parse even
-when others do not, so an editor shows what it can beside what is broken.
-An item's `end_line` is the line before the next item in its file, or the file's
-last: the lines where `runtests("file.jl:line")` picks that item.
+`test/TestItems.toml` does not accept, or `config` when it names another file to
+read in its place; and the items that are failing — whose last verdict was not a
+pass — which [`runtestsf`](@ref) would run. Items come from the files that parse
+even when others do not, so an editor shows what it can beside what is broken. An
+item's `end_line` is the line before the next item in its file, or the file's last:
+the lines where `runtests("file.jl:line")` picks that item.
 """
-function list_items(root::AbstractString)
+function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     target = resolve_target((root,))
     files, strays = walk_test_dir(target.testdir)
     setups = setup_modules(target.testdir)
     items, errors, _ = scan_files(files, Filter(), setups; strays)
-    config = joinpath(target.testdir, "TestItems.toml")
+    config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
     if !isempty(items)
         # What a run would refuse to start on beyond the files: the settings, the
         # profiles items name, the items `[order]` names.
         try
-            plan(items, read_config(target.testdir; nunits = length(items)); root = target.root)
+            plan(items, read_config(target.testdir; config, nunits = length(items)); root = target.root)
         catch e
-            e isa ConfigError ? push!(errors, ScanError(config, 0, e.msg)) :
+            e isa ConfigError ? push!(errors, ScanError(config_file, 0, e.msg)) :
                 e isa ScanFailure ? append!(errors, e.errors) : rethrow()
         end
     end
@@ -147,6 +148,7 @@ const RUN_OPTIONS = (
 
 mutable struct Session
     const root::String
+    const config::Union{Nothing, String}   # the file read in place of test/TestItems.toml
     const stream::EventStream
     task::Union{Nothing, Task}   # the run in flight, or the last one
     cancelled::Bool              # a cancel that arrived before the run's task started
@@ -154,20 +156,24 @@ mutable struct Session
 end
 
 """
-    serve(path = "."; input = stdin, output = stdout)
+    serve(path = "."; config = nothing, input = stdin, output = stdout)
 
 Drive the test suite of the package at `path` from an editor: read commands from
 `input` and write events to `output`, one JSON object per line, until `input` ends
 or a `shutdown` command arrives; a run still going is cancelled first. The commands
 are `list`, `run`, `cancel` and `shutdown`; `docs/editor-protocol.md` has them and
-the events they answer with.
+the events they answer with. `config` names a file every listing and run of the
+session reads in place of `test/TestItems.toml`, relative to the current directory.
 
 Serving over this process's own `stdout` takes it over for the rest of the process:
 everything else written there, by the run, by `Pkg` or by C libraries, goes to
 `stderr` from then on, so that the stream holds events and nothing else.
 """
-function serve(path::AbstractString = "."; input::IO = stdin, output::IO = stdout)
+function serve(path::AbstractString = "."; config::Union{Nothing, AbstractString} = nothing,
+               input::IO = stdin, output::IO = stdout)
     target = resolve_target((path,))
+    # Where the session started: a run that changes directory does not move it.
+    config = config === nothing ? nothing : abspath(config)
     if output === stdout
         # The events keep a descriptor of their own on what stdout was; stdout itself
         # is pointed at stderr, C level included.
@@ -175,9 +181,9 @@ function serve(path::AbstractString = "."; input::IO = stdin, output::IO = stdou
         output = fdio(reinterpret(Cint, fd), true)
         redirect_stdout(stderr)
     end
-    s = Session(target.root, EventStream(output), nothing, false, "")
+    s = Session(target.root, config, EventStream(output), nothing, false, "")
     emit(s.stream, "hello"; protocol = PROTOCOL_VERSION, runtests = string(pkgversion(@__MODULE__)),
-         julia = string(VERSION), pid = getpid(), root = target.root)
+         julia = string(VERSION), pid = getpid(), root = target.root, config)
     try
         while !eof(input)
             line = readline(input)
@@ -221,7 +227,7 @@ function command!(s::Session, line::AbstractString)
     name = get(cmd, "command", nothing)
     try
         if name == "list"
-            emit(s.stream, "items"; id, list_items(s.root)...)
+            emit(s.stream, "items"; id, list_items(s.root; s.config)...)
         elseif name == "run"
             start_run!(s, id, cmd)
         elseif name == "cancel"
@@ -281,7 +287,8 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
     # The last run's logs were an editor's to read until now.
     isempty(s.logdir) || rm(s.logdir; force = true, recursive = true)
     s.logdir = ""
-    p, target = prepare((s.root,); name = names === nothing ? nothing : Set{String}(names), announce = false, kwargs...)
+    p, target = prepare((s.root,); name = names === nothing ? nothing : Set{String}(names), announce = false,
+                        s.config, kwargs...)
     unknown = names === nothing ? String[] : sort!(setdiff(Set{String}(names), Set(p.suite_names)) |> collect)
     emit(s.stream, "run_started"; id, items = p.items.name, workers = single_process(p) ? 0 : nslots(p),
          seed = seed_text(p.cfg.seed), unknown)

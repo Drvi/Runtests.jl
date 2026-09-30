@@ -463,8 +463,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test textwidth(shown["zebra crossings are long and winding roads"]) == 1 + 20
         # What makes it the only one does not fit: the column is overrun, not the name cut.
         @test shown["a long name about parsing dates carefully"] == "r\"^a long name about parsing d\""
-        # A regex character is escaped, so the prefix is matched as written.
-        @test shown["long name (with parens) and more words"] == "r\"^long name \\(with \""
+        # A regex character is quoted, so the prefix is matched as written.
+        @test shown["long name (with parens) and more words"] == "r\"^\\Qlong name (with\""
         # Every shortened name, passed to `name=`, picks out its item and no other.
         for (n, c) in zip(names, cells)
             startswith(c, 'r') || continue
@@ -496,6 +496,152 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         row = only(filter(l -> occursin("r\"^", l), split(sprint(print_plan, p), '\n')))
         rx = eval(Meta.parse(match(r"r\"\^.*?[^\\]\"", row).match))
         @test occursin(rx, shown) && !occursin(rx, other)
+    end
+
+    @testset "a shortened name's regex matches its own prefix, whatever characters the name has" begin
+        regex_prefix = Runtests.Private.regex_prefix
+        special = Runtests.Private.REGEX_SPECIAL
+        # Every character a regex or a raw string reads as other than itself: alone,
+        # doubled, first, between, last and three together.
+        names = String[]
+        for c in string(special, '"'), form in ("$c", "$c$c", "a$(c)b", "ab$c", "$(c)ab", "a$c$c$c")
+            push!(names, form)
+        end
+        append!(names, [
+            # What ends quoting, what starts it, and both together.
+            "\\E", "\\Q", "\\E\\E", "\\Q\\E", "a\\Eb\\Qc", "\\\\E", "\\\\\\E", "E\\", "Q\\",
+            # Backslashes before the closing quote, however many.
+            "\\", "\\\\", "\\\\\\", "\\\\\\\\", "a\\", "a\\\\", "a\\\\\\",
+            # Backslashes before a quote in the name, and quotes around them.
+            "\\\"", "\\\\\"", "\"\\", "\"\\\"", "\"\"\\\\\"\"", "a\\\"b\\\\\"c",
+            # What a string would interpolate, and escapes written as text.
+            "\$(x)", "\$x \$\$", "#{x}", "\\d\\w\\s\\1\\x41\\u0041\\n\\t",
+            # Spaces, and what prints beyond ASCII.
+            "a b  c", " leading", "trailing ", "∑ α → 🙂 漢字", "é combining", "(∑|α)+", "∑.∑",
+        ])
+        for n in names, k in 1:length(n)
+            s = regex_prefix(n, k)
+            @test s !== nothing
+            s === nothing && continue
+            rx = eval(Meta.parse(s))
+            m = match(rx, n)
+            @test m !== nothing && m.offset == 1 && m.match == first(n, k)
+            # Anchored: the same text anywhere else does not match.
+            @test !occursin(rx, "\0" * n)
+            # Quoted only when a character needs it.
+            @test startswith(s, "r\"^\\Q") == any(in(special), first(n, k))
+        end
+    end
+
+    @testset "random names of those characters: every prefix matches as it is written" begin
+        regex_prefix = Runtests.Private.regex_prefix
+        # Seeded, so a name that breaks it breaks every run.
+        rng = Xoshiro(20260929)
+        alphabet = collect(string(Runtests.Private.REGEX_SPECIAL, "\"EQab ∑"))
+        for _ in 1:300
+            n = String(rand(rng, alphabet, rand(rng, 1:12)))
+            for k in 1:length(n)
+                m = match(eval(Meta.parse(regex_prefix(n, k))), n)
+                @test m !== nothing && m.offset == 1 && m.match == first(n, k)
+            end
+        end
+    end
+
+    @testset "escaping costs a shortened name characters of its prefix, never the column" begin
+        regex_prefix = Runtests.Private.regex_prefix
+        # `\E` is written as five more characters, a backslash before the closing
+        # quote as one more, `\Q` as two: a longer prefix is never narrower, which is
+        # what lets the prefix grow until the next character would not fit.
+        for n in ["a\\E\\E\\Eb", "x\\", "x\\\\\"y", "\\E\\\\E\\Q\\E", "plain then \\E then (x)", "q\\\"b\\", "(a)\\E\\"]
+            ws = [textwidth(regex_prefix(n, k)) for k in 1:length(n)]
+            @test issorted(ws)
+        end
+        # Over a column only when the shortest prefix that tells it apart is.
+        names = ["runs \\E on and on for a long while", "runs \\E on and on for ever and ever",
+                 "\\E\\E\\E at the start of a long name", "a name with \\E\\Q\\E and more after",
+                 "a name with \\E\\Q\\E and other words", "short", "tiny"]
+        common(a, b) = (k = 0; for (x, y) in zip(a, b); x == y || break; k += 1; end; k)
+        need(n) = 1 + maximum(m -> m == n ? 0 : common(n, m), names)
+        for width in 8:40, (n, cell) in zip(names, Runtests.Private.shown_names(names, width))
+            startswith(cell, 'r') || continue
+            if textwidth(cell) - 1 > width
+                @test cell == regex_prefix(n, need(n)) && textwidth(cell) - 1 > width
+            end
+            @test occursin(eval(Meta.parse(cell)), n) && count(m -> occursin(eval(Meta.parse(cell)), m), names) == 1
+        end
+    end
+
+    @testset "a prefix that its escaped `\\E` makes too wide overruns the column rather than stop matching one item" begin
+        regex_prefix = Runtests.Private.regex_prefix
+        picks(cell, names) = filter(m -> occursin(eval(Meta.parse(cell)), m), names)
+        # The two part only after a `\E`, which the prefix must then hold, written as
+        # five characters more. A shorter prefix would fit the column, and match both.
+        names = ["long name \\E and a then more words", "long name \\E and b then more words", "short"]
+        width = 20
+        fits = regex_prefix(names[1], 10)
+        @test textwidth(fits) - 1 <= width && length(picks(fits, names)) == 2
+        cells = Runtests.Private.shown_names(names, width)
+        for (n, cell) in zip(names[1:2], cells[1:2])
+            @test cell == regex_prefix(n, 18)             # the shortest prefix that is its own
+            @test textwidth(cell) - 1 > width             # over the column, as it must be
+            @test picks(cell, names) == [n]
+        end
+        # The character that tells them apart is the one that makes the `\E`.
+        names = ["path\\Ea long name", "path\\Fb long name", "short"]
+        cells = Runtests.Private.shown_names(names, 8)
+        @test cells[1] == regex_prefix(names[1], 6) == "r\"^\\Qpath\\E\\\\E\\Q\""
+        @test cells[2] == regex_prefix(names[2], 6)
+        @test picks(cells[1], names) == [names[1]] && picks(cells[2], names) == [names[2]]
+    end
+
+    @testset "a character that does not print ends a prefix; a name that needs one past it stays whole" begin
+        regex_prefix = Runtests.Private.regex_prefix
+        shown_names = Runtests.Private.shown_names
+        for c in ('\n', '\t', '\r', '\0', '\x01', '\x7f', '\u0085', '​', '﻿', '\U0e0001')
+            n = string("a long name ", c, " that goes on for a while")
+            @test regex_prefix(n, 12) !== nothing   # up to it
+            @test regex_prefix(n, 13) === nothing   # with it
+        end
+        @test regex_prefix("a long name \xff that goes on", 13) === nothing   # not UTF-8 at all
+        # Told apart from the other before the character: shortened, and the prefix
+        # stops short of it.
+        cells = shown_names(["a long name \n that goes on and on", "b short"], 20)
+        @test cells[1] == "r\"^a long name \""
+        @test occursin(eval(Meta.parse(cells[1])), "a long name \n that goes on and on")
+        # Told apart only after it: whole, as `repr` writes it, which is its name exactly.
+        names = ["a long\tname that goes on and on", "a long\tname that goes elsewhere"]
+        cells = shown_names(names, 12)
+        @test all(!startswith(c, 'r') for c in cells)
+        @test [eval(Meta.parse(c)) for c in cells] == names
+    end
+
+    @testset "names that differ only in characters a regex reads are each picked out by their own" begin
+        names = [
+            "a.b (1) of a long name", "a.b (2) of a long name", "axb (1) of a long name", "a.b [1] of a long name",
+            "path\\to\\file one is long", "path\\to\\file two is long", "path/to/file one is long",
+            "ends with a backslash \\", "ends with a backslash \\\\", "ends with a backslash \\\\\\",
+            "quote \" then more text", "quote \\\" then more text", "quote \\\\\" then more text",
+            "\\E inside, then more text", "\\Q inside, then more text", "\\E\\Q inside, then more",
+            "\$(interp) is not run here", "\$interp is not run here", "(a|b)+ is a lot of text", "(a|b)* is a lot of text",
+        ]
+        cells = Runtests.Private.shown_names(names, 14)
+        @test count(c -> startswith(c, 'r'), cells) >= 10
+        for (n, c) in zip(names, cells)
+            x = eval(Meta.parse(lstrip(c)))
+            if x isa Regex
+                @test occursin(x, n) && count(m -> occursin(x, m), names) == 1
+            else
+                @test x == n   # whole, as `repr` writes it
+            end
+        end
+        # And as a run takes it: `name=` with the regex shown selects that item alone.
+        items = join((string("@testitem ", repr(n), " begin\n    @test true\nend\n") for n in names), "\n")
+        dir = make_pkg("RegexNames", "test/r_test.jl" => items)
+        for (n, c) in zip(names, cells)
+            startswith(c, 'r') || continue
+            p, _ = Runtests.Private.prepare((dir,); name = eval(Meta.parse(c)), workers = 1, announce = false)
+            @test p.items.name == [n]
+        end
     end
 
     @testset "the names line up on their opening quotes" begin

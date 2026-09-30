@@ -94,6 +94,29 @@ filtered(paths...; kwargs...) =
         @test filtered(dir, joinpath(dir, "test", "sub")) == ["step one", "step two", "unrelated"]
         # `file.jl:line` is the item that line is inside.
         @test filtered(dir, string(joinpath(dir, "test", "a_test.jl"), ":6")) == ["multiplies numbers"]
+        # Beside another file or directory, the line could pick an item there instead.
+        for other in (joinpath(dir, "test", "sub", "b_test.jl"), joinpath(dir, "test", "sub"),
+                      string(joinpath(dir, "test", "sub", "b_test.jl"), ":6"))
+            e = try
+                filtered(dir, string(joinpath(dir, "test", "a_test.jl"), ":6"), other)
+            catch err
+                err
+            end
+            @test e isa ArgumentError && occursin("without other files or directories", e.msg)
+        end
+    end
+
+    @testset "a path beside test/ is not under it" begin
+        # `test2/` starts with the same letters as `test/` and is somewhere else.
+        mkpath(joinpath(dir, "test2"))
+        write(joinpath(dir, "test2", "c_test.jl"), "@testitem \"elsewhere\" begin\nend\n")
+        e = try
+            filtered(joinpath(dir, "test2", "c_test.jl"))
+        catch err
+            err
+        end
+        @test e isa ArgumentError && occursin("is not under", e.msg)
+        rm(joinpath(dir, "test2"); recursive = true)
     end
 
     @testset "a module stands for its package's directory" begin

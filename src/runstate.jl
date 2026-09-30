@@ -258,7 +258,9 @@ function run_meta(p::Plan)
     env = something(Base.active_project(), "")
     meta = Pair{String, String}[
         "julia" => string(VERSION), "julia_commit" => Base.GIT_VERSION_INFO.commit,
-        "runtests" => string(pkgversion(@__MODULE__)), "runtests_revision" => project_revision(pkgdir(@__MODULE__)),
+        # Runtests built into a system image has no directory of its own.
+        "runtests" => string(pkgversion(@__MODULE__)),
+        "runtests_revision" => (dir = pkgdir(@__MODULE__); dir === nothing ? "" : project_revision(dir)),
         "host" => run_host(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
         "memory_bytes" => string(Sys.total_memory()),
         "coordinator_threads" => string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
@@ -724,7 +726,7 @@ end
 function parse_block(str::AbstractString)
     isempty(strip(str)) && return Expr(:block)
     ex = try
-        Meta.parseall(str)
+        Meta.parseall(str)::Expr
     catch
         return Expr(:block)
     end
@@ -736,10 +738,9 @@ end
 # are written or compared. Otherwise every run would think the recorded
 # configuration differs from its own and say so.
 function normalize_block(ex::Expr)
-    out = Base.remove_linenums!(deepcopy(ex))
-    while out isa Expr && out.head === :block && length(out.args) == 1 &&
-            out.args[1] isa Expr && out.args[1].head === :block
-        out = out.args[1]
+    out = Base.remove_linenums!(deepcopy(ex))::Expr
+    while out.head === :block && length(out.args) == 1 && (inner = out.args[1]) isa Expr && inner.head === :block
+        out = inner
     end
     return out
 end
@@ -757,7 +758,9 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     m(k) = get(rs.meta, k, "")
     println(io, "Runtests run state ", rs.path, rs.complete ? "" : " (incomplete: the run did not finish)")
     took = rs.end_unix > rs.start_unix ? string(", took ", fmt_seconds(rs.end_unix - rs.start_unix)) : ""
-    println(io, "  started ", Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix), took, rs.cancelled ? ", cancelled" : "")
+    # A damaged file's start is no time a clock can show.
+    started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
+    println(io, "  started ", started, took, rs.cancelled ? ", cancelled" : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
@@ -771,10 +774,10 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     passed = count(==(PASSED), states)
     tally = [passed > 0 ? ["$passed passed"] : String[]; state_tally(states)]
     println(io, "  ", length(rs.items), " items: ", join(tally, ", "))
-    bad = [i for i in eachindex(rs.items, rs.statuses) if is_non_pass(rs.statuses[i].state) || rs.statuses[i].state === RUNNING]
+    # Paired by `zip`: a damaged file can hold fewer items than statuses.
+    bad = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if is_non_pass(st.state) || st.state === RUNNING]
     isempty(bad) || println(io, "  not passed:")
-    for i in bad
-        it, st = rs.items[i], rs.statuses[i]
+    for (it, st) in bad
         println(io, "    ", rpad(repr(it.name), 30), " ", rpad(string(st.state), 12), " attempt ", st.attempt,
             " · worker ", st.slot, " (pid ", st.pid, ") · ", fmt_seconds(st.elapsed), " · ", it.file, ":", it.line)
     end
@@ -1002,7 +1005,9 @@ Clear the default location of projects that are gone: in each directory whose
 recorded project path no longer exists, delete this machine's run states, and then
 the directory once nothing else is left in it. A run state recorded elsewhere, one
 that cannot be read, and a directory without a recorded project stay: nothing shows
-they are this machine's to delete.
+they are this machine's to delete. So does a project that is out of reach rather
+than gone: one whose parent directory is missing or empty, as a drive that is not
+mounted leaves it.
 """
 function sweep_runstate_dirs(base::AbstractString = runstate_root())
     isdir(base) || return nothing
@@ -1011,7 +1016,10 @@ function sweep_runstate_dirs(base::AbstractString = runstate_root())
         mark = joinpath(dir, PROJECT_MARK)
         try
             isfile(mark) || continue
-            ispath(strip(read(mark, String))) && continue
+            project = String(strip(read(mark, String)))
+            ispath(project) && continue
+            parent = dirname(project)
+            (isdir(parent) && !isempty(readdir(parent))) || continue
             for f in filter!(endswith(".runstate"), readdir(dir; join = true))
                 rs = read_run_state(f)
                 rs !== nothing && get(rs.meta, "host", "") == here && rm(f; force = true)
@@ -1081,8 +1089,9 @@ end
 """
     history(root; nruns = HISTORY_RUNS, base = nothing) -> History
 
-Per-item durations from every run state kept, each item's newest, so that runs of a
-few items leave the others' standing. Last-run failures, when the newest run
+Per-item durations from every run state kept, each item's newest that ran to an
+end (see [`timed`](@ref)), so that runs of a few items leave the others' standing, and a
+run stopped part way through leaves those it stopped. Last-run failures, when the newest run
 started, and what a fresh worker cost, from the most recent `nruns`. With `base`,
 the run state a replay names, those come from it and the runs after it only; the
 durations still come from every run. Only items that actually ran contribute; a
@@ -1099,7 +1108,7 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
         for (i, it) in enumerate(rs.items)
             i <= length(rs.statuses) || break
             st = rs.statuses[i]
-            st.state === UNSEEN || st.elapsed <= 0 || (seconds[it.name] = Float64(st.elapsed))
+            timed(st.state) && st.elapsed > 0 && (seconds[it.name] = Float64(st.elapsed))
         end
     end
     failed = Dict{String, Int}()
@@ -1125,6 +1134,15 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     end
     return History(seconds, failed, since, recorded_cold_cost(recent))
 end
+
+"""
+    timed(state) -> Bool
+
+Whether the time recorded with an outcome is how long the item takes: not for one the
+run stopped part way through (`cancelled`), whose time is how far it got, nor for one
+that never ran (`unseen`, a chain's `broken` members).
+"""
+timed(state::ItemState) = !(state === UNSEEN || state === CANCELLED || state === BROKEN_CHAIN)
 
 # What a fresh worker cost across `runs`: how long its process took to come up, and
 # how much longer a process's first item spent compiling than its later ones did.
@@ -1172,7 +1190,8 @@ function project_revision(root::AbstractString)
             # A worktree or a submodule: `.git` is a file pointing at the real one.
             m = match(r"^gitdir:\s*(.+?)\s*$"m, read(gitdir, String))
             m === nothing && return ""
-            gitdir = isabspath(m.captures[1]) ? String(m.captures[1]) : joinpath(root, m.captures[1])
+            to = m[1]::AbstractString   # the group is not optional
+            gitdir = isabspath(to) ? String(to) : joinpath(root, to)
         end
         isdir(gitdir) || return ""
         head = String(strip(read(joinpath(gitdir, "HEAD"), String)))
@@ -1199,20 +1218,22 @@ function project_revision(root::AbstractString)
 end
 
 # Identity of the project, so a run state from somewhere else is not mistaken for
-# this project's: the UUID when there is one, else the name, else a checksum of
-# the project file.
-function project_id(root::AbstractString)
+# this project's: the UUID when there is one, else the name, else the name of its
+# directory, which a checkout elsewhere usually shares. Nothing else of the project
+# file: the rest changes with every dependency added, and each change would make
+# every earlier run state another project's, never read again and never deleted.
+function project_id(root::AbstractString)::String
     for name in PROJECT_NAMES
         path = joinpath(root, name)
         isfile(path) || continue
         proj = try
             TOML.parsefile(path)
         catch
-            return string(crc32c(read(path)); base = 16)
+            Dict{String, Any}()
         end
         haskey(proj, "uuid") && return string(proj["uuid"])
         haskey(proj, "name") && return string(proj["name"])
-        return string(crc32c(read(path)); base = 16)
+        return last(splitpath(abspath(root)))
     end
     return ""
 end

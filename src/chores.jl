@@ -1,52 +1,63 @@
 # A suite's upkeep in one call: what a run would refuse to start on, setups whose
 # packages have fallen behind what they import, and run states nothing reads.
 
-# A run state of this machine's older than this is deleted by `chores(fix = true)`.
-const STALE_RUN_DAYS = 7
-
 """
-    chores([path]; fix = false) -> Bool
+    chores([path]; dry_run = false, config = nothing)
 
-Check the upkeep a package's suite needs, and with `fix = true` do what can be done
-without a person:
+Look after a package's suite: do what needs no person, then say what does.
 
 - test items and `test/TestItems.toml`: everything a run would refuse to start on,
   such as a syntax error, a name declared twice, a setting it does not accept, an
   `[order]` entry naming no item or an unknown profile. Reported, never changed.
+- config files given as `config`, a path or several, relative to the current
+  directory: each checked as a run given it would check it, as well as
+  `test/TestItems.toml`.
 - test setups: what [`setups_to_packages`](@ref) would do, making packages of the
   setups that are not and adding to their `[deps]` what they have come to import.
-- run states: this machine's, modified more than $(STALE_RUN_DAYS) days ago, are
-  deleted, except the newest $(HISTORY_RUNS) that name any of the suite's test items,
-  however old: their durations order the next run. A run that names none of them
-  orders nothing and is not among those kept. Neither is deleted one that holds what
-  makes an item failing, which `runtestsf` would lose. One recorded elsewhere, a CI
-  artifact say, is never deleted.
+- run states: this machine's are kept as a run keeps them, the newest $(KEEP_RUNS)
+  and any older one a failing item's last verdict is in. Of those, one is deleted
+  only when it holds nothing about an item the suite has now: a dry run, a run
+  stopped before any item finished, or one whose items have all been renamed or
+  deleted since. One recorded elsewhere, a CI artifact say, and one that cannot be
+  read are never deleted.
 
-Returns whether nothing is left to do: `true` when the check finds nothing, or when
-`fix = true` found nothing it could not do. `path` finds the package as it does for
-[`runtests`](@ref).
+Returns whether nothing is left to do. Having done the rest, it throws a
+[`ChoresError`](@ref) when something is left that a person has to fix, and otherwise
+returns `true`; so `Runtests.chores(); Runtests.runtests()` stops before any test
+runs on a suite a person has to fix first. With `dry_run = true` it changes nothing
+and never throws, and returns whether there is nothing to do, neither for a person
+nor for it. `path` finds the package as it does for [`runtests`](@ref).
 """
-function chores(args...; fix::Bool = false)
+function chores(args...; dry_run::Bool = false,
+                config::Union{Nothing, AbstractString, AbstractVector{<:AbstractString}} = nothing)
     target = resolve_target(args)
+    configs = config === nothing ? String[] : config isa AbstractString ? [String(config)] : String.(config)
+    fix = !dry_run
     todo = problems = 0
     body = styled() do io
         bad, names = check_suite!(io, target)
         problems += bad
+        for path in configs
+            problems += check_named_config!(io, target, path)
+        end
         n, bad = chore_setups!(io, target, fix)
         todo += n
         problems += bad
         todo += chore_runstates!(io, target, fix, names)
         if problems > 0
+            fix && todo > 0 && print(io, "done: ", todo, " · ")
             print(io, "to fix by hand: ", problems)
-            todo > 0 && !fix && print(io, " · the rest `Runtests.chores(fix = true)` does")
+            !fix && todo > 0 && print(io, " · the rest `Runtests.chores()` does")
         elseif todo > 0
-            print(io, fix ? "done: $todo" : "to do: $todo, which `Runtests.chores(fix = true)` does")
+            print(io, fix ? "done: $todo" : "to do: $todo, which `Runtests.chores()` does")
         else
             print(io, "nothing to do")
         end
     end
-    print(stdout, bracket(body, "[TEST]", fix ? "chores" : "chores, checking only", "", :white))
-    return problems == 0 && (fix || todo == 0)
+    print(stdout, bracket(body, "[TEST]", fix ? "chores" : "chores, checking only", "", :default))
+    dry_run && return problems == 0 && todo == 0
+    problems == 0 || throw(ChoresError(string(plural(problems, "problem"), " to fix by hand, as the report says")))
+    return true
 end
 
 # The suite as a full run would read it: its items, then its settings and what they
@@ -89,6 +100,31 @@ function check_suite!(io::IO, target)
         end
         return n, nothing
     end
+end
+
+# A config file the call named, checked as a run given it would check it: its
+# settings, and what they name among the test items, or the settings alone when the
+# items do not read. The number of problems a person has to fix, one when it is
+# wrong at all.
+function check_named_config!(io::IO, target, path::AbstractString)
+    items_read = true
+    try
+        prepare((target.root,); config = path, announce = false)
+    catch e
+        e isa ConfigError && return print_problem(io, "config", e.msg)
+        e isa ScanFailure || e isa NoTestsError || rethrow()
+        items_read = false
+        try
+            read_config(target.testdir; config = path)
+        catch e2
+            e2 isa ConfigError || rethrow()
+            return print_problem(io, "config", e2.msg)
+        end
+    end
+    print(io, "config: ")
+    printstyled(io, relpath_or_path(abspath(path), target.root); color = :light_black)
+    println(io, items_read ? ", valid" : " reads; the items it names are checked once the test items read")
+    return 0
 end
 
 # `label: msg`, a message of several lines indented under its first. Counts as one.
@@ -135,35 +171,39 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
         return 0
     end
     fix && foreach(f -> rm(f; force = true), stale)
-    println(io, ", ", length(stale), " of this machine's older than ", STALE_RUN_DAYS, " days ",
-            fix ? "deleted" : "to delete", " (the newest ", HISTORY_RUNS,
-            names === nothing ? "" : " naming a test item", " stay)")
+    println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete",
+            ": beyond the newest ", KEEP_RUNS, " with no failing item's verdict in them",
+            names === nothing ? "" : ", or with nothing about an item the suite has")
     return length(stale)
 end
 
 """
     stale_runstates(root, names = nothing) -> Vector{String}
 
-The run states `chores(fix = true)` deletes, oldest first: this machine's, for this
-project, modified more than `STALE_RUN_DAYS` ago, and not among the newest
-`HISTORY_RUNS` that `history` could read and that name any of `names`, the suite's
-test items, and not one a failing item's verdict rests on (`removable_runs`).
-Without `names` the newest `HISTORY_RUNS` stay whatever they name. One recorded
-elsewhere, one of another project, and one that cannot be read are never among them:
-nothing shows they are this machine's to delete.
+The run states `chores` deletes, oldest first, all of them this machine's and this
+project's: those that hold nothing about any of `names`, the suite's test items,
+however new, and of the rest those a run's own pruning deletes, beyond the newest
+`KEEP_RUNS` and with no failing item's last verdict in them (`removable_runs`).
+Without `names` nothing says what the suite has, and only the second go. One
+recorded elsewhere, one of another project, and one that cannot be read are never
+among them: nothing shows they are this machine's to delete.
 """
 function stale_runstates(root::AbstractString, names::Union{Nothing, AbstractSet{String}} = nothing)
     here = run_host()
-    cutoff = time() - STALE_RUN_DAYS * 86400
+    ours(rs) = get(rs.meta, "host", "") == here
     runs = project_runs(root)
-    stale = String[]
-    kept = 0
-    for (f, rs) in Iterators.reverse(runs)
-        if kept < HISTORY_RUNS && !rs.dry_run && (names === nothing || any(it -> it.name in names, rs.items))
-            kept += 1
-        elseif mtime(f) < cutoff && get(rs.meta, "host", "") == here
-            push!(stale, f)
-        end
-    end
-    return removable_runs(runs, reverse!(stale))
+    useless = names === nothing ? Set{String}() :
+        Set(f for (f, rs) in runs if ours(rs) && !holds_any(rs, names))
+    # The rest as they stand once those are deleted: those count neither among the
+    # newest `KEEP_RUNS` nor as holding a verdict that keeps another.
+    rest = filter(((f, _),) -> !(f in useless), runs)
+    mine = [f for (f, rs) in rest if ours(rs)]
+    beyond = Set(removable_runs(rest, mine[1:max(0, length(mine) - KEEP_RUNS)]))
+    return [f for (f, _) in runs if f in useless || f in beyond]
 end
+
+# Whether a run recorded anything about one of `names`: an item it ran, to an end
+# or part way, which is what every reader of a run state takes from it. Paired by
+# `zip`, since a damaged file can hold fewer statuses than items or the other way.
+holds_any(rs::RunStateRecord, names) =
+    any(((it, st),) -> st.state !== UNSEEN && it.name in names, zip(rs.items, rs.statuses))

@@ -347,8 +347,9 @@ function execute(p::Plan, target)
         )
     end
     if cfg.monitor
-        run.monitor = Monitor(run; print_interval = cfg.monitor_interval)
-        start_monitor!(run.monitor)
+        monitor = Monitor(run; print_interval = cfg.monitor_interval)
+        run.monitor = monitor
+        start_monitor!(monitor)
     end
     setup_path = joinpath(target.testdir, TESTSETUPS_DIR)
     return try
@@ -477,7 +478,7 @@ function test_env_for(target, announce = nothing)
         testproj = joinpath(target.testdir, "Project.toml")
         isfile(testproj) && abspath(current) == abspath(testproj) && return nothing
     end
-    env = test_env(target, announce)
+    env = test_env(target, announce)::String
     (current !== nothing && abspath(current) == abspath(env)) && return nothing
     return env
 end
@@ -508,7 +509,8 @@ function test_env(target, announce = nothing)
                 Pkg.activate(proj; io = devnull)
                 TestEnv.activate()
             end
-            env = Base.active_project()
+            # What `TestEnv.activate` made active: a project, or it would have thrown.
+            env = Base.active_project()::String
             # Stamped *after* generating it: resolving writes the package's manifest,
             # so a stamp taken beforehand never matches again and every call would
             # rebuild the environment it was supposed to cache.
@@ -669,13 +671,15 @@ function profile_projects!(run::Run, p::Plan)
     return nothing
 end
 
-# The project `prof`'s workers run in, beside the environment `env`, or `nothing` for
-# a profile without preferences, whose workers run in `env` itself. Rewritten on
-# every call, so it follows the environment and the preferences file.
+# The project `prof`'s workers run in, or `nothing` for a profile without
+# preferences, whose workers run in the environment `env` itself. In the system's
+# temporary files, keyed by `env`'s path, and never beside `env`, which can be the
+# package's own `test/`. Rewritten on every call, so it follows the environment and
+# the preferences file.
 function profile_project(prof::Profile, env)
     (env === nothing || isempty(prof.preferences)) && return nothing
     root = dirname(env)
-    dir = joinpath(root, string("runtests_profile_", prof.name))
+    dir = joinpath(tempdir(), "runtests_profiles", string(crc32c(abspath(env)); base = 16, pad = 8), String(prof.name))
     mkpath(dir)
     copy_env_files(dir, root)
     own = joinpath(root, "LocalPreferences.toml")
@@ -693,9 +697,9 @@ end
     copy_env_files(dir, root)
 
 Write `root`'s `Project.toml` and `Manifest.toml` into `dir`, every path made
-absolute: `dir` is below `root`, so a relative path would resolve one directory too
-deep, and a worker whose project cannot find a developed package dies before it is
-ready.
+absolute: `dir` is elsewhere, so a relative path would resolve from the wrong
+directory, and a worker whose project cannot find a developed package dies before it
+is ready.
 """
 function copy_env_files(dir::AbstractString, root::AbstractString)
     for file in ("Project.toml", "Manifest.toml")
@@ -737,8 +741,8 @@ end
 function precompile_phase(run::Run, p::Plan, target)
     # The environment first: a setup module compiled before it would make its
     # worker build the dependencies itself, one at a time.
-    precompile_env(run, p)
-    precompile_setups(run, p, target)
+    others = precompile_env(run, p)
+    precompile_setups(run, p, target, others)
     return nothing
 end
 
@@ -772,20 +776,30 @@ package image built under other flags cannot be used, so a worker with other fla
 would otherwise compile the package and its dependencies itself, serially and
 silently, while the run looks stalled on its first item. `test_env` turns off
 `Pkg`'s own precompilation so that this is the one pass.
+
+Returns every set of cache flags the pools' workers have besides this process's, with
+the julia arguments that give it, for the setups to be compiled for too.
 """
 function precompile_env(run::Run, p::Plan)
+    # Each profile's flags are asked of a process of their own, so once.
+    asked = Dict{Symbol, Union{Nothing, Base.CacheFlags}}()
+    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.name)
     # The flags this process runs under lead, because every pool without julia
-    # arguments of its own uses them and because `Pkg` is no longer doing it.
+    # arguments of its own uses them and because `test_env` switched `Pkg`'s own
+    # precompilation off.
     configs = Pair{Cmd, Base.CacheFlags}[`` => Base.CacheFlags()]
     names = String[]
+    others = Pair{Cmd, Base.CacheFlags}[]
     for pool in p.pools
         prof = p.profiles[pool.profile]
-        # Only julia arguments reach the cache key. A profile with preferences runs
-        # in a project of its own, which `configs` cannot carry; it gets a call of
-        # its own below.
-        (isempty(prof.julia_args) || haskey(run.profile_projects, prof.name)) && continue
-        flags = profile_flags(prof)
-        (flags === nothing || flags in last.(configs)) && continue
+        # Only julia arguments reach the cache key.
+        isempty(prof.julia_args) && continue
+        flags = flags_of(prof)
+        flags === nothing && continue
+        flags == Base.CacheFlags() || flags in last.(others) || push!(others, Cmd(prof.julia_args) => flags)
+        # A profile with preferences runs in a project of its own, which `configs`
+        # cannot carry; it gets a call of its own below.
+        (haskey(run.profile_projects, prof.name) || flags in last.(configs)) && continue
         push!(configs, Cmd(prof.julia_args) => flags)
         push!(names, String(prof.name))
     end
@@ -793,7 +807,7 @@ function precompile_env(run::Run, p::Plan)
     # different preferences are two environments, not two configurations of one.
     for (name, dir) in run.profile_projects
         prof = p.profiles[findfirst(q -> q.name === name, p.profiles)]
-        flags = profile_flags(prof)
+        flags = flags_of(prof)
         flags === nothing && continue
         say(run, "precompiling the test environment for profile ", name)
         precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$name`")
@@ -802,7 +816,7 @@ function precompile_env(run::Run, p::Plan)
     # nothing when there is nothing to do.
     isempty(names) || say(run, "precompiling the test environment for ", plural(length(names), "profile"), ": ", join(names, ", "))
     precompile_configs(run, configs, Base.active_project(), join(names, ", "))
-    return nothing
+    return others
 end
 
 # The cache flags a profile's workers will have, or `nothing` — said once — when
@@ -842,18 +856,22 @@ function precompile_configs(run::Run, configs, project, what::AbstractString)
     return nothing
 end
 
-function precompile_setups(run::Run, p::Plan, target)
+"""
+    precompile_setups(run, p, target, others)
+
+Compile every setup the items load for this process's flags, and each setup that is
+a package for `others` too, the other sets of flags the pools' workers have (see
+[`precompile_env`](@ref)), wherever there is no valid cache for them. A setup that is
+not a package has a single cache file per depot, which a second set of flags would
+write over; its workers under other flags compile it for themselves.
+"""
+function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, Base.CacheFlags}} = Pair{Cmd, Base.CacheFlags}[])
     isempty(p.setups) && return nothing
-    # `isprecompiled` asks whether there is a *valid* cache, which is the question:
-    # a cache file left over from another checkout of the same setup would be
-    # rebuilt by every worker at once, which is the whole thing this avoids.
-    stale = filter(p.setups) do name
-        pkg = Base.identify_package(String(name))
-        pkg === nothing || !Base.isprecompiled(pkg)
-    end
-    isempty(stale) && return nothing
-    say(run, "precompiling ", join(stale, ", "))
-    for name in stale
+    # A *valid* cache is the question: a cache file left over from another checkout
+    # of the same setup would be rebuilt by every worker at once, which is the whole
+    # thing this avoids.
+    stale = Tuple{Base.PkgId, Pair{Cmd, Base.CacheFlags}}[]
+    for name in p.setups
         pkg = Base.identify_package(String(name))
         if pkg === nothing
             throw(
@@ -863,17 +881,25 @@ function precompile_setups(run::Run, p::Plan, target)
                 )
             )
         end
+        for config in (pkg.uuid === nothing ? [`` => Base.CacheFlags()] : [`` => Base.CacheFlags(); others])
+            has_fresh_cache(pkg, last(config)) || push!(stale, (pkg, config))
+        end
+    end
+    isempty(stale) && return nothing
+    say(run, "precompiling ", join(unique(pkg.name for (pkg, _) in stale), ", "))
+    for (pkg, (args, flags)) in stale
         # Julia writes why a module would not precompile to the stream it is given,
         # and throws an exception saying only that it failed; both go in the error.
         out = IOBuffer()
         try
-            Base.compilecache(pkg, out, out)
+            Base.compilecache(pkg, out, out; flags = args, cacheflags = flags)
         catch e
             is_interrupt(e) && rethrow()
             detail = strip(String(take!(out)))
             throw(
                 ConfigError(
-                    "test setup module `$name` failed to precompile:\n" *
+                    "test setup module `$(pkg.name)` failed to precompile" *
+                        (isempty(args) ? "" : string(" under `", join(args.exec, " "), "`")) * ":\n" *
                         sprint(showerror, e) *
                         (isempty(detail) ? "" : string("\n", detail))
                 )
@@ -881,6 +907,16 @@ function precompile_setups(run::Run, p::Plan, target)
         end
     end
     return nothing
+end
+
+# Whether `pkg` has a cache that a process with cache flags `flags` can load. 1.12's
+# `isprecompiled` takes the flags; from 1.13 it asks for this process's only, and
+# the function behind it takes them.
+@static if hasmethod(Base.isprecompiled, Tuple{Base.PkgId}, (:flags,))
+    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) = Base.isprecompiled(pkg; flags)
+else
+    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) =
+        Base.compilecache_freshest_path(pkg; flags, verify_checksums = false) !== nothing
 end
 
 ### Workers ################################################################
@@ -1638,7 +1674,7 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
         end
         record_error!(
             run, i, slot, attempt, ERRORED,
-            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)))
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "in this process"))
         )
         return true
     end
@@ -1730,7 +1766,7 @@ function handle_dispatch_failure!(
         @atomic slot.worker = nothing
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
-            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)));
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker"));
             ended
         )
         return false
@@ -1759,7 +1795,7 @@ function handle_dispatch_failure!(
                 string(
                     e isa RuntestsWorkers.WorkerTerminatedException ?
                         string("the worker running this item died: ", how) : sprint(showerror, e),
-                    " · ", retry_note(attempt, max_attempts, false)
+                    " · ", retry_note(attempt, max_attempts, false, "on a new worker")
                 );
                 ended
             )
@@ -1796,14 +1832,16 @@ timeout_setting(p::Plan, i::Integer) =
 ### Recording ##############################################################
 
 # What happens next, said where the failure is reported: a dead worker is only
-# half the story if the reader cannot tell whether the item gets another go.
-function retry_note(attempt::Integer, max_attempts::Integer, cancelled::Bool)
+# half the story if the reader cannot tell whether the item gets another go, and
+# where: `next` is where that go runs, "on a new worker", "on the same worker" or
+# "in this process".
+function retry_note(attempt::Integer, max_attempts::Integer, cancelled::Bool, next::AbstractString)
     # A stopped run retries nothing, whatever the item asked for. Saying it will is
     # a promise the next line of the log breaks.
     cancelled && return "the run was stopped"
     retries = max_attempts - 1
     retries <= 0 && return "not retried (retries=0)"
-    attempt <= retries && return string("retrying on a new worker (retry ", attempt, " of ", retries, ")")
+    attempt <= retries && return string("retrying ", next, " (retry ", attempt, " of ", retries, ")")
     return string("no retries left (", retries, " of ", retries, " used)")
 end
 
@@ -1852,10 +1890,17 @@ function record_result!(
     # Only worth saying when there is a policy to state: a plain failure with no
     # retries configured explains itself.
     note = (is_non_pass(res.state) && max_attempts > 1) ?
-        retry_note(attempt, max_attempts, is_cancelled(run.queues)) : ""
+        retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, run.plan.items.unit[i])) : ""
     record!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false, note)
     return nothing
 end
+
+# Where a unit's next attempt runs after one that failed with its process intact: a
+# sandbox's process runs one unit and goes, while a pool worker, and this process,
+# carry on with the next attempt.
+next_attempt_where(p::Plan, u::UnitIdx) =
+    p.units.exclusive[u] ? "on a new worker" :
+    single_process(p) && !needs_worker(p, u) ? "in this process" : "on the same worker"
 
 record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString; ended::Float64 = time()) =
     record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), RuntestsWorkers.PerfStats(), true, msg; ended)

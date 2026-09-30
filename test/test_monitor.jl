@@ -281,7 +281,7 @@ end
             @test m.stats.peak_total_bytes >= m.stats.peak_single_bytes
             @test m.stats.peak_total_bytes >= s.total_rss
         end
-        @test count("w0", line) == 1        # the speaker, and no longer a field label
+        @test count("w0", line) == 1        # the speaker, not a field label
 
         # It is redrawn after every line the run prints, so it must not allocate to
         # do it: this is the one place in the run where formatting is on the hot path.
@@ -633,7 +633,7 @@ end
         @test occursin("coordinator + 2 workers", testing)
         @test !occursin(r"over \d+ process", summary)
 
-        # The single run-wide peak it used to lead with is gone: the stages say it.
+        # No single run-wide peak leads the summary: the stages say it.
         @test !occursin("largest single process", summary)
         @test !occursin("across all Runtests processes", summary)
         @test !occursin("by phase", summary)
@@ -818,10 +818,9 @@ end
     end
 
     @testset "a run that throws before its first item takes the line down" begin
-        # `stop_monitor!` used to be reached only on the way out of the test phase,
-        # so a run that fell over before that — a setup that will not compile, an
-        # environment that will not resolve — left the line pinned, and whatever
-        # printed the error wrote on top of it.
+        # A run that falls over before its test phase — a setup that will not
+        # compile, an environment that will not resolve — takes the line down too:
+        # left pinned, whatever prints the error would write on top of it.
         dir = make_pkg("SetupThrows")
         setup = string("Boom", string(hash(dir); base=16))
         mkpath(joinpath(dir, "test", "testsetups"))
@@ -881,9 +880,10 @@ end
     end
 
     @testset "what is written once the monitor stops starts its own row" begin
-        # A stopped monitor draws nothing, so `printline` no longer erases before it
-        # writes: stopping has to take the line down in the same step. A writer that
-        # goes the moment it sees the stop is what a slow machine's warning did.
+        # A stopped monitor draws nothing, so `printline` does not erase before it
+        # writes: stopping has to take the line down in the same step, or a writer
+        # that goes the moment it sees the stop, as a warning on a slow machine does,
+        # continues the pinned line.
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)

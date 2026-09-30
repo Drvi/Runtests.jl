@@ -36,7 +36,7 @@ using TOML: TOML
 using RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_test_run, run_item,
-    with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded
+    with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK
 
 include("types.jl")
 include("json.jl")
@@ -63,7 +63,7 @@ Run the test items under `test/`. With no arguments, the project of the active
 environment is used.
 
 `paths` narrow what is read: a directory, a test file, or `file.jl:42` to select
-the item that line is inside.
+the item that line is inside, which is given without other files or directories.
 
 Returns the run's testset, a [`RunTestSet`](@ref) named `testset_name` (`"Runtests"`
 unless given), holding one testset per test file. Inside an enclosing `@testset`
@@ -96,7 +96,9 @@ and seed, with any keyword given here winning, and a warning naming each package
 whose version differs from the one recorded.
 
 Every keyword can also be set in `test/TestItems.toml`, which additionally
-declares sandbox profiles and forced ordering; an explicit keyword wins.
+declares sandbox profiles and forced ordering; an explicit keyword wins. `config`
+names another file to read in its place, relative to the current directory, which
+has to exist; nothing but this keyword makes a run read one.
 """
 function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, kwargs...)
     # A dry run says what it found in its own block, with the plan.
@@ -276,7 +278,7 @@ function resolve_target(args)
     for a in args
         a isa AbstractString || throw(ArgumentError("Runtests.runtests takes paths or a module, got $(repr(a))"))
         path, ln = split_line_suffix(String(a))
-        ln == 0 || (line == 0 || throw(ArgumentError("only one `file.jl:line` target is allowed")); line = ln)
+        ln == 0 || (line = ln)
         push!(paths, abspath(path))
     end
     for path in paths
@@ -287,7 +289,7 @@ function resolve_target(args)
     narrowing = String[]
     for path in paths
         rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && continue
-        startswith(path, t.testdir) || throw(
+        startswith(path, joinpath(t.testdir, "")) || throw(
             ArgumentError(
                 "$(path) is not under $(t.testdir); Runtests only reads test files from `test/`"
             )
@@ -299,6 +301,12 @@ function resolve_target(args)
         )
         push!(narrowing, path)
     end
+    # The line picks one item, the last to start at or above it among those the paths
+    # select: beside another file or directory, it could pick one there.
+    line == 0 || length(narrowing) == 1 || throw(ArgumentError(
+        "a `file.jl:line` target picks the item at that line, so it is given without other " *
+        "files or directories: got $(join(map(repr, args), ", "))"
+    ))
     return Target(t.root, t.project, t.testdir, narrowing, line)
 end
 
@@ -313,7 +321,8 @@ end
 function split_line_suffix(path::AbstractString)
     m = match(r"^(.*\.jl):(\d+)$", path)
     m === nothing && return String(path), Int32(0)
-    return String(m.captures[1]), parse(Int32, m.captures[2])
+    # Neither group is optional, so a match has both.
+    return String(m[1]::AbstractString), parse(Int32, m[2]::AbstractString)
 end
 
 # Not the active project: under `Pkg.test` that is a temporary environment, and the
@@ -459,7 +468,7 @@ end # module Private
 using Test
 using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
-    ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 export @testitem, runtests, runtestsf, chores
 
@@ -473,6 +482,6 @@ end
 
 public current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
-    ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 end # module Runtests

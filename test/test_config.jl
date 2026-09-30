@@ -165,11 +165,133 @@ end
         end
     end
 
+    @testset "a value of the wrong shape is refused, not taken apart" begin
+        # A string where a list goes would be read as its characters, and a table's
+        # entries as pairs of them; `true` would be the integer 1.
+        for (toml, said) in (
+                "[profiles.p]\njulia_args = \"-O0\"\n" => r"`julia_args` of \[profiles\.p\] in \S*TestItems.toml must be a list of strings",
+                "[profiles.p]\njulia_args = [\"-O0\", 1]\n" => "`julia_args` of [profiles.p]",
+                "[profiles.p]\nenv = [\"A=1\"]\n" => r"`env` of \[profiles\.p\] in \S*TestItems.toml must be a table of variables",
+                "[profiles.p]\nenv = { A = [1] }\n" => "`env` of [profiles.p]",
+                "[profiles.p]\ninit = 1\n" => r"`init` of \[profiles\.p\] in \S*TestItems.toml must be a string",
+                "[profiles.p]\ntest_end = [\"x\"]\n" => "`test_end` of [profiles.p]",
+                "[order]\nfirst = \"one\"\n" => r"`first` of \[order\] in \S*TestItems.toml must be a list of strings",
+                "[order]\nlast = [1]\n" => "`last` of [order]",
+                "[run]\ntimeout = true\n" => "`timeout` must be a positive number of seconds",
+                "[run]\nworkers = true\n" => "`workers` must be",
+                "[run]\nretries = true\n" => "`retries` must be an integer",
+                "[run]\nseed = true\n" => "`seed` must be an integer",
+                "[run]\nmemory_threshold = true\n" => "`memory_threshold` must be",
+                "[run]\nmonitor_interval = false\n" => "`monitor_interval` must be",
+            )
+            with_toml(toml) do dir
+                @test_throws ConfigError read_config(dir)
+                e = try read_config(dir) catch err; err end
+                @test occursin(said, e.msg)
+            end
+        end
+        # From a keyword too.
+        with_toml("") do dir
+            @test_throws r"`timeout` must be a positive number" read_config(dir; timeout = true)
+            @test_throws r"`retries` must be an integer" read_config(dir; retries = false)
+        end
+        # What they are for still reads: numbers and flags for variables among them.
+        with_toml("[profiles.p]\njulia_args = []\nenv = { A = \"x\", N = 1, F = true }\n[order]\nfirst = []\n") do dir
+            cfg = read_config(dir)
+            @test isempty(cfg.profiles[:p].julia_args)
+            @test cfg.profiles[:p].env == ["A" => "x", "F" => "true", "N" => "1"]
+        end
+    end
+
     @testset "malformed TOML is an error with the file named" begin
         with_toml("[run\n") do dir
             err = try; read_config(dir); catch e; e; end
             @test err isa ConfigError
             @test occursin("TestItems.toml", sprint(showerror, err))
+        end
+    end
+
+    @testset "a config file the call names is read in place of TestItems.toml" begin
+        # The suite's own file is broken, so reading it at all would throw.
+        with_toml("[run]\nworkers = 3\nnot_a_key = 1\n") do testdir
+            other = mktempdir()
+            prefs = joinpath(other, "prefs", "Fast.toml")
+            mkpath(dirname(prefs)); write(prefs, "[Foo]\nx = 1\n")
+            custom = joinpath(other, "custom.toml")
+            write(custom, """
+            [run]
+            workers = 2
+            timeout = 90
+            [order]
+            first = ["a"]
+            [profiles.fast]
+            julia_args = ["-O0"]
+            preferences = "prefs/Fast.toml"
+            """)
+            cfg = read_config(testdir; config = custom)
+            @test (cfg.workers, cfg.timeout_s, cfg.order_first) == (2, 90, ["a"])
+            @test cfg.profiles[:fast].julia_args == ["-O0"]
+            # A path in it is relative to its own directory, not to `test/`.
+            @test cfg.profiles[:fast].preferences == prefs
+            @test cfg.config_file == custom
+            # A keyword still wins over it.
+            @test read_config(testdir; config = custom, workers = 1).workers == 1
+            # Relative to the current directory.
+            @test cd(() -> read_config(testdir; config = "custom.toml").timeout_s, other) == 90
+            # Without the keyword the suite's own file is read, and refused.
+            @test_throws ConfigError read_config(testdir)
+            # Without it, the suite's own is read, and no file is named.
+            @test read_config(mktempdir()).config_file == ""
+        end
+    end
+
+    @testset "a config file the call names has to exist, and what is wrong with it names it" begin
+        dir = mktempdir()
+        message(f) = (err = try; f(); nothing; catch e; e; end; err isa ConfigError ? sprint(showerror, err) : "")
+        missing_file = joinpath(dir, "missing.toml")
+        @test occursin("missing.toml", message(() -> read_config(dir; config = missing_file)))
+        @test occursin("does not exist", message(() -> read_config(dir; config = missing_file)))
+        # A directory is not a file to read.
+        @test occursin("does not exist", message(() -> read_config(dir; config = dir)))
+        bad = joinpath(dir, "bad.toml")
+        write(bad, "[run]\nworkerz = 2\n")
+        @test occursin("bad.toml", message(() -> read_config(dir; config = bad)))
+        write(bad, "[run\n")
+        @test occursin("bad.toml", message(() -> read_config(dir; config = bad)))
+        write(bad, "[profiles.p]\npreferences = \"nowhere.toml\"\n")
+        @test occursin(joinpath(dir, "nowhere.toml"), message(() -> read_config(dir; config = bad)))
+    end
+
+    @testset "a run reads the config file it is given, and runtestsf passes it on" begin
+        dir = make_pkg("CustomConfig", "test/t_test.jl" => """
+        @testitem "fast" sandbox=:fast begin
+            @test true
+        end
+        @testitem "fails" begin
+            @test false
+        end
+        """)
+        profile = joinpath(mktempdir(), "ci.toml")
+        write(profile, "[run]\ntimeout = 77\n[profiles.fast]\nthreads = \"1\"\n")
+        no_profile = joinpath(dirname(profile), "bare.toml")
+        write(no_profile, "[run]\ntimeout = 78\n")
+        message(f) = (err = try; f(); nothing; catch e; e; end; err isa ConfigError ? sprint(showerror, err) : "")
+        prep(; kw...) = Runtests.Private.prepare((dir,); announce = false, kw...)
+        # The suite has no TestItems.toml: the profile is unknown, and the message
+        # names where it was looked for.
+        @test occursin("TestItems.toml", message(() -> prep()))
+        p, _ = prep(; config = profile)
+        @test p.cfg.timeout_s == 77 && p.cfg.profiles[:fast].threads == "1"
+        @test occursin("bare.toml", message(() -> prep(; config = no_profile)))
+        # `runtestsf` hands it to the run: a missing one stops it.
+        with_runstate_dir() do _
+            capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, config = profile))
+            err = try
+                Runtests.runtestsf(dir; config = joinpath(dirname(profile), "gone.toml"), dry_run = true)
+            catch e
+                e
+            end
+            @test err isa ConfigError && occursin("gone.toml", sprint(showerror, err))
         end
     end
 

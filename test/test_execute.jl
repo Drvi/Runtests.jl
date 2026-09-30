@@ -193,10 +193,13 @@ end
 
     @testset "retries re-run a failing item" begin
         with_marker_dir() do dir
-            states, run, _ = run_states(FAULTY; workers=1, tags=[:retry], logs=:issues)
+            (states, run, _), out = capture_run(() -> run_states(FAULTY; workers=1, tags=[:retry], logs=:issues))
             @test states["passes on the second try"] === PASSED
             @test isfile(joinpath(dir, "runtests_retry"))
             @test run.nonpass == count(is_non_pass, run.statuses.state) == 0
+            # A plain failure leaves its worker fit to use, and the retry runs there.
+            @test occursin("retrying on the same worker (retry 1 of 1)", out)
+            @test !occursin("on a new worker", out)
         end
         # An item's own `retries` wins over the run default, in both directions.
         with_marker_dir() do dir

@@ -61,11 +61,12 @@ parsing them, never by evaluating them, so a test file cannot run anything in th
 process that is coordinating the run.
 
 Every Julia file under `test/` has to be a test file, a module in `testsetups/`,
-or `runtests.jl`. Files inside a directory with its own `Project.toml` are left
-alone, and so are hidden (dot-prefixed) files and directories. Anything else stops
-the run until it is named, moved or removed: a file of tests that nobody named
-`*_test.jl` would otherwise sit there for months, never read, while the suite
-reported a clean pass without it.
+or `runtests.jl`. Files inside a directory with its own `Project.toml` or
+`JuliaProject.toml`, such as a package of test helpers, are left alone, and so are
+hidden (dot-prefixed) files and directories. Anything else stops the run until it
+is named, moved or removed: a file of tests that nobody named `*_test.jl` would
+otherwise sit there for months, never read, while the suite reported a clean pass
+without it.
 
 A run reads every test file whatever it was asked to run: a suite that does not
 parse, or that declares one name twice, is a broken suite rather than a smaller
@@ -98,7 +99,10 @@ work without the test environment having to declare `Test` itself.
 | `sandbox=true` | run alone in a process that is torn down afterwards (not with `chain`) |
 | `sandbox=:name` | run under `[profiles.name]` of `TestItems.toml` |
 
-Every keyword except `skip` must be a literal.
+Every keyword except `skip` must be a literal of the kind the table says:
+`timeout=true` is refused rather than read as one second. A retry runs on the same
+worker, unless the failure took the worker with it (a timeout, a crash) or the item
+is sandboxed; the failed attempt's report says which.
 
 An item's body runs at the top level of a fresh module, with the REPL's soft scope:
 `x = 1` followed by a loop that updates `x` works as it does at the prompt. As in a
@@ -131,10 +135,11 @@ file for it per depot: another checkout with a setup of the same name, or a prof
 with other Julia flags, compiles over it. `Runtests.setups_to_packages()` makes every
 setup a package, after which each checkout and each set of flags keeps its own
 cache. `Name.jl` moves to `Name/src/Name.jl`, beside a `Name/Project.toml` with a
-UUID and the packages the setup imports. In a moved setup, `@__DIR__` becomes
-`pkgdir(MyPkg, "test", "testsetups")`, which still names that directory when the
-code is pasted at the REPL. A package can import only what its project lists, so
-run it again after a setup starts importing something new.
+UUID and the packages the setup imports, and a run precompiles it for the Julia
+flags of every profile before any worker needs it. In a moved setup, `@__DIR__`
+becomes `pkgdir(MyPkg, "test", "testsetups")`, which still names that directory
+when the code is pasted at the REPL. A package can import only what its project
+lists, so run it again after a setup starts importing something new.
 
 ## Running tests
 
@@ -148,20 +153,29 @@ Runtests.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||
 Runtests.runtests("test/db"; tags=:fast)     # they narrow together
 Runtests.runtests(dry_run=true)              # print the plan, run nothing
 Runtests.runtestsf()                         # run what is failing, each item as it last ran
-Runtests.chores()                            # what the suite needs tidying; fix=true tidies it
+Runtests.chores()                            # tidy the suite; dry_run=true only says what it would do
 ```
 
 A tag expression is names joined with `&&` and `||`, each optionally negated with
 `!`; `&&` binds tighter, and there are no parentheses. `name` also takes several
-names, as a vector or a set.
+names, as a vector or a set. A `file.jl:line` target picks one item, so it is given
+without other files or directories.
 
-`Runtests.chores()` reports what a suite needs looking after: anything a run would
-refuse to start on, in the test items or in `TestItems.toml`; setups that are not
-packages yet, or whose imports have outgrown their `[deps]`; and this machine's
-run states older than a week, apart from the newest five, whose durations order
-the next run. Another machine's run state, a downloaded CI artifact say, is never
-deleted. `Runtests.chores(fix = true)` makes the setups packages and deletes those run
-states; the rest needs a person. It returns `true` when nothing is left to do.
+`Runtests.chores()` looks after a suite: it makes packages of the setups that are
+not yet, and adds to their `[deps]` what they have come to import; it deletes this
+machine's run states that nothing reads; and it reports anything a run would refuse
+to start on, in the test items or in `TestItems.toml`, which needs a person. Run
+states are kept as a run keeps them, the newest 20 and any older one a failing item's
+last verdict is in, and of those only one with nothing about an item the suite has
+now goes: a dry run, a run stopped before any item finished, or one whose items have
+all been renamed or deleted since. Another machine's run state, a downloaded CI
+artifact say, is never deleted. Once it has done what it can, it throws
+`Runtests.ChoresError` if anything is left for a person, and otherwise returns
+`true`, so `Runtests.chores(); Runtests.runtests()` stops before a long run on a
+suite that needs fixing first. `Runtests.chores(dry_run = true)` changes nothing,
+never throws, says what it would do, and returns `true` when nothing is left to do.
+`Runtests.chores(config = "ci.toml")`, or with several files, checks those too, each
+as a run given it would, beside `test/TestItems.toml`.
 
 A run that cannot start throws before any item runs: `Runtests.ScanFailure` when test
 files cannot be read as a suite, `Runtests.NoTestsError` when there is nothing to run,
@@ -189,8 +203,9 @@ given.
 | `seed` | where every item's random numbers start, with its name; random unless given, and printed at the start of the run |
 | `dry_run` | print the plan and run nothing |
 | `replay` | run a recorded run again (see [Run state](#run-state)) |
+| `config` | a file to read in place of `test/TestItems.toml`, relative to the current directory (see [`test/TestItems.toml`](#testtestitemstoml)) |
 
-All but `dry_run` and `replay` can also go under `[run]` in `test/TestItems.toml`;
+All but `dry_run`, `replay` and `config` can also go under `[run]` in `test/TestItems.toml`;
 a keyword given to `runtests` wins over the file.
 
 With `workers = 0` the items run in this process, one after another. An item that
@@ -322,7 +337,7 @@ The run ends with what it cost, stage by stage, followed by `Test`'s usual summa
 <b>│ </b>(summed resident sizes over-count pages the processes share)
 <b>│ </b>machine · 57.7G of 64.0G in use at peak
 <b>│ </b>cpu · 9% of 18 threads for this run's processes, 14% for the whole machine (averages over the run)
-<b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276-96211.runstate
+<b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276123456-96211.runstate
 </pre>
 
 The memory figures cover every process the run owns: the coordinator, the workers,
@@ -374,9 +389,15 @@ test_end = "GC.gc(true)"
 preferences = "prefs/bounds.toml"
 ```
 
-An unknown key, or a name in `[order]` that is not a test item, is an error: a
-misspelled option that silently does nothing is how a suite ends up not running
-the way its author believes it does.
+The file is read from the package's `test/` directory, unless a call names another
+with `config = "path/to/file.toml"`, relative to the current directory, which then
+has to exist. Nothing but that keyword makes a run read another file: not an
+environment variable, and not a file lying next to the suite.
+
+An unknown key, a value of the wrong kind (a string where a list goes, `true` where
+a number does), or a name in `[order]` that is not a test item, is an error: a
+misspelled option that silently does nothing is how a suite ends up not running the
+way its author believes it does.
 
 An `[order]` pin is relative to the items that run alongside it. Items under
 different profiles run concurrently, and a sandboxed item runs concurrently with
@@ -388,9 +409,11 @@ the suite's own code, so what they cost is not charged to the item, and an item'
 timeout stays a budget for the item. What `test_end` finds is reported as the
 item's result, because that is what it was checking.
 
-A profile's `preferences` file, relative to `test/`, is laid over the test
+A profile's `preferences` file, relative to the directory of the file that declares
+the profile (`test/` for `test/TestItems.toml`), is laid over the test
 environment's `LocalPreferences.toml` in a copy of the environment that its workers
-use. Packages see different preferences there, so they are precompiled separately.
+use, kept among the system's temporary files. Packages see different preferences
+there, so they are precompiled separately.
 
 ## At the REPL
 
@@ -486,21 +509,32 @@ run again somewhere else:
 - the commit, the Julia version and build, the machine, the settings, the
   profiles with their preferences, and the seed every item's random numbers came
   from;
+- the environment variables a run's behaviour can depend on (`JULIA_*` and
+  `RUNTESTS_*`) and the ones naming the CI job it ran in, leaving out any whose name
+  looks like a credential;
 - the test environment's `Project.toml` and `Manifest.toml`.
 
 The path is printed at the end of every run. Run states live in the depot, in a
-directory per project under `runtests/runs/` named for the project, or in the directory
-`RUNTESTS_RUNSTATE_DIR` names. The 20 most recent that this machine recorded are kept,
-and so is any older one that a failing item's last verdict is in, however many runs
-back: running one item again and again does not make `runtestsf` forget the others.
-An item that a run of the whole suite no longer finds was renamed or deleted: it is
-not failing from then on, and keeps no run state. Once a project no longer exists, the run states this machine recorded for it are
-deleted too. The
-machine is the hostname, or the name `RUNTESTS_HOST` gives it.
-One recorded elsewhere, such as a run state downloaded from CI, is never changed
-or deleted, wherever it is, and a replay deletes nothing. Run states count in the
-order they started, as each records it, so a downloaded one counts from when it
+directory per project under `runtests/runs/` named for the project, or in the
+directory `RUNTESTS_RUNSTATE_DIR` names, which several projects can share: each reads
+only its own, known by the project's UUID, else its name, else the name of its
+directory. A run writes its run state there, under a name of its choosing; a call
+cannot give it another path. Only the run states in that directory are read, to plan
+a run, to find what `runtestsf` runs and to decide what pruning keeps. One anywhere
+else, such as a run state downloaded from CI or copied next to the project, counts
+only when a call names it with `replay`, and for that call alone. Run states count in
+the order they started, as each records it, so a downloaded one counts from when it
 ran, whatever it is named.
+
+The 20 most recent that this machine recorded are kept, and so is any older one that
+a failing item's last verdict is in, however many runs back: running one item again
+and again does not make `runtestsf` forget the others. An item that a run of the
+whole suite no longer finds was renamed or deleted: it is not failing from then on,
+and keeps no run state. Once a project's directory is gone, the run states this
+machine recorded for it are deleted too, unless the directory above it is missing or
+empty, as a drive that is not mounted leaves it. The machine is the hostname, or the
+name `RUNTESTS_HOST` gives it. One recorded elsewhere, such as a run state downloaded
+from CI, is never changed or deleted, wherever it is, and a replay deletes nothing.
 
 On CI, cache them from one run to the next, so each run is ordered by the ones
 before it, and keep a failed run's as an artifact:

@@ -95,7 +95,8 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     setups = target === nothing ? Dict{Symbol, String}() : setup_modules(target.testdir)
     errors = ScanError[]
     item = parse_testitem(ex, path, Int32(source.line), errors, setups)
-    isempty(errors) || throw(ScanFailure(errors))
+    # `nothing` comes with the error that says why.
+    (item === nothing || !isempty(errors)) && throw(ScanFailure(errors))
     sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE
     warn_ignored(item, sandboxed)
     return with_interactive_env(target) do
@@ -180,7 +181,7 @@ function run_sandboxed(item::RawItem, target)
     prof = interactive_profile(item, target)
     timeout = item.timeout_s == USE_RUN_DEFAULT ? nothing : Int(item.timeout_s)
     attempts = item.retries == USE_RUN_DEFAULT ? 1 : Int(item.retries) + 1
-    local result::ItemResult
+    result = nothing
     relay(io, pid, line) = let rec = parse_record(line)
         rec === nothing ? println(io, "      worker ", pid, " | ", line) : say(item, target, rec.attempt, rec.how)
     end
@@ -201,7 +202,7 @@ function run_sandboxed(item::RawItem, target)
             if !isempty(prof.test_end.args) && result.state !== SKIPPED
                 result = merge_test_end(result, fetch(RuntestsWorkers.remote_end(w, spec, prof.test_end))::ItemResult)
             end
-            (result.state === RuntestsWorkers.PASSED || attempt == attempts) && break
+            (!is_non_pass(result.state) || attempt == attempts) && break
         catch e
             e isa TimeoutException || rethrow()
             RuntestsWorkers.terminate!(w, :timeout)
@@ -210,6 +211,8 @@ function run_sandboxed(item::RawItem, target)
             close(w)
         end
     end
+    # Every attempt sets it or throws, and the last one never goes round again.
+    result = result::ItemResult
     # In a run the coordinator prints results; here this process is the coordinator.
     print_interactive_result(result)
     return result

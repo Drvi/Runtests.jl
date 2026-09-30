@@ -38,7 +38,7 @@ function plan_block(p::Plan, order)
                         "as if every item took as long, since no durations are recorded yet")
         end
     end
-    return bracket(body, "[TEST]", head, "", :white)
+    return bracket(body, "[TEST]", head, "", :default)
 end
 
 # The opening words of a run's header and of a dry run's: which Runtests and Julia, how
@@ -180,10 +180,11 @@ Each of `names` as a column `width` wide shows it. A name that fits is quoted as
 is. One that does not becomes `r"^…"`: a prefix of it as long as fits, and never
 shorter than the shortest prefix no other name in `among` starts with, so that
 passed to `name=` it picks out that item and no other. `among` is every name in the
-suite, since a filter can leave out the item whose name a prefix would also match. When even that prefix does
-not fit, the name overruns the column with it; when no prefix is its own (the name
-begins another), it overruns the column whole. With any name shortened, every name
-gets a column in front of its opening quote, `r` or a space, so the quotes line up.
+suite, since a filter can leave out the item whose name a prefix would also match.
+When even that prefix does not fit, the name overruns the column with it; when no
+prefix is its own (the name begins another), it overruns the column whole. With any
+name shortened, every name gets a column in front of its opening quote, `r` or a
+space, so the quotes line up.
 """
 function shown_names(names::Vector{String}, width::Integer; among::Vector{String} = names)
     quoted = [repr(n) for n in names]
@@ -203,10 +204,15 @@ function shown_names(names::Vector{String}, width::Integer; among::Vector{String
         need[i] >= length(n) && return nothing   # no prefix of its own, or none shorter
         # The longest prefix whose `"^…"` fits, but no shorter than `need`.
         k = need[i]
-        while k + 1 < length(n) && textwidth(regex_prefix(n, k + 1)) - 1 <= width
+        shown = regex_prefix(n, k)
+        shown === nothing && return nothing   # a character no regex here can show: the name stays whole
+        while k + 1 < length(n)
+            longer = regex_prefix(n, k + 1)
+            (longer !== nothing && textwidth(longer) - 1 <= width) || break
             k += 1
+            shown = longer
         end
-        return regex_prefix(n, k)
+        return shown
     end
     any(!isnothing, shortened) || return quoted
     return [s === nothing ? " " * q : s for (s, q) in zip(shortened, quoted)]
@@ -226,24 +232,27 @@ function item_names(p::Plan, width::Integer)
     return names, width + any(n -> !startswith(n, '"'), names)
 end
 
+# The characters PCRE reads as other than themselves outside a character class.
+const REGEX_SPECIAL = "\\^\$.|?*+()[]{}"
+
 # `r"^…"` for the first `k` characters of `name`, written as Julia source for a
-# regular expression that matches those characters literally.
+# regular expression that matches those characters literally: as they are when none
+# is special, after `\Q` when one is, which PCRE reads every character after as
+# itself until `\E`. Quoted only when needed, because `\Q` takes two of the column's
+# characters. `nothing` when one of them does not print: inside `\Q` nothing is an
+# escape, and the line could not show it as it is.
 function regex_prefix(name::AbstractString, k::Integer)
-    io = IOBuffer()
-    print(io, "r\"^")
-    for c in first(name, k)
-        if c in "\\^\$.|?*+()[]{}"
-            print(io, '\\', c)
-        elseif c == '"'
-            print(io, "\\\"")
-        elseif !isprint(c)
-            print(io, escape_string(string(c)))   # `\n`, `\x01`: escapes the regex reads too
-        else
-            print(io, c)
-        end
+    prefix = first(name, k)
+    all(isprint, prefix) || return nothing
+    pattern = if any(in(REGEX_SPECIAL), prefix)
+        # A `\E` in the name would end the quoting: it closes it, is written
+        # escaped, and opens it again.
+        string("^\\Q", replace(prefix, "\\E" => "\\E\\\\E\\Q"))
+    else
+        string("^", prefix)
     end
-    print(io, '"')
-    return String(take!(io))
+    # A raw string halves the backslashes before a quote, its closing one included.
+    return string("r\"", Base.escape_raw_string(pattern), "\"")
 end
 
 """
@@ -311,6 +320,9 @@ plural(n::Integer, one::AbstractString, many::AbstractString = one * "s") =
 # prints reads the same way.
 function fmt_seconds(s::Real)
     s < 60 && return string(round(s; digits = 1), "s")
+    # A time no run takes, or not a number, which only a damaged run state holds, is
+    # said as it is rather than in minutes that overflow an `Int`.
+    s < 1.0e12 || return string(s, "s")
     m, rest = divrem(s, 60)
     return string(round(Int, m), "m", lpad(string(round(rest; digits = 1)), 4, "0"), "s")
 end
@@ -464,7 +476,9 @@ end
 
 # `text` padded to `width` in `color`, byte for byte as `printstyled` writes it,
 # without the closure and the padded copy it builds: two lines per item use it.
-function print_colored(io::IO, text::AbstractString, width::Integer, color::Symbol)
+# A colour is a name or, as `JULIA_ERROR_COLOR=196` makes `Base.error_color()`, a
+# number from 0 to 255.
+function print_colored(io::IO, text::AbstractString, width::Integer, color::Union{Symbol, Int})
     on = get(io, :color, false)::Bool
     on && print(io, Base.text_colors[color])
     print(io, text)
@@ -545,11 +559,11 @@ A worker's record of an item starting or finishing (`RuntestsWorkers.record_run`
 `nothing` for any other line.
 """
 function parse_record(line::AbstractString)
-    startswith(line, RuntestsWorkers.RECORD_MARK) || return nothing
-    # Cut at each space by position and parsed into a tuple, which allocates
-    # nothing: two of these arrive for every item.
+    startswith(line, RECORD_MARK) || return nothing
+    # Cut at each space by position and parsed into a tuple, with no string built for
+    # any field: two of these arrive for every item.
     stop = ncodeunits(line)
-    lo = ncodeunits(RuntestsWorkers.RECORD_MARK) + 1
+    lo = ncodeunits(RECORD_MARK) + 1
     word = :other
     n, k = (0, 0, 0, 0, 0, 0), -1   # k: the numbers read, after the word
     while true
@@ -609,7 +623,7 @@ is printed as the plain line it is.
 """
 function print_label_block(run, head::AbstractString, body::AbstractString)
     isempty(strip(body)) && return say(run, head)
-    return printline(run, bracket(body, "[TEST]", head, "", :white))
+    return printline(run, bracket(body, "[TEST]", head, "", :default))
 end
 
 """
@@ -686,8 +700,9 @@ function print_conclusion(run, ended::Symbol = :finished)
         isempty(tally) ? ", all passed" : string(", ", join(tally, ", "))
     )
     body = styled() do io
-        run.monitor === nothing || print_memory_summary(io, run.monitor; indent = "")
-        run.coverage === nothing || print_coverage(io, run.coverage, p.root)
+        monitor, coverage = run.monitor, run.coverage
+        monitor === nothing || print_memory_summary(io, monitor; indent = "")
+        coverage === nothing || print_coverage(io, coverage, p.root)
         if run.runstate !== nothing
             print(io, "run state: ")
             printstyled(io, run.runstate.path; color = :light_black)

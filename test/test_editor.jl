@@ -11,9 +11,9 @@ struct EditorSession
     task::Task
 end
 
-function open_session(dir)
+function open_session(dir; config = nothing)
     input, output = Base.BufferStream(), Base.BufferStream()
-    task = @async Runtests.serve(dir; input, output)
+    task = @async Runtests.serve(dir; config, input, output)
     events = Channel{Any}(Inf)
     @async begin
         for line in eachline(output)
@@ -212,6 +212,40 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 close_session(s)
                 @test last(collect(s.events))["event"] == "bye"
             end
+        end
+    end
+
+    @testset "a session reads the config file it was started with, to list and to run" begin
+        dir = make_pkg("ServedConfig", "test/a_test.jl" => string(item("plain"), item("fast"; opts = "sandbox=:fast")))
+        config = joinpath(mktempdir(), "editor.toml")
+        write(config, "[run]\nworkers = 1\n[profiles.fast]\nthreads = \"1\"\n")
+        with_runstate_dir() do _
+            # Without it, the profile the item names is unknown, and said to be.
+            s = open_session(dir)
+            @test next_event(s)["config"] === nothing
+            send(s, (; id = 1, command = "list"))
+            errors = next_event(s)["errors"]
+            @test length(errors) == 1 && occursin("[profiles.fast]", only(errors)["message"])
+            @test only(errors)["file"] == joinpath(dir, "test", "TestItems.toml")
+            close_session(s)
+            # With it: said in `hello`, read for the listing, and for the run.
+            s = open_session(dir; config)
+            @test next_event(s)["config"] == config
+            send(s, (; id = 1, command = "list"))
+            @test isempty(next_event(s)["errors"])
+            send(s, (; id = 2, command = "run", names = ["plain"]))
+            seen = events_until(e -> e["event"] == "run_finished", s)
+            @test only(e for e in seen if e["event"] == "run_started")["workers"] == 1
+            @test last(seen)["state"] == "passed"
+            close_session(s)
+            # A file that is not there is a problem the listing names.
+            s = open_session(dir; config = joinpath(dirname(config), "gone.toml"))
+            next_event(s)
+            send(s, (; id = 1, command = "list"))
+            errors = next_event(s)["errors"]
+            @test length(errors) == 1 && occursin("gone.toml does not exist", only(errors)["message"])
+            @test only(errors)["file"] == joinpath(dirname(config), "gone.toml")
+            close_session(s)
         end
     end
 

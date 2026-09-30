@@ -12,10 +12,11 @@ const PROTOCOL = 1;
 class RuntestsServer extends EventEmitter {
     /**
      * @param {{julia: string, juliaArgs?: string[], environment: string, root: string,
-     *          env?: NodeJS.ProcessEnv, onLog?: (line: string) => void}} options
+     *          config?: string, env?: NodeJS.ProcessEnv, onLog?: (line: string) => void}} options
      *   `julia` and `juliaArgs` start Julia (`juliaArgs` go first, so `+1.12` works
      *   for juliaup); `environment` is the project it runs in, which must have
-     *   Runtests; `root` the package whose suite it serves.
+     *   Runtests; `root` the package whose suite it serves; `config` a file every
+     *   listing and run reads in place of `test/TestItems.toml`.
      */
     constructor(options) {
         super();
@@ -35,7 +36,8 @@ class RuntestsServer extends EventEmitter {
         const o = this.options;
         // In colour: what it writes for people is shown in a terminal, which renders it.
         const args = [...(o.juliaArgs ?? []), `--project=${o.environment}`, '--startup-file=no', '--color=yes',
-            '-e', 'using Runtests; Runtests.serve(ARGS[1])', o.root];
+            '-e', 'using Runtests; Runtests.serve(ARGS[1]; config = get(ARGS, 2, nothing))', o.root,
+            ...(o.config ? [o.config] : [])];
         this.onLog(`starting: ${o.julia} ${args.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
         const proc = spawn(o.julia, args, { cwd: o.root, env: o.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
         this.proc = proc;

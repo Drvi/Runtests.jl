@@ -55,6 +55,15 @@ end
                 @test isfile(paths[kept])
                 @test !ispath(dirname(paths[gone]))
                 @test isfile(paths[foreign])        # not this machine's to delete
+                # Out of reach rather than gone: a drive that is not mounted leaves no
+                # parent, or an empty mount point, where the project was.
+                for recorded in (joinpath(mktempdir(), "Volume", "Unmounted"), joinpath(mktempdir(), "Unmounted"))
+                    away = mkpath(joinpath(dirname(dirname(paths[kept])), "Unmounted-" * string(hash(recorded); base = 16)))
+                    write(joinpath(away, "project"), recorded)
+                    cp(paths[kept], joinpath(away, basename(paths[kept])))
+                    Runtests.Private.sweep_runstate_dirs()
+                    @test isfile(joinpath(away, basename(paths[kept])))
+                end
 
                 # A project without a name is named for its directory, and what a
                 # directory name cannot hold everywhere is left out.
@@ -179,11 +188,50 @@ end
                 bytes[rand(rng, 1:length(bytes))] = rand(rng, UInt8)
             end
             write(garbled, bytes)
-            @test (read_run_state(garbled); true)
+            rs = read_run_state(garbled)
+            # What is read of it can be shown, however little that is.
+            @test (rs === nothing || sprint(show, MIME"text/plain"(), rs) isa String)
         end
         @test read_run_state(joinpath(mktempdir(), "not_a_file")) === nothing
         write(garbled, "not a run state at all")
         @test read_run_state(garbled) === nothing
+    end
+
+    @testset "a file with fewer items than statuses shows, and says what failed" begin
+        pkg = make_pkg("FewerItems", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("a", "b", "c"))))
+        with_runstate_dir() do dir
+            path = record_run(dir, pkg, 1, Dict("a" => (FAILED, 1.0), "b" => (PASSED, 1.0), "c" => (FAILED, 1.0)); whole = true)
+            # The items section says two where the header says three.
+            bytes = read(path)
+            at = Runtests.Private.read_record(IOBuffer(bytes), Runtests.Private.Header).off_items
+            bytes[(at + 1):(at + 4)] = reinterpret(UInt8, [UInt32(2)])
+            write(path, bytes)
+            rs = read_run_state(path)
+            @test length(rs.items) == 2 && length(rs.statuses) == 3
+            shown = sprint(show, MIME"text/plain"(), rs)
+            @test occursin("\"a\"", shown) && !occursin("\"c\"", shown)
+            @test Runtests.Private.last_failure(Runtests.Private.resolve_target((pkg,))).name == "a"
+        end
+    end
+
+    @testset "a damaged file's times are shown as they are" begin
+        pkg = make_pkg("OddTimes", "test/t_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n")
+        with_runstate_dir() do dir
+            path = record_run(dir, pkg, 1, Dict("a" => (FAILED, 1.0)); whole = true)
+            H = Runtests.Private.Header
+            clean = read(path)
+            h = Runtests.Private.read_record(IOBuffer(clean), H)
+            put!(bytes, at, x) = (bytes[(at + 1):(at + sizeof(x))] = reinterpret(UInt8, [x]); bytes)
+            for t in (NaN, Inf, -Inf, 2.5e219)
+                bytes = copy(clean)
+                put!(bytes, Runtests.Private.header_offset(:start_unix), t)
+                put!(bytes, Runtests.Private.header_offset(:end_unix), -t)
+                put!(bytes, Int(h.off_status) + 8, Float32(t))   # the item's elapsed
+                write(path, bytes)
+                shown = sprint(show, MIME"text/plain"(), read_run_state(path))
+                @test occursin("started ", shown) && occursin("\"a\"", shown)
+            end
+        end
     end
 
     @testset "a killed run still reports what finished" begin
@@ -264,6 +312,39 @@ end
             @test history(pkg).seconds == Dict("x" => 0.5, "y" => 2.0, "z" => 3.0)
             p, _ = prepare((pkg,); announce = false)
             @test all(>(0), p.units.est_s)
+        end
+    end
+
+    @testset "a run stopped part way through leaves the durations of the items it stopped" begin
+        pkg = make_pkg("StoppedTimings", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("slow", "chained"))))
+        with_runstate_dir() do dir
+            record_run(dir, pkg, 1, Dict("slow" => (PASSED, 300.0), "chained" => (PASSED, 4.0)); whole = true)
+            # Stopped 2 s into `slow`; `chained` never ran, its chain having broken.
+            record_run(dir, pkg, 2, Dict("slow" => (Runtests.Private.CANCELLED, 2.0),
+                                         "chained" => (Runtests.Private.BROKEN_CHAIN, 0.1)); whole = true)
+            @test history(pkg).seconds == Dict("slow" => 300.0, "chained" => 4.0)
+            # A timeout is how long the item took at the least, and counts.
+            record_run(dir, pkg, 3, Dict("slow" => (TIMEDOUT, 600.0)); whole = true)
+            @test history(pkg).seconds["slow"] == 600.0
+        end
+    end
+
+    @testset "a project without a name keeps its run states when its project file changes" begin
+        env = mkpath(joinpath(mktempdir(), "Analysis"))
+        write(joinpath(env, "Project.toml"), "[deps]\n")
+        mkpath(joinpath(env, "test"))
+        write(joinpath(env, "test", "a_test.jl"), "@testitem \"one\" begin\n    @test true\nend\n")
+        with_runstate_dir() do dir
+            for n in 1:25
+                record_run(dir, env, n, Dict("one" => (n == 1 ? FAILED : PASSED, 1.0)))
+            end
+            @test Runtests.Private.project_id(env) == "Analysis"
+            # A dependency added: the project is the same one, and so are its runs.
+            write(joinpath(env, "Project.toml"), "[deps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n")
+            @test length(Runtests.Private.project_runs(env)) == 25
+            @test history(env).seconds == Dict("one" => 1.0)
+            prune_runstates(env)
+            @test length(runstate_files(env)) == Runtests.Private.KEEP_RUNS
         end
     end
 

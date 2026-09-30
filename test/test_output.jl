@@ -277,6 +277,19 @@ using RuntestsWorkers: RuntestsWorkers
         @test !occursin("\e[", log)
     end
 
+    @testset "an outcome is drawn in a colour given as a number" begin
+        # `JULIA_ERROR_COLOR=196` makes `Base.error_color()` a number rather than a name.
+        P = Runtests.Private
+        withenv("JULIA_ERROR_COLOR" => "196", "JULIA_WARN_COLOR" => "208") do
+            for (state, code) in ((P.FAILED, 196), (P.SKIPPED, 208))
+                text = sprint(io -> P.print_colored(io, P.short_state(state), 4, P.state_color(state)); context = :color => true)
+                @test startswith(text, Base.text_colors[code]) && occursin(P.short_state(state), text)
+            end
+            how = (; state = P.FAILED, elapsed_ns = UInt64(1), compile_ns = UInt64(0), maxrss = UInt64(1))
+            @test occursin("FAIL", P.item_line(1, 1, 2, "\"x\"", 12, 1, 1, how))
+        end
+    end
+
     @testset "the child that wrote that log was never asked for colour" begin
         # Every assertion above reads the log as plain text, so the child that
         # writes it must not colour it — and whether it does is decided by the

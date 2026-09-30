@@ -96,15 +96,16 @@ function last_failure(target)
         )
     )
     rs = last(only(runs))
-    failed = filter(i -> rs.statuses[i].state in STEPPABLE, eachindex(rs.statuses))
+    # Paired by `zip`: a damaged file can hold fewer items than statuses.
+    failed = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if st.state in STEPPABLE]
     isempty(failed) && throw(
         NoTestsError(
             "the last recorded run of this project had no failures to step into; " *
                 "name an item instead: `Runtests.debug(\"name\")`"
         )
     )
-    sort!(failed; by = i -> rs.statuses[i].start_off + rs.statuses[i].elapsed, rev = true)
-    names = [rs.items[i].name for i in failed]
+    sort!(failed; by = ((_, st),) -> st.start_off + st.elapsed, rev = true)
+    names = [it.name for (it, _) in failed]
     return (; name = first(names), others = names[2:end], seed = tryparse(UInt64, get(rs.meta, "seed", "")))
 end
 
@@ -149,7 +150,7 @@ function print_debug_header(item::RawItem, prof::Profile, seed::UInt64, failure,
     if isempty(body)
         println(stdout, label_prefix(), head)
     else
-        print(stdout, bracket(join(body, "\n"), "[TEST]", head, "", :white))
+        print(stdout, bracket(join(body, "\n"), "[TEST]", head, "", :default))
     end
     flush(stdout)
     return nothing

@@ -49,6 +49,42 @@ using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, 
         @test !occursin("precompiling", again)
     end
 
+    @testset "a setup that is a package is precompiled for every profile's flags" begin
+        # A package keeps a cache per set of flags, so the `checked` pool's can be
+        # built before its worker starts rather than inside its first item.
+        dir = make_pkg("ProfiledSetup")
+        setup = string("Flagged", string(hash(dir); base=16))
+        write(joinpath(dir, "test", "TestItems.toml"), "[profiles.checked]\njulia_args = [\"--check-bounds=yes\"]\n")
+        # Each item asks, before it loads the setup, whether its own process has a
+        # cache to load: `false` would mean the worker compiles it itself. (Loading a
+        # cache touches its file, so the file's time cannot say who wrote it.)
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "plain" begin
+            @test Base.isprecompiled(Base.identify_package("$setup"))
+            using $setup
+            @test $setup.value() == 7
+        end
+        @testitem "checked" sandbox=:checked begin
+            @test Base.isprecompiled(Base.identify_package("$setup"))
+            using $setup
+            @test $setup.value() == 7
+        end
+        """)
+        src = mkpath(joinpath(dir, "test", "testsetups", setup, "src"))
+        write(joinpath(src, setup * ".jl"), "module $setup\nvalue() = 7\nend\n")
+        write(joinpath(dir, "test", "testsetups", setup, "Project.toml"), "name = \"$setup\"\nuuid = \"$(next_uuid())\"\n")
+
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["plain"] === PASSED && states["checked"] === PASSED
+        @test occursin("precompiling $setup", out)
+        # A cache for each set of flags, and nothing left to compile the next time.
+        cachedir = joinpath(first(DEPOT_PATH), "compiled", "v$(VERSION.major).$(VERSION.minor)", setup)
+        @test count(endswith(".ji"), readdir(cachedir)) == 2
+        (states, _, _), again = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["plain"] === PASSED && states["checked"] === PASSED
+        @test !occursin("precompiling $setup", again)
+    end
+
     @testset "setups are found as a file or as a directory" begin
         dir = make_pkg(
             "SetupShapes",
@@ -384,9 +420,9 @@ end
     end
 
     @testset "a profile's project finds every package the environment found" begin
-        # The copy sits a directory below the environment it is taken from, so a
-        # path written relative to the environment names the wrong place from
-        # there — and Pkg writes a relative one for any package it reached through
+        # The copy sits elsewhere than the environment it is taken from (here, a
+        # directory below it), so a path written relative to the environment names
+        # the wrong place from there — and Pkg writes a relative one for any package it reached through
         # another package's checkout, which is how a developed package is reached.
         base = mktempdir()
         env = joinpath(base, "env")
@@ -450,6 +486,24 @@ end
         # A `[sources]` path is read relative to the project file, so it moves too.
         sources = Runtests.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["sources"]
         @test realpath(sources["Outside"]["path"]) == realpath(outside)
+    end
+
+    @testset "a profile's project is never written into the package" begin
+        # With `--project=test`, and in the editor, the environment is the package's
+        # own `test/Project.toml`: its profile projects would land in `test/`.
+        dir = make_pkg("PrefsOutside", "test/a_test.jl" => "@testitem \"x\" begin\nend\n",
+                       "test/Project.toml" => "[deps]\n", "test/prefs.toml" => "[PrefsOutside]\nk = 1\n")
+        before = readdir(joinpath(dir, "test"))
+        prof = Runtests.Private.Profile(:tuned; preferences = joinpath(dir, "test", "prefs.toml"))
+        proj = Runtests.Private.profile_project(prof, joinpath(dir, "test", "Project.toml"))
+        @test !startswith(proj, dir)
+        @test readdir(joinpath(dir, "test")) == before
+        @test isfile(joinpath(proj, "Project.toml"))
+        @test occursin("k = 1", read(joinpath(proj, "LocalPreferences.toml"), String))
+        # One per environment and profile, and the same one each time.
+        @test Runtests.Private.profile_project(prof, joinpath(dir, "test", "Project.toml")) == proj
+        other = make_pkg("PrefsOutsideToo", "test/Project.toml" => "[deps]\n")
+        @test Runtests.Private.profile_project(prof, joinpath(other, "test", "Project.toml")) != proj
     end
 
     @testset "a preferences file that is missing or broken is a config error" begin

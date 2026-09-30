@@ -184,6 +184,9 @@ function plan(
     return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold)
 end
 
+# The file the settings came from, as a message names it.
+config_name(cfg) = isempty(cfg.config_file) ? "TestItems.toml" : relpath_or_path(cfg.config_file)
+
 function validate_profiles(raw, cfg)
     bad = Dict{Symbol, Vector{RawItem}}()
     for it in raw
@@ -195,7 +198,7 @@ function validate_profiles(raw, cfg)
     throw(ConfigError(sprint() do io
         println(io, "unknown sandbox profiles (known: ", join(known, ", "), "):")
         for (name, items) in sort!(collect(bad); by = first)
-            println(io, "  `sandbox=:$name` has no [profiles.$name] in TestItems.toml, used by:")
+            println(io, "  `sandbox=:$name` has no [profiles.$name] in ", config_name(cfg), ", used by:")
             foreach(it -> println(io, "    ", repr(it.name), " at ", relpath_or_path(it.file), ":", it.line), items)
         end
     end))
@@ -210,7 +213,7 @@ function validate_order(raw, cfg)
     check_order_conflicts(raw, cfg)
     isempty(missing_) && return
     throw(ConfigError(sprint() do io
-        println(io, "[order] of TestItems.toml names test items that do not exist:")
+        println(io, "[order] of ", config_name(cfg), " names test items that do not exist:")
         for n in missing_
             near = nearest(n, names)
             println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
@@ -237,7 +240,7 @@ function check_order_conflicts(raw, cfg)
                            " while `last` names ", join(map(repr, l), ", ")))
     end
     isempty(both) && return nothing
-    throw(ConfigError("[order] of TestItems.toml puts these both first and last:\n" *
+    throw(ConfigError("[order] of $(config_name(cfg)) puts these both first and last:\n" *
                       join(("  " * b for b in both), "\n")))
 end
 

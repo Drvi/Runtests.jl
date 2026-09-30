@@ -34,6 +34,12 @@ end
             "test/.hidden.jl" => "# not ours\n",
             "test/vendor/Project.toml" => "name = \"Vendor\"\n",
             "test/vendor/vendored.jl" => "# a subproject's own\n",
+            # A package of test helpers under the other name Julia gives a project
+            # file, with tests of its own that are not this suite's.
+            "test/helpers/Tools/JuliaProject.toml" => "name = \"Tools\"\n",
+            "test/helpers/Tools/src/Tools.jl" => "module Tools end\n",
+            "test/helpers/Tools/test/runtests.jl" => "using Test\n",
+            "test/helpers/Tools/test/tools_test.jl" => "",
         )
         tests, strays = walk_test_dir(joinpath(dir, "test"))
         @test map(basename, tests) == ["a_test.jl", "b_tests.jl"]

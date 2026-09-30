@@ -162,6 +162,7 @@ class Suite {
             : fs.existsSync(path.join(this.root, 'test', 'Project.toml')) ? path.join(this.root, 'test') : this.root;
         this.server = new RuntestsServer({
             julia, juliaArgs: config.get('julia.args') ?? [], environment, root: this.root,
+            config: config.get('config') ? path.resolve(this.root, config.get('config')) : undefined,
             // What Runtests writes for people: into the output of the run in progress,
             // shown in a terminal, and into the log.
             onLog: line => {

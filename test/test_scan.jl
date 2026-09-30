@@ -63,6 +63,12 @@ end
         @test a[1].retries == 3
         @test a[1].failfast == 1
         @test a[1].setups == [:MySetup]
+        # Every way of naming a module a body can load it by.
+        for load in ("using MySetup", "import MySetup", "using MySetup: f", "import MySetup: f as g",
+                     "import MySetup as S", "using MySetup.Inner")
+            b, _ = scan_source("@testitem \"x\" begin\n    $load\nend\n"; setups=Dict(:MySetup => "x.jl"))
+            @test b[1].setups == [:MySetup]
+        end
         @test a[2].chain === :c
         @test a[2].profile === :bounds
         @test a[2].skip isa Expr                 # evaluated on the worker, not here
@@ -112,6 +118,9 @@ end
             ("""@testitem "a" timeout=5/0 begin\n end\n""", "at most 2147483647"),
             ("""@testitem "a" timeout=1e12 begin\n end\n""", "at most 2147483647"),
             ("""@testitem "a" retries=10000000000 begin\n end\n""", "an integer from 0 to 126"),
+            # `true` is an integer to Julia, and not a number of seconds or retries.
+            ("""@testitem "a" timeout=true begin\n end\n""", "positive number"),
+            ("""@testitem "a" retries=true begin\n end\n""", "an integer from 0 to 126"),
         )
             a, _ = scan_source(src)
             @test a isa ScanFailure

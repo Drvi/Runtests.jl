@@ -40,6 +40,7 @@ const TEST_FILES = [
     "test_runner.jl",
     "test_execute.jl",
     "test_setups.jl",
+    "test_static.jl",
     "test_workers.jl",
     "test_runstate.jl",
     "test_matrix.jl",

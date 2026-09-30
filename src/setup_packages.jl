@@ -116,7 +116,7 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
         toml = tomls[name]
         have = get(Dict{String, Any}, toml, "deps")
         for (n, u) in deps
-            haskey(have, n) && Base.UUID(have[n]) != u &&
+            haskey(have, n) && Base.UUID(have[n])::Base.UUID != u &&
                 push!(problems, "$(shown(project)): lists `$n` as $(have[n]); it is $u")
         end
         rewritten, imported = 0, false
@@ -164,7 +164,7 @@ function print_setup_packages(io::IO, plans::Vector{SetupPackage}, dir::String, 
     body = styled() do s
         print_setup_changes(s, plans, dir; done = true)
     end
-    print(io, bracket(body, "[TEST]", head, "", :white))
+    print(io, bracket(body, "[TEST]", head, "", :default))
     return nothing
 end
 
@@ -251,9 +251,9 @@ function package_binding(ex::Expr, name::Symbol, pkg::Symbol)
         for st in m.args[end].args
             st isa Expr && (st.head === :using || st.head === :import) || continue
             for b in st.args
-                b isa Expr && b.head === :. && b.args == Any[pkg] && return pkg
+                b isa Expr && b.head === :. && only_name(b, pkg) && return pkg
                 if st.head === :import && b isa Expr && b.head === :as && b.args[1] isa Expr &&
-                        b.args[1].args == Any[pkg]
+                        only_name(b.args[1]::Expr, pkg)
                     return b.args[2]::Symbol
                 end
             end
@@ -261,6 +261,9 @@ function package_binding(ex::Expr, name::Symbol, pkg::Symbol)
     end
     return nothing
 end
+
+# Whether the path `ex` of an import is `pkg` and nothing more.
+only_name(ex::Expr, pkg::Symbol) = length(ex.args) == 1 && ex.args[1] === pkg
 
 # Where `Meta.parseall` put a syntax error in place of a statement: its line and
 # message, or `nothing`.

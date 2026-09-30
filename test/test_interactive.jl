@@ -366,6 +366,21 @@ end
         end
     end
 
+    @testset "a skipped item is not retried" begin
+        # Skipping is an outcome, not a failure to try again.
+        with_activated(DEPS) do _
+            log = tempname()
+            withenv("RUNTESTS_ATTEMPTS" => log) do
+                capture_run() do
+                    @testitem "paste skipped" retries=2 sandbox=true skip=(open(io -> println(io, "asked"), ENV["RUNTESTS_ATTEMPTS"], "a"); true) begin
+                        @test false
+                    end
+                end
+            end
+            @test readlines(log) == ["asked"]
+        end
+    end
+
     @testset "a sandbox that never finishes reports the timeout" begin
         with_activated(DEPS) do _
             ex = :(@testitem "paste overruns" timeout=2 sandbox=true begin

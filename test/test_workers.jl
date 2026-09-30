@@ -316,6 +316,28 @@ end
         @test occursin("no coordinator connected", read(proc, String))
     end
 
+    @testset "a worker waits out connections that are not its coordinator's" begin
+        # Whatever else connects first, a scanner that hangs up or a client that says
+        # something else, is closed; the connection that presents the cookie is served.
+        cookie = "c"^RuntestsWorkers.COOKIE_BYTES
+        port, server = listenany(Sockets.localhost, UInt16(21000))
+        try
+            accepted = Threads.@spawn RuntestsWorkers.accept_coordinator(server, cookie)
+            close(connect(Sockets.localhost, port))
+            other = connect(Sockets.localhost, port)
+            write(other, "x"^RuntestsWorkers.COOKIE_BYTES)
+            coordinator = connect(Sockets.localhost, port)
+            write(coordinator, cookie)
+            sock = fetch(accepted)
+            write(sock, "served\n")
+            @test readline(coordinator) == "served"
+            @test eof(other)   # closed, never answered
+            close(sock); close(other); close(coordinator)
+        finally
+            close(server)
+        end
+    end
+
     @testset "these tests leave no worker running" begin
         @test @lock(RuntestsWorkers.LIVE_LOCK, count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)) == 0
     end

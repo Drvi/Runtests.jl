@@ -44,8 +44,9 @@ const MSG_BOUNDARY = UInt8[0x79, 0x8e, 0x8e, 0xf5, 0x6e, 0x9b, 0x2e, 0x97, 0xd5,
 const HEADER_BYTES = sizeof(UInt64) + sizeof(UInt8) + sizeof(UInt32)
 
 # The coordinator writes a cookie to the worker's stdin, and the worker serves only
-# the connection that presents it. Not against attackers: it stops a port scanner
-# or an endpoint agent from taking the worker's one connection.
+# the connection that presents it. Not against attackers: a port scanner or an
+# endpoint agent that connects first is closed, and the worker keeps waiting for
+# the coordinator (`accept_coordinator`).
 const COOKIE_BYTES = 32
 
 # A healthy worker exits within milliseconds of the connection closing. On SIGTERM
@@ -899,16 +900,9 @@ function startworker(connect_timeout::Real)
         println(stdout, "Runtests worker: no coordinator connected within $(connect_timeout)s; exiting")
         exit(1)
     end
-    sock = accept(server)
+    sock = accept_coordinator(server, cookie)
     close(server)   # exactly one connection is ever served
-    Sockets.nagle(sock, false)
-    Sockets.quickack(sock, true)
-    presented = read!(sock, Vector{UInt8}(undef, COOKIE_BYTES))
     close(deadline)
-    if presented != codeunits(cookie)
-        println(stdout, "Runtests worker: the connection did not present this worker's cookie; exiting")
-        exit(1)
-    end
     try
         serve_requests(sock)
     catch e
@@ -918,6 +912,34 @@ function startworker(connect_timeout::Real)
         exit(1)
     end
     exit(0)
+end
+
+"""
+    accept_coordinator(server, cookie) -> TCPSocket
+
+The first connection to `server` that presents `cookie`. Any other is closed and the
+wait goes on: whatever else on the machine connects first, a port scanner or an
+endpoint agent, would otherwise take the worker's one connection and leave the
+coordinator nothing to connect to. A connection that neither presents the cookie nor
+closes holds the wait until the worker's deadline.
+"""
+function accept_coordinator(server, cookie::AbstractString)
+    expected = codeunits(cookie)
+    while true
+        sock = accept(server)
+        presented = try
+            read!(sock, Vector{UInt8}(undef, length(expected)))
+        catch e
+            (e isa EOFError || e isa Base.IOError) || rethrow()
+            nothing
+        end
+        if presented == expected
+            Sockets.nagle(sock, false)
+            Sockets.quickack(sock, true)
+            return sock
+        end
+        close(sock)
+    end
 end
 
 """

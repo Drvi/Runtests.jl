@@ -59,7 +59,12 @@
                 "runtests.run.options": {
                     "type": "object",
                     "default": {},
-                    "markdownDescription": "Settings sent with every run, such as `{\"workers\": 2}`: any of the `run` command's options in the editor protocol. Everything else comes from `test/TestItems.toml`."
+                    "markdownDescription": "Settings sent with every run, such as `{\"workers\": 2}`: any of the `run` command's options in the editor protocol. Everything else comes from `test/TestItems.toml`, or the file `#runtests.config#` names."
+                },
+                "runtests.config": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "A config file to read in place of `test/TestItems.toml`, relative to the workspace folder, for listing the items and for every run. Empty: `test/TestItems.toml`. Read when the server starts: run `Runtests: Restart Server` after changing it."
                 }
             }
         },

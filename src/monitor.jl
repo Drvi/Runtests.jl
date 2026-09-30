@@ -307,9 +307,10 @@ function stop_monitor!(m::Union{Nothing, Monitor})
         @atomic m.stop = true
         clear_status_line(m)
     end
-    m.task === nothing || (
+    task = m.task
+    task === nothing || (
         try
-            wait(m.task)
+            wait(task)
         catch
         end
     )

@@ -13,6 +13,11 @@ const USE_RUN_DEFAULT = Int32(-1)
 const MAX_RETRIES = Int(typemax(Int8)) - 1
 const MAX_TIMEOUT_S = Int(typemax(Int32))
 
+# A number a setting or a keyword takes. `true` and `false` are integers to Julia and
+# not numbers to anyone writing one: `timeout = true` is a slip, not one second.
+is_number(x) = x isa Real && !(x isa Bool)
+is_whole_number(x) = x isa Integer && !(x isa Bool)
+
 """
     RawItem
 
@@ -24,15 +29,15 @@ struct RawItem
     file::String
     line::Int32
     tags::Vector{Symbol}
-    setups::Vector{Symbol}   # modules `using`d by the body, filtered to known setups
+    setups::Vector{Symbol} # modules `using`d by the body, filtered to known setups
     code::Expr
     skip::Any              # Bool, or an expression evaluated on the worker
-    timeout_s::Int32            # USE_RUN_DEFAULT to inherit
-    retries::Int32            # USE_RUN_DEFAULT to inherit
-    failfast::Int8             # -1 to inherit, 0/1 otherwise
-    chain::Symbol           # NO_CHAIN when the item stands alone
-    profile::Symbol           # DEFAULT_PROFILE, or a name from TestItems.toml
-    exclusive::Bool             # sandbox=true: alone in a process, torn down after
+    timeout_s::Int32       # USE_RUN_DEFAULT to inherit
+    retries::Int32         # USE_RUN_DEFAULT to inherit
+    failfast::Int8         # -1 to inherit, 0/1 otherwise
+    chain::Symbol          # NO_CHAIN when the item stands alone
+    profile::Symbol        # DEFAULT_PROFILE, or a name from TestItems.toml
+    exclusive::Bool        # sandbox=true: alone in a process, torn down after
 end
 
 # A problem in a test file, located. Scanning collects all of them before failing,
@@ -87,6 +92,17 @@ struct ConfigError <: Exception
     msg::String
 end
 Base.showerror(io::IO, e::ConfigError) = print(io, "Runtests: ", e.msg)
+
+"""
+    ChoresError
+
+Thrown by [`chores`](@ref) once it has done what it could, when what is left needs a
+person: the problems its report names. `msg` counts them.
+"""
+struct ChoresError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::ChoresError) = print(io, "Runtests: ", e.msg)
 
 """
     RunStalled
@@ -151,10 +167,11 @@ end
 """
     Filter
 
-A run's selection: `name` (exact, a `Regex`, or a set of exact names) and `tags`
-(a vector an item must carry all of, or a [`TagExpr`](@ref)) are matched against items, `paths` against their files (empty
-means all), and `line` picks the item defined at or above it. Every test file is
-read whatever the selection: a suite that does not parse is broken, not smaller.
+A run's selection: `name` (exact, a `Regex`, or a set of exact names) and `tags` (a
+vector an item must carry all of, or a [`TagExpr`](@ref)) are matched against items,
+`paths` against their files (empty means all), and `line` picks the item defined at
+or above it. Every test file is read whatever the selection: a suite that does not
+parse is broken, not smaller.
 """
 struct Filter
     name::Union{Nothing, String, Regex, Set{String}}

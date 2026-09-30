@@ -68,6 +68,8 @@ Base.@kwdef struct RunConfig
     replayed_manifest::String = ""
     # The run state a replay runs, or empty for a run that is not one.
     replayed_from::String = ""
+    # The file a call named to read in place of `test/TestItems.toml`, or empty.
+    config_file::String = ""
 end
 
 const RUN_KEYS = (
@@ -81,13 +83,17 @@ const TOP_KEYS = (:run, :order, :profiles)
 const LOG_MODES = (:eager, :batched, :issues)
 
 """
-    read_config(testdir; kwargs...) -> RunConfig
+    read_config(testdir; config = nothing, kwargs...) -> RunConfig
 
 Merge `test/TestItems.toml` with explicit keyword arguments. An unknown key is an
 error, not a no-op: a misspelled option would otherwise be ignored in silence.
+`config` names another file to read in its place, relative to the current
+directory; named, it has to exist, where `test/TestItems.toml` may be absent.
 """
-function read_config(testdir::AbstractString; kwargs...)
-    path = joinpath(testdir, "TestItems.toml")
+function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
+    path = config === nothing ? joinpath(testdir, "TestItems.toml") : abspath(config)
+    config === nothing || isfile(path) ||
+        throw(ConfigError("the config file $(relpath_or_path(path)) does not exist"))
     toml = Dict{String, Any}()
     if isfile(path)
         toml = try
@@ -97,7 +103,7 @@ function read_config(testdir::AbstractString; kwargs...)
         end
         check_keys(path, toml, TOP_KEYS, "")
     end
-    return build_config(path, toml; kwargs...)
+    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
 end
 
 function check_keys(path, tbl::AbstractDict, allowed::Tuple, where_)
@@ -123,6 +129,26 @@ function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple
     return t
 end
 
+# `key` of the table labelled `label`, a list of strings, empty when absent. A string on
+# its own is refused rather than read as the list of its characters: `key = "a"` for
+# `key = ["a"]` is the likeliest slip.
+function string_list(path, table::AbstractDict, key::AbstractString, label::AbstractString)
+    v = get(Vector{String}, table, key)
+    (v isa AbstractVector && all(x -> x isa AbstractString, v)) || throw(ConfigError(
+        "`$key` of [$label] in $(relpath_or_path(path)) must be a list of strings, as in " *
+            "`$key = [\"…\"]`, got $(repr(v))"
+    ))
+    return String[x for x in v]
+end
+
+# `key` of the table labelled `label`, a string, empty when absent.
+function string_setting(path, table::AbstractDict, key::AbstractString, label::AbstractString)
+    v = get(table, key, "")
+    v isa AbstractString ||
+        throw(ConfigError("`$key` of [$label] in $(relpath_or_path(path)) must be a string, got $(repr(v))"))
+    return String(v)
+end
+
 # `true` or `false` from an environment variable, or `nothing` when it is unset or empty.
 function env_flag(name::AbstractString)
     v = lowercase(strip(get(ENV, name, "")))
@@ -132,18 +158,18 @@ function env_flag(name::AbstractString)
     throw(ConfigError("`$name` must be true or false (or 1, 0, yes, no), got $(repr(ENV[name]))"))
 end
 
-function build_config(path, toml; nunits = 0, kwargs...)
+function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(ConfigError("unknown keyword `$k`; the run settings are $(join(RUN_KEYS, ", "))"))
     end
     run = section(path, toml, "run", RUN_KEYS)
     # A keyword wins over the file, and the file over the default.
     pick(key, default) = something(get(kwargs, key, nothing), get(run, string(key), default))
-    seconds(key, x) = (x isa Real && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+    seconds(key, x) = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(ConfigError("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))"))
     # 0 prints at every sample, five times a second: a test's way to make the
     # monitor print as often as it can.
-    interval(x) = (x isa Real && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+    interval(x) = (is_number(x) && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(ConfigError("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))"))
     flag(key, default) = (v = pick(key, default); v isa Bool ? v :
         throw(ConfigError("`$key` must be true or false, got $(repr(v))")))
@@ -151,21 +177,21 @@ function build_config(path, toml; nunits = 0, kwargs...)
     threads = threads_spec("threads", pick(:threads, "2,1"))
     w = pick(:workers, "auto")
     # A worker is a slot, and slots are numbered in a `SlotIdx`.
-    ((w isa Integer && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(ConfigError(
+    ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(ConfigError(
         "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))"
     ))
     workers = w isa Integer ? Int(w) : auto_workers(threads, nunits)
-    logs = Symbol(pick(:logs, default_logs(workers)))
+    logs = Symbol(pick(:logs, default_logs(workers)))::Symbol
     logs in LOG_MODES || throw(ConfigError("`logs` must be one of $(LOG_MODES), got $(repr(logs))"))
     timeout = seconds(:timeout, pick(:timeout, 30 * 60))
     retries = pick(:retries, 0)
-    (retries isa Integer && 0 <= retries <= MAX_RETRIES) ||
+    (is_whole_number(retries) && 0 <= retries <= MAX_RETRIES) ||
         throw(ConfigError("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))"))
     mt = pick(:memory_threshold, 0.9)
-    (mt isa Real && 0 < mt <= 1) || throw(ConfigError("`memory_threshold` must be in (0, 1], got $(repr(mt))"))
+    (is_number(mt) && 0 < mt <= 1) || throw(ConfigError("`memory_threshold` must be in (0, 1], got $(repr(mt))"))
     failfast = flag(:failfast, false)
     seed = pick(:seed, 0)
-    (seed isa Integer && 0 <= seed <= typemax(UInt64)) ||
+    (is_whole_number(seed) && 0 <= seed <= typemax(UInt64)) ||
         throw(ConfigError("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))"))
     order = section(path, toml, "order", ORDER_KEYS)
     # A keyword, then the environment, then the file: CI switches coverage on for a
@@ -199,9 +225,10 @@ function build_config(path, toml; nunits = 0, kwargs...)
         testset_name = String(testset_name), coverage, coverage_source,
         monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
-        order_first = String[string(x) for x in get(Vector{String}, order, "first")],
-        order_last = String[string(x) for x in get(Vector{String}, order, "last")],
-        seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed)
+        order_first = string_list(path, order, "first", "order"),
+        order_last = string_list(path, order, "last", "order"),
+        seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed),
+        config_file = String(config_file)
     )
 end
 
@@ -229,15 +256,21 @@ function read_profiles(path, toml, default_threads::String)
     length(tbl) < typemax(ProfileIdx) ||
         throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $(typemax(ProfileIdx) - 1) fit"))
     for name in keys(tbl)
-        p = section(path, tbl, name, PROFILE_KEYS, "profiles.$name")
-        args = String[string(a) for a in get(Vector{String}, p, "julia_args")]
-        env = Pair{String, String}[string(k) => string(v) for (k, v) in get(Dict{String, Any}, p, "env")]
+        label = "profiles.$name"
+        p = section(path, tbl, name, PROFILE_KEYS, label)
+        args = string_list(path, p, "julia_args", label)
+        vars = get(Dict{String, Any}, p, "env")
+        (vars isa AbstractDict && all(v -> v isa Union{AbstractString, Real}, values(vars))) || throw(ConfigError(
+            "`env` of [$label] in $(relpath_or_path(path)) must be a table of variables, as in " *
+                "`env = { NAME = \"value\" }`, got $(repr(vars))"
+        ))
+        env = Pair{String, String}[string(k) => string(v) for (k, v) in vars]
         sort!(env; by = first)
         profiles[Symbol(name)] = Profile(
             Symbol(name), args,
-            threads_spec("threads of [profiles.$name]", get(p, "threads", default_threads)), env,
-            parse_expr(path, name, "init", get(p, "init", "")),
-            parse_expr(path, name, "test_end", get(p, "test_end", "")),
+            threads_spec("threads of [$label]", get(p, "threads", default_threads)), env,
+            parse_expr(path, name, "init", string_setting(path, p, "init", label)),
+            parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
             profile_preferences(path, name, get(p, "preferences", ""))
         )
     end

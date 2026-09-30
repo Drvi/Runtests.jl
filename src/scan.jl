@@ -18,8 +18,10 @@ discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 
 Every test file under `testdir`, and every other Julia file there, both sorted.
 Hidden files and directories, `testsetups/` and subprojects (directories with a
-`Project.toml`) are skipped. The strays are reported, not skipped: a file of tests
-not named `*_test.jl` would otherwise never run, and the run would pass without it.
+`Project.toml` or a `JuliaProject.toml`) are skipped: a package of test helpers
+there has tests and code of its own, for an environment this run cannot build. The
+strays are reported, not skipped: a file of tests not named `*_test.jl` would
+otherwise never run, and the run would pass without it.
 """
 function walk_test_dir(testdir::AbstractString)
     tests, strays = String[], String[]
@@ -27,7 +29,7 @@ function walk_test_dir(testdir::AbstractString)
     for (dir, dirs, names) in walkdir(testdir; topdown = true)
         filter!(dirs) do d
             !startswith(d, '.') && d != TESTSETUPS_DIR &&
-                !isfile(joinpath(dir, d, "Project.toml"))
+                !any(n -> isfile(joinpath(dir, d, n)), PROJECT_NAMES)
         end
         for n in names
             startswith(n, '.') && continue
@@ -49,7 +51,7 @@ stray_error(path::AbstractString) = ScanError(
     path, 0,
     "not a test file. Test files are named `*_test.jl` or `*_tests.jl`; shared code goes in " *
         "`test/$TESTSETUPS_DIR/` as a module that test items load with `using`; a directory " *
-        "with its own Project.toml is left alone. Rename it, move it there, or remove it."
+        "with its own Project.toml or JuliaProject.toml is left alone. Rename it, move it there, or remove it."
 )
 
 """
@@ -182,12 +184,12 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `tags` must be a vector of symbols, got `$(_show(val))`")
         elseif key === :timeout
             v = literal(val)
-            (v isa Real && 0 < v <= MAX_TIMEOUT_S) ||
+            (is_number(v) && 0 < v <= MAX_TIMEOUT_S) ||
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got `$(_show(val))`")
             timeout = Int32(ceil(v))
         elseif key === :retries
             v = literal(val)
-            (v isa Integer && 0 <= v <= MAX_RETRIES) ||
+            (is_whole_number(v) && 0 <= v <= MAX_RETRIES) ||
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `retries` must be an integer from 0 to $MAX_RETRIES, got `$(_show(val))`")
             retries = Int32(v)
         elseif key === :failfast
@@ -242,7 +244,8 @@ function literal(@nospecialize(v))
         end
         return isempty(out) ? Any[] : [x for x in out]
     end
-    if v isa Expr && v.head === :call && length(v.args) == 3 && v.args[1] in (:*, :+, :-, :/)
+    if v isa Expr && v.head === :call && length(v.args) == 3 && v.args[1] isa Symbol &&
+            (v.args[1]::Symbol) in (:*, :+, :-, :/)
         # `timeout=5*60` reads better than `timeout=300`, and folding literal
         # arithmetic looks nothing up.
         a, b = literal(v.args[2]), literal(v.args[3])
@@ -288,10 +291,11 @@ function collect_setups!(out::Vector{Symbol}, @nospecialize(ex), known)
     return out
 end
 
+# The module a `using` or `import` names, as in `M`, `M.x`, `M: f` and `M as N`.
 function module_head(@nospecialize(a))
     a isa Expr || return nothing
     a.head === :. && !isempty(a.args) && a.args[1] isa Symbol && return a.args[1]
-    a.head === :(:) && return module_head(a.args[1])
+    (a.head === :(:) || a.head === :as) && return module_head(a.args[1])
     return nothing
 end
 

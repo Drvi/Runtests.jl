@@ -15,9 +15,22 @@ chain_link(name; chain::Symbol, before="") = journal_item(name; opts="chain=:$ch
     @test true
     """)
 
+# The longest step the coordinator's clock, `time()`, was seen to take. Next to
+# nothing on Linux and macOS; on Windows it moves in steps of a millisecond or more,
+# and a time it stamps can read up to one step early.
+function clock_step(seconds = 0.2)
+    step, t = 0.0, time()
+    deadline = t + seconds
+    while t < deadline
+        u = time()
+        u > t && ((step, t) = (max(step, u - t), u))
+    end
+    return step
+end
+
 # The chain `links` ran in one process, each member starting after the one before
 # it ended: by the worker's clock, in the journal, and by the coordinator's, in the
-# dispatch time and duration it recorded.
+# dispatch time and duration it recorded, to within a step of that clock.
 function check_ran_in_sequence(rows, run, p, links)
     ours = [r for r in rows if r.name in links || r.name in (l * " end" for l in links)]
     @test [r.name for r in ours] == collect(Iterators.flatten((l, l * " end") for l in links))
@@ -26,8 +39,9 @@ function check_ran_in_sequence(rows, run, p, links)
     st = run.statuses
     @test allequal(st.slot[i] for i in idx)
     @test all(i -> st.pid[i] == first(ours).pid, idx)
+    slack = 1e-3 + clock_step()
     for (a, b) in zip(idx, idx[2:end])
-        @test st.start[b] >= st.start[a] + st.elapsed[a] - 1e-3
+        @test st.start[b] >= st.start[a] + st.elapsed[a] - slack
     end
 end
 

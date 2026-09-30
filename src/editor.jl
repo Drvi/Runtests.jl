@@ -1,8 +1,8 @@
 # The editor protocol: a Runtests process an editor drives over its standard streams.
 # Commands arrive on stdin and events leave on stdout, one JSON object per line;
 # everything written for people — the run's own lines, `Pkg`, what items print —
-# goes to stderr, so nothing but events reaches the stream. What each command and
-# event holds is in `docs/editor-protocol.md`.
+# goes to stderr, so nothing but events reaches the stream. What a command holds is
+# read in `command!`, and what an event holds is where it is emitted.
 
 const PROTOCOL_VERSION = 1
 
@@ -161,9 +161,11 @@ end
 Drive the test suite of the package at `path` from an editor: read commands from
 `input` and write events to `output`, one JSON object per line, until `input` ends
 or a `shutdown` command arrives; a run still going is cancelled first. The commands
-are `list`, `run`, `cancel` and `shutdown`; `docs/editor-protocol.md` has them and
-the events they answer with. `config` names a file every listing and run of the
-session reads in place of `test/TestItems.toml`, relative to the current directory.
+are `list`, `run`, `cancel` and `shutdown`: each an object naming its `command`, with
+an `id` that the events answering it carry, and for `run` the `names` of the items to
+run and the `options` to run them with (`RUN_OPTIONS`). `config` names a file every
+listing and run of the session reads in place of `test/TestItems.toml`, relative to
+the current directory.
 
 Serving over this process's own `stdout` takes it over for the rest of the process:
 everything else written there, by the run, by `Pkg` or by C libraries, goes to

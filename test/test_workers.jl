@@ -1,7 +1,7 @@
 # The worker protocol: the framing on its own, then real worker processes.
 using RuntestsWorkers: RuntestsWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
                     WorkerTerminatedException, RemoteException
-using RuntestsWorkers: ItemSpec, ItemResult, PASSED
+using RuntestsWorkers: ItemSpec, ItemResult, PASSED, ERRORED
 using Sockets
 
 # A connected socket pair standing in for coordinator and worker.
@@ -166,19 +166,15 @@ end
             end)))
             @test res.state === PASSED
             keeps_passes && @test only(res.testset.results).value == "a custom Boom"
-            # A `skip` that is not a Bool is reported with its value as it prints.
+            # A `skip` that is not a Bool is the item's error, its value shown as it prints.
             odd = quote
                 struct Maybe end
                 Base.show(io::IO, ::Maybe) = print(io, "a custom Maybe")
                 Maybe()
             end
-            err = try
-                fetch(remote_run(w, probe_spec(:(begin end); name="odd skip", skip=odd)))
-            catch e
-                e
-            end
-            @test err isa RemoteException
-            @test occursin("a custom Maybe", sprint(showerror, err))
+            res = fetch(remote_run(w, probe_spec(:(begin end); name="odd skip", skip=odd)))
+            @test res.state === ERRORED
+            @test occursin("`skip` must evaluate to a Bool, got a custom Maybe", sprint(show, only(res.testset.results)))
         end
     end
 

@@ -111,8 +111,8 @@ end
 
 # The item called `name`, from the whole suite read the way a run reads it.
 function find_item(target, name::String)
-    files, strays = walk_test_dir(target.testdir)
-    items = scan(files, Filter(), setup_modules(target.testdir); strays)
+    files, strays, templates = walk_test_dir(target.testdir)
+    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates)
     i = findfirst(it -> it.name == name, items)
     i === nothing || return items[i]
     near = [it.name for it in items if occursin(lowercase(name), lowercase(it.name))]

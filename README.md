@@ -51,8 +51,11 @@ test/
   runtests.jl          using Runtests; Runtests.runtests()
   solver_test.jl       @testitem declarations, and nothing else
   sub/parser_tests.jl
+  periods_tests.jl     the items its template declares, which Runtests.chores() writes
   testsetups/
     MySetups.jl        ordinary modules that test items load with `using`
+  testtemplates/
+    periods_tests_template.jl   @testtemplate declarations, each a loop
   TestItems.toml       optional: run settings, forced ordering, sandbox profiles
 ```
 
@@ -60,7 +63,8 @@ A test file contains only `@testitem` declarations. Runtests reads test files by
 parsing them, never by evaluating them, so a test file cannot run anything in the
 process that is coordinating the run.
 
-Every Julia file under `test/` has to be a test file, a module in `testsetups/`,
+Every Julia file under `test/` has to be a test file, a test template in
+`testtemplates/` (see [Test templates](#test-templates)), a module in `testsetups/`,
 or `runtests.jl`. Files inside a directory with its own `Project.toml` or
 `JuliaProject.toml`, such as a package of test helpers, are left alone, and so are
 hidden (dot-prefixed) files and directories. Anything else stops the run until it
@@ -93,14 +97,16 @@ work without the test environment having to declare `Test` itself.
 | `tags=[:a, :b]` | tags to filter by |
 | `timeout=N` | seconds before the item is killed |
 | `retries=N` | attempts after a failed one; the item's value wins over the run's |
-| `skip=expr` | `true`, or an expression evaluated on the worker |
+| `skip=expr` | `true`, or an expression evaluated on the worker before the body |
 | `failfast=true` | stop this item at its first failure |
 | `chain=:sym` | items sharing a chain run in sequence, on one worker |
 | `sandbox=true` | run alone in a process that is torn down afterwards (not with `chain`) |
 | `sandbox=:name` | run under `[profiles.name]` of `TestItems.toml` |
 
 Every keyword except `skip` must be a literal of the kind the table says:
-`timeout=true` is refused rather than read as one second. A retry runs on the same
+`timeout=true` is refused rather than read as one second. `skip` sees `Test` and
+the package, as the body does before its own imports, and must give a `Bool`; an
+error in it is the item's error, reported as one in the body would be. A retry runs on the same
 worker, unless the failure took the worker with it (a timeout, a crash) or the item
 is sandboxed; the failed attempt's report says which.
 
@@ -141,6 +147,84 @@ becomes `pkgdir(MyPkg, "test", "testsetups")`, which still names that directory
 when the code is pasted at the REPL. A package can import only what its project
 lists, so run it again after a setup starts importing something new.
 
+### Test templates
+
+A test item per element of a list that code computes, such as the subtypes of an
+abstract type or the files of a data directory, comes from a template in
+`test/testtemplates/`: `periods_tests_template.jl` there expands into the test file
+`test/periods_tests.jl`.
+
+```julia
+# test/testtemplates/periods_tests_template.jl
+@testtemplate "doubling a $P of $n" tags=[:gen] for P in filter(T -> T <: DatePeriod, [Day, Hour, Month]), n in 1:2
+    using Dates
+    @test $P($n) + $P($n) == $P(2 * $n)
+end
+```
+
+A template holds `@testtemplate` declarations and nothing else; an ordinary
+`@testitem` goes in a test file. A `@testtemplate` declares an item per iteration of
+the `for` in its header, the first variable varying slowest, each written out as a
+`@testitem` with a literal name. `Runtests.chores()` runs the loops in a process of
+its own, with the test environment active and the setups loadable as in a worker,
+and each loop sees what its item will: the package and the body's `using` and
+`import` statements, here `Dates`. A list several templates share goes in a setup
+module, as other shared code does.
+
+```julia
+# Expanded from testtemplates/periods_tests_template.jl by `Runtests.chores()`.
+# Change the template and run `Runtests.chores()` again, rather than editing this file.
+# runtests-expansion 1 433820ad 8fb456c8
+
+@testitem "doubling a Day of 1" tags=[:gen] begin
+    using Dates
+    @test Day(1) + Day(1) == Day(2 * 1)
+end
+```
+
+and so on, for `Day` at 2 and `Month` at 1 and 2.
+
+In the name, `$P` interpolates as in any string, with the values printed as the
+item's module shows them. In the keywords and the body, `$P` puts the value of
+the loop variable `P` there, written as code, as `Threads.@spawn` takes `$x`: `repr`
+of it as the item's module sees it with the body's `using` and `import` statements,
+in parentheses where the code beside it would bind to it otherwise. It has to
+evaluate back to an equal value there, or the template is refused, so a closure or a
+type the template defines cannot be looped over. Nothing binds `P` in the item, so
+a `P` without its `$` is refused unless the body binds `P` itself: `P = $P` gives it a
+variable of that name, wherever the template puts it and with what it shadows there.
+
+In the keywords, a `$(...)` is computed as the template expands, once per iteration
+and among the names the loop sees, and its value is written the same way:
+
+```julia
+@testtemplate "case $n" skip = $(n in KNOWN_BAD) for n in 1:1000
+    using MySetups          # KNOWN_BAD = (42, 666)
+    @test check($n)
+end
+```
+
+gives `@testitem "case 42" skip = true begin`, and `skip = false` to the items not
+in `KNOWN_BAD`. What is outside a `$(...)` is the item's, evaluated as it runs:
+`skip = Sys.iswindows() || $(n in KNOWN_BAD)` decides its first half on the machine
+that runs the item. In the body only a loop variable's `$` is the template's, since a
+`$(...)` there may be a macro's: any other `$` is left as it is, for a macro of the
+body's own such as BenchmarkTools' `@btime`, and so is every `$` inside a quoted
+expression; in a string, `"$($P)"` puts the value in.
+
+The expansion is an ordinary test file: commit it, as `Pkg.test` of an installed
+package needs it. Nothing expands a template but `Runtests.chores()`. A run, and
+`Runtests.chores(dry_run = true)`, only compare the two files, by the stamp on the
+expansion's third line, and a run refuses to start when the expansion is not the
+template's: the template changed since it was expanded, the expansion was edited by
+hand, or the template is gone. The stamp hashes the text as its author wrote it:
+line endings, a byte-order mark and whitespace at the end of the file do not count.
+
+`Runtests.chores()` expands every template each time, since what a template's code
+computes can change while its text does not, and writes only the files that change.
+On CI, `Runtests.chores()` followed by `git diff --exit-code` fails a commit whose
+expansions are out of date.
+
 ## Running tests
 
 ```julia
@@ -162,9 +246,11 @@ names, as a vector or a set. A `file.jl:line` target picks one item, so it is gi
 without other files or directories.
 
 `Runtests.chores()` looks after a suite: it makes packages of the setups that are
-not yet, and adds to their `[deps]` what they have come to import; it deletes this
-machine's run states that nothing reads; and it reports anything a run would refuse
-to start on, in the test items or in `TestItems.toml`, which needs a person. Run
+not yet, and adds to their `[deps]` what they have come to import; it expands the
+test templates (see [Test templates](#test-templates)), and deletes the expansion of
+one that is gone; it deletes this machine's run states that nothing reads; and it
+reports anything a run would refuse to start on, in the test items or in
+`TestItems.toml`, which needs a person, as is an expansion edited by hand. Run
 states are kept as a run keeps them, the newest 20 and any older one a failing item's
 last verdict is in, and of those only one with nothing about an item the suite has
 now goes: a dry run, a run stopped before any item finished, or one whose items have
@@ -178,7 +264,7 @@ never throws, says what it would do, and returns `true` when nothing is left to 
 as a run given it would, beside `test/TestItems.toml`.
 
 A run that cannot start throws before any item runs: `Runtests.ScanFailure` when test
-files cannot be read as a suite, `Runtests.NoTestsError` when there is nothing to run,
+files cannot be read as a suite, an expansion out of date with its template among them, `Runtests.NoTestsError` when there is nothing to run,
 and `Runtests.ConfigError` when a setting, profile or test setup cannot be used as
 given.
 
@@ -580,6 +666,18 @@ duration from the newest run that ran it, and `runtestsf` runs every item the su
 has whose last verdict in them was not a pass. A replay happens only when
 asked: a run state lying next to the project is not a request to run differently,
 and an explicit keyword always wins.
+
+Runs can share a directory as they go: CI jobs on one machine, or an editor and a
+REPL. Each writes a file of its own, under a name it claims by creating it, and the
+others read it part way through. A run still going writes its file at least every 30
+seconds, and one whose file has not been written for 90 seconds, or whose process
+this machine knows to be gone, is taken to have died. Until a run has finished or
+died, its verdicts are not in: it changes nothing about what is failing or what the
+next run takes first, though the items it has finished give their durations, and
+its file is not pruned, however many runs started since. A run that died counts as a
+cancelled one does, and an item it was running when it did is failing. Machines that
+share a directory over a network have to agree on the time to within a minute, and a
+`RUNTESTS_HOST` names one machine at a time.
 
 ## Editors
 

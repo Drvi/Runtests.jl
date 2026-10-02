@@ -1,7 +1,7 @@
 # Shared machinery for the tests that run a whole suite: building a throwaway
 # package, running it, and reading back what happened and what was printed.
 
-using Runtests.Private: prepare, execute, report, nitems
+using Runtests.Private: prepare, execute, exclusively, report, nitems
 using RuntestsWorkers: RuntestsWorkers
 
 # Fixture packages are written to a tempdir rather than checked in when their
@@ -52,13 +52,15 @@ end
 # Run a suite and hand back the per-item states by name. Never throws for a
 # failing test item: the point is to assert on what was recorded.
 function run_states(pkg; kwargs...)
-    p, target = prepare((pkg,); kwargs...)
-    run = execute(p, target)
-    try
-        states = Dict(p.items.name[i] => run.statuses.state[i] for i in 1:nitems(p))
-        return states, run, p
-    finally
-        rm(run.logdir; force=true, recursive=true)
+    return exclusively() do
+        p, target = prepare((pkg,); kwargs...)
+        run = execute(p, target)
+        try
+            states = Dict(p.items.name[i] => run.statuses.state[i] for i in 1:nitems(p))
+            return states, run, p
+        finally
+            rm(run.logdir; force=true, recursive=true)
+        end
     end
 end
 

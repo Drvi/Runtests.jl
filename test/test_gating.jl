@@ -45,7 +45,7 @@ end
         @test map(basename, tests) == ["a_test.jl", "b_tests.jl"]
         # `runtests.jl`, setups, hidden files and subprojects are all expected;
         # the two loose files are not.
-        @test map(basename, strays) == ["helpers.jl", "more.jl"]
+        @test map(e -> basename(e.file), strays) == ["helpers.jl", "more.jl"]
         @test discover(joinpath(dir, "test")) == tests
     end
 

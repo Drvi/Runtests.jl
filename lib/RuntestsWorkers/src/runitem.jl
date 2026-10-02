@@ -226,7 +226,20 @@ function trim_backtrace(bt)
 end
 
 function _run_item(spec::ItemSpec, enter=nothing)
-    if should_skip(spec)
+    skipped = try
+        should_skip(spec)
+    catch err
+        is_interrupt(err) && rethrow()
+        # The item's own error, as one its body throws would be, not the worker's.
+        ts = Test.DefaultTestSet(spec.name)
+        stack = Base.current_exceptions()
+        spec.full_stacktraces || (stack = trim_internal_frames(stack))
+        Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), err, stack,
+                                   LineNumberNode(Int(spec.line), spec.file)))
+        finish_testset!(ts)
+        return ItemResult(spec.index, ERRORED, transferrable(ts), PerfStats(; maxrss=Sys.maxrss()))
+    end
+    if skipped
         ts = Test.DefaultTestSet(spec.name)
         Test.record(ts, Test.Broken(:skipped, spec.name))
         return ItemResult(spec.index, SKIPPED, transferrable(ts), PerfStats(; maxrss=Sys.maxrss()))
@@ -319,11 +332,7 @@ end
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString,
                      enter=nothing)
     stats = Ref(PerfStats())
-    # The `Test` this package already has, bound in the module rather than found by
-    # name: `@test` works whether or not the test environment declares `Test`, and a
-    # worker does not load Runtests, the whole coordinator, to reach it.
-    prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
-    isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
+    prelude = item_prelude(spec)
     modsym = gensym(modname)
     evaluate = if enter === nothing
         item = Expr(:module, true, modsym, softscope_all!(Expr(:block, prelude..., code.args...)))
@@ -487,11 +496,22 @@ end
 
 is_failfast_error(err) = isdefined(Test, :FailFastError) && err isa Test.FailFastError
 
+# What an item's code starts with, the body and `skip` alike: the `Test` this package
+# already has, bound in the module rather than found by name, so that `@test` works
+# whether or not the test environment declares `Test`, and a worker does not load
+# Runtests, the whole coordinator, to reach it; and the package under test.
+function item_prelude(spec::ItemSpec)
+    prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
+    isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
+    return prelude
+end
+
+# `skip` sees what the body does before its own imports: `Test` and the package.
 function should_skip(spec::ItemSpec)
     spec.skip isa Bool && return spec.skip
-    body = softscope_all!(Expr(:block, deepcopy(spec.skip)))
     mod = Module(Symbol("skip_", spec.name))
-    skip = Core.eval(mod, body)
+    foreach(ex -> Core.eval(mod, ex), item_prelude(spec))
+    skip = Core.eval(mod, softscope_all!(Expr(:block, deepcopy(spec.skip))))
     # Shown in the latest world: the expression may have defined how its value prints.
     skip isa Bool || error("test item $(repr(spec.name)): `skip` must evaluate to a Bool, " *
                            "got $(Base.invokelatest(repr, skip))")

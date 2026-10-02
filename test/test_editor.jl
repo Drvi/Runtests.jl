@@ -215,6 +215,30 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         end
     end
 
+    @testset "a run asked for while this process runs another is refused, and leaves that one be" begin
+        beside = make_pkg("ServedBeside", "test/t_test.jl" => item("takes a while", "sleep(3)\n    @test true"))
+        dir = make_pkg("ServedAfter", "test/a_test.jl" => item("passes"))
+        with_runstate_dir() do _
+            s = open_session(dir)
+            @test next_event(s)["event"] == "hello"
+            first_run = @async run_states(beside; workers=1, logs=:issues, monitor=false)
+            timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
+            target = RuntestsWorkers.INTERRUPT_TARGET.task
+            send(s, (; id = 1, command = "run", options = (; workers = 1)))
+            refused = next_event(s)
+            @test refused["event"] == "error" && refused["id"] == 1
+            @test occursin("already at work in this process", refused["message"])
+            # Ctrl-C still goes to the run that is going, and its paths print as they did.
+            @test RuntestsWorkers.INTERRUPT_TARGET.task === target
+            @test Runtests.Private.PROJECT_ROOT[] == beside
+            states, _, _ = fetch(first_run)
+            @test states["takes a while"] === Runtests.Private.PASSED
+            send(s, (; id = 2, command = "run", options = (; workers = 1)))
+            @test last(events_until(e -> e["event"] == "run_finished", s))["state"] == "passed"
+            close_session(s)
+        end
+    end
+
     @testset "a session reads the config file it was started with, to list and to run" begin
         dir = make_pkg("ServedConfig", "test/a_test.jl" => string(item("plain"), item("fast"; opts = "sandbox=:fast")))
         config = joinpath(mktempdir(), "editor.toml")

@@ -310,12 +310,35 @@ mutable struct Run
     const events::Union{Nothing, EventStream}
 end
 
+# One at a time in a process: a run, `chores` and a pasted item set the root paths
+# are printed against, switch the active project and put the setups on `LOAD_PATH`,
+# and a run takes the process's interrupt and exit hook, all of which a second beside
+# it, in another task, would change under the first. Each claims the process before
+# it touches any of that, so a refused one changes nothing.
+const RUN_ACTIVE = Threads.Atomic{Bool}(false)
+const BUSY = "Runtests is already at work in this process (a run, `chores` or a pasted " *
+    "`@testitem`); wait for it to end, or use another Julia process"
+
+# Whether this call claimed the process; one that did releases it.
+claim_process!() = !Threads.atomic_cas!(RUN_ACTIVE, false, true)
+release_process!() = (RUN_ACTIVE[] = false; nothing)
+
+function exclusively(f)
+    claim_process!() || throw(ConfigError(BUSY))
+    try
+        return f()
+    finally
+        release_process!()
+    end
+end
+
 """
     execute(plan, target) -> Run
 
 Run the plan to completion and return the run, whose `statuses` hold what
 happened to every item. Printing and the pass/fail verdict are `report`'s job,
 so a caller that wants to inspect the outcome does not have to catch anything.
+The caller holds the process (`exclusively`).
 """
 function execute(p::Plan, target)
     cfg = p.cfg
@@ -593,9 +616,13 @@ end
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
 function open_runstate(p::Plan, start::Float64)
+    path = nothing
     try
-        return init_run_state(new_runstate_path(p.root), p; start)
+        path = new_runstate_path(p.root)
+        return init_run_state(path, p; start)
     catch e
+        # A name claimed and left empty would never be read, nor pruned.
+        path === nothing || rm(path; force = true)
         @warn "Runtests: could not open a run state file; continuing without one" exception = e
         return nothing
     end
@@ -1443,7 +1470,7 @@ function report_unfinished_run()
         # Nothing unwound, so the slots never recorded what they were holding.
         # They are frozen where they were, and each still names its item.
         foreach(slot -> record_stopped_item!(run, slot), run.slots)
-        finish_run_state!(run.runstate; cancelled = true)
+        finish_run_state!(run.runstate; cancelled = true, exiting = true)
         if trylock(run.printer)
             try
                 clear_status_line(run.monitor)
@@ -1533,6 +1560,9 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
                 print_failfast(run, first(i for i in p.units.span[u] if is_non_pass(run.statuses.state[i])))
             return nothing
         end
+        # A run stopped meanwhile, by another item's failfast or a profile whose
+        # `init` failed, retries nothing: the attempt's verdict is the item's.
+        is_cancelled(run.queues) && return nothing
         # Retrying a chain restarts it from its first item: re-running one item of
         # a sequence that mutates state does not mean anything.
         reset_unit!(run, u)

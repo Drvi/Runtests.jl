@@ -669,8 +669,12 @@ end
             taken = new_runstate_path(dir; start_us)
             write(taken, "someone else's")
             path = new_runstate_path(dir; start_us)
-            @test path != taken && !ispath(path) && endswith(path, ".runstate")
+            # Claimed: created, empty, before anything is written to it.
+            @test path != taken && isfile(path) && filesize(path) == 0 && endswith(path, ".runstate")
             @test read(taken, String) == "someone else's"
+            # Two processes asking for the same name, before either has written a byte.
+            again = new_runstate_path(dir; start_us)
+            @test again != path && again != taken && isfile(again)
         end
     end
 

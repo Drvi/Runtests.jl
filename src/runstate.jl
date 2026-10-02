@@ -187,7 +187,15 @@ struct RunStateFile
     # nothing. Only ever touched under `lock`.
     status_ref::Base.RefValue{StatusRecord}
     event_ref::Base.RefValue{EventRecord}
+    # Keeps the file's modification time fresh while the run lasts; see `is_live`.
+    heartbeat::Base.RefValue{Union{Nothing, Tuple{Timer, Task}}}
 end
+
+# How often a running run writes its file at the least, and how long a file goes
+# unwritten before a reader takes the run that wrote it to have died. Three beats
+# missed, so a busy machine's late beat is not a death.
+const HEARTBEAT_S = 30.0
+const LIVE_S = 90.0
 
 ### Writing ################################################################
 
@@ -262,6 +270,8 @@ function run_meta(p::Plan)
         "runtests" => string(pkgversion(@__MODULE__)),
         "runtests_revision" => (dir = pkgdir(@__MODULE__); dir === nothing ? "" : project_revision(dir)),
         "host" => run_host(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
+        # The process writing the file, and the machine by its own name: see `writer_gone`.
+        "pid" => string(getpid()), "hostname" => gethostname(),
         "memory_bytes" => string(Sys.total_memory()),
         "coordinator_threads" => string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
         "environment_variables" => environment_variables(),
@@ -382,10 +392,36 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     end
     write(io, zeros(UInt8, RS_MEMORY_BYTES))
     flush(io)
-    return RunStateFile(
+    rsf = RunStateFile(
         io, String(path), off_status, off_memory, UInt32(nitems(p)),
-        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}()
+        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{Union{Nothing, Tuple{Timer, Task}}}(nothing)
     )
+    rsf.heartbeat[] = start_heartbeat(rsf)
+    return rsf
+end
+
+# While the run lasts, its file is written at least every `HEARTBEAT_S`: the magic
+# number, rewritten in place with the value it has, so that a beat changes no byte,
+# and one landing in a file a pruner deleted harms nothing. Its own task, which hands
+# an interrupt on, as the stall watchdog's does.
+function start_heartbeat(rsf::RunStateFile)
+    timer = Timer(HEARTBEAT_S; interval = HEARTBEAT_S)
+    task = shielded(() -> @async beat(rsf, timer))
+    return (timer, task)
+end
+
+function beat(rsf::RunStateFile, timer::Timer)
+    while true
+        try
+            wait(timer)
+            update!(io -> write(io, RS_MAGIC), rsf, 0)
+        catch e
+            e isa EOFError && break   # closed: the run is over
+            is_interrupt(e) || break
+            RuntestsWorkers.forward_interrupt(e)
+        end
+    end
+    return nothing
 end
 
 function write_status_record(
@@ -455,8 +491,17 @@ write_memory!(rsf::Union{Nothing, RunStateFile}, m) = update!(rsf, rsf === nothi
     write(io, Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak))
 end
 
-function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false)
+# `exiting`, from the exit hook, which waits on no task: there the beat is stopped and
+# not waited for, and one that comes after the file is closed writes nothing. Waited
+# for otherwise, so that nothing is written once this returns.
+function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false, exiting::Bool = false)
     rsf === nothing && return nothing
+    beating = rsf.heartbeat[]
+    if beating !== nothing
+        rsf.heartbeat[] = nothing
+        close(first(beating))
+        exiting || wait(last(beating))
+    end
     update!(io -> write(io, RS_FLAG_COMPLETE | (cancelled ? RS_FLAG_CANCELLED : UInt32(0))), rsf, header_offset(:flags))
     update!(io -> write(io, time()), rsf, header_offset(:end_unix))
     @lock rsf.lock close(rsf.io)
@@ -537,6 +582,32 @@ struct RunStateRecord
         peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32, nprocs_peak::Int32}
     events::Vector{RunStateEvent}
     truncated::Bool
+    mtime::Float64      # when the file was last written, as it was read; see `is_live`
+end
+
+"""
+    is_live(rs; now = time()) -> Bool
+
+Whether the run that wrote `rs` is still going, as far as its file can say: it has
+not finished, its file was written in the last `LIVE_S` seconds, which a running
+one's always is (`start_heartbeat`), and the process that wrote it is not known to
+be gone (`writer_gone`). Another process's run state can be read part
+way through. A live one's verdicts are not in yet, and an item it holds as `running`
+is being run, not one a run left so when it died; its finished items' durations are
+as good as any.
+"""
+is_live(rs::RunStateRecord; now::Real = time()) = !rs.complete && now - rs.mtime < LIVE_S && !writer_gone(rs)
+
+# Whether the process that wrote `rs` is known to have exited, so that a run killed a
+# moment ago counts as over at once rather than `LIVE_S` later: it ran on this
+# machine, by its own hostname, not `RUNTESTS_HOST`, which names one machine across
+# the CI runners that take turns being it and whose pids mean nothing here, and its
+# pid is free. A pid another process has taken since says nothing either way.
+function writer_gone(rs::RunStateRecord)
+    get(rs.meta, "hostname", "") == gethostname() || return false
+    pid = tryparse(Int32, get(rs.meta, "pid", ""))
+    pid === nothing && return false
+    return ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == Base.UV_ESRCH
 end
 
 """
@@ -552,6 +623,7 @@ function read_run_state(path::AbstractString)
     catch
         return nothing
     end
+    written = mtime(path)
     length(bytes) >= RS_HEADER_BYTES || return nothing
     io = IOBuffer(bytes)
     total = length(bytes)
@@ -633,7 +705,7 @@ function read_run_state(path::AbstractString)
             String(path), h.version, h.flags & RS_FLAG_COMPLETE != 0,
             h.flags & RS_FLAG_DRY_RUN != 0, h.flags & RS_FLAG_CANCELLED != 0,
             h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
-            units, items, statuses, memory, events, truncated
+            units, items, statuses, memory, events, truncated, written
         )
     catch e
         is_interrupt(e) && rethrow()
@@ -667,9 +739,15 @@ function read_status_record(io::IO)
     r = read_record(io, StatusRecord)
     return RunStateStatus(
         r.state <= UInt8(CANCELLED) ? ItemState(r.state) : UNSEEN, r.attempt, r.slot,
-        r.start_off, r.elapsed, r.compile, r.recompile, r.alloc_mb, r.peak_rss_mb, r.pid
+        recorded(r.start_off), recorded(r.elapsed), recorded(r.compile), recorded(r.recompile),
+        recorded(r.alloc_mb), recorded(r.peak_rss_mb), r.pid
     )
 end
+
+# A time or a size as recorded, or 0 for one that no write made: a record read while
+# its run writes it can be torn, and one a crash cut short can read as zeros or as
+# garbage, which as a duration would be the planner's.
+recorded(x::Float32) = isfinite(x) && x >= 0 ? x : 0.0f0
 
 """
     bounded(n, limit) -> Int
@@ -857,27 +935,42 @@ const PROJECT_MARK = "project"
 # name takes a suffix instead.
 function new_runstate_path(root::AbstractString; start_us::Integer = wall_microseconds())
     dir = runstate_dir(root)
+    mkpath(dir)
     if isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", ""))
-        mkpath(dir)
         mark = joinpath(dir, PROJECT_MARK)
-        isfile(mark) || write(mark, abspath(root))
+        # Whole or not at all: `sweep_runstate_dirs` reading half a path would take
+        # the project for gone.
+        isfile(mark) || write_whole(mark, abspath(root))
     end
     stem = string(lpad(start_us, 16, '0'), "-", getpid())
-    path = joinpath(dir, stem * ".runstate")
     n = 1
-    while ispath(path)
+    while true
+        path = joinpath(dir, n == 1 ? stem * ".runstate" : string(stem, "_", n, ".runstate"))
+        # Created, not checked for: two processes that name a file the same, in
+        # containers sharing the directory say, get one each.
+        claimed = try
+            close(Base.Filesystem.open(path, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_EXCL | Base.Filesystem.JL_O_WRONLY, 0o644))
+            true
+        catch e
+            (e isa Base.IOError && e.code == Base.UV_EEXIST) || rethrow()
+            false
+        end
+        claimed && return path
         n += 1
-        path = joinpath(dir, string(stem, "_", n, ".runstate"))
     end
-    return path
 end
 
 wall_microseconds() = (tv = Libc.TimeVal(); tv.sec * 1_000_000 + tv.usec)
 
 function runstate_files(root::AbstractString)
     dir = runstate_dir(root)
-    isdir(dir) || return String[]
-    files = filter!(endswith(".runstate"), readdir(dir; join = true))
+    # Another process can delete the directory between any two calls.
+    files = try
+        filter!(endswith(".runstate"), readdir(dir; join = true))
+    catch e
+        e isa Base.IOError || rethrow()
+        return String[]
+    end
     return sort!(files)   # names start with a unix timestamp, so this is oldest-first
 end
 
@@ -894,12 +987,14 @@ of_project(rs::RunStateRecord, project::AbstractString) = get(rs.meta, "project_
 # `keep` of them stay, and of the rest each that can go without changing which
 # items are failing goes (`removable_runs`). One recorded elsewhere, a CI artifact
 # downloaded into the directory say, one of another project, and one that cannot be
-# read are never deleted: nothing shows they are ours.
+# read are never deleted: nothing shows they are ours. Nor is one still being
+# written (`is_live`), by a run that started long before the newest `keep`.
 function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
     here = run_host()
     runs = project_runs(root)
     ours = [f for (f, rs) in runs if get(rs.meta, "host", "") == here]
-    for f in removable_runs(runs, ours[1:max(0, length(ours) - keep)])
+    live = Set(f for (f, rs) in runs if is_live(rs))
+    for f in removable_runs(runs, filter(!in(live), ours[1:max(0, length(ours) - keep)]))
         try
             rm(f; force = true)
         catch
@@ -966,6 +1061,8 @@ function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates)
     verdicts = [Dict{String, Bool}() for _ in runs]   # per run: item => failing
     holders = Dict{String, Vector{Int}}()             # per item: the runs left with a verdict, oldest first
     for (k, (_, rs)) in enumerate(runs)
+        # Nothing it holds is a verdict yet.
+        is_live(rs) && continue
         for (i, it) in enumerate(rs.items)
             v = verdict(rs, i)
             v === nothing || (verdicts[k][it.name] = v)
@@ -1010,9 +1107,14 @@ than gone: one whose parent directory is missing or empty, as a drive that is no
 mounted leaves it.
 """
 function sweep_runstate_dirs(base::AbstractString = runstate_root())
-    isdir(base) || return nothing
     here = run_host()
-    for dir in readdir(base; join = true)
+    dirs = try
+        readdir(base; join = true)
+    catch e
+        e isa Base.IOError || rethrow()
+        return nothing
+    end
+    for dir in dirs
         mark = joinpath(dir, PROJECT_MARK)
         try
             isfile(mark) || continue
@@ -1022,7 +1124,7 @@ function sweep_runstate_dirs(base::AbstractString = runstate_root())
             (isdir(parent) && !isempty(readdir(parent))) || continue
             for f in filter!(endswith(".runstate"), readdir(dir; join = true))
                 rs = read_run_state(f)
-                rs !== nothing && get(rs.meta, "host", "") == here && rm(f; force = true)
+                rs !== nothing && get(rs.meta, "host", "") == here && !is_live(rs) && rm(f; force = true)
             end
             readdir(dir) == [PROJECT_MARK] && rm(dir; recursive = true, force = true)
         catch
@@ -1040,7 +1142,7 @@ and not dry runs, which ran nothing. The files of other projects in a shared
 directory are passed over rather than counted.
 """
 function recent_runs(root::AbstractString, n::Int)
-    runs = filter!(((_, rs),) -> !rs.dry_run, project_runs(root))
+    runs = filter!(((_, rs),) -> !rs.dry_run && !is_live(rs), project_runs(root))
     return runs[max(1, end - n + 1):end]
 end
 
@@ -1052,7 +1154,8 @@ the last run in which it ran to a verdict decides, so running a few of one run's
 failures again does not forget the rest. A verdict other than passed or skipped —
 failed, errored, timed out, cut short by a dead worker, left running when the run
 itself died — is failing. A run that stopped before reaching an item, or while
-running it, says nothing about it, and the verdict before stands. An item that a
+running it, says nothing about it, and the verdict before stands, as does a run
+another process is still in the middle of (`is_live`). An item that a
 newer run of the whole suite did not find was renamed or deleted, and is not
 failing whatever older runs say. With `names`, only those items, and the reading
 stops once each has its verdict. With `base`, the run state a replay names, the
@@ -1068,7 +1171,7 @@ function failing_items(
     # Newest first, as far back as it takes: pruning keeps every run state an
     # item's failure rests on, however many runs ago.
     for (_, rs) in Iterators.reverse(since_base(runs_with(root, base), base))
-        rs.dry_run && continue
+        (rs.dry_run || is_live(rs)) && continue
         for (i, it) in enumerate(rs.items)
             (it.name in decided || (names !== nothing && !(it.name in names))) && continue
             v = verdict(rs, i)
@@ -1091,8 +1194,9 @@ end
 
 Per-item durations from every run state kept, each item's newest that ran to an
 end (see [`timed`](@ref)), so that runs of a few items leave the others' standing, and a
-run stopped part way through leaves those it stopped. Last-run failures, when the newest run
-started, and what a fresh worker cost, from the most recent `nruns`. With `base`,
+run stopped part way through, or another process's still going, leaves those it
+finished. Last-run failures, when the newest run started, and what a fresh worker
+cost, from the most recent `nruns` that are over (see [`is_live`](@ref)). With `base`,
 the run state a replay names, those come from it and the runs after it only; the
 durations still come from every run. Only items that actually ran contribute; a
 name that has never been seen simply has no estimate and is scheduled as if it
@@ -1113,7 +1217,9 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     end
     failed = Dict{String, Int}()
     since = 0.0
-    counted = last.(since_base(everything, base))
+    # Failures and the newest run's start from runs that are over, finished or died:
+    # another process's run part way through has no verdicts yet.
+    counted = last.(since_base(filter(((_, rs),) -> !is_live(rs), everything), base))
     recent = counted[max(1, end - nruns + 1):end]
     for (k, rs) in enumerate(recent)
         ago = length(recent) - k

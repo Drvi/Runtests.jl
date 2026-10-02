@@ -54,6 +54,8 @@ include("execute.jl")
 include("interactive.jl")
 include("debug.jl")
 include("setup_packages.jl")
+include("expander.jl")
+include("templates.jl")
 include("chores.jl")
 
 """
@@ -70,6 +72,9 @@ unless given), holding one testset per test file. Inside an enclosing `@testset`
 it is recorded there, so the runs of several calls add up under one, told apart by
 their names. Outside any, an item that did not pass makes the call throw, which is
 what fails `Pkg.test`. A dry run returns `nothing`.
+
+A process holds one run at a time: a call made while another is running, from
+another task or thread, throws and leaves that run going.
 
 # Keywords
 
@@ -101,23 +106,28 @@ names another file to read in its place, relative to the current directory, whic
 has to exist; nothing but this keyword makes a run read one.
 """
 function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, kwargs...)
-    # A dry run says what it found in its own block, with the plan.
-    p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
-    if dry_run
-        print_plan(stdout, p)
-        return nothing
-    end
-    run = execute(p, target)
-    try
-        return RunTestSet(report(run))
-    finally
-        rm(run.logdir; force = true, recursive = true)
+    return exclusively() do
+        # A dry run says what it found in its own block, with the plan.
+        p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
+        if dry_run
+            print_plan(stdout, p)
+            return nothing
+        end
+        run = execute(p, target)
+        try
+            return RunTestSet(report(run))
+        finally
+            rm(run.logdir; force = true, recursive = true)
+        end
     end
 end
 
 # Everything up to starting a process, so a plan can be inspected, printed or run.
 # `announce` prints what is being read and what was found, as it happens.
-function prepare(args; name = nothing, tags = nothing, replay = nothing, announce::Bool = true, kwargs...)
+# `expansions = false` leaves the expansions of templates unchecked, for `chores`,
+# which says itself where they stand.
+function prepare(args; name = nothing, tags = nothing, replay = nothing, announce::Bool = true,
+                 expansions::Bool = true, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     rs = replay === nothing ? nothing : read_replay(String(replay), target)
@@ -136,11 +146,13 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
         is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
     t_files = time()
-    files, strays = walk_test_dir(target.testdir)
+    files, strays, templates = walk_test_dir(target.testdir)
     if isempty(files)
-        # A stray file is the likeliest reason there is nothing to run, so it is
-        # what the run says rather than "no test files found".
-        isempty(strays) || throw(ScanFailure(map(stray_error, strays)))
+        # A stray file, or a template not expanded yet, is the likeliest reason there
+        # is nothing to run, so it is what the run says rather than "no test files found".
+        errors = copy(strays)
+        expansions && append!(errors, expansion_errors(files, templates))
+        isempty(errors) || throw(ScanFailure(errors))
         throw(
             NoTestsError(
                 "no test files found under $(relpath_or_path(target.testdir)); test files are " *
@@ -150,7 +162,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     end
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
-    items = scan(files, filter, setups; strays, suite_names)
+    items = scan(files, filter, setups; strays, templates, expansions, suite_names)
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
@@ -251,9 +263,9 @@ end
 # Every item's name in the suite, read as a run reads it: a suite that does not
 # parse throws here as it would there.
 function suite_item_names(target)
-    files, strays = walk_test_dir(target.testdir)
+    files, strays, templates = walk_test_dir(target.testdir)
     names = String[]
-    scan(files, Filter(), setup_modules(target.testdir); strays, suite_names = names)
+    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names)
     return Set(names)
 end
 
@@ -395,12 +407,14 @@ const PRECOMPILE_SIGNATURES = (
 )
 
 # Everything between `runtests()` and the first test item: reading, configuring,
-# planning and the shapes the run prints. On a 2,000-item suite this takes 2.3 s
-# uncompiled and 0.04 s compiled, paid before anything appears on screen.
+# planning and the shapes the run prints; and `chores` but for expanding templates.
+# On a 2,000-item suite the first takes 2.3 s uncompiled and 0.04 s compiled, paid
+# before anything appears on screen.
 @setup_workload begin
     source = """
     @testitem "precompile one" tags=[:a] timeout=60 begin
         using Test
+        using PrecompileSetup
         @test true
     end
     @testitem "precompile two" chain=:c retries=1 begin
@@ -415,10 +429,24 @@ const PRECOMPILE_SIGNATURES = (
     write(joinpath(dir, "test", "precompile_test.jl"), source)
     write(joinpath(dir, "test", "TestItems.toml"), "[run]\nworkers = 2\n")
     testdir = joinpath(dir, "test")
+    # A setup as `chores` leaves one, a package whose `[deps]` hold what it imports.
+    setup = mkpath(joinpath(testdir, TESTSETUPS_DIR, "PrecompileSetup", "src"))
+    write(joinpath(setup, "PrecompileSetup.jl"), "module PrecompileSetup\nusing Test\nend\n")
+    write(joinpath(dirname(setup), "Project.toml"), "name = \"PrecompileSetup\"\n" *
+          "uuid = \"1a2b3c4d-0000-4000-8000-0000000000f0\"\n\n[deps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n")
+    # A template and its expansion, as `chores` would have written it: every run checks
+    # the stamp, and expanding would evaluate code, which a workload must not.
+    template = joinpath(mkpath(joinpath(testdir, TESTTEMPLATES_DIR)), "precompile_tests_template.jl")
+    template_source = "@testtemplate \"precompile three \$n\" skip = \$(n > 2) for n in 1:2\n    @test \$n > 0\nend\n"
+    write(template, template_source)
     @compile_workload begin
-        files = discover(testdir)
+        instances = [Dict{String, Any}("name" => "precompile three $n", "values" => [["n", string(n)]],
+                                       "computed" => [["n > 2", "false"]]) for n in 1:2]
+        write_whole(expansion_of(template), render_expansion(template, template_source,
+            [Dict{String, Any}("line" => 1, "instances" => instances)]))
+        files, strays, templates = walk_test_dir(testdir)
         setups = setup_modules(testdir)
-        items = scan(files, Filter(), setups; ntasks = 2)
+        items = scan(files, Filter(), setups; ntasks = 2, strays, templates)
         scan(files, Filter(name = "precompile one"), setups; ntasks = 1)
         cfg = read_config(testdir; nunits = length(items), monitor = false)
         p = plan(items, cfg; history = history(dir), root = dir)
@@ -456,6 +484,14 @@ const PRECOMPILE_SIGNATURES = (
         # What an editor asks for first: the listing, as JSON, and a command read.
         json(list_items(dir))
         read_json("{\"id\":1,\"command\":\"run\",\"names\":[\"precompile one\"],\"options\":{\"workers\":2}}")
+
+        # `chores` on a suite with nothing to do, the common case: checking it, then
+        # doing it, without the template, whose expanding would start a process.
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
+            redirect_stdout(() -> chores(dir; dry_run = true), devnull)
+            rm(template); rm(expansion_of(template))
+            redirect_stdout(() -> chores(dir), devnull)
+        end
     end
     rm(dir; force = true, recursive = true)
     for (f, types) in PRECOMPILE_SIGNATURES
@@ -466,11 +502,11 @@ end
 end # module Private
 
 using Test
-using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
+using .Private: @testitem, @testtemplate, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
-export @testitem, runtests, runtestsf, chores
+export @testitem, @testtemplate, runtests, runtestsf, chores
 
 # Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test

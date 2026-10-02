@@ -105,9 +105,9 @@ the lines where `runtests("file.jl:line")` picks that item.
 """
 function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     target = resolve_target((root,))
-    files, strays = walk_test_dir(target.testdir)
+    files, strays, templates = walk_test_dir(target.testdir)
     setups = setup_modules(target.testdir)
-    items, errors, _ = scan_files(files, Filter(), setups; strays)
+    items, errors, _ = scan_files(files, Filter(), setups; strays, templates)
     config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
     if !isempty(items)
         # What a run would refuse to start on beyond the files: the settings, the
@@ -289,14 +289,22 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
     # The last run's logs were an editor's to read until now.
     isempty(s.logdir) || rm(s.logdir; force = true, recursive = true)
     s.logdir = ""
-    p, target = prepare((s.root,); name = names === nothing ? nothing : Set{String}(names), announce = false,
-                        s.config, kwargs...)
-    unknown = names === nothing ? String[] : sort!(setdiff(Set{String}(names), Set(p.suite_names)) |> collect)
-    emit(s.stream, "run_started"; id, items = p.items.name, workers = single_process(p) ? 0 : nslots(p),
-         seed = seed_text(p.cfg.seed), unknown)
-    s.cancelled = false
-    s.stream.run_id = id
-    s.task = @async run_for_editor(s, id, p, target)
+    claim_process!() || (emit_error(s.stream, BUSY; id); return nothing)
+    # From here the process is the run's, released by its task when it ends.
+    started = false
+    try
+        p, target = prepare((s.root,); name = names === nothing ? nothing : Set{String}(names), announce = false,
+                            s.config, kwargs...)
+        unknown = names === nothing ? String[] : sort!(setdiff(Set{String}(names), Set(p.suite_names)) |> collect)
+        emit(s.stream, "run_started"; id, items = p.items.name, workers = single_process(p) ? 0 : nslots(p),
+             seed = seed_text(p.cfg.seed), unknown)
+        s.cancelled = false
+        s.stream.run_id = id
+        s.task = @async run_for_editor(s, id, p, target)
+        started = true
+    finally
+        started || release_process!()
+    end
     return nothing
 end
 
@@ -315,6 +323,7 @@ function run_for_editor(s::Session, id, p::Plan, target)
         ended == "error" && say_failure(s.stream, id, e)
     finally
         @atomic RuntestsWorkers.INTERRUPT_TARGET.task = nothing
+        release_process!()
     end
     run === nothing || (s.logdir = run.logdir)
     emit_run_finished(s.stream, id, run, ended)

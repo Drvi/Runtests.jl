@@ -1,5 +1,6 @@
 # A suite's upkeep in one call: what a run would refuse to start on, setups whose
-# packages have fallen behind what they import, and run states nothing reads.
+# packages have fallen behind what they import, templates to expand, and run states
+# nothing reads.
 
 """
     chores([path]; dry_run = false, config = nothing)
@@ -14,6 +15,12 @@ Look after a package's suite: do what needs no person, then say what does.
   `test/TestItems.toml`.
 - test setups: what [`setups_to_packages`](@ref) would do, making packages of the
   setups that are not and adding to their `[deps]` what they have come to import.
+- test templates: each `test/testtemplates/*_tests_template.jl` expanded into the test
+  file of its name in `test/`, in a process with the test environment, and the
+  expansion of a template that is gone deleted. Every template is expanded, since
+  what its code computes can change while its text does not; a dry run reads the
+  expansions' stamps instead and runs nothing. An expansion edited by hand, and a
+  test file in a template's way that `chores` did not write, are left to a person.
 - run states: this machine's are kept as a run keeps them, the newest $(KEEP_RUNS)
   and any older one a failing item's last verdict is in. Of those, one is deleted
   only when it holds nothing about an item the suite has now: a dry run, a run
@@ -30,19 +37,29 @@ nor for it. `path` finds the package as it does for [`runtests`](@ref).
 """
 function chores(args...; dry_run::Bool = false,
                 config::Union{Nothing, AbstractString, AbstractVector{<:AbstractString}} = nothing)
+    return exclusively(() -> run_chores(args, dry_run, config))
+end
+
+function run_chores(args, dry_run::Bool, config)
     target = resolve_target(args)
+    PROJECT_ROOT[] = target.root
     configs = config === nothing ? String[] : config isa AbstractString ? [String(config)] : String.(config)
     fix = !dry_run
     todo = problems = 0
     body = styled() do io
+        # Setups first, as expanding a template loads them, and the suite after the
+        # templates, so that it is read with their new expansions.
+        n, bad = chore_setups!(io, target, fix)
+        todo += n
+        problems += bad
+        n, bad = chore_templates!(io, target, fix)
+        todo += n
+        problems += bad
         bad, names = check_suite!(io, target)
         problems += bad
         for path in configs
             problems += check_named_config!(io, target, path)
         end
-        n, bad = chore_setups!(io, target, fix)
-        todo += n
-        problems += bad
         todo += chore_runstates!(io, target, fix, names)
         if problems > 0
             fix && todo > 0 && print(io, "done: ", todo, " · ")
@@ -62,11 +79,12 @@ end
 
 # The suite as a full run would read it: its items, then its settings and what they
 # name. The number of problems a person has to fix, and the names of the test items,
-# `nothing` when they could not be read.
+# `nothing` when they could not be read. The expansions of templates are the
+# templates step's to report.
 function check_suite!(io::IO, target)
     config = joinpath(target.testdir, "TestItems.toml")
     try
-        p, _ = prepare((target.root,); announce = false)
+        p, _ = prepare((target.root,); announce = false, expansions = false)
         println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
         print(io, "config: ")
         if isfile(config)
@@ -79,6 +97,11 @@ function check_suite!(io::IO, target)
     catch e
         e isa ConfigError && return print_problem(io, "config", e.msg), nothing
         e isa ScanFailure || e isa NoTestsError || rethrow()
+        # Under a dry run the test files may be expansions `chores` has yet to write.
+        if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), last(walk_test_dir(target.testdir)))
+            println(io, "test items: none to read until the templates are expanded")
+            return 0, nothing
+        end
         n = if e isa ScanFailure
             println(io, "test items: ", plural(length(e.errors), "problem"), ":")
             foreach(err -> println(io, "  ", err), e.errors)
@@ -109,7 +132,7 @@ end
 function check_named_config!(io::IO, target, path::AbstractString)
     items_read = true
     try
-        prepare((target.root,); config = path, announce = false)
+        prepare((target.root,); config = path, announce = false, expansions = false)
     catch e
         e isa ConfigError && return print_problem(io, "config", e.msg)
         e isa ScanFailure || e isa NoTestsError || rethrow()
@@ -170,7 +193,14 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
         println(io, ", none to delete")
         return 0
     end
-    fix && foreach(f -> rm(f; force = true), stale)
+    # Another process may be reading one, or have deleted it, already.
+    fix && foreach(stale) do f
+        try
+            rm(f; force = true)
+        catch e
+            e isa Base.IOError || rethrow()
+        end
+    end
     println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete",
             ": beyond the newest ", KEEP_RUNS, " with no failing item's verdict in them",
             names === nothing ? "" : ", or with nothing about an item the suite has")
@@ -186,19 +216,21 @@ however new, and of the rest those a run's own pruning deletes, beyond the newes
 `KEEP_RUNS` and with no failing item's last verdict in them (`removable_runs`).
 Without `names` nothing says what the suite has, and only the second go. One
 recorded elsewhere, one of another project, and one that cannot be read are never
-among them: nothing shows they are this machine's to delete.
+among them: nothing shows they are this machine's to delete. Nor is one a run is
+still writing (`is_live`).
 """
 function stale_runstates(root::AbstractString, names::Union{Nothing, AbstractSet{String}} = nothing)
     here = run_host()
     ours(rs) = get(rs.meta, "host", "") == here
     runs = project_runs(root)
     useless = names === nothing ? Set{String}() :
-        Set(f for (f, rs) in runs if ours(rs) && !holds_any(rs, names))
+        Set(f for (f, rs) in runs if ours(rs) && !is_live(rs) && !holds_any(rs, names))
     # The rest as they stand once those are deleted: those count neither among the
     # newest `KEEP_RUNS` nor as holding a verdict that keeps another.
     rest = filter(((f, _),) -> !(f in useless), runs)
     mine = [f for (f, rs) in rest if ours(rs)]
-    beyond = Set(removable_runs(rest, mine[1:max(0, length(mine) - KEEP_RUNS)]))
+    live = Set(f for (f, rs) in rest if is_live(rs))
+    beyond = Set(removable_runs(rest, filter(!in(live), mine[1:max(0, length(mine) - KEEP_RUNS)])))
     return [f for (f, _) in runs if f in useless || f in beyond]
 end
 

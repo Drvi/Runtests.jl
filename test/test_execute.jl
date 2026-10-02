@@ -302,6 +302,23 @@ end
             @test occursin("runitem.jl", full["outside any test"]) && occursin("runitem.jl", full["in a task"])
     end
 
+    @testset "skip sees the package, and an error in it is the item's" begin
+        dir = make_pkg("SkipByPkg", "src/SkipByPkg.jl" => "module SkipByPkg\nflag() = true\nend\n",
+            "test/s_test.jl" => """
+                @testitem "skipped by the package" skip = SkipByPkg.flag() begin
+                    @test false
+                end
+                @testitem "skip throws" skip = error("no skipping today") begin
+                    @test true
+                end
+                """)
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["skipped by the package"] === SKIPPED
+        @test states["skip throws"] === ERRORED
+        @test occursin("no skipping today", out)
+        @test !occursin("could not run this test item", out) && !occursin("handle_request", out)
+    end
+
     @testset "skip is honoured, statically and dynamically" begin
         states, _, _ = run_states(FAULTY; workers=1, tags=[:skip], logs=:issues)
         @test states["skipped statically"] === SKIPPED
@@ -328,6 +345,57 @@ end
         # has failed too: stopping under the retry would record it as cancelled.
         @test count(s -> s === FAILED || s === ERRORED, values(states)) == 1
         @test any(==(UNSEEN), values(states)) || length(states) == 1
+    end
+
+    @testset "a retry another item's failfast stops leaves the failure it was" begin
+        dir = make_pkg("FailfastRetry", "test/t_test.jl" => """
+            @testitem "fails slowly, retries" retries=1 begin
+                sleep(3)
+                @test false
+            end
+            @testitem "fails quickly" begin
+                sleep(1)
+                @test false
+            end
+            """)
+        states, run, p = run_states(dir; workers=2, failfast=true, logs=:issues, monitor=false)
+        # The quick failure stops the run while the slow one's first attempt runs: that
+        # attempt's failure is its verdict, in memory and on disk, and nothing ran less.
+        @test states["fails slowly, retries"] === FAILED && states["fails quickly"] === FAILED
+        rs = Runtests.Private.read_run_state(run.runstate.path)
+        @test all(st -> st.state === FAILED, rs.statuses)
+    end
+
+    @testset "a second run in the same process is refused, and the first goes on" begin
+        dir = make_pkg("OneAtATime", "test/t_test.jl" => """
+            @testitem "takes a while" begin
+                sleep(3)
+                @test true
+            end
+            """)
+        other = make_pkg("OneAtATimeOther", "test/t_test.jl" => """
+            @testitem "never runs" begin
+                @test true
+            end
+            """)
+        first_run = @async run_states(dir; workers=1, logs=:issues, monitor=false)
+        timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
+        target = RuntestsWorkers.INTERRUPT_TARGET.task
+        @test Runtests.Private.RUN_ACTIVE[] && target !== nothing
+        busy = "Runtests is already at work in this process"
+        @test_throws busy run_states(dir; workers=1, logs=:issues, monitor=false)
+        # Refused before it touches anything the run has set: not the root its paths
+        # print against, not where Ctrl-C goes.
+        @test_throws busy Runtests.runtests(other; workers=1, logs=:issues, monitor=false)
+        @test_throws busy Runtests.runtests(other; dry_run=true)
+        @test_throws busy Runtests.chores(other; dry_run=true)
+        @test_throws busy @eval @testitem "pasted" begin
+            @test true
+        end
+        @test Runtests.Private.PROJECT_ROOT[] == dir
+        @test RuntestsWorkers.INTERRUPT_TARGET.task === target
+        states, _, _ = fetch(first_run)
+        @test states["takes a while"] === PASSED && !Runtests.Private.RUN_ACTIVE[]
     end
 
     @testset "failfast names the member of a chain that failed" begin

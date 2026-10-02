@@ -3,6 +3,7 @@
 
 const TEST_FILE_SUFFIXES = ("_test.jl", "_tests.jl")
 const TESTSETUPS_DIR = "testsetups"
+const TESTTEMPLATES_DIR = "testtemplates"
 
 is_test_file(path::AbstractString) = any(s -> endswith(path, s), TEST_FILE_SUFFIXES)
 
@@ -14,33 +15,54 @@ Every test file under `testdir`, sorted. See [`walk_test_dir`](@ref).
 discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 
 """
-    walk_test_dir(testdir) -> (tests, strays)
+    walk_test_dir(testdir) -> (tests, strays, templates)
 
-Every test file under `testdir`, and every other Julia file there, both sorted.
+Every test file under `testdir`; an error for every other Julia file there, each
+saying where such a file belongs; and every test template, a `*_tests_template.jl`
+in `testtemplates/` (see [`expansion_errors`](@ref)). Each is sorted by path.
 Hidden files and directories, `testsetups/` and subprojects (directories with a
 `Project.toml` or a `JuliaProject.toml`) are skipped: a package of test helpers
 there has tests and code of its own, for an environment this run cannot build. The
 strays are reported, not skipped: a file of tests not named `*_test.jl` would
-otherwise never run, and the run would pass without it.
+otherwise never run, and the run would pass without it, and a template anywhere but
+`testtemplates/` would never be expanded.
 """
 function walk_test_dir(testdir::AbstractString)
-    tests, strays = String[], String[]
-    isdir(testdir) || return tests, strays
+    tests, strays, templates = String[], ScanError[], String[]
+    isdir(testdir) || return tests, strays, templates
+    templates_dir = joinpath(testdir, TESTTEMPLATES_DIR)
     for (dir, dirs, names) in walkdir(testdir; topdown = true)
         filter!(dirs) do d
-            !startswith(d, '.') && d != TESTSETUPS_DIR &&
+            !startswith(d, '.') && d != TESTSETUPS_DIR && !(dir == testdir && d == TESTTEMPLATES_DIR) &&
                 !any(n -> isfile(joinpath(dir, d, n)), PROJECT_NAMES)
         end
         for n in names
             startswith(n, '.') && continue
             if is_test_file(n)
                 push!(tests, joinpath(dir, n))
+            elseif is_template_file(n)
+                push!(strays, misplaced_template_error(joinpath(dir, n)))
             elseif endswith(n, ".jl") && !(n == RUNTESTS_FILE && dir == testdir)
-                push!(strays, joinpath(dir, n))
+                push!(strays, stray_error(joinpath(dir, n)))
             end
         end
     end
-    return sort!(tests), sort!(strays)
+    isdir(templates_dir) && for (dir, dirs, names) in walkdir(templates_dir; topdown = true)
+        filter!(d -> !startswith(d, '.'), dirs)
+        for n in names
+            path = joinpath(dir, n)
+            if startswith(n, '.') || !endswith(n, ".jl")
+                continue
+            elseif !is_template_file(n)
+                push!(strays, ScanError(path, 0, NOT_A_TEMPLATE))
+            elseif dir == templates_dir
+                push!(templates, path)
+            else
+                push!(strays, misplaced_template_error(path))
+            end
+        end
+    end
+    return sort!(tests), sort!(strays; by = e -> e.file), sort!(templates)
 end
 
 # `Pkg.test` runs this one, so it belongs at the top of `test/` and nowhere else.
@@ -49,10 +71,21 @@ const RUNTESTS_FILE = "runtests.jl"
 # One error per file, because the fix is per file.
 stray_error(path::AbstractString) = ScanError(
     path, 0,
-    "not a test file. Test files are named `*_test.jl` or `*_tests.jl`; shared code goes in " *
-        "`test/$TESTSETUPS_DIR/` as a module that test items load with `using`; a directory " *
+    "not a test file. Test files are named `*_test.jl` or `*_tests.jl`, and test templates live in " *
+        "`test/$TESTTEMPLATES_DIR/`; shared code goes in `test/$TESTSETUPS_DIR/` as a module that test " *
+        "items load with `using`; a directory " *
         "with its own Project.toml or JuliaProject.toml is left alone. Rename it, move it there, or remove it."
 )
+
+misplaced_template_error(path::AbstractString) = ScanError(
+    path, 0,
+    "a test template belongs in `test/$TESTTEMPLATES_DIR/` itself, from where `Runtests.chores()` " *
+        "expands it into `test/$(basename(expansion_of(path)))`: move it there"
+)
+
+const NOT_A_TEMPLATE = "not a test template. `test/$TESTTEMPLATES_DIR/` holds test templates, " *
+    "`*_tests_template.jl` or `*_test_template.jl`, each of which `Runtests.chores()` expands into the " *
+    "test file of its name without `_template`, in `test/`. Rename it, or move it out."
 
 """
     setup_modules(testdir) -> Dict{Symbol,String}
@@ -114,13 +147,7 @@ end
 # that boxes every argument once per item.
 function handle_statement!(items, errors, names, @nospecialize(ex), path, line, filter, known_setups)
     if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
-        what = ex isa Expr && ex.head === :macrocall ? string(ex.args[1]) : summary(ex)
-        push!(
-            errors, ScanError(
-                path, line,
-                "test files may only contain `@testitem` declarations, found `$what`"
-            )
-        )
+        push!(errors, ScanError(path, line, not_an_item(ex)))
         return
     end
     item = parse_testitem(ex, path, line, errors, known_setups)
@@ -132,6 +159,18 @@ function handle_statement!(items, errors, names, @nospecialize(ex), path, line, 
     end
     push!(items, item)
     return
+end
+
+# Why a statement in a test file is refused: anything but a `@testitem` is.
+function not_an_item(@nospecialize ex)
+    ex isa Expr && ex.head === :for && return "test files may only contain `@testitem` declarations, " *
+        "found a `for` loop; to declare an item per element, write a `@testtemplate` in a test template, " *
+        "`test/$TESTTEMPLATES_DIR/*_tests_template.jl`, which `Runtests.chores()` expands into a test file"
+    ex isa Expr && ex.head === :macrocall && ex.args[1] === Symbol("@testtemplate") && return "a " *
+        "`@testtemplate` belongs in a test template, `test/$TESTTEMPLATES_DIR/*_tests_template.jl`, which " *
+        "`Runtests.chores()` expands into a test file"
+    what = ex isa Expr && ex.head === :macrocall ? string(ex.args[1]) : summary(ex)
+    return "test files may only contain `@testitem` declarations, found `$what`"
 end
 
 # The keywords a `@testitem` accepts. A position in this tuple is a bit in the
@@ -151,6 +190,10 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
     at = numbered ? Int32((ex.args[lo]::LineNumberNode).line) : Int32(line)
     numbered && (lo += 1)
     lo > hi && return scan_error!(errors, path, at, "`@testitem` needs a name and a body")
+    last_arg = ex.args[hi]
+    last_arg isa Expr && last_arg.head === :for && return scan_error!(errors, path, at,
+        "`@testitem` declares one item; to declare one per element, write `@testtemplate` in a test template, " *
+            "`test/$TESTTEMPLATES_DIR/*_tests_template.jl`, which `Runtests.chores()` expands into a test file")
     name = ex.args[lo]
     name isa String || return scan_error!(errors, path, at, "`@testitem` needs a string literal name, got `$(_show(name))`")
     isempty(strip(name)) && return scan_error!(errors, path, at, "`@testitem` name must not be blank")
@@ -302,20 +345,24 @@ end
 ### Driver #################################################################
 
 """
-    scan(files, filter, known_setups; ntasks, strays, suite_names) -> Vector{RawItem}
+    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
-(file, line). Throws a `ScanFailure` listing every problem, the `strays` among
-them, so one run surfaces every broken file. `suite_names`, when given, gets the
-name of every item read, the filter's rejects included.
+(file, line). Throws a `ScanFailure` listing every problem, so one run surfaces every
+broken file: among them the `strays`, and, unless `expansions` is false, every
+expansion of a template that is not the template's as it is now (see
+[`expansion_errors`](@ref)). `suite_names`, when given, gets the name of every item
+read, the filter's rejects included.
 """
 function scan(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(),
-        strays::Vector{String} = String[],
+        strays::Vector{ScanError} = ScanError[],
+        templates::Vector{String} = String[],
+        expansions::Bool = true,
         suite_names::Union{Nothing, Vector{String}} = nothing
     )
-    items, errors, rejected = scan_files(files, filter, known_setups; ntasks, strays)
+    items, errors, rejected = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions)
     isempty(errors) || throw(ScanFailure(errors))
     if suite_names !== nothing
         append!(suite_names, (it.name for it in items))
@@ -326,7 +373,7 @@ function scan(
 end
 
 """
-    scan_files(files, filter, known_setups; ntasks, strays) -> (items, errors, rejected)
+    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions) -> (items, errors, rejected)
 
 What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
 by (file, line), every problem found sorted the same way, and the name and place
@@ -335,7 +382,8 @@ what is broken.
 """
 function scan_files(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
-        ntasks::Int = default_scan_tasks(), strays::Vector{String} = String[]
+        ntasks::Int = default_scan_tasks(), strays::Vector{ScanError} = ScanError[],
+        templates::Vector{String} = String[], expansions::Bool = true
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64)) for _ in 1:nt]
@@ -351,7 +399,8 @@ function scan_files(
             end
         end
     end
-    errors = ScanError[stray_error(path) for path in strays]
+    errors = copy(strays)
+    expansions && append!(errors, expansion_errors(files, templates))
     for c in chunks
         append!(errors, c[2])
     end

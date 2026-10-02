@@ -99,12 +99,14 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     (item === nothing || !isempty(errors)) && throw(ScanFailure(errors))
     sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE
     warn_ignored(item, sandboxed)
-    return with_interactive_env(target) do
-        sandboxed && return run_sandboxed(item, target).testset
-        say(item, target, 1, nothing)
-        result = run_item(interactive_spec(item, target); printing = true)
-        say(item, target, 1, outcome(result))
-        return result.testset
+    return exclusively() do
+        with_interactive_env(target) do
+            sandboxed && return run_sandboxed(item, target).testset
+            say(item, target, 1, nothing)
+            result = run_item(interactive_spec(item, target); printing = true)
+            say(item, target, 1, outcome(result))
+            return result.testset
+        end
     end
 end
 

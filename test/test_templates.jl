@@ -266,15 +266,17 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
     end
 
     @testset "a loop sees each package the body imports by its name, and nothing it exports" begin
+        # Packages of this test environment, as `Pkg.test` gives it no standard library
+        # it does not list.
         body = quote
-            using Dates: Day
-            import Random as R
+            using Random: shuffle
+            import Sockets as S
             using .Local
             @test true
         end
         m = Runtests.Private.Expander.loop_module(body, "", 1)
-        @test isdefined(m, :Dates) && isdefined(m, :R) && isdefined(m, :Test)
-        @test !isdefined(m, :Day) && !isdefined(m, :Random) && !isdefined(m, :Local)
+        @test isdefined(m, :Random) && isdefined(m, :S) && isdefined(m, :Test)
+        @test !isdefined(m, :shuffle) && !isdefined(m, :Sockets) && !isdefined(m, :Local)
         @test !isdefined(m, Symbol("@test"))
         @test_throws "the loop's `import Missing_Package_X` failed" Runtests.Private.Expander.loop_module(
             quote using Missing_Package_X end, "", 3)

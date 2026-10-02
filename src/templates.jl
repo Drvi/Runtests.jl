@@ -346,7 +346,8 @@ end
 
 # `nothing` once the process has exited cleanly; otherwise why it did not, with what it
 # said that shows why. One past `limit` gets SIGTERM first, on which Julia says which
-# line of a template it was running, and SIGKILL if it is still there.
+# line of a template it was running (on Windows it ends without a word), and SIGKILL
+# if it is still there.
 function run_expander(cmd::Cmd, limit::Real)
     said = tempname()
     try

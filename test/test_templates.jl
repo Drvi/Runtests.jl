@@ -167,8 +167,9 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         @test templates == [template_in(pkg, "placed")]
         @test files == [joinpath(pkg, "test", "other_test.jl")]
         said = Dict(relpath(e.file, pkg) => e.msg for e in strays)
-        @test sort!(collect(keys(said))) == sort!(joinpath.(["test", "test/testtemplates/io", "test/io", "test/testtemplates", "test/testtemplates"],
-            ["beside_tests_template.jl", "deep_tests_template.jl", "nested_tests_template.jl", "helpers.jl", "written_tests.jl"]))
+        @test sort!(collect(keys(said))) == sort!([joinpath("test", "beside_tests_template.jl"),
+            joinpath("test", "testtemplates", "io", "deep_tests_template.jl"), joinpath("test", "io", "nested_tests_template.jl"),
+            joinpath("test", "testtemplates", "helpers.jl"), joinpath("test", "testtemplates", "written_tests.jl")])
         @test said[joinpath("test", "beside_tests_template.jl")] == "a test template belongs in `test/testtemplates/` itself, " *
             "from where `Runtests.chores()` expands it into `test/beside_tests.jl`: move it there"
         @test occursin("expands it into `test/deep_tests.jl`", said[joinpath("test", "testtemplates", "io", "deep_tests_template.jl")])
@@ -354,8 +355,9 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             @test err isa Runtests.ChoresError && elapsed < 50
             @test occursin("took longer than 2.0s, the `init_timeout` setting, and was stopped", out)
             # Where it was stopped, as Julia says on SIGTERM: the template's line once
-            # the process has got that far, which under load it may not have.
-            @test occursin("was stopped:\n│     in expression starting at ", out)
+            # the process has got that far, which under load it may not have. Windows
+            # has no signals, and the process ends without a word.
+            Sys.iswindows() || @test occursin("was stopped:\n│     in expression starting at ", out)
             @test !isfile(expansion_of(t))
         end
     end

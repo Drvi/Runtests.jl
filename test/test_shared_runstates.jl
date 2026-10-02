@@ -20,14 +20,23 @@ function shared_run(pkg, p, states; ago = 0.0, elapsed = 1.0, finish = true)
     return rsf
 end
 
-# What a run that died leaves: its beats stopped, and its file last written long ago.
-function died!(rsf)
+# What a run whose writer stalled leaves: its beats stopped, and its file last written
+# long ago.
+function stalled!(rsf)
     beating = rsf.heartbeat[]
     rsf.heartbeat[] = nothing
     close(first(beating)); wait(last(beating))
     f = Base.Filesystem.open(rsf.path, Base.Filesystem.JL_O_WRONLY)
     Base.Filesystem.futime(f, time() - 2LIVE_S, time() - 2LIVE_S)
     close(f)
+    return rsf
+end
+
+# What a run that died leaves: that, and its file closed, as the system closes a dead
+# process's files. Windows deletes no file that is open.
+function died!(rsf)
+    stalled!(rsf)
+    @lock rsf.lock close(rsf.io)
     return rsf
 end
 
@@ -98,7 +107,7 @@ end
         pkg = make_pkg("SharedBeat", "test/t_test.jl" => shared_items("a"))
         withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
             p, _ = prepare((pkg,); announce = false)
-            rsf = died!(shared_run(pkg, p, ["a" => RUNNING]; finish = false))
+            rsf = stalled!(shared_run(pkg, p, ["a" => RUNNING]; finish = false))
             @test !is_live(read_run_state(rsf.path))
             # Its beats again, every 50 ms rather than every 30 s.
             timer = Timer(0.05; interval = 0.05)

@@ -110,7 +110,8 @@ const FILE_LIMIT_SECONDS = something(tryparse(Int, get(ENV, "RUNTESTS_TEST_FILE_
 
 # A hung file is asked where its tasks are before it is killed: the child installed
 # Runtests' inspection hook, so the signal prints every task's backtrace into its log,
-# and SIGTERM then prints every thread's. Windows has neither and is just killed.
+# and SIGTERM then prints every thread's. Windows has neither, and its child prints
+# the backtraces itself a minute before the limit (see runtests.jl).
 function stop_hung(proc::Base.Process)
     exited(seconds) = timedwait(() -> process_exited(proc), seconds; pollint = 0.2) === :ok
     signal(sig) = try

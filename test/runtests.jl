@@ -91,6 +91,15 @@ if !isempty(ARGS)
     # A child, or someone running one file by hand. The hook makes the signal a
     # hung file is sent print every task's backtrace, which is where it is stuck.
     RuntestsWorkers.install_inspection_hook()
+    # Windows has no such signal: a file still running a minute before the runner's
+    # limit prints the backtraces itself, into the log the runner shows once it kills it.
+    RuntestsWorkers.INSPECT_SIGNAL === nothing && Timer(max(FILE_LIMIT_SECONDS - 60, 1)) do _
+        println(stderr, "[tests] ", join(ARGS, ", "), " still running after ", FILE_LIMIT_SECONDS - 60,
+                "s: every task's backtrace follows")
+        # Before the backtraces, which the runtime writes to the descriptor directly.
+        flush(stderr)
+        ccall(:jl_print_task_backtraces, Cvoid, (Cint,), 0)
+    end
     foreach(run_file, ARGS)
 elseif default_jobs() <= 1
     print_environment()

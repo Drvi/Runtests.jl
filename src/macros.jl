@@ -61,15 +61,16 @@ without `_template`, in `test/`.
 
 ```julia
 # test/testtemplates/periods_tests_template.jl, expanded into test/periods_tests.jl
-@testtemplate "doubling a \$P of \$n" for P in (Day, Month), n in 1:2
+@testtemplate "doubling a \$P of \$n" for P in (Dates.Day, Dates.Month), n in 1:2
     using Dates
     @test \$P(\$n) + \$P(\$n) == \$P(2 * \$n)
 end
 ```
 
-The loop runs as Julia's does, among the names the item will have: the package and
-the body's `using` and `import` statements. The name interpolates each iteration's
-values. A template holds `@testtemplate`s and nothing else: an ordinary `@testitem`
+The loop runs as Julia's does, in a module holding `Test`, the package and each
+package the body imports, by name and nothing more: it says `Dates.Day` where the
+item, after its `using Dates`, says `Day`. The name interpolates each iteration's
+values, printed as the item would. A template holds `@testtemplate`s and nothing else: an ordinary `@testitem`
 goes in a test file, and a list several templates share in a setup module. In the
 keywords and the body, `\$x` puts the value of the loop variable `x` there, written as
 code, as `Threads.@spawn` takes `\$x`: `repr(x)` as the item's module sees it with the
@@ -78,7 +79,7 @@ there. Nothing binds `x` in the item, so `x` written without its `\$` is refused
 the body binds it itself, as `x = \$x` does.
 
 In the keywords, a `\$(...)` is computed as the template expands, once per iteration
-among the same names, and its value written the same way: `skip = \$(x in KNOWN_BAD)`
+among the same names, and its value written the same way: `skip = \$(x in MySetup.KNOWN_BAD)`
 is `skip = true` or `skip = false` in each item. Outside a `\$(...)` a keyword is the
 item's, evaluated as it runs. In the body, a `\$` before anything but a loop variable
 is left as it is, for a macro of the body's own, and so is every `\$` inside a quoted

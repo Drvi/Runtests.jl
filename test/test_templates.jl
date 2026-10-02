@@ -215,8 +215,8 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         pkg = make_pkg("Expands", "test/other_test.jl" => PLAIN_ITEM,
             "test/testsetups/ExpandsSetup.jl" => "module ExpandsSetup\nexport twice, COUNTS\ntwice(x) = 2x\nconst COUNTS = 1:2\nend\n",
             "test/testtemplates/periods_tests_template.jl" => """
-                # The loop sees what the item does: Dates, and the counts from the setup.
-                @testtemplate "doubling a \$P of \$n" tags=[:gen] for P in filter(T -> T <: DatePeriod, [Day, Hour, Month]), n in COUNTS
+                # The loop sees the packages the item imports, by name: Dates, and the setup.
+                @testtemplate "doubling a \$P of \$n" tags=[:gen] for P in filter(T -> T <: Dates.DatePeriod, [Dates.Day, Dates.Hour, Dates.Month]), n in ExpandsSetup.COUNTS
                     using Dates
                     using ExpandsSetup
                     P = \$P
@@ -243,7 +243,7 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             states, _, _ = run_states(pkg; workers = 1, monitor = false)
             @test length(states) == 5 && all(==(PASSED), values(states))
 
-            write(t, replace(read(t, String), "[Day, Hour, Month]" => "[Day, Hour, Month, Year]"))
+            write(t, replace(read(t, String), "[Dates.Day, Dates.Hour, Dates.Month]" => "[Dates.Day, Dates.Hour, Dates.Month, Dates.Year]"))
             @test occursin("expanded from an older", refusal(pkg))
             ok, out = template_chores(pkg; dry_run = true)
             @test ok === false && read(o, String) == text && occursin("which changed since it was expanded", out)
@@ -265,11 +265,26 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         end
     end
 
+    @testset "a loop sees each package the body imports by its name, and nothing it exports" begin
+        body = quote
+            using Dates: Day
+            import Random as R
+            using .Local
+            @test true
+        end
+        m = Runtests.Private.Expander.loop_module(body, "", 1)
+        @test isdefined(m, :Dates) && isdefined(m, :R) && isdefined(m, :Test)
+        @test !isdefined(m, :Day) && !isdefined(m, :Random) && !isdefined(m, :Local)
+        @test !isdefined(m, Symbol("@test"))
+        @test_throws "the loop's `import Missing_Package_X` failed" Runtests.Private.Expander.loop_module(
+            quote using Missing_Package_X end, "", 3)
+    end
+
     @testset "a keyword's `\$(...)` is computed as the template expands, among the names the loop sees" begin
         pkg = make_pkg("Computed", "test/other_test.jl" => PLAIN_ITEM,
             "test/testsetups/ComputedSetup.jl" => "module ComputedSetup\nexport KNOWN_BAD\nconst KNOWN_BAD = (2,)\nend\n",
             "test/testtemplates/cases_tests_template.jl" => """
-                @testtemplate "case \$n" skip = \$(n in KNOWN_BAD) timeout = \$(60n) tags = [:gen, \$(n > 1 ? :big : :small)] for n in 1:3
+                @testtemplate "case \$n" skip = \$(n in ComputedSetup.KNOWN_BAD) timeout = \$(60n) tags = [:gen, \$(n > 1 ? :big : :small)] for n in 1:3
                     using ComputedSetup
                     @test \$n != 2
                 end
@@ -295,6 +310,7 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             "throws" => "@testtemplate \"x \$T\" for T in error(\"no list today\")\n    @test true\nend\n",
             "closure" => "@testtemplate \"f \$k\" for (k, f) in ((1, x -> x),)\n    @test \$f(1) == 1\nend\n",
             "needs_import" => "@testtemplate \"p \$p\" for p in (Day(1),)\n    @test \$p isa Any\nend\n",
+            "exported_name" => "@testtemplate \"x \$p\" for p in (Day(1),)\n    using Dates\n    @test \$p isa Any\nend\n",
             "top_level_code" => "const XS = (1, 2)\n@testtemplate \"t \$x\" for x in XS\n    @test \$x > 0\nend\n",
             "duplicate" => "@testtemplate \"same\" for T in (Int8, Int16)\n    @test true\nend\n",
             "nested" => "for T in (Int8,)\n    @testitem \"n \$T\" begin\n    end\nend\n",
@@ -316,9 +332,11 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             @test err isa Runtests.ChoresError
             @test occursin("templates: $(length(templates)), $(length(templates)) to fix by hand:", out)
             for msg in ["no list today",
-                        "`\$f` would be written `Main.Item.var",
+                        "`\$f` would be written `Main.Template.var",
                         "UndefVarError: `Day` not defined",
-                        "a template holds `@testtemplate`s and nothing else: a `@testtemplate`'s loop sees what its item does",
+                        "a template holds `@testtemplate`s and nothing else: a `@testtemplate`'s loop sees the package and each package the body imports, by name",
+                        # What `using Dates` brings into the item's scope is not the loop's.
+                        "exported_name_tests_template.jl: line 1: UndefVarError: `Day` not defined",
                         "declares the test item name \"same\" a second time",
                         "a `@testtemplate` belongs at the top level of a template, its loop in its header",
                         "a template holds `@testtemplate`s and nothing else: a `@testitem` belongs in a test file",

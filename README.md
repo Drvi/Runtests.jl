@@ -2,79 +2,132 @@
 
 [![CI](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml)
 
-Runtests.jl runs a package's tests as independent *test items* spread over worker processes,
-and plans each run from what the runs before it recorded: what failed last time runs first,
-the longest items start early, and the rest go in file order, so that a worker reuses the code
-it has already compiled. Every run leaves a record that is enough to run it again elsewhere.
+Runtests.jl runs a Julia package's tests as independent **test items** across
+worker processes. Call `Runtests.runtests()` to run the suite and
+`Runtests.runtestsf()` to rerun failures.
 
-The aim is a workflow with next to nothing to decide. Most of the time you call
-`Runtests.runtests()` to run the suite and `Runtests.runtestsf()` to run again what
-failed, and Runtests picks the rest: how many workers the machine has room for, what
-order the items run in, whose output is worth printing, and the environment the tests
-need. Every one of those choices has a keyword for when the default is wrong for you
-(see [Running tests](#running-tests)).
+Runtests chooses a worker count from the available CPUs and memory, builds the
+test environment, and uses previous runs to plan the next one. Recent failures
+and long items get priority; other items run in file order to reuse compiled
+code. Each run records its results, settings, profiles, and random seed for
+[inspection and replay](#run-state).
 
-Runtests is a vibe-coded package: its code was written with an AI coding assistant.
+**Requires Julia 1.12 or later.** Runtests is a vibe-coded package: its code was
+written with an AI coding assistant.
 
-Julia 1.12+. Beyond the standard library it needs three packages: `TestEnv` to
-build the environment tests run in, `PrecompileTools` to keep the wait before the
-first test item short, and `RuntestsWorkers`, the part of Runtests a worker process loads.
-With [Debugger.jl](https://github.com/JuliaDebug/Debugger.jl) loaded, it can step
-into a test item.
+- [Quick start](#quick-start) · [Running tests](#running-tests)
+- [Test files](#test-files) · [Writing test items](#writing-test-items)
+- [Test setups](#test-setups) · [Test templates](#test-templates) · [Suite maintenance](#suite-maintenance)
+- [Configuration](#testtestitemstoml) · [Coverage](#coverage)
+- [The plan](#the-plan) · [While it runs](#while-it-runs)
+- [At the REPL](#at-the-repl) · [Run state](#run-state) · [Editors](#editors)
 
 ## Quick start
 
-Add Runtests to the package's test dependencies (`test/Project.toml`, or `[extras]`
-and `[targets]` in `Project.toml`), and make `test/runtests.jl`:
+1. Add Runtests to the package's test dependencies: `test/Project.toml`, or
+   `[extras]` and `[targets]` in `Project.toml`.
+2. Create the test entry point:
+
+   ```julia
+   # test/runtests.jl
+   using Runtests
+   Runtests.runtests()
+   ```
+
+3. Write test items in files named `*_test.jl` or `*_tests.jl`:
+
+   ```julia
+   # test/arithmetic_tests.jl
+   @testitem "adds numbers" begin
+       @test 1 + 1 == 2
+   end
+   ```
+
+4. Run the package's tests from its active project:
+
+   ```julia
+   using Pkg
+   Pkg.test()
+   ```
+
+Each item gets `Test` and the package under test automatically. Test files contain
+only `@testitem` declarations; put imports and other executable code inside an
+item, or shared helpers in a [test setup](#test-setups).
+
+For an interactive session where Runtests is available, `using Runtests` followed
+by `Runtests.runtests()` runs the active project's suite and builds its test
+environment. See [At the REPL](#at-the-repl) for activating that environment
+yourself or debugging an item.
+
+## Running tests
+
+With the package's project active and Runtests loaded:
 
 ```julia
-using Runtests
-Runtests.runtests()
+Runtests.runtests()                         # entire suite
+Runtests.runtests("test/solver_test.jl")    # one file
+Runtests.runtests("test/solver_test.jl:42") # item containing this line
+Runtests.runtests(name="adds numbers")      # exact name
+Runtests.runtests(name=r"numbers$")         # names matching a Regex
+Runtests.runtests(tags=:fast)               # one tag
+Runtests.runtests(tags=[:fast, :math])      # must have both tags
+Runtests.runtests(tags="fast && !slow")     # tag expression
+Runtests.runtests("test/db"; tags=:fast)    # combine path and tag filters
+Runtests.runtests(dry_run=true)             # inspect the plan without running
+Runtests.runtestsf()                        # items whose latest verdict did not pass
 ```
 
-Then write test items in files named `*_test.jl` or `*_tests.jl`:
+Paths, names, and tags narrow the selection together. `name` also accepts a vector
+or set of exact names. A `file.jl:line` target must be the only positional target.
+Tag expressions support `!`, `&&`, and `||`; `&&` binds tighter than `||`, and
+parentheses are not supported.
 
-```julia
-# test/arithmetic_tests.jl
-@testitem "adds numbers" begin
-    @test 1 + 1 == 2
-end
-```
+`runtestsf()` remembers each item's latest verdict across runs. Rerunning one
+failure does not forget other failures, and renamed or deleted items are left
+out. To reproduce a recorded run's settings and seed, use
+[`replay`](#run-state).
 
-`Pkg.test()` runs them as usual. At the REPL, `Runtests.runtests()` runs the suite of
-the active project, building its test environment itself.
+A normal run returns a `RunTestSet`; a dry run returns `nothing`. Outside an
+existing `@testset`, an item that did not pass makes the call throw, so
+`Pkg.test()` fails. Inside an existing `@testset`, the result is recorded there.
+
+Problems discovered before execution also throw:
+
+| Error | Cause |
+|:------|:------|
+| `Runtests.ScanFailure` | Invalid test files, duplicate names, or missing or stale template expansions. |
+| `Runtests.NoTestsError` | No test files, no matching items, or no recorded failures for `runtestsf()`. |
+| `Runtests.ConfigError` | Invalid settings, profiles, or test setup configuration. |
+
+See [Configuration](#testtestitemstoml) for worker counts, timeouts, output,
+coverage, and other run options.
 
 ## Test files
 
-```
+```text
 test/
-  runtests.jl          using Runtests; Runtests.runtests()
-  solver_test.jl       @testitem declarations, and nothing else
+  runtests.jl                      # test entry point
+  solver_test.jl                   # @testitem declarations
   sub/parser_tests.jl
-  periods_tests.jl     the items its template declares, which Runtests.chores() writes
+  periods_tests.jl                 # generated by Runtests.chores(); commit this
   testsetups/
-    MySetups.jl        ordinary modules that test items load with `using`
+    MySetups.jl                    # shared helpers, loaded with using MySetups
   testtemplates/
-    periods_tests_template.jl   @testtemplate declarations, each a loop
-  TestItems.toml       optional: run settings, forced ordering, sandbox profiles
+    periods_tests_template.jl      # @testtemplate declarations
+  TestItems.toml                   # optional settings, ordering, and profiles
 ```
 
-A test file contains only `@testitem` declarations. Runtests reads test files by
-parsing them, never by evaluating them, so a test file cannot run anything in the
-process that is coordinating the run.
+Runtests discovers items by parsing test files, without evaluating them in the
+coordinator process. Item names must be nonblank string literals and unique
+across the suite.
 
-Every Julia file under `test/` has to be a test file, a test template in
-`testtemplates/` (see [Test templates](#test-templates)), a module in `testsetups/`,
-or `runtests.jl`. Files inside a directory with its own `Project.toml` or
-`JuliaProject.toml`, such as a package of test helpers, are left alone, and so are
-hidden (dot-prefixed) files and directories. Anything else stops the run until it
-is named, moved or removed: a file of tests that nobody named `*_test.jl` would
-otherwise sit there for months, never read, while the suite reported a clean pass
-without it.
+Every Julia file under `test/` must belong to one of the categories above.
+Unrecognized files stop the run with an error, so a misnamed test file cannot
+silently go untested. Hidden files and directories, and directories with their
+own `Project.toml` or `JuliaProject.toml`, are excluded from discovery.
 
-A run reads every test file whatever it was asked to run: a suite that does not
-parse, or that declares one name twice, is a broken suite rather than a smaller
-one. What a filter decides is which items *run*.
+**Filters select what runs, not what is validated.** Every run parses the entire
+suite and checks for duplicate names, even when you select a single item.
 
 ## Writing test items
 
@@ -95,20 +148,23 @@ work without the test environment having to declare `Test` itself.
 | Keyword | Meaning |
 |:--------|:--------|
 | `tags=[:a, :b]` | tags to filter by |
-| `timeout=N` | seconds before the item is killed |
-| `retries=N` | attempts after a failed one; the item's value wins over the run's |
+| `timeout=N` | positive number of seconds allowed for an attempt; overrides the run default |
+| `retries=N` | additional attempts after failure, from 0 to 126; overrides the run default |
 | `skip=expr` | `true`, or an expression evaluated on the worker before the body |
 | `failfast=true` | stop this item at its first failure |
 | `chain=:sym` | items sharing a chain run in sequence, on one worker |
 | `sandbox=true` | run alone in a process that is torn down afterwards (not with `chain`) |
-| `sandbox=:name` | run under `[profiles.name]` of `TestItems.toml` |
+| `sandbox=:name` | run in the worker pool for `[profiles.name]` of `TestItems.toml` |
 
-Every keyword except `skip` must be a literal of the kind the table says:
-`timeout=true` is refused rather than read as one second. `skip` sees `Test` and
-the package, as the body does before its own imports, and must give a `Bool`; an
-error in it is the item's error, reported as one in the body would be. A retry runs on the same
-worker, unless the failure took the worker with it (a timeout, a crash) or the item
-is sandboxed; the failed attempt's report says which.
+Every keyword except `skip` must be a literal; arithmetic on numeric literals,
+such as `timeout=5*60`, is also accepted. Invalid values are rejected:
+`timeout=true` is not one second. `skip` runs before the body's imports, with
+`Test` and the package in scope. It must return a `Bool`; an exception or any other
+result is reported as an item error.
+
+A retry uses the same worker unless the worker timed out or crashed, or the item
+uses `sandbox=true`. A chain retries from its first item. Named profiles share
+workers; use `sandbox=true` when an item needs a fresh process of its own.
 
 An item's body runs at the top level of a fresh module, with the REPL's soft scope:
 `x = 1` followed by a loop that updates `x` works as it does at the prompt. As in a
@@ -130,175 +186,220 @@ ping() = true
 end
 ```
 
-An item loads it with `using MySetups` or `import MySetups`, which is also how
-Runtests knows which setups an item needs. Before any worker starts, it precompiles
-each of them once, so that the workers do not all compile the same module at the
-same moment. A setup is precompiled like any package: its top-level code runs when
-it is compiled, and what has to happen in every process goes in its `__init__`.
+An item loads a setup with `using MySetups` or `import MySetups`. Runtests discovers
+these imports and precompiles the required setups before starting workers. As
+with any package, top-level setup code runs during precompilation; put work that
+must happen in each process in `__init__`.
 
-A setup without a project of its own has no UUID, and Julia keeps a single cache
-file for it per depot: another checkout with a setup of the same name, or a profile
-with other Julia flags, compiles over it. `Runtests.setups_to_packages()` makes every
-setup a package, after which each checkout and each set of flags keeps its own
-cache. `Name.jl` moves to `Name/src/Name.jl`, beside a `Name/Project.toml` with a
-UUID and the packages the setup imports, and a run precompiles it for the Julia
-flags of every profile before any worker needs it. In a moved setup, `@__DIR__`
-becomes `pkgdir(MyPkg, "test", "testsetups")`, which still names that directory
-when the code is pasted at the REPL. A package can import only what its project
-lists, so run it again after a setup starts importing something new.
+`Runtests.setups_to_packages()` converts setups into packages:
+
+- Moves `Name.jl` to `Name/src/Name.jl`.
+- Creates `Name/Project.toml` with a UUID and the setup's imported dependencies.
+- Rewrites `@__DIR__` to `pkgdir(MyPkg, "test", "testsetups")`, using the package
+  under test's name, so fixture paths also work when pasted into the REPL.
+
+Without a project and UUID, setups of the same name share a precompile cache per
+depot. Conversion gives each checkout its own cache identity; runs precompile
+setups for each profile's Julia flags. Rerun the conversion when a setup imports
+new dependencies. [`Runtests.chores()`](#suite-maintenance) includes this step.
 
 ### Test templates
 
-A test item per element of a list that code computes, such as the subtypes of an
-abstract type or the files of a data directory, comes from a template in
-`test/testtemplates/`: `periods_tests_template.jl` there expands into the test file
-`test/periods_tests.jl`.
+Use a template when a list of values should produce independently runnable test
+items. Templates live in `test/testtemplates/`, contain only `@testtemplate`
+declarations, and have names ending in `_test_template.jl` or
+`_tests_template.jl`. Add `Dates` to your test dependencies for this example:
 
 ```julia
 # test/testtemplates/periods_tests_template.jl
-@testtemplate "doubling a $P of $n" tags=[:gen] for P in filter(T -> T <: DatePeriod, [Day, Hour, Month]), n in 1:2
+@testtemplate "doubling a $P of $n" tags=[:gen] for P in (Dates.Day, Dates.Month), n in 1:2
     using Dates
     @test $P($n) + $P($n) == $P(2 * $n)
 end
 ```
 
-A template holds `@testtemplate` declarations and nothing else; an ordinary
-`@testitem` goes in a test file. A `@testtemplate` declares an item per iteration of
-the `for` in its header, the first variable varying slowest, each written out as a
-`@testitem` with a literal name. `Runtests.chores()` runs the loops in a process of
-its own, with the test environment active and the setups loadable as in a worker,
-and each loop sees what its item will: the package and the body's `using` and
-`import` statements, here `Dates`. A list several templates share goes in a setup
-module, as other shared code does.
+Run `Runtests.chores()` to generate `test/periods_tests.jl`. It contains four
+ordinary `@testitem` declarations, with the first loop variable varying slowest:
+`Day` at 1 and 2, then `Month` at 1 and 2. The first item is:
 
 ```julia
-# Expanded from testtemplates/periods_tests_template.jl by `Runtests.chores()`.
-# Change the template and run `Runtests.chores()` again, rather than editing this file.
-# runtests-expansion 1 433820ad 8fb456c8
-
 @testitem "doubling a Day of 1" tags=[:gen] begin
     using Dates
     @test Day(1) + Day(1) == Day(2 * 1)
 end
 ```
 
-and so on, for `Day` at 2 and `Month` at 1 and 2.
+**Commit the generated file.** Installed packages need it to run `Pkg.test()`.
+Edit the template and rerun `Runtests.chores()` when the cases change.
 
-In the name, `$P` interpolates as in any string, with the values printed as the
-item's module shows them. In the keywords and the body, `$P` puts the value of
-the loop variable `P` there, written as code, as `Threads.@spawn` takes `$x`: `repr`
-of it as the item's module sees it with the body's `using` and `import` statements,
-in parentheses where the code beside it would bind to it otherwise. It has to
-evaluate back to an equal value there, or the template is refused, so a closure or a
-type the template defines cannot be looped over. Nothing binds `P` in the item, so
-a `P` without its `$` is refused unless the body binds `P` itself: `P = $P` gives it a
-variable of that name, wherever the template puts it and with what it shadows there.
+#### Scope and interpolation
 
-In the keywords, a `$(...)` is computed as the template expands, once per iteration
-and among the names the loop sees, and its value is written the same way:
+Expansion runs in a separate process with the test environment and setups
+available. The loop sees `Test`, the package under test, and packages imported by
+the body **by module name only**. In this example, the loop uses `Dates.Day`;
+the item can use `Day` after `using Dates`. Shared lists belong in a setup module,
+referenced by a qualified name such as `MySetups.PERIODS`.
+
+| Location | Meaning |
+|:---------|:--------|
+| Name: `"case $n"` | Interpolate the iteration's value into the item's literal name. |
+| Body or keywords: `$n` | Insert the loop variable's value as Julia code. |
+| Keywords: `$(expression)` | Evaluate during expansion, once per iteration, in the loop's scope. |
+| Body: other `$` expressions | Leave them for the body's own macros, such as `@btime`. |
+| Quoted expressions | Leave all `$` expressions unchanged. |
+
+Inserted values use `repr` in the item's scope, including its imports, and must
+evaluate back to equal values there. Values that cannot round-trip, such as
+closures, are rejected. Parentheses are added where needed to preserve how the
+surrounding code parses.
+
+Loop variables are not bound in the generated item. Use `$P` to insert a value,
+or `P = $P` to give the item a variable named `P`; an unbound `P` is rejected.
+Inside a body string, use `"$($P)"` to insert the template value.
+
+For example, compute a keyword during expansion:
 
 ```julia
-@testtemplate "case $n" skip = $(n in KNOWN_BAD) for n in 1:1000
-    using MySetups          # KNOWN_BAD = (42, 666)
-    @test check($n)
+# test/testtemplates/cases_tests_template.jl
+@testtemplate "case $n" skip=$(n == 2) for n in 1:3
+    @test $n != 2
 end
 ```
 
-gives `@testitem "case 42" skip = true begin`, and `skip = false` to the items not
-in `KNOWN_BAD`. What is outside a `$(...)` is the item's, evaluated as it runs:
-`skip = Sys.iswindows() || $(n in KNOWN_BAD)` decides its first half on the machine
-that runs the item. In the body only a loop variable's `$` is the template's, since a
-`$(...)` there may be a macro's: any other `$` is left as it is, for a macro of the
-body's own such as BenchmarkTools' `@btime`, and so is every `$` inside a quoted
-expression; in a string, `"$($P)"` puts the value in.
+This writes `skip=true` for case 2 and `skip=false` for the others. Code outside
+`$(...)` remains part of the item's keyword: `skip=Sys.iswindows() || $(n == 2)`
+checks the operating system when the item runs. A shared exclusion list works
+as `skip=$(n in MySetups.KNOWN_BAD)` when the body imports `MySetups`.
 
-The expansion is an ordinary test file: commit it, as `Pkg.test` of an installed
-package needs it. Nothing expands a template but `Runtests.chores()`. A run, and
-`Runtests.chores(dry_run = true)`, only compare the two files, by the stamp on the
-expansion's third line, and a run refuses to start when the expansion is not the
-template's: the template changed since it was expanded, the expansion was edited by
-hand, or the template is gone. The stamp hashes the text as its author wrote it:
-line endings, a byte-order mark and whitespace at the end of the file do not count.
+#### Keeping expansions current
 
-`Runtests.chores()` expands every template each time, since what a template's code
-computes can change while its text does not, and writes only the files that change.
-On CI, `Runtests.chores()` followed by `git diff --exit-code` fails a commit whose
-expansions are out of date.
+Only `Runtests.chores()` expands templates. A test run and
+`Runtests.chores(dry_run=true)` check the generated file's stamp without running
+the template. A test run refuses to start if an expansion is missing, its template
+changed, the generated file was edited by hand, or its template was deleted.
+Line endings, a byte-order mark, and trailing whitespace at the end of the file
+do not affect the stamp.
 
-## Running tests
+`Runtests.chores()` evaluates every template each time, because its input data can
+change without its source changing, and writes only changed expansions. It
+reports manually edited expansions for you to resolve. On CI, run
+`Runtests.chores()` followed by `git diff --exit-code` to check committed
+expansions against the current data.
+
+## Suite maintenance
 
 ```julia
-Runtests.runtests()                          # everything under test/
-Runtests.runtests("test/solver_test.jl")     # one file
-Runtests.runtests("test/solver_test.jl:42")  # the item that line is inside
-Runtests.runtests(name="adds numbers")       # one item; a Regex matches part of a name
-Runtests.runtests(tags=:fast)                # by tag
-Runtests.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||`
-Runtests.runtests("test/db"; tags=:fast)     # they narrow together
-Runtests.runtests(dry_run=true)              # print the plan, run nothing
-Runtests.runtestsf()                         # run what is failing, each item as it last ran
-Runtests.chores()                            # tidy the suite; dry_run=true only says what it would do
+Runtests.chores(dry_run=true)  # report needed changes without making them
+Runtests.chores()              # apply automatic fixes and report remaining problems
 ```
 
-A tag expression is names joined with `&&` and `||`, each optionally negated with
-`!`; `&&` binds tighter, and there are no parentheses. `name` also takes several
-names, as a vector or a set. A `file.jl:line` target picks one item, so it is given
-without other files or directories.
+`chores()` performs these tasks:
 
-`Runtests.chores()` looks after a suite: it makes packages of the setups that are
-not yet, and adds to their `[deps]` what they have come to import; it expands the
-test templates (see [Test templates](#test-templates)), and deletes the expansion of
-one that is gone; it deletes this machine's run states that nothing reads; and it
-reports anything a run would refuse to start on, in the test items or in
-`TestItems.toml`, which needs a person, as is an expansion edited by hand. Run
-states are kept as a run keeps them, the newest 20 and any older one a failing item's
-last verdict is in, and of those only one with nothing about an item the suite has
-now goes: a dry run, a run stopped before any item finished, or one whose items have
-all been renamed or deleted since. Another machine's run state, a downloaded CI
-artifact say, is never deleted. Once it has done what it can, it throws
-`Runtests.ChoresError` if anything is left for a person, and otherwise returns
-`true`, so `Runtests.chores(); Runtests.runtests()` stops before a long run on a
-suite that needs fixing first. `Runtests.chores(dry_run = true)` changes nothing,
-never throws, says what it would do, and returns `true` when nothing is left to do.
-`Runtests.chores(config = "ci.toml")`, or with several files, checks those too, each
-as a run given it would, beside `test/TestItems.toml`.
+- Converts setups to packages and adds newly imported dependencies.
+- Expands templates and deletes generated files whose templates were removed.
+- Checks test items and `test/TestItems.toml`, reporting problems that need manual
+  changes, including manually edited expansions.
+- Removes this machine's obsolete run states, respecting the
+  [retention rules](#run-state). Among retained states, it removes only those with
+  no information about any current item, such as empty dry runs. Records from
+  other machines are preserved.
 
-A run that cannot start throws before any item runs: `Runtests.ScanFailure` when test
-files cannot be read as a suite, an expansion out of date with its template among them, `Runtests.NoTestsError` when there is nothing to run,
-and `Runtests.ConfigError` when a setting, profile or test setup cannot be used as
-given.
+After applying automatic fixes, it returns `true` or throws
+`Runtests.ChoresError` if manual work remains. This lets you check the suite before
+starting a run:
 
-| Keyword | Meaning |
-|:--------|:--------|
-| `workers` | how many worker processes: a number, or `"auto"` (the default: as many as the CPUs allow at `threads` each and memory allows at 4 GiB each, at most 8) |
-| `threads` | each worker's `--threads`; `"2,1"` by default |
-| `timeout` | seconds an item may run; 1800 by default |
-| `init_timeout`, `test_end_timeout` | the same for a profile's `init` and `test_end`; `timeout` by default |
-| `retries` | attempts after a failed one; 0 by default |
-| `failfast` | stop the run once an item fails |
-| `item_failfast` | stop an item at its first failure; `failfast` by default |
-| `logs` | whose output to print: `:issues`, only items that did not pass (the default); `:batched`, every item's once it ends; `:eager`, as it is written (the default for an interactive run with one worker) |
-| `verbose` | print every item's results and output, passing ones included |
-| `memory_threshold` | the share of the machine's memory in use at which the run holds off on new items; 0.9 by default |
-| `monitor` | watch memory and show the progress line; on by default |
-| `monitor_interval` | how often the progress line is printed when there is no terminal to redraw it on; 30 seconds by default, and 0 prints it five times a second |
-| `full_stacktraces` | keep Runtests' own frames in a failing item's backtrace |
-| `full_names` | write every item's name whole, where by default one much longer than the rest is shortened to a prefix of its own (see [The plan](#the-plan)) |
-| `testset_name` | what the run's testset is called in the summary; `"Runtests"` by default. Runs of several calls under one `@testset` are told apart by it |
-| `coverage` | count which lines of `src/` and `ext/` the items run, into `lcov.info` at the package's root; also `RUNTESTS_COVERAGE` (see [Coverage](#coverage)) |
-| `seed` | where every item's random numbers start, with its name; random unless given, and printed at the start of the run |
-| `dry_run` | print the plan and run nothing |
-| `replay` | run a recorded run again (see [Run state](#run-state)) |
-| `config` | a file to read in place of `test/TestItems.toml`, relative to the current directory (see [`test/TestItems.toml`](#testtestitemstoml)) |
+```julia
+Runtests.chores(); Runtests.runtests()
+```
 
-All but `dry_run`, `replay` and `config` can also go under `[run]` in `test/TestItems.toml`;
-a keyword given to `runtests` wins over the file.
+`chores(dry_run=true)` changes nothing and returns `true` only when nothing needs
+doing; reported problems do not throw `ChoresError`. To check additional config
+files alongside `test/TestItems.toml`, pass `config="ci.toml"` or a vector of paths.
+
+## `test/TestItems.toml`
+
+Use this optional file for suite defaults, dispatch order, and worker profiles.
+Explicit `runtests` keywords override `[run]` settings.
+
+```toml
+[run]
+workers = "auto"       # or an integer
+timeout = 600          # per test item
+init_timeout = 120     # per `init` expression; defaults to `timeout`
+test_end_timeout = 60  # per `test_end` expression; defaults to `timeout`
+
+[order]
+first = ["smoke test"]         # use exact item names from your suite
+last  = ["large simulation"]
+
+[profiles.bounds]
+julia_args = ["--check-bounds=yes"]
+threads = "4"
+env = { JULIA_DEBUG = "Main" }
+init = "using MyPkg"
+test_end = "GC.gc(true)"
+preferences = "prefs/bounds.toml"  # optional; this file must exist
+```
+
+Select the example profile with `sandbox=:bounds` on an item. Replace `MyPkg`
+with your package's name. `[profiles.default]` configures ordinary workers and
+the fresh workers used by `sandbox=true`.
+
+`config="path/to/file.toml"` selects a file instead of `test/TestItems.toml`.
+The path is relative to the current directory and must exist. No environment
+variable or neighbouring file selects a config implicitly. Unknown keys and
+invalid values are errors. On a full run, `[order]` must name existing items;
+filtered runs allow names of items outside the selection.
+
+**Ordering across profiles or sandbox boundaries is not sequential.** Those
+items can run concurrently. Use a `chain` for items that must run in sequence
+on one worker; all items in a chain must use the same profile.
+
+A profile's `init` runs once per worker before its items; `test_end` runs after
+each item. Each has its own timeout, separate from the item's budget. Failures
+in `test_end` count toward the item's result.
+
+The `preferences` path is relative to the config file. Its contents overlay
+`LocalPreferences.toml` in a temporary copy of the test environment, with separate
+precompilation for the profile's preferences.
+
+### Run options
+
+| Keyword | Default | Meaning |
+|:--------|:--------|:--------|
+| `workers` | `"auto"` | Worker count. Auto uses CPU count, threads per worker, and an assumed 4 GiB per worker, capped at 8. |
+| `threads` | `"2,1"` | Each worker's Julia `--threads` value. |
+| `timeout` | `1800` | Seconds allowed per item attempt. |
+| `init_timeout`, `test_end_timeout` | `timeout` | Separate limits for profile hooks. |
+| `retries` | `0` | Additional attempts after failure, from 0 to 126. |
+| `failfast` | `false` | Stop the run after an item fails. |
+| `item_failfast` | `failfast` | Stop each item at its first failure. |
+| `logs` | `:issues` | Print output for nonpassing items. Use `:batched` for every item's output when it ends, or `:eager` to stream it. |
+| `verbose` | `false` | Print results and output for passing items too. |
+| `memory_threshold` | `0.9` | Fraction of machine memory in use at which new items wait; must be in `(0, 1]`. |
+| `monitor` | `true` | Monitor memory and display progress. |
+| `monitor_interval` | `30` | Seconds between progress lines outside a terminal; `0` prints at each sample, five times a second. |
+| `full_stacktraces` | `false` | Include Runtests' internal frames in failure backtraces. |
+| `full_names` | `false` | Print long names in full instead of [unique prefixes](#the-plan). |
+| `testset_name` | `"Runtests"` | Summary testset name; useful for several runs inside one `@testset`. |
+| `coverage` | `false` | Write merged line coverage to `lcov.info`; see [Coverage](#coverage). |
+| `seed` | random | Seed combined with each item's name. `0` chooses a random seed; the run prints the chosen value. |
+| `dry_run` | `false` | Print the plan without executing tests. |
+| `replay` | `nothing` | Path to a recorded [run state](#run-state). |
+| `config` | `test/TestItems.toml` | Config file to read; an explicit path is relative to the current directory. |
+
+An interactive run with at most one worker defaults to `logs=:eager`. All options
+above except `dry_run`, `replay`, and `config` can also go under `[run]`; use TOML
+strings for symbols, such as `logs = "issues"`. Explicit keywords override the file.
+
+Timeouts must be positive and at most 2,147,483,647 seconds; fractional values
+round up to whole seconds. Invalid settings are rejected before execution.
 
 With `workers = 0` the items run in this process, one after another. An item that
 needs a process of its own (`sandbox=true`, or a profile) still gets one, started
 and stopped around it, and the run lists which items did.
 
-### Coverage
+## Coverage
 
 `coverage = true`, as a keyword, as `RUNTESTS_COVERAGE=true` in the environment, or
 under `[run]` in `TestItems.toml`, has every worker count which lines of the
@@ -338,6 +439,9 @@ merge; nothing needs setting. To upload the merged file instead:
 
 `Runtests.runtests(dry_run=true)` prints what a run would do and runs nothing:
 
+The output below and in [While it runs](#while-it-runs) illustrates a small suite;
+timings and resource usage depend on the suite and machine.
+
 <pre>
 <b>┌ [TEST]</b> dry run · v0.1.0 · julia 1.13.0 · 6 test items in 2 files · 2 workers · threads 2,1
 <b>│ </b>startup: files 0.0s · plan 0.0s
@@ -359,6 +463,7 @@ with the worker expected to run it. The prediction plays out the run's own
 dispatch with the durations earlier runs recorded, so it is as good as they are.
 
 A run hands out, in this order:
+
 1. the items `[order] first` names;
 2. sandboxed items, while every process is still fresh;
 3. items that failed recently, or whose file changed since the last run;
@@ -435,8 +540,8 @@ spawned`, say).
 `cpu` gives two averages over the whole run, each a share of the machine's CPU
 threads: how much of them the run's processes used — the coordinator, the workers
 and every process they started and waited for — and how busy the machine was with
-everything counted. A run far below the machine is sharing it; a run near the top
-of it will not go faster with more workers. On Windows, which keeps no total for a
+everything counted. Compare these figures to see how much CPU time other work on
+the machine is using. On Windows, which keeps no total for a
 process's children, only the machine's share is given.
 
 If memory gets tight the run holds off on new items, collects garbage, and only
@@ -452,54 +557,6 @@ memory hold, and five minutes to spare) is stopped as hung: the workers are kill
 the items that were running are recorded as timed out, and `runtests` throws. An
 item past its own timeout is killed long before that, so this catches only what
 should have stopped and did not.
-
-## `test/TestItems.toml`
-
-```toml
-[run]
-workers = "auto"       # or an integer
-timeout = 600          # per test item
-init_timeout = 120     # per `init` expression; defaults to `timeout`
-test_end_timeout = 60  # per `test_end` expression; defaults to `timeout`
-
-[order]
-first = ["build the artifacts"]   # handed out first, in this order
-last  = ["tear down the cluster"]
-
-[profiles.bounds]
-julia_args = ["--check-bounds=yes"]
-threads = "4"
-env = { JULIA_DEBUG = "Main" }
-init = "using MyPkg"
-test_end = "GC.gc(true)"
-preferences = "prefs/bounds.toml"
-```
-
-The file is read from the package's `test/` directory, unless a call names another
-with `config = "path/to/file.toml"`, relative to the current directory, which then
-has to exist. Nothing but that keyword makes a run read another file: not an
-environment variable, and not a file lying next to the suite.
-
-An unknown key, a value of the wrong kind (a string where a list goes, `true` where
-a number does), or a name in `[order]` that is not a test item, is an error: a
-misspelled option that silently does nothing is how a suite ends up not running the
-way its author believes it does.
-
-An `[order]` pin is relative to the items that run alongside it. Items under
-different profiles run concurrently, and a sandboxed item runs concurrently with
-the ordinary ones, so pinning across either boundary does not sequence them.
-
-A profile's `init` runs once per worker before any item, and `test_end` runs after
-every item, on the same worker but timed against limits of their own. They are
-the suite's own code, so what they cost is not charged to the item, and an item's
-timeout stays a budget for the item. What `test_end` finds is reported as the
-item's result, because that is what it was checking.
-
-A profile's `preferences` file, relative to the directory of the file that declares
-the profile (`test/` for `test/TestItems.toml`), is laid over the test
-environment's `LocalPreferences.toml` in a copy of the environment that its workers
-use, kept among the system's temporary files. Packages see different preferences
-there, so they are precompiled separately.
 
 ## At the REPL
 
@@ -584,46 +641,59 @@ change `Project.toml` or a manifest, and rebuilds.
 
 ## Run state
 
-Every run writes a binary record as it goes, so a run that is killed still leaves
-a readable account of what had finished. It holds what it takes to run the same
-run again somewhere else:
+Every run writes a binary record as it progresses and prints its path at the end.
+Even an interrupted run leaves a record of completed items. Use a record from a
+local run or a downloaded CI artifact to inspect or replay it:
 
-- which items ran, how each ended, how long it took and how much of that was
-  compilation, and every attempt and every worker's start and end in order: which
-  items a worker had run before it died, and whether it exited, was killed for a
-  timeout, or was killed by a signal nobody in the run sent;
-- the commit, the Julia version and build, the machine, the settings, the
-  profiles with their preferences, and the seed every item's random numbers came
-  from;
-- the environment variables a run's behaviour can depend on (`JULIA_*` and
-  `RUNTESTS_*`) and the ones naming the CI job it ran in, leaving out any whose name
-  looks like a credential;
-- the test environment's `Project.toml` and `Manifest.toml`.
+```julia
+Runtests.read_run_state("run.runstate")
+Runtests.runtests(replay="run.runstate")
+Runtests.runtestsf(replay="run.runstate")
+```
 
-The path is printed at the end of every run. Run states live in the depot, in a
-directory per project under `runtests/runs/` named for the project, or in the
-directory `RUNTESTS_RUNSTATE_DIR` names, which several projects can share: each reads
-only its own, known by the project's UUID, else its name, else the name of its
-directory. A run writes its run state there, under a name of its choosing; a call
-cannot give it another path. Only the run states in that directory are read, to plan
-a run, to find what `runtestsf` runs and to decide what pruning keeps. One anywhere
-else, such as a run state downloaded from CI or copied next to the project, counts
-only when a call names it with `replay`, and for that call alone. Run states count in
-the order they started, as each records it, so a downloaded one counts from when it
-ran, whatever it is named.
+`runtests(replay=...)` uses the recorded items, settings, profiles, and seed.
+Explicit keywords override recorded settings. Replay reports package versions
+that differ from the recorded environment; it does not restore those versions.
+`runtestsf(replay=...)` selects failures using that run's verdicts and those of
+runs started after it. Earlier runs contribute durations only.
 
-The 20 most recent that this machine recorded are kept, and so is any older one that
-a failing item's last verdict is in, however many runs back: running one item again
-and again does not make `runtestsf` forget the others. An item that a run of the
-whole suite no longer finds was renamed or deleted: it is not failing from then on,
-and keeps no run state. Once a project's directory is gone, the run states this
-machine recorded for it are deleted too, unless the directory above it is missing or
-empty, as a drive that is not mounted leaves it. The machine is the hostname, or the
-name `RUNTESTS_HOST` gives it. One recorded elsewhere, such as a run state downloaded
-from CI, is never changed or deleted, wherever it is, and a replay deletes nothing.
+### What is recorded
 
-On CI, cache them from one run to the next, so each run is ordered by the ones
-before it, and keep a failed run's as an artifact:
+- Item outcomes, durations, compilation time, and every attempt.
+- Worker starts and exits, including whether a worker timed out, crashed, or
+  received an external signal.
+- The commit, Julia version and build, machine, settings, profiles, preferences,
+  and random seed.
+- `JULIA_*`, `RUNTESTS_*`, and CI job environment variables, excluding names that
+  look like credentials.
+- The test environment's `Project.toml` and `Manifest.toml`.
+
+### Storage and retention
+
+By default, records live under the Julia depot's `runtests/runs/`, in a directory
+per project. Set `RUNTESTS_RUNSTATE_DIR` to use another directory; several projects
+can share it. Records are matched by project UUID, falling back to project name,
+then directory name.
+
+Only records in that directory contribute to scheduling and failure history.
+A record elsewhere is used only when explicitly passed as `replay`, for that call.
+Runs are ordered by their recorded start time, regardless of filename or when a
+record was downloaded. Each item's latest completed verdict determines whether
+it is failing, and its latest recorded duration informs scheduling.
+
+Runtests keeps this machine's newest 20 records, plus any older record containing
+a failing item's latest verdict. A full run retires failures for items that have
+been renamed or deleted. Records for a deleted project are also removed, unless
+its parent directory is missing or empty, as with an unmounted drive.
+
+The machine identity is its hostname, overridden by `RUNTESTS_HOST`. Records from
+other machines are never changed or deleted. Replay performs no pruning and
+never deletes the supplied record.
+
+### Keeping history on CI
+
+Cache run states between jobs to preserve scheduling history, and upload them
+as artifacts after failures. For a GitHub Actions matrix with `os` and `version`:
 
 ```yaml
 - uses: actions/cache/restore@v4
@@ -647,39 +717,29 @@ before it, and keep a failed run's as an artifact:
     path: ${{ runner.temp }}/runtests
 ```
 
-A cache is written once per key, so every run saves under a key of its own, and
-`restore-keys` brings back the newest one saved before it. It is saved whether or
-not the tests passed: which items failed is what orders the next run most. A
-runner has a new hostname every run, so `RUNTESTS_HOST` names the machine: the run
-states the cache brings back are then this machine's, and pruned to the newest 20
-like a local directory's, where otherwise they would pile up.
+Use a unique cache key per run and `restore-keys` to retrieve the previous cache.
+Save it even when tests fail, so the next run sees those failures. A stable
+`RUNTESTS_HOST` makes restored records eligible for normal retention instead of
+accumulating under a new hostname each run.
 
-Then, locally, `Runtests.read_run_state("run.runstate")` shows what happened, and
-`Runtests.runtests(replay="run.runstate")` runs the same items with the same settings,
-profiles and seed, naming every package whose version differs from the one CI had.
-`Runtests.runtestsf(replay="run.runstate")` runs what is failing counted from that run:
-its verdicts and those of the runs after it, the runs before it giving only how long
-items take. A run pointed at a run state never deletes it.
+### Concurrent runs
 
-Later runs read the run states to plan (see [The plan](#the-plan)), taking each item's
-duration from the newest run that ran it, and `runtestsf` runs every item the suite
-has whose last verdict in them was not a pass. A replay happens only when
-asked: a run state lying next to the project is not a request to run differently,
-and an explicit keyword always wins.
+An editor, a REPL, or CI jobs can share a run-state directory. Each run claims its
+own file and flushes it at least every 30 seconds. Completed items supply timing
+data immediately; verdicts affect failure history and scheduling priority only
+when the run finishes or is declared dead. Active records are never pruned.
 
-Runs can share a directory as they go: CI jobs on one machine, or an editor and a
-REPL. Each writes a file of its own, under a name it claims by creating it, and the
-others read it part way through. A run still going writes its file at least every 30
-seconds, and one whose file has not been written for 90 seconds, or whose process
-this machine knows to be gone, is taken to have died. Until a run has finished or
-died, its verdicts are not in: it changes nothing about what is failing or what the
-next run takes first, though the items it has finished give their durations, and
-its file is not pruned, however many runs started since. A run that died counts as a
-cancelled one does, and an item it was running when it did is failing. Machines that
-share a directory over a network have to agree on the time to within a minute, and a
-`RUNTESTS_HOST` names one machine at a time.
+A run is considered dead if its record has not been updated for 90 seconds, or
+its local process is known to have exited. It then counts as cancelled, with any
+item that was running counted as failing. Machines sharing records over a network
+must agree on time to within a minute, and each `RUNTESTS_HOST` must identify only
+one machine at a time.
 
 ## Editors
+
+The [VS Code extension](editors/vscode/README.md) provides a Test Explorer,
+per-item results, and a **Run Failed Tests** command. Its README covers local
+installation and settings.
 
 `Runtests.serve(path)` lets an editor drive a package's suite: it lists the test items
 with where they are and what they declare, runs the ones asked for, reports each

@@ -9,14 +9,14 @@ any. The coordinator includes this file too, for the rules both sides have to ag
 
 A template holds `@testtemplate`s and nothing else, and each,
 `@testtemplate "name \$x" for x in xs ... end`, declares a test item per iteration.
-Julia runs the loop as written, in a module holding what the item's will, the package
-and the body's `using` and `import` statements, and interpolates the name; each `\$x`
+Julia runs the loop as written, in a module holding `Test`, the package and each
+package the body imports, by name only, and interpolates the name; each `\$x`
 in the keywords and the body, `x` a loop variable, is where its value goes, written as
 code, as `Threads.@spawn` takes `\$x`, and each other `\$(...)` in the keywords is
 computed as the loop runs and its value written the same way. Nothing binds the loop
 variables in the item: what a name means there is the template's to say. The code is
-`repr(value)` as such a module sees it, and it has to give back an `isequal` value
-there, so a value no file can hold is refused rather than written.
+`repr(value)` as the item's module sees it, after its imports, and it has to give back
+an `isequal` value there, so a value no file can hold is refused rather than written.
 
 It depends on `Base` and `TOML` alone: the process runs this file, the coordinator's,
 whichever Runtests the test environment holds.
@@ -159,7 +159,7 @@ const NESTED = "a `@testtemplate` belongs at the top level of a template, its lo
     "`@testtemplate \"name \$x\" for x in xs ... end`"
 
 const ONLY_TEMPLATES = "a template holds `@testtemplate`s and nothing else: a `@testtemplate`'s loop " *
-    "sees what its item does, the package and the body's `using` and `import` statements, and code " *
+    "sees the package and each package the body imports, by name, as in `MySetup.CASES`, and code " *
     "that several share goes in a module under `test/testsetups/`"
 
 const NO_TESTITEM = "a template holds `@testtemplate`s and nothing else: a `@testitem` belongs in a " *
@@ -239,13 +239,14 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
             "`$v` in the body names a loop variable, which nothing binds in the item: write `\$$v` " *
             "where its value goes, `\"\$(\$$v)\"` in a string, or bind it first, as in `$v = \$$v`"))
     end
-    # The loop runs among the names the item will have. Its values' code is checked in a
-    # second module of the same names, where nothing the loop itself defined, a closure
-    # in its header say, is any more visible than it is to the item.
-    found = run_loop(item_module(body, project, line), specs, name, vars, Any[last(p) for p in computed],
+    # The loop runs among the packages, by name. The name and the values are written as
+    # the item will see them, among its imports, and the values' code is checked there,
+    # where nothing the loop itself defined, a closure in its header say, is any more
+    # visible than it is to the item.
+    item = item_module(body, project, line)
+    found = run_loop(loop_module(body, project, line), item, specs, name, vars, Any[last(p) for p in computed],
                      LineNumberNode(line, Symbol(path)))
     isempty(found) && throw(TemplateError(line, "the `for` of this `@testtemplate` ran no iteration, so it declares no test item"))
-    item = item_module(body, project, line)
     instances = Dict{String, Any}[]
     for (n, values, results) in found
         n isa AbstractString || throw(TemplateError(line, "a test item's name must be a string, and this one's is $(repr(n))"))
@@ -277,16 +278,16 @@ end
 label(@nospecialize a) = a isa Symbol ? string("\$", a) : string("\$(", interpolation_key(a), ")")
 
 # The loop as written, in `mod`: per iteration, the name, the loop variables' values,
-# and the value of each of `computed`. An interpolated name prints its values as `mod`
-# sees them, `Day` once it has `using Dates`, where a plain `string` would print them as
-# `Main` does.
-function run_loop(mod::Module, specs, name, vars::Vector{Symbol}, computed::Vector{Any}, at::LineNumberNode)
+# and the value of each of `computed`. An interpolated name prints its values as
+# `shown` sees them, `Day` once it has `using Dates`, where a plain `string` would
+# print them as `Main` does.
+function run_loop(mod::Module, shown::Module, specs, name, vars::Vector{Symbol}, computed::Vector{Any}, at::LineNumberNode)
     acc = gensym("instances")
     if name isa Expr && name.head === :string
         io = gensym("io")
         prints = Any[Expr(:call, GlobalRef(Base, :print), io, part) for part in name.args]
         name = Expr(:call, GlobalRef(Base, :sprint), Expr(:->, io, Expr(:block, prints...)),
-                    Expr(:kw, :context, Expr(:call, GlobalRef(Base, :(=>)), QuoteNode(:module), mod)))
+                    Expr(:kw, :context, Expr(:call, GlobalRef(Base, :(=>)), QuoteNode(:module), shown)))
     end
     push = Expr(:call, GlobalRef(Base, :push!), acc, Expr(:tuple, name, Expr(:tuple, vars...), Expr(:tuple, computed...)))
     ex = Expr(:let, Expr(:block), Expr(:block,
@@ -294,6 +295,36 @@ function run_loop(mod::Module, specs, name, vars::Vector{Symbol}, computed::Vect
         Expr(:for, specs, Expr(:block, push)),
         acc))
     return Core.eval(mod, Expr(:toplevel, at, ex))::Vector{Any}
+end
+
+# The module a `@testtemplate`'s loop runs in: `Test`, the package under test and each
+# package the body imports, by name and nothing more, so the loop says `Dates.Day`
+# where the item, after its `using Dates`, says `Day`. What the imports bring into
+# scope is the item's.
+function loop_module(body::Expr, project::String, line::Int)
+    imports = Any[:(import Test)]
+    isempty(project) || push!(imports, :(import $(Symbol(project))))
+    for ex in body.args
+        is_import(ex) || continue
+        for a in ex.args
+            # `A: x, y` binds names of `A`; the loop gets `A` itself.
+            p = a isa Expr && a.head === :(:) ? a.args[1] : a
+            path = p isa Expr && p.head === :as ? p.args[1] : p
+            # A relative path names a module of the item's own, which the loop has none of.
+            path isa Expr && path.head === :. && !isempty(path.args) && path.args[1] !== :. || continue
+            push!(imports, Expr(:import, p))
+        end
+    end
+    m = Module(:Template)
+    for ex in imports
+        try
+            Core.eval(m, ex)
+        catch e
+            e isa InterruptException && rethrow()
+            throw(TemplateError(line, "the loop's `$ex` failed: $(sprint(showerror, e))"))
+        end
+    end
+    return m
 end
 
 # A module holding what the item's will once its imports have run: `Test`, the

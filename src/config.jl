@@ -22,13 +22,16 @@ struct Profile
     # from the environment that owns it, so this becomes the worker's own project
     # rather than anything layered on the test environment.
     preferences::String
+    # An absolute path to a directory with an environment of its own, its workers'
+    # in place of the test environment, or empty. Its tests run under this profile.
+    environment::String
 end
 
 Profile(
     name::Symbol; julia_args = String[], threads = "2,1", env = Pair{String, String}[],
-    init = Expr(:block), test_end = Expr(:block), preferences = ""
+    init = Expr(:block), test_end = Expr(:block), preferences = "", environment = ""
 ) =
-    Profile(name, julia_args, threads, env, init, test_end, preferences)
+    Profile(name, julia_args, threads, env, init, test_end, preferences, environment)
 
 Base.@kwdef struct RunConfig
     workers::Int
@@ -58,6 +61,8 @@ Base.@kwdef struct RunConfig
     monitor::Bool = true
     monitor_interval::Int = 30
     profiles::Dict{Symbol, Profile} = Dict(DEFAULT_PROFILE => Profile(DEFAULT_PROFILE))
+    # The `[groups]` table, which a run has already selected by; kept for `chores`.
+    groups::Dict{String, TagExpr} = Dict{String, TagExpr}()
     order_first::Vector{String} = String[]
     order_last::Vector{String} = String[]
     # Every item's random numbers start from this and its name, so a run with the
@@ -78,9 +83,14 @@ const RUN_KEYS = (
     :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
 )
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
-const TOP_KEYS = (:run, :order, :profiles)
+const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :environment)
+const TOP_KEYS = (:run, :order, :profiles, :groups)
 const LOG_MODES = (:eager, :batched, :issues)
+
+# The group a run selects when nothing else selects, and the name of the whole suite,
+# which no `[groups]` entry may take.
+const DEFAULT_GROUP = "default"
+const ALL_GROUP = "all"
 
 """
     read_config(testdir; config = nothing, kwargs...) -> RunConfig
@@ -91,19 +101,28 @@ error, not a no-op: a misspelled option would otherwise be ignored in silence.
 directory; named, it has to exist, where `test/TestItems.toml` may be absent.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
+    path, toml = config_toml(testdir, config)
+    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
+end
+
+"""
+    config_toml(testdir, config) -> (path, toml)
+
+The config file a run reads, `test/TestItems.toml` or the file `config` names, and
+what it holds: an empty table for a `TestItems.toml` that is not there.
+"""
+function config_toml(testdir::AbstractString, config::Union{Nothing, AbstractString})
     path = config === nothing ? joinpath(testdir, "TestItems.toml") : abspath(config)
     config === nothing || isfile(path) ||
         throw(ConfigError("the config file $(relpath_or_path(path)) does not exist"))
-    toml = Dict{String, Any}()
-    if isfile(path)
-        toml = try
-            TOML.parsefile(path)
-        catch e
-            throw(ConfigError("could not parse $(relpath_or_path(path)): $(sprint(showerror, e))"))
-        end
-        check_keys(path, toml, TOP_KEYS, "")
+    isfile(path) || return path, Dict{String, Any}()
+    toml = try
+        TOML.parsefile(path)
+    catch e
+        throw(ConfigError("could not parse $(relpath_or_path(path)): $(sprint(showerror, e))"))
     end
-    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
+    check_keys(path, toml, TOP_KEYS, "")
+    return path, toml
 end
 
 function check_keys(path, tbl::AbstractDict, allowed::Tuple, where_)
@@ -225,6 +244,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         testset_name = String(testset_name), coverage, coverage_source,
         monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
+        groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
         seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed),
@@ -271,12 +291,144 @@ function read_profiles(path, toml, default_threads::String)
             threads_spec("threads of [$label]", get(p, "threads", default_threads)), env,
             parse_expr(path, name, "init", string_setting(path, p, "init", label)),
             parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
-            profile_preferences(path, name, get(p, "preferences", ""))
+            profile_preferences(path, name, get(p, "preferences", "")),
+            profile_environment(path, name, get(p, "environment", ""))
         )
     end
+    check_environment_owners(path, Pair{Symbol, String}[n => p.environment for (n, p) in profiles if !isempty(p.environment)])
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = default_threads))
     return profiles
+end
+
+"""
+    profile_environment(config_path, name, value) -> String
+
+The absolute path to the directory a profile names as its `environment`, or `""`
+when it names none. Relative to the directory of the config file, as `preferences`
+is, and checked here, before any worker starts: a directory holding a `Project.toml`
+or a `JuliaProject.toml`.
+"""
+function profile_environment(config_path, name, value)
+    bad(what) = ConfigError("`environment` of [profiles.$name] in $(relpath_or_path(config_path))" * what)
+    value isa AbstractString ||
+        throw(bad(" must be the path of a directory with a Project.toml, as in `environment = \"qa\"`, got $(repr(value))"))
+    isempty(value) && return ""
+    dir = rstrip_path(normpath(isabspath(value) ? value : joinpath(dirname(config_path), value)))
+    isdir(dir) || throw(bad(" names $(relpath_or_path(dir)), which is not a directory"))
+    any(n -> isfile(joinpath(dir, n)), PROJECT_NAMES) ||
+        throw(bad(" names $(relpath_or_path(dir)), which has no Project.toml: an environment is a directory with one"))
+    return dir
+end
+
+# Which profile an item in an environment's directory runs under has one answer: a
+# directory is one profile's environment, and the default profile runs in the test
+# environment.
+function check_environment_owners(path, owners::Vector{Pair{Symbol, String}})
+    seen = Dict{String, Symbol}()
+    for (name, dir) in sort(owners; by = first)
+        name === DEFAULT_PROFILE && throw(ConfigError(
+            "`environment` of [profiles.$name] in $(relpath_or_path(path)): the default profile's workers run in " *
+                "the test environment; give $(relpath_or_path(dir)) a profile of its own"
+        ))
+        other = get(seen, dir, nothing)
+        other === nothing || throw(ConfigError(
+            "$(relpath_or_path(dir)) is the `environment` of both [profiles.$other] and [profiles.$name] in " *
+                "$(relpath_or_path(path)), and the items in it can run under one profile only"
+        ))
+        seen[dir] = name
+    end
+    return nothing
+end
+
+"""
+    claimed_environments(path, toml) -> Dict{String, Symbol}
+
+Every directory a profile of the config file names as its `environment`, with that
+profile: what reading the test directory needs to know before the rest of the
+settings are read. Checked as [`read_config`](@ref) checks it.
+"""
+function claimed_environments(path, toml)
+    claimed = Dict{String, Symbol}()
+    tbl = get(Dict{String, Any}, toml, "profiles")
+    tbl isa AbstractDict || return claimed   # `read_config` says what is wrong with it
+    owners = Pair{Symbol, String}[]
+    for (name, p) in tbl
+        p isa AbstractDict || continue
+        dir = profile_environment(path, name, get(p, "environment", ""))
+        isempty(dir) || push!(owners, Symbol(name) => dir)
+    end
+    check_environment_owners(path, owners)
+    for (name, dir) in owners
+        claimed[dir] = name
+    end
+    return claimed
+end
+
+"""
+    read_groups(path, toml) -> Dict{String, TagExpr}
+
+The `[groups]` table: names for tag expressions, each written as a string as `tags`
+takes one, which a run selects by with the `group` keyword or `RUNTESTS_GROUP`.
+`$DEFAULT_GROUP` is what a run selects when nothing else selects; `$ALL_GROUP` is the
+whole suite, and is not declared.
+"""
+function read_groups(path, toml)
+    tbl = get(Dict{String, Any}, toml, "groups")
+    tbl isa AbstractDict || throw(ConfigError("[groups] of $(relpath_or_path(path)) must be a table"))
+    groups = Dict{String, TagExpr}()
+    for (name, value) in tbl
+        what = "group `$name` of [groups] in $(relpath_or_path(path))"
+        name == ALL_GROUP && throw(ConfigError("$what: `$ALL_GROUP` is the whole suite, and is not declared"))
+        value isa AbstractString || throw(ConfigError(
+            "$what must be a tag expression written as a string, as in `$name = \"fast && !slow\"`, got $(repr(value))"
+        ))
+        groups[name] = try
+            parse_tag_expr(value; what)
+        catch e
+            e isa ArgumentError || rethrow()
+            throw(ConfigError(e.msg))
+        end
+    end
+    return groups
+end
+
+"""
+    select_group(groups, path, requested, selected) -> Union{Nothing, GroupSelection}
+
+The group a run selects by: the `group` keyword, `requested`, else `RUNTESTS_GROUP`,
+else, for a run that selects nothing else (`selected` false), the `$DEFAULT_GROUP`
+group when `[groups]` of the config file `path` declares one. `nothing` for no group,
+and for `$ALL_GROUP`, which is the whole suite. A name `[groups]` does not declare is
+an error, as a misspelled option is.
+"""
+function select_group(groups::Dict{String, TagExpr}, path::AbstractString, requested, selected::Bool)
+    if requested !== nothing
+        (requested isa Union{AbstractString, Symbol} && !isempty(string(requested))) || throw(ArgumentError(
+            "`group = $(repr(requested))`: expected the name of a group of [groups], or \"$ALL_GROUP\""
+        ))
+        name, asker = String(string(requested)), "the `group` keyword"
+    else
+        env = strip(get(ENV, "RUNTESTS_GROUP", ""))
+        if !isempty(env)
+            name, asker = String(env), "`RUNTESTS_GROUP`"
+        elseif !selected && haskey(groups, DEFAULT_GROUP)
+            return GroupSelection(DEFAULT_GROUP, groups[DEFAULT_GROUP], "the default", path)
+        else
+            return nothing
+        end
+    end
+    name == ALL_GROUP && return nothing
+    haskey(groups, name) && return GroupSelection(name, groups[name], string("from ", asker), path)
+    file = relpath_or_path(path)
+    isempty(groups) && throw(ConfigError("$asker asks for group `$name`, and $file declares no [groups]"))
+    declared = sort!(collect(keys(groups)))
+    near = nearest(name, declared)
+    throw(ConfigError(string(
+        asker, " asks for group `", name, "`, which [groups] of ", file, " does not declare; it declares ",
+        join(("`$g`" for g in declared), ", "), ", and `$ALL_GROUP` is the whole suite",
+        isempty(near) ? "" : string(" (did you mean ", join(("`$g`" for g in near), " or "), "?)")
+    )))
 end
 
 """

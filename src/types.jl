@@ -137,7 +137,8 @@ Base.show(io::IO, e::TagExpr) = show(io, e.text)
 # says what is wrong instead of matching nothing.
 const TAG_NAME = r"^[^\s!&|:()]+$"
 
-function parse_tag_expr(text::AbstractString)
+# `what` is how a message names where the expression was written.
+function parse_tag_expr(text::AbstractString; what::AbstractString = "`tags = $(repr(text))`")
     alternatives = Vector{Tuple{Symbol, Bool}}[]
     for alt in split(text, "||")
         terms = Tuple{Symbol, Bool}[]
@@ -147,12 +148,12 @@ function parse_tag_expr(text::AbstractString)
             present || (s = strip(chop(s; head = 1, tail = 0)))
             isempty(s) && throw(
                 ArgumentError(
-                    "`tags = $(repr(text))`: a tag name is missing" * (present ? "" : " after `!`")
+                    "$what: a tag name is missing" * (present ? "" : " after `!`")
                 )
             )
             occursin(TAG_NAME, s) || throw(
                 ArgumentError(
-                    "`tags = $(repr(text))`: $(repr(String(s))) is not a tag name; a tag " *
+                    "$what: $(repr(String(s))) is not a tag name; a tag " *
                         "expression is names joined with `&&` and `||`, each optionally " *
                         "negated with `!`, as in `fast && !slow`"
                 )
@@ -164,23 +165,44 @@ function parse_tag_expr(text::AbstractString)
     return TagExpr(String(text), alternatives)
 end
 
+# Every tag a selection names, present or negated.
+tag_names(::Nothing) = Symbol[]
+tag_names(tags::Vector{Symbol}) = tags
+tag_names(e::TagExpr) = Symbol[tag for alt in e.alternatives for (tag, _) in alt]
+
+"""
+    GroupSelection
+
+The group of `[groups]` a run selects: its `name`, the tag expression it stands for,
+and what chose it, as the run says it: the `group` keyword, `RUNTESTS_GROUP`, or the
+`default` of the config file `file`, which declares it.
+"""
+struct GroupSelection
+    name::String
+    tags::TagExpr
+    source::String
+    file::String
+end
+
 """
     Filter
 
 A run's selection: `name` (exact, a `Regex`, or a set of exact names) and `tags` (a
 vector an item must carry all of, or a [`TagExpr`](@ref)) are matched against items,
-`paths` against their files (empty means all), and `line` picks the item defined at
-or above it. Every test file is read whatever the selection: a suite that does not
-parse is broken, not smaller.
+as is the tag expression of `group`, a [`GroupSelection`](@ref); `paths` against
+their files (empty means all); and `line` picks the item defined at or above it.
+Every test file is read whatever the selection: a suite that does not parse is
+broken, not smaller.
 """
 struct Filter
     name::Union{Nothing, String, Regex, Set{String}}
     tags::Union{Nothing, Vector{Symbol}, TagExpr}
     paths::Vector{String}
     line::Int32
+    group::Union{Nothing, GroupSelection}
 end
-Filter(; name = nothing, tags = nothing, paths = String[], line = 0) =
-    Filter(_asname(name), _astags(tags), collect(paths), Int32(line))
+Filter(; name = nothing, tags = nothing, paths = String[], line = 0, group = nothing) =
+    Filter(_asname(name), _astags(tags), collect(paths), Int32(line), group)
 
 _asname(n::Union{Nothing, Regex}) = n
 _asname(n::AbstractString) = String(n)
@@ -225,6 +247,7 @@ matches_tags(::Nothing, ::Vector{Symbol}) = true
 matches_tags(want::Vector{Symbol}, have::Vector{Symbol}) = all(in(have), want)
 matches_tags(e::TagExpr, have::Vector{Symbol}) =
     any(alt -> all(((tag, present),) -> (tag in have) == present, alt), e.alternatives)
+matches_tags(g::GroupSelection, have::Vector{Symbol}) = matches_tags(g.tags, have)
 
 # A selected path is either the file itself or a directory holding it. Both come
 # from `abspath` and `walkdir`, so both use the platform's own separator.

@@ -15,26 +15,36 @@ Every test file under `testdir`, sorted. See [`walk_test_dir`](@ref).
 discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 
 """
-    walk_test_dir(testdir) -> (tests, strays, templates)
+    walk_test_dir(testdir; claimed) -> (; tests, strays, templates, unclaimed)
 
 Every test file under `testdir`; an error for every other Julia file there, each
 saying where such a file belongs; and every test template, a `*_tests_template.jl`
 in `testtemplates/` (see [`expansion_errors`](@ref)). Each is sorted by path.
-Hidden files and directories, `testsetups/` and subprojects (directories with a
-`Project.toml` or a `JuliaProject.toml`) are skipped: a package of test helpers
-there has tests and code of its own, for an environment this run cannot build. The
-strays are reported, not skipped: a file of tests not named `*_test.jl` would
-otherwise never run, and the run would pass without it, and a template anywhere but
-`testtemplates/` would never be expanded.
+Hidden files and directories and `testsetups/` are skipped. So is a directory with
+an environment of its own, a `Project.toml` or a `JuliaProject.toml`, unless a
+profile names it as its `environment` (`claimed`, from [`claimed_environments`](@ref)):
+then its files are read as any others are, and its items run under that profile.
+One that no profile names and that holds test files is in `unclaimed`, with how many:
+its tests do not run, and the run says so. The strays are reported, not skipped: a
+file of tests not named `*_test.jl` would otherwise never run, and the run would pass
+without it, and a template anywhere but `testtemplates/` would never be expanded.
 """
-function walk_test_dir(testdir::AbstractString)
+function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = Dict{String, Symbol}())
     tests, strays, templates = String[], ScanError[], String[]
-    isdir(testdir) || return tests, strays, templates
+    unclaimed = Pair{String, Int}[]
+    isdir(testdir) || return (; tests, strays, templates, unclaimed)
     templates_dir = joinpath(testdir, TESTTEMPLATES_DIR)
+    projects = String[]
     for (dir, dirs, names) in walkdir(testdir; topdown = true)
+        # `walkdir` reads `dirs` as soon as this task yields, so nothing in the
+        # filter may yield: the projects it skips are counted after the walk.
         filter!(dirs) do d
-            !startswith(d, '.') && d != TESTSETUPS_DIR && !(dir == testdir && d == TESTTEMPLATES_DIR) &&
-                !any(n -> isfile(joinpath(dir, d, n)), PROJECT_NAMES)
+            (startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && d == TESTTEMPLATES_DIR)) && return false
+            path = joinpath(dir, d)
+            any(n -> isfile(joinpath(path, n)), PROJECT_NAMES) || return true
+            haskey(claimed, path) && return true
+            push!(projects, path)
+            return false
         end
         for n in names
             startswith(n, '.') && continue
@@ -62,7 +72,32 @@ function walk_test_dir(testdir::AbstractString)
             end
         end
     end
-    return sort!(tests), sort!(strays; by = e -> e.file), sort!(templates)
+    for path in projects
+        n = count_test_files(path)
+        n > 0 && push!(unclaimed, path => n)
+    end
+    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates),
+            unclaimed = sort!(unclaimed; by = first))
+end
+
+# The test files under `dir`, hidden ones aside, for saying how many a run leaves out.
+function count_test_files(dir::AbstractString)
+    n = 0
+    for (_, dirs, names) in walkdir(dir; topdown = true)
+        filter!(d -> !startswith(d, '.'), dirs)
+        n += count(f -> !startswith(f, '.') && is_test_file(f), names)
+    end
+    return n
+end
+
+# The profile whose environment holds `path`, the innermost when several do, or the
+# default profile when none does.
+function owner_of(path::AbstractString, claimed::Dict{String, Symbol})
+    best, len = DEFAULT_PROFILE, 0
+    for (dir, prof) in claimed
+        startswith(path, joinpath(dir, "")) && ncodeunits(dir) > len && ((best, len) = (prof, ncodeunits(dir)))
+    end
+    return best
 end
 
 # `Pkg.test` runs this one, so it belongs at the top of `test/` and nowhere else.
@@ -73,8 +108,8 @@ stray_error(path::AbstractString) = ScanError(
     path, 0,
     "not a test file. Test files are named `*_test.jl` or `*_tests.jl`, and test templates live in " *
         "`test/$TESTTEMPLATES_DIR/`; shared code goes in `test/$TESTSETUPS_DIR/` as a module that test " *
-        "items load with `using`; a directory " *
-        "with its own Project.toml or JuliaProject.toml is left alone. Rename it, move it there, or remove it."
+        "items load with `using`; a directory with its own Project.toml or JuliaProject.toml is read only " *
+        "when a profile names it as its `environment`. Rename it, move it there, or remove it."
 )
 
 misplaced_template_error(path::AbstractString) = ScanError(
@@ -112,10 +147,11 @@ end
 
 # `Meta.parseall` returns a syntax error as a statement at the line where parsing
 # stopped, rather than throwing. Nothing after it can be trusted, so it is the
-# file's one error.
+# file's one error. `tags` gets every tag an item of the file carries, selected or
+# not, and `profile` is the one its items run under unless they say otherwise.
 function scan_file!(
-        items::Vector{RawItem}, errors::Vector{ScanError}, names::Vector{ItemName},
-        path::String, filter::Filter, known_setups
+        items::Vector{RawItem}, errors::Vector{ScanError}, names::Vector{ItemName}, tags::Set{Symbol},
+        path::String, filter::Filter, known_setups, profile::Symbol = DEFAULT_PROFILE
     )
     src = try
         read(path, String)
@@ -135,7 +171,7 @@ function scan_file!(
             push!(errors, ScanError(path, line, msg isa AbstractString ? msg : sprint(showerror, msg)))
             return
         else
-            handle_statement!(items, errors, names, a, path, line, filter, known_setups)
+            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, profile)
         end
     end
     return
@@ -145,15 +181,16 @@ end
 
 # One method whatever the statement is, so that the call is direct, not a dispatch
 # that boxes every argument once per item.
-function handle_statement!(items, errors, names, @nospecialize(ex), path, line, filter, known_setups)
+function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, profile)
     if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
         push!(errors, ScanError(path, line, not_an_item(ex)))
         return
     end
-    item = parse_testitem(ex, path, line, errors, known_setups)
+    item = parse_testitem(ex, path, line, errors, known_setups, profile)
     item === nothing && return
+    union!(tags, item.tags)
     if !(matches_path(filter.paths, path) && matches_name(filter.name, item.name) &&
-            matches_tags(filter.tags, item.tags))
+            matches_tags(filter.tags, item.tags) && matches_tags(filter.group, item.tags))
         push!(names, ItemName(item.name, path, item.line))
         return
     end
@@ -183,7 +220,9 @@ function keyword_bit(key::Symbol)
     return i === nothing ? UInt8(0) : UInt8(1) << (i - 1)
 end
 
-function parse_testitem(ex::Expr, path, line, errors, known_setups)
+# `default_profile` is the profile of the environment the item's file is in: one a
+# `sandbox` keyword may repeat but not change.
+function parse_testitem(ex::Expr, path, line, errors, known_setups, default_profile::Symbol = DEFAULT_PROFILE)
     # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
     numbered = lo <= hi && ex.args[lo] isa LineNumberNode
@@ -204,7 +243,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
 
     tags = nothing; setups = Symbol[]
     timeout = USE_RUN_DEFAULT; retries = USE_RUN_DEFAULT
-    failfast = Int8(-1); chain = NO_CHAIN; profile = DEFAULT_PROFILE
+    failfast = Int8(-1); chain = NO_CHAIN; profile = default_profile
     exclusive = false; skip = false
     seen = UInt8(0)
     for k in (lo + 1):(hi - 1)
@@ -248,6 +287,10 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
             if v isa Bool
                 exclusive = v
             elseif v isa Symbol
+                (default_profile === DEFAULT_PROFILE || v === default_profile) || return scan_error!(errors, path, at,
+                    "`@testitem $(repr(name))`: its file is in the environment of profile `$default_profile`, " *
+                        "so it runs under `$default_profile`, and `sandbox = :$v` asks for another profile"
+                )
                 profile = v
             else
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `sandbox` must be `true` or a profile name, got `$(_show(val))`")
@@ -345,14 +388,19 @@ end
 ### Driver #################################################################
 
 """
-    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names) -> Vector{RawItem}
+    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names, claimed) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
 (file, line). Throws a `ScanFailure` listing every problem, so one run surfaces every
 broken file: among them the `strays`, and, unless `expansions` is false, every
 expansion of a template that is not the template's as it is now (see
 [`expansion_errors`](@ref)). `suite_names`, when given, gets the name of every item
-read, the filter's rejects included.
+read, the filter's rejects included. An item in a directory a profile names as its
+environment (`claimed`) runs under that profile.
+
+A tag the filter names that no item of the suite carries is a slip, not a selection:
+`tags = "!slw"` would select everything and say nothing. It throws an `ArgumentError`
+for the `tags` keyword and a `ConfigError` for the group's tag expression.
 """
 function scan(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
@@ -360,10 +408,12 @@ function scan(
         strays::Vector{ScanError} = ScanError[],
         templates::Vector{String} = String[],
         expansions::Bool = true,
-        suite_names::Union{Nothing, Vector{String}} = nothing
+        suite_names::Union{Nothing, Vector{String}} = nothing,
+        claimed::Dict{String, Symbol} = Dict{String, Symbol}()
     )
-    items, errors, rejected = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions)
+    items, errors, rejected, tags = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, claimed)
     isempty(errors) || throw(ScanFailure(errors))
+    check_tags_exist(filter, tags)
     if suite_names !== nothing
         append!(suite_names, (it.name for it in items))
         append!(suite_names, (r.name for r in rejected))
@@ -372,30 +422,60 @@ function scan(
     return items
 end
 
+# Throws when the filter names a tag that none of `tags`, the suite's, is.
+function check_tags_exist(filter::Filter, tags::Set{Symbol})
+    unknown(names) = unique!(Symbol[t for t in names if !(t in tags)])
+    missing_ = unknown(tag_names(filter.tags))
+    isempty(missing_) || throw(ArgumentError(
+        string("`tags = ", filter.tags isa TagExpr ? repr(filter.tags.text) : repr(filter.tags), "`: ",
+               no_such_tags(missing_, tags))
+    ))
+    g = filter.group
+    g === nothing && return nothing
+    missing_ = unknown(tag_names(g.tags))
+    isempty(missing_) || throw(ConfigError(
+        string("group `", g.name, "` of [groups] in ", relpath_or_path(g.file), ", ",
+               repr(g.tags.text), ": ", no_such_tags(missing_, tags))
+    ))
+    return nothing
+end
+
+function no_such_tags(missing_::Vector{Symbol}, tags::Set{Symbol})
+    known = sort!([String(t) for t in tags])
+    near = unique!(reduce(vcat, (nearest(String(t), known) for t in missing_); init = String[]))
+    return string(
+        length(missing_) == 1 ? "no test item has the tag " : "no test item has the tags ",
+        join(("`$t`" for t in missing_), ", "),
+        isempty(near) ? "" : string(" (did you mean ", join(("`$t`" for t in near), " or "), "?)"),
+        isempty(known) ? "; no item in the suite has a tag" : string("; the suite's tags are ", join(known, ", "))
+    )
+end
+
 """
-    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions) -> (items, errors, rejected)
+    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, claimed) -> (items, errors, rejected, tags)
 
 What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
-by (file, line), every problem found sorted the same way, and the name and place
-of each item the filter left out. For a caller that shows what it can read beside
-what is broken.
+by (file, line), every problem found sorted the same way, the name and place of each
+item the filter left out, and every tag an item of the suite carries. For a caller
+that shows what it can read beside what is broken.
 """
 function scan_files(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(), strays::Vector{ScanError} = ScanError[],
-        templates::Vector{String} = String[], expansions::Bool = true
+        templates::Vector{String} = String[], expansions::Bool = true,
+        claimed::Dict{String, Symbol} = Dict{String, Symbol}()
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
-    chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64)) for _ in 1:nt]
+    chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64), Set{Symbol}()) for _ in 1:nt]
     ch = Channel{String}(length(files))
     foreach(f -> put!(ch, f), files)
     close(ch)
     @sync for t in 1:nt
-        items, errors, names = chunks[t]
+        items, errors, names, tags = chunks[t]
         Threads.@spawn begin
-            its, errs, nms = $items, $errors, $names
+            its, errs, nms, tgs = $items, $errors, $names, $tags
             for path in ch
-                scan_file!(its, errs, nms, path, filter, known_setups)
+                scan_file!(its, errs, nms, tgs, path, filter, known_setups, owner_of(path, claimed))
             end
         end
     end
@@ -409,7 +489,7 @@ function scan_files(
     rejected = reduce(vcat, (c[3] for c in chunks); init = ItemName[])
     append!(errors, duplicate_name_errors(items, rejected))
     sort!(errors; by = e -> (e.file, e.line))
-    return items, errors, rejected
+    return items, errors, rejected, reduce(union!, (c[4] for c in chunks); init = Set{Symbol}())
 end
 
 # Twice the threads, to keep each busy while another task reads its file. Capped,

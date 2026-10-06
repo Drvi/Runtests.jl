@@ -77,15 +77,17 @@ function run_chores(args, dry_run::Bool, config)
     return true
 end
 
-# The suite as a full run would read it: its items, then its settings and what they
-# name. The number of problems a person has to fix, and the names of the test items,
-# `nothing` when they could not be read. The expansions of templates are the
-# templates step's to report.
+# The suite as a full run would read it: its items, all of them whatever group the
+# config or the environment would select, then its settings and what they name,
+# each group's selection among them. The number of problems a person has to fix,
+# and the names of the test items, `nothing` when they could not be read. The
+# expansions of templates are the templates step's to report.
 function check_suite!(io::IO, target)
     config = joinpath(target.testdir, "TestItems.toml")
     try
-        p, _ = prepare((target.root,); announce = false, expansions = false)
+        p, _ = prepare((target.root,); announce = false, expansions = false, group = ALL_GROUP)
         println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
+        print_unclaimed(io, p)
         print(io, "config: ")
         if isfile(config)
             printstyled(io, relpath_or_path(config, target.root); color = :light_black)
@@ -93,12 +95,12 @@ function check_suite!(io::IO, target)
         else
             println(io, "none")
         end
-        return 0, Set(p.items.name)
+        return check_groups!(io, target, p.cfg.groups), Set(p.items.name)
     catch e
         e isa ConfigError && return print_problem(io, "config", e.msg), nothing
         e isa ScanFailure || e isa NoTestsError || rethrow()
         # Under a dry run the test files may be expansions `chores` has yet to write.
-        if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), last(walk_test_dir(target.testdir)))
+        if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), walk_test_dir(target.testdir).templates)
             println(io, "test items: none to read until the templates are expanded")
             return 0, nothing
         end
@@ -131,8 +133,10 @@ end
 # wrong at all.
 function check_named_config!(io::IO, target, path::AbstractString)
     items_read = true
+    groups = Dict{String, TagExpr}()
     try
-        prepare((target.root,); config = path, announce = false, expansions = false)
+        p, _ = prepare((target.root,); config = path, announce = false, expansions = false, group = ALL_GROUP)
+        groups = p.cfg.groups
     catch e
         e isa ConfigError && return print_problem(io, "config", e.msg)
         e isa ScanFailure || e isa NoTestsError || rethrow()
@@ -147,7 +151,23 @@ function check_named_config!(io::IO, target, path::AbstractString)
     print(io, "config: ")
     printstyled(io, relpath_or_path(abspath(path), target.root); color = :light_black)
     println(io, items_read ? ", valid" : " reads; the items it names are checked once the test items read")
-    return 0
+    return check_groups!(io, target, groups; config = path)
+end
+
+# Every group of `[groups]` as a run selecting it would read it, since a lane of CI
+# that selects one finds a tag no item carries, or nothing to run, only when it
+# runs. The number of groups wrong.
+function check_groups!(io::IO, target, groups::Dict{String, TagExpr}; config = nothing)
+    bad = 0
+    for name in sort!(collect(keys(groups)))
+        try
+            prepare((target.root,); config, announce = false, expansions = false, group = name)
+        catch e
+            e isa ConfigError || e isa NoTestsError || rethrow()
+            bad += print_problem(io, "groups", e isa ConfigError ? e.msg : "group `$name` selects no test item")
+        end
+    end
+    return bad
 end
 
 # `label: msg`, a message of several lines indented under its first. Counts as one.

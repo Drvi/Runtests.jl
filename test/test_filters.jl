@@ -119,6 +119,30 @@ filtered(paths...; kwargs...) =
         rm(joinpath(dir, "test2"); recursive = true)
     end
 
+    @testset "a path of another package's tests is that package's, and a call runs one package" begin
+        # A monorepo's layout: a package below the one being run, with tests of its own.
+        sub = joinpath(dir, "lib", "Sub")
+        mkpath(joinpath(sub, "test"))
+        write(joinpath(sub, "Project.toml"), "name = \"Sub\"\nuuid = \"$(next_uuid())\"\n")
+        write(joinpath(sub, "test", "s_test.jl"), "@testitem \"sub\" begin\nend\n")
+        thrown_by(paths...) = try
+            filtered(paths...)
+            nothing
+        catch err
+            err
+        end
+        for (paths, owner) in (((dir, joinpath(sub, "test", "s_test.jl")), sub),
+                               ((joinpath(sub, "test"), joinpath(dir, "test", "a_test.jl")), dir))
+            e = thrown_by(paths...)
+            @test e isa ArgumentError
+            @test occursin("$(last(paths)) belongs to the package at $owner", e.msg)
+            @test occursin("a call runs one package's tests, so give each package a call of its own", e.msg)
+        end
+        # On its own, the other package's path runs that package.
+        @test filtered(joinpath(sub, "test", "s_test.jl")) == ["sub"]
+        rm(joinpath(dir, "lib"); recursive = true)
+    end
+
     @testset "a module stands for its package's directory" begin
         @test Runtests.Private.resolve_target((Runtests,)).root == pkgdir(Runtests)
         @test_throws r"could not find a directory for module" Runtests.Private.resolve_target((Module(:Loose),))

@@ -40,6 +40,7 @@ const TEST_FILES = [
     "test_runner.jl",
     "test_execute.jl",
     "test_setups.jl",
+    "test_environments.jl",
     "test_static.jl",
     "test_workers.jl",
     "test_runstate.jl",
@@ -52,6 +53,7 @@ const TEST_FILES = [
     "test_templates.jl",
     "test_editor.jl",
     "test_filters.jl",
+    "test_groups.jl",
     "test_scan.jl",
     "test_plan.jl",
     "test_gating.jl",
@@ -61,6 +63,7 @@ const TEST_FILES = [
     "test_interactive.jl",
     "test_chores.jl",
     "test_coverage.jl",
+    "test_port.jl",
 ]
 
 # Four is where this stops paying: the longest file takes about as long as a

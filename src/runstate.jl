@@ -282,6 +282,12 @@ function run_meta(p::Plan)
     for key in RUN_KEYS
         push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
     end
+    # Where each profile that names an environment found it: in the project, as the
+    # project's path, so that a replay elsewhere finds it in its own checkout.
+    for prof in p.profiles
+        isempty(prof.environment) ||
+            push!(meta, string(PROFILE_ENVIRONMENT, prof.name) => relpath_or_path(prof.environment, p.root))
+    end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     return meta
 end
@@ -642,7 +648,7 @@ function read_run_state(path::AbstractString)
         end
 
         seek(io, Int(h.off_profiles))
-        profiles, preferences = read_profiles_section(io, strings)
+        profiles, preferences = read_profiles_section(io, strings, meta)
 
         seek(io, Int(h.off_units))
         # A `Symbol` per chain name, not per unit: nearly every unit has the same one.
@@ -776,7 +782,11 @@ end
 
 lookup(strings::Vector{String}, i::UInt32) = (1 <= i <= length(strings)) ? strings[i] : ""
 
-function read_profiles_section(io::IO, strings)
+# The meta key under which a profile's environment is recorded, the profile's name
+# after it. The profiles section has no room for it, and its layout is the format's.
+const PROFILE_ENVIRONMENT = "profile_environment."
+
+function read_profiles_section(io::IO, strings, meta::Dict{String, String} = Dict{String, String}())
     n = bounded(read(io, UInt32), bytesavailable(io))
     profiles = Dict{Symbol, Profile}()
     preferences = Dict{Symbol, String}()
@@ -795,7 +805,8 @@ function read_profiles_section(io::IO, strings)
         test_end = parse_block(lookup(strings, read(io, UInt32)))
         path = lookup(strings, read(io, UInt32))
         content = lookup(strings, read(io, UInt32))
-        profiles[name] = Profile(name, args, threads, env, init, test_end, path)
+        environment = get(meta, string(PROFILE_ENVIRONMENT, name), "")
+        profiles[name] = Profile(name, args, threads, env, init, test_end, path, environment)
         isempty(content) || (preferences[name] = content)
     end
     return profiles, preferences
@@ -1282,6 +1293,24 @@ function recorded_cold_cost(runs::Vector{RunStateRecord})
 end
 
 """
+    repository_root(dir) -> Union{String, Nothing}
+
+The checkout `dir` is in: the nearest directory at or above it that holds `.git`, as
+`git` finds it, a directory or, in a worktree or a submodule, a file. `nothing`
+outside a checkout. A package in a subdirectory, as in a monorepo, is in its
+repository's checkout and holds no `.git` of its own.
+"""
+function repository_root(dir::AbstractString)
+    d = abspath(dir)
+    while true
+        ispath(joinpath(d, ".git")) && return d
+        parent = dirname(d)
+        parent == d && return nothing
+        d = parent
+    end
+end
+
+"""
     project_revision(root) -> String
 
 The commit the tests run from, or `""`, so a run state (one downloaded from CI,
@@ -1291,13 +1320,15 @@ not the working tree: local edits do not change it.
 """
 function project_revision(root::AbstractString)
     try
-        gitdir = joinpath(root, ".git")
+        repo = repository_root(root)
+        repo === nothing && return ""
+        gitdir = joinpath(repo, ".git")
         if isfile(gitdir)
             # A worktree or a submodule: `.git` is a file pointing at the real one.
             m = match(r"^gitdir:\s*(.+?)\s*$"m, read(gitdir, String))
             m === nothing && return ""
             to = m[1]::AbstractString   # the group is not optional
-            gitdir = isabspath(to) ? String(to) : joinpath(root, to)
+            gitdir = isabspath(to) ? String(to) : joinpath(repo, to)
         end
         isdir(gitdir) || return ""
         head = String(strip(read(joinpath(gitdir, "HEAD"), String)))

@@ -27,20 +27,26 @@ coverage_flags(root::AbstractString, dir::AbstractString) =
     merge_coverage(tracedir, root, out) -> (files, lines, hit)
 
 Sum the LCOV tracefiles in `tracedir` over the package's `src/` and `ext/`, and
-write them to `out` as one, with paths relative to `root`. A tracefile has the lines
-of the functions that were compiled and no others, so every other line of a function
-body in those directories goes in as not run: a function nothing called, in a file
-nothing loaded, counts against the package.
+write them to `out` as one. Paths are relative to the root of the repository `root`
+is in (see [`repository_root`](@ref)), which is what Codecov and Coveralls resolve
+them against, so a package in a subdirectory, as in a monorepo, has its own path in
+front of them; outside a checkout they are relative to `root`. A tracefile has the
+lines of the functions that were compiled and no others, so every other line of a
+function body in those directories goes in as not run: a function nothing called,
+in a file nothing loaded, counts against the package.
 """
 function merge_coverage(tracedir::AbstractString, root::AbstractString, out::AbstractString)
     roots = unique([abspath(root), realpath(root)])
+    repo = repository_root(root)
+    # The package's own path from the repository's root, empty at the root.
+    prefix = repo === nothing ? String[] : filter!(!=("."), splitpath(relpath(abspath(root), repo)))
     counts = Dict{String, Dict{Int, Int}}()
     for f in readdir(tracedir; join = true)
         endswith(f, ".info") || continue
         file = nothing
         for line in eachline(f)
             if startswith(line, "SF:")
-                file = package_source(line[4:end], roots)
+                file = package_source(line[4:end], roots, prefix)
             elseif startswith(line, "DA:") && file !== nothing
                 fields = split(line[4:end], ',')
                 length(fields) >= 2 || continue
@@ -58,7 +64,7 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
         for (d, _, names) in walkdir(joinpath(root, dir)), name in names
             endswith(name, ".jl") || continue
             path = joinpath(d, name)
-            lines = get!(Dict{Int, Int}, counts, join(splitpath(relpath(path, root)), '/'))
+            lines = get!(Dict{Int, Int}, counts, join([prefix; splitpath(relpath(path, root))], '/'))
             for l in function_body_lines(path)
                 haskey(lines, l) || (lines[l] = 0)
             end
@@ -81,9 +87,10 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
             sum(lines -> count(>(0), values(lines)), values(counts); init = 0))
 end
 
-# A tracefile's source path as the report names it, `src/…` or `ext/…` relative to
-# the package's root, or `nothing` for a file outside those.
-function package_source(path::AbstractString, roots)
+# A tracefile's source path as the report names it: a file of the package's `src/` or
+# `ext/`, after the package's own path in its repository, `prefix`; or `nothing` for a
+# file outside those.
+function package_source(path::AbstractString, roots, prefix::Vector{String} = String[])
     for r in roots
         rel = try
             relpath(path, r)
@@ -91,7 +98,7 @@ function package_source(path::AbstractString, roots)
             continue   # another drive, on Windows
         end
         parts = splitpath(rel)
-        !isempty(parts) && first(parts) in ("src", "ext") && return join(parts, '/')
+        !isempty(parts) && first(parts) in ("src", "ext") && return join([prefix; parts], '/')
     end
     return nothing
 end

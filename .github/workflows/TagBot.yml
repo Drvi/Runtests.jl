@@ -1,0 +1,32 @@
+name: TagBot
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+# No `permissions:` block: TagBot needs the repository's default token with read and
+# write access, and with an explicit block creating a release fails with 403.
+
+jobs:
+  TagBot:
+    if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
+    # TagBot runs in a container, which ubuntu-slim does not support.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag Runtests
+        uses: JuliaRegistries/TagBot@d8d3e8f45a4cd9839f1d6d8798ca246431564418 # v1.25.12
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # With a deploy key, the tag push starts CI, and a commit that changes a
+          # workflow file can be tagged; GITHUB_TOKEN can do neither.
+          ssh: ${{ secrets.DOCUMENTER_KEY }}
+      - name: Tag RuntestsWorkers
+        # Each package is tagged whatever became of the other.
+        if: ${{ !cancelled() }}
+        uses: JuliaRegistries/TagBot@d8d3e8f45a4cd9839f1d6d8798ca246431564418 # v1.25.12
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ssh: ${{ secrets.DOCUMENTER_KEY }}
+          # Its tags are `RuntestsWorkers-v<version>`, beside Runtests' `v<version>`.
+          subdir: lib/RuntestsWorkers

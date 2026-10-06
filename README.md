@@ -54,6 +54,9 @@ Each item gets `Test` and the package under test automatically. Test files conta
 only `@testitem` declarations; put imports and other executable code inside an
 item, or shared helpers in a [test setup](#test-setups).
 
+Porting an existing suite? Agents can follow
+[`skills/port-to-runtests/SKILL.md`](skills/port-to-runtests/SKILL.md).
+
 For an interactive session where Runtests is available, `using Runtests` followed
 by `Runtests.runtests()` runs the active project's suite and builds its test
 environment. See [At the REPL](#at-the-repl) for activating that environment
@@ -73,6 +76,7 @@ Runtests.runtests(tags=:fast)               # one tag
 Runtests.runtests(tags=[:fast, :math])      # must have both tags
 Runtests.runtests(tags="fast && !slow")     # tag expression
 Runtests.runtests("test/db"; tags=:fast)    # combine path and tag filters
+Runtests.runtests(group="gpu")              # a named selection from TestItems.toml
 Runtests.runtests(dry_run=true)             # inspect the plan without running
 Runtests.runtestsf()                        # items whose latest verdict did not pass
 ```
@@ -80,7 +84,14 @@ Runtests.runtestsf()                        # items whose latest verdict did not
 Paths, names, and tags narrow the selection together. `name` also accepts a vector
 or set of exact names. A `file.jl:line` target must be the only positional target.
 Tag expressions support `!`, `&&`, and `||`; `&&` binds tighter than `||`, and
-parentheses are not supported.
+parentheses are not supported. A tag that no item in the suite carries is an
+error, so a misspelled tag cannot pass for a selection of nothing or, under `!`,
+of everything.
+
+`group` picks a named selection from [`[groups]`](#testtestitemstoml), and
+`RUNTESTS_GROUP` does the same from the environment, for a CI matrix; the keyword
+wins. A group named `default` is what a run selects when nothing else selects, and
+`group="all"` is the whole suite.
 
 `runtestsf()` remembers each item's latest verdict across runs. Rerunning one
 failure does not forget other failures, and renamed or deleted items are left
@@ -97,7 +108,8 @@ Problems discovered before execution also throw:
 |:------|:------|
 | `Runtests.ScanFailure` | Invalid test files, duplicate names, or missing or stale template expansions. |
 | `Runtests.NoTestsError` | No test files, no matching items, or no recorded failures for `runtestsf()`. |
-| `Runtests.ConfigError` | Invalid settings, profiles, or test setup configuration. |
+| `Runtests.ConfigError` | Invalid settings, profiles, groups, or test setup configuration, an undeclared group, or a profile's environment that does not resolve. |
+| `ArgumentError` | Invalid arguments, such as a malformed tag expression, a tag no item carries, or a path outside `test/` or in another package. |
 
 See [Configuration](#testtestitemstoml) for worker counts, timeouts, output,
 coverage, and other run options.
@@ -114,7 +126,10 @@ test/
     MySetups.jl                    # shared helpers, loaded with using MySetups
   testtemplates/
     periods_tests_template.jl      # @testtemplate declarations
-  TestItems.toml                   # optional settings, ordering, and profiles
+  qa/
+    Project.toml                   # an environment of its own, which a profile names
+    aqua_tests.jl
+  TestItems.toml                   # optional settings, ordering, groups, and profiles
 ```
 
 Runtests discovers items by parsing test files, without evaluating them in the
@@ -123,8 +138,10 @@ across the suite.
 
 Every Julia file under `test/` must belong to one of the categories above.
 Unrecognized files stop the run with an error, so a misnamed test file cannot
-silently go untested. Hidden files and directories, and directories with their
-own `Project.toml` or `JuliaProject.toml`, are excluded from discovery.
+silently go untested. Hidden files and directories are excluded from discovery.
+A directory with its own `Project.toml` or `JuliaProject.toml` is read only when a
+profile names it as its [`environment`](#environments); a run lists the test files
+in any other such directory as not run.
 
 **Filters select what runs, not what is validated.** Every run parses the entire
 suite and checks for duplicate names, even when you select a single item.
@@ -318,8 +335,8 @@ files alongside `test/TestItems.toml`, pass `config="ci.toml"` or a vector of pa
 
 ## `test/TestItems.toml`
 
-Use this optional file for suite defaults, dispatch order, and worker profiles.
-Explicit `runtests` keywords override `[run]` settings.
+Use this optional file for suite defaults, dispatch order, named selections, and
+worker profiles. Explicit `runtests` keywords override `[run]` settings.
 
 ```toml
 [run]
@@ -331,6 +348,14 @@ test_end_timeout = 60  # per `test_end` expression; defaults to `timeout`
 [order]
 first = ["smoke test"]         # use exact item names from your suite
 last  = ["large simulation"]
+
+[groups]
+default = "!gpu"               # what a run selects when nothing else does
+gpu = "gpu"
+quick = "fast && !slow"
+
+[profiles.qa]
+environment = "qa"             # test/qa, with a Project.toml of its own
 
 [profiles.bounds]
 julia_args = ["--check-bounds=yes"]
@@ -363,6 +388,52 @@ The `preferences` path is relative to the config file. Its contents overlay
 `LocalPreferences.toml` in a temporary copy of the test environment, with separate
 precompilation for the profile's preferences.
 
+### Groups
+
+`[groups]` names tag expressions, written as `tags` takes them. `runtests(group="gpu")`
+or `RUNTESTS_GROUP=gpu` runs the items an expression selects, and the run's header
+says which group it was and what picked it: the keyword, the variable, or nothing
+else selecting, for `default`. Any other selection, a path, `name`, `tags` or
+`group`, replaces `default`; `tags` and `group` given together both apply.
+`group="all"` is the whole suite and is not declared. A name `[groups]` does not
+declare is an error that lists the ones it does, and so is an expression that names
+a tag no item carries. `Runtests.chores()` checks every group.
+
+A run of a group, `default` included, is a selection like any other: `[order]` may
+name items outside it, and it is not a run of the whole suite, which `group="all"`
+is (see [retention](#storage-and-retention)).
+
+### Environments
+
+A profile with `environment` runs in that directory's environment instead of the
+test environment. This is how a suite keeps tests whose dependencies the test
+environment should not carry, such as Aqua or JET checks, or a group that needs
+other versions:
+
+```text
+test/
+  TestItems.toml                   # [profiles.qa] environment = "qa"
+  qa/
+    Project.toml                   # Aqua, JET, ...
+    aqua_tests.jl                  # its items run under the qa profile
+```
+
+Every test item under the directory runs under that profile, and an item
+elsewhere can ask for it with `sandbox=:qa`. The workers run in a copy of the
+environment, in the system's temporary files, with the package under test added by
+path, which brings the packages its `[sources]` name, such as its siblings in a
+monorepo; and with the directory's `LocalPreferences.toml` under the profile's
+`preferences`. Nothing is written into the directory. The copy is stacked over the
+test environment, as `Pkg.test` stacks its sandbox over the active project: an
+item loads the environment's packages first, and can still load the test
+environment's. The copy is resolved once a session, and again when a file it was
+built from changes; one that does not resolve stops the run before anything runs.
+
+The path is relative to the config file. A directory is one profile's
+environment, and never the `default` profile's. A directory with its own project
+that no profile names is not read; the dry run, the run's header and its closing
+block each say how many test files it holds.
+
 ### Run options
 
 | Keyword | Default | Meaning |
@@ -387,9 +458,10 @@ precompilation for the profile's preferences.
 | `dry_run` | `false` | Print the plan without executing tests. |
 | `replay` | `nothing` | Path to a recorded [run state](#run-state). |
 | `config` | `test/TestItems.toml` | Config file to read; an explicit path is relative to the current directory. |
+| `group` | `RUNTESTS_GROUP`, else `default` | A [group](#groups) to run; `"all"` for the whole suite. |
 
 An interactive run with at most one worker defaults to `logs=:eager`. All options
-above except `dry_run`, `replay`, and `config` can also go under `[run]`; use TOML
+above except `dry_run`, `replay`, `config`, and `group` can also go under `[run]`; use TOML
 strings for symbols, such as `logs = "issues"`. Explicit keywords override the file.
 
 Timeouts must be positive and at most 2,147,483,647 seconds; fractional values
@@ -405,10 +477,13 @@ and stopped around it, and the run lists which items did.
 under `[run]` in `TestItems.toml`, has every worker count which lines of the
 package's `src/` and `ext/` run. A keyword wins over the variable, and the variable
 over the file; the run's opening block says which of them decided. At the end the
-workers' counts are merged into `lcov.info` at the package's root, with paths
-relative to it, ready for Codecov or Coveralls. Every line of a function that never
-ran counts as not covered, in a file that was never loaded too, and the closing
-block gives the share that ran:
+workers' counts are merged into `lcov.info` at the package's root, ready for Codecov
+or Coveralls. Its paths are relative to the root of the git checkout the package is
+in, which is what those services resolve them against, so a package in a
+subdirectory, as in a monorepo, has its directory in front of them
+(`lib/Foo/src/Foo.jl`); outside a checkout they are relative to the package.
+Every line of a function that never ran counts as not covered, in a file that was
+never loaded too, and the closing block gives the share that ran:
 
 <pre>
 <b>│ </b>coverage: 33.3% of 6 lines in 2 files · lcov.info
@@ -639,6 +714,9 @@ Generated environments are cached for the session, so calling `runtests()` again
 at the REPL does not re-resolve and re-precompile. The cache notices when you
 change `Project.toml` or a manifest, and rebuilds.
 
+The items of a profile that names an [environment](#environments) run in that one
+instead, stacked over this one.
+
 ## Run state
 
 Every run writes a binary record as it progresses and prints its path at the end.
@@ -662,8 +740,9 @@ runs started after it. Earlier runs contribute durations only.
 - Item outcomes, durations, compilation time, and every attempt.
 - Worker starts and exits, including whether a worker timed out, crashed, or
   received an external signal.
-- The commit, Julia version and build, machine, settings, profiles, preferences,
-  and random seed.
+- The commit, Julia version and build, machine, settings, the selection and the
+  group that made it, profiles and the environment each names, preferences, and
+  random seed. A replay finds a profile's environment in the checkout it runs in.
 - `JULIA_*`, `RUNTESTS_*`, and CI job environment variables, excluding names that
   look like credentials.
 - The test environment's `Project.toml` and `Manifest.toml`.
@@ -683,7 +762,7 @@ it is failing, and its latest recorded duration informs scheduling.
 
 Runtests keeps this machine's newest 20 records, plus any older record containing
 a failing item's latest verdict. A full run retires failures for items that have
-been renamed or deleted. Records for a deleted project are also removed, unless
+been renamed or deleted; with a `default` group, that is a run with `group="all"`. Records for a deleted project are also removed, unless
 its parent directory is missing or empty, as with an unmounted drive.
 
 The machine identity is its hostname, overridden by `RUNTESTS_HOST`. Records from
@@ -693,27 +772,29 @@ never deletes the supplied record.
 ### Keeping history on CI
 
 Cache run states between jobs to preserve scheduling history, and upload them
-as artifacts after failures. For a GitHub Actions matrix with `os` and `version`:
+as artifacts after failures. For a GitHub Actions matrix with `os`, `version`, and
+a [`group`](#groups) per job:
 
 ```yaml
 - uses: actions/cache/restore@v4
   with:
     path: ${{ runner.temp }}/runtests
-    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
-    restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-
+    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+    restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
   env:
+    RUNTESTS_GROUP: ${{ matrix.group }}
     RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
     RUNTESTS_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
 - uses: actions/cache/save@v4
   if: always()
   with:
     path: ${{ runner.temp }}/runtests
-    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+    key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
   with:
-    name: runtests-run-state-${{ matrix.os }}-${{ matrix.version }}
+    name: runtests-run-state-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}
     path: ${{ runner.temp }}/runtests
 ```
 
@@ -721,6 +802,13 @@ Use a unique cache key per run and `restore-keys` to retrieve the previous cache
 Save it even when tests fail, so the next run sees those failures. A stable
 `RUNTESTS_HOST` makes restored records eligible for normal retention instead of
 accumulating under a new hostname each run.
+
+Every dimension of the matrix belongs in the key: two jobs of one workflow run
+with the same key race to save it, and the cache keeps only one of them. A
+monorepo whose jobs each test one package (`julia-runtest`'s `project` input) adds
+that package to the key, and to the artifact's name, as the group is added here.
+An empty `RUNTESTS_GROUP` is unset, so a job whose `matrix.group` is empty runs
+what a run selects by default.
 
 ### Concurrent runs
 

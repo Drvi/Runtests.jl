@@ -94,6 +94,8 @@ end
         @test count(l -> occursin("· sandbox", l), ups) == 2
         # The pool worker that ran the two ordinary items is not one of them.
         @test count(l -> !occursin("· sandbox", l), ups) == 1
+        # A run of the default profile alone names no profile.
+        @test !any(l -> occursin("· profile", l), ups)
         # The one that hung was killed; the one that passed was closed. Both words
         # appear, and neither stands in for the other.
         @test count(l -> occursin("· KILL", l), lines) == 1

@@ -93,8 +93,11 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     path = source.file === nothing ? "REPL" : String(source.file)
     target = interactive_target()
     setups = target === nothing ? Dict{Symbol, String}() : setup_modules(target.testdir)
+    # An item from a file in a profile's environment runs under that profile, as in a run.
+    owner = target === nothing ? DEFAULT_PROFILE :
+        owner_of(abspath(path), claimed_environments(config_toml(target.testdir, nothing)...))
     errors = ScanError[]
-    item = parse_testitem(ex, path, Int32(source.line), errors, setups)
+    item = parse_testitem(ex, path, Int32(source.line), errors, setups, owner)
     # `nothing` comes with the error that says why.
     (item === nothing || !isempty(errors)) && throw(ScanFailure(errors))
     sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE
@@ -137,12 +140,23 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
 end
 
 # The run's environment for the length of one item. After `activate` the session is
-# already in it, and `with_test_env` leaves it alone.
-function with_interactive_env(f, target)
+# already in it, and `with_test_env` leaves it alone. For an item of a profile that
+# names an environment, `prof`, that environment over it, as its workers have it.
+function with_interactive_env(f, target, prof::Union{Nothing, Profile} = nothing)
     target === nothing && return f()
     return with_test_env(target) do
         with_load_path(joinpath(target.testdir, TESTSETUPS_DIR)) do
-            f()
+            (prof === nothing || isempty(prof.environment)) && return f()
+            project = profile_project(prof, Base.active_project(), target.root)
+            current, load_path = Base.active_project(), copy(LOAD_PATH)
+            Base.set_active_project(joinpath(project, "Project.toml"))
+            copy!(LOAD_PATH, stacked_load_path(load_path, current))
+            try
+                return f()
+            finally
+                copy!(LOAD_PATH, load_path)
+                Base.set_active_project(current)
+            end
         end
     end
 end
@@ -167,10 +181,10 @@ function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UIn
 end
 
 # A worker configured as a run would configure it, in the profile's own project
-# when it declares preferences.
+# when it declares preferences or an environment.
 function sandbox_worker(prof, target, redirect_fn)
     env = Base.active_project()
-    project = something(profile_project(prof, env), Some(env))
+    project = something(profile_project(prof, env, target === nothing ? nothing : target.root), Some(env))
     return RuntestsWorkers.Worker(;
         julia_args = prof.julia_args, threads = prof.threads,
         extra_env = worker_env("repl", 1, project, prof),

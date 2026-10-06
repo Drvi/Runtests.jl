@@ -10,8 +10,8 @@ random numbers it failed with. When no run of the project is recorded, or the la
 one had no failures, there is nothing to step into, and it says so.
 
 The item runs here, in this process, as a run would run it: its module and imports,
-the test environment and the setups, and its profile's `env`, `init` and
-`test_end`. Its body is a function the debugger enters at the body's first call.
+the test environment, or the environment its profile names, and the setups, and
+its profile's `env`, `init` and `test_end`. Its body is a function the debugger enters at the body's first call.
 What cannot be part of a function, `using` and `struct` among it, has run by then.
 Only this item runs: the items before it in a chain do not.
 
@@ -54,7 +54,7 @@ function debug_item(enter, name::Union{Nothing, String}, seed::Union{Nothing, In
     runs = failure === nothing ? nothing : failure.seed
     run_seed = UInt64(something(seed, runs, rand(RandomDevice(), UInt64)))
     print_debug_header(item, prof, run_seed, failure, seed === nothing && runs !== nothing)
-    return with_interactive_env(target) do
+    return with_interactive_env(target, prof) do
         withenv(prof.env...) do
             isempty(prof.init.args) || Core.eval(Main, Expr(:block, prof.init.args...))
             spec = interactive_spec(item, target, 1, item_seed(run_seed, item.name))
@@ -111,8 +111,9 @@ end
 
 # The item called `name`, from the whole suite read the way a run reads it.
 function find_item(target, name::String)
-    files, strays, templates = walk_test_dir(target.testdir)
-    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates)
+    claimed = claimed_environments(config_toml(target.testdir, nothing)...)
+    files, strays, templates = walk_test_dir(target.testdir; claimed)
+    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, claimed)
     i = findfirst(it -> it.name == name, items)
     i === nothing || return items[i]
     near = [it.name for it in items if occursin(lowercase(name), lowercase(it.name))]
@@ -162,7 +163,8 @@ function debug_ignored(item::RawItem, prof::Profile)
     isempty(prof.julia_args) || push!(out, string("`", join(prof.julia_args, " "), "`", of))
     here = string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive))
     prof.threads == here || push!(out, string("threads ", prof.threads, of))
-    isempty(prof.preferences) || push!(out, string("preferences", of))
+    # A profile's environment is activated here, and its copy holds the preferences.
+    isempty(prof.preferences) || !isempty(prof.environment) || push!(out, string("preferences", of))
     item.exclusive && push!(out, "sandbox=true")
     item.timeout_s == USE_RUN_DEFAULT || push!(out, string("timeout=", item.timeout_s))
     item.retries == USE_RUN_DEFAULT || push!(out, string("retries=", item.retries))

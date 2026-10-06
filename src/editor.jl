@@ -105,10 +105,18 @@ the lines where `runtests("file.jl:line")` picks that item.
 """
 function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     target = resolve_target((root,))
-    files, strays, templates = walk_test_dir(target.testdir)
-    setups = setup_modules(target.testdir)
-    items, errors, _ = scan_files(files, Filter(), setups; strays, templates)
     config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
+    # The environments profiles name hold items too; a config that cannot be read
+    # names none, and says why below.
+    claimed = try
+        claimed_environments(config_toml(target.testdir, config)...)
+    catch e
+        e isa ConfigError || rethrow()
+        Dict{String, Symbol}()
+    end
+    files, strays, templates = walk_test_dir(target.testdir; claimed)
+    setups = setup_modules(target.testdir)
+    items, errors, _ = scan_files(files, Filter(), setups; strays, templates, claimed)
     if !isempty(items)
         # What a run would refuse to start on beyond the files: the settings, the
         # profiles items name, the items `[order]` names.

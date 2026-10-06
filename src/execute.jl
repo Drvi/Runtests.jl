@@ -389,12 +389,14 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
     cfg = p.cfg
     return with_logger(RunLogger(current_logger(), run)) do
         with_test_env(target, run) do
+            # Before the run state: a profile's environment that does not resolve
+            # stops the run before anything has run to record.
+            profile_projects!(run, p)
             # Opened once the test environment is active: its manifest is part of
             # what the file records.
             @atomic run.runstate = open_runstate(p, run.t0)
             check_replayed_environment(run)
             with_load_path(setup_path) do
-                profile_projects!(run, p)
                 precompile_phase(run, p, target)
                 # From the start of the run, as the monitor's setup stage is, so the
                 # header and the closing block give the same figure.
@@ -639,6 +641,9 @@ cannot give an item a process to itself. Such an item gets a worker even under
 needs_worker(p::Plan, u::UnitIdx) =
     p.units.exclusive[u] || p.profiles[p.units.profile[u]].name !== DEFAULT_PROFILE
 
+# Whether any of the run's items runs under a profile other than the default.
+uses_profiles(p::Plan) = any(i -> p.profiles[i].name !== DEFAULT_PROFILE, p.units.profile)
+
 # `workers=0` is a promise about the pool, not about never starting a process.
 # Starting one anyway is the right thing and a surprising thing, so it is said out
 # loud, once, with the items that caused it.
@@ -681,29 +686,35 @@ end
 """
     profile_projects!(run, p)
 
-Give every profile that declares preferences a project of its own. A package takes
-its preferences from the environment that owns it, and a stacked environment is not
-consulted, so a profile's preferences have to arrive as the worker's own project:
-the test environment's `Project.toml` and `Manifest.toml`, over a
-`LocalPreferences.toml` of the environment's preferences with the profile's on top.
-Preferences are part of a cache's identity, so these projects keep caches of their
-own.
+Give every profile that declares preferences or an environment a project of its
+own. A package takes its preferences from the environment that owns it, and a
+stacked environment is not consulted, so a profile's preferences have to arrive as
+the worker's own project: the test environment's `Project.toml` and `Manifest.toml`,
+over a `LocalPreferences.toml` of the environment's preferences with the profile's
+on top. Preferences are part of a cache's identity, so these projects keep caches of
+their own. A profile that names an environment runs in a copy of it instead (see
+[`environment_project`](@ref)).
 """
 function profile_projects!(run::Run, p::Plan)
     env = Base.active_project()
     for prof in values(p.profiles)
-        dir = profile_project(prof, env)
+        announce = () -> say(run, "resolving the environment of profile ", prof.name, ", ",
+                             relpath_or_path(prof.environment, p.root))
+        dir = profile_project(prof, env, p.root, announce)
         dir === nothing || (run.profile_projects[prof.name] = dir)
     end
     return nothing
 end
 
 # The project `prof`'s workers run in, or `nothing` for a profile without
-# preferences, whose workers run in the environment `env` itself. In the system's
-# temporary files, keyed by `env`'s path, and never beside `env`, which can be the
-# package's own `test/`. Rewritten on every call, so it follows the environment and
-# the preferences file.
-function profile_project(prof::Profile, env)
+# preferences or an environment, whose workers run in the environment `env` itself.
+# For one with an environment, see `environment_project`, which `root`, the package
+# under test, and `announce` are for. Otherwise in the system's temporary files,
+# keyed by `env`'s path, and never beside `env`, which can be the package's own
+# `test/`. Rewritten on every call, so it follows the environment and the
+# preferences file.
+function profile_project(prof::Profile, env, root = nothing, announce = nothing)
+    isempty(prof.environment) || return environment_project(prof, root, announce)
     (env === nothing || isempty(prof.preferences)) && return nothing
     root = dirname(env)
     dir = joinpath(tempdir(), "runtests_profiles", string(crc32c(abspath(env)); base = 16, pad = 8), String(prof.name))
@@ -718,6 +729,127 @@ function profile_project(prof::Profile, env)
     end
     open(io -> TOML.print(io, merged), joinpath(dir, "LocalPreferences.toml"), "w")
     return dir
+end
+
+# The projects of profiles that name an environment, kept for the session as the
+# test environment is, and keyed by the environment, the package and the
+# preferences: building one is a resolve.
+const ENVIRONMENT_PROJECTS = Dict{NTuple{3, String}, Tuple{String, Vector{Float64}}}()
+const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
+
+"""
+    environment_project(prof, root, announce = nothing) -> String
+
+The project the workers of a profile that names an environment run in. A copy of
+that environment, in the system's temporary files so that nothing is written to the
+directory the profile names, which is the package's own; with the package under
+test at `root` developed into it by path, as it is in the test environment, which
+brings the packages its `[sources]` name with it; resolved; and with the
+environment's `LocalPreferences.toml` under the profile's preferences, as
+[`profile_project`](@ref) lays them. Kept for the session, and built again once a
+file it was built from changes: the environment's own, the package's project, the
+preferences, or the project of a package it holds by path. `announce` is called
+before building.
+"""
+function environment_project(prof::Profile, root, announce = nothing)
+    root === nothing && throw(ConfigError(
+        "profile `$(prof.name)` runs in an environment of its own, and there is no package here to test in it"
+    ))
+    key = (prof.environment, String(root), prof.preferences)
+    return @lock ENVIRONMENT_PROJECTS_LOCK begin
+        cached = get(ENVIRONMENT_PROJECTS, key, nothing)
+        if cached !== nothing && isdir(cached[1]) && cached[2] == environment_stamp(cached[1], prof, root)
+            return cached[1]
+        end
+        announce === nothing || announce()
+        dir = mktempdir(; prefix = "runtests_environment_")
+        write_environment(dir, prof, root)
+        resolve_environment(dir, prof)
+        # Stamped once resolved: the packages it holds by path are in its manifest.
+        ENVIRONMENT_PROJECTS[key] = (dir, environment_stamp(dir, prof, root))
+        return dir
+    end
+end
+
+# The environment `prof` names, written into `dir` with its paths made absolute, the
+# package at `root` added by path, and the preferences laid over its own.
+function write_environment(dir::AbstractString, prof::Profile, root::AbstractString)
+    src = prof.environment
+    projfile = something(project_file_in(src), joinpath(src, "Project.toml"))
+    project = absolute_paths!(TOML.parsefile(projfile), src)
+    own = project_file_in(root)
+    pkg = own === nothing ? Dict{String, Any}() : TOML.parsefile(own)
+    name, uuid = get(pkg, "name", nothing), get(pkg, "uuid", nothing)
+    if name isa String && uuid isa String
+        get!(Dict{String, Any}, project, "deps")[name] = uuid
+        get!(Dict{String, Any}, project, "sources")[name] = Dict{String, Any}("path" => abspath(root))
+    end
+    open(io -> TOML.print(io, project; sorted = true), joinpath(dir, "Project.toml"), "w")
+    manifest = Base.project_file_manifest_path(projfile)
+    if manifest !== nothing && isfile(manifest)
+        # A manifest's paths are its own directory's, which for a member of a
+        # workspace is the workspace's.
+        open(io -> TOML.print(io, absolute_paths!(TOML.parsefile(manifest), dirname(manifest)); sorted = true),
+             joinpath(dir, "Manifest.toml"), "w")
+    end
+    own_prefs = joinpath(src, "LocalPreferences.toml")
+    prefs = isfile(own_prefs) ? TOML.parsefile(own_prefs) : Dict{String, Any}()
+    if !isempty(prof.preferences)
+        for (p, table) in TOML.parsefile(prof.preferences)
+            prefs[p] = table   # per package, as in `profile_project`
+        end
+    end
+    isempty(prefs) || open(io -> TOML.print(io, prefs), joinpath(dir, "LocalPreferences.toml"), "w")
+    return nothing
+end
+
+project_file_in(dir::AbstractString) =
+    (i = findfirst(n -> isfile(joinpath(dir, n)), PROJECT_NAMES); i === nothing ? nothing : joinpath(dir, PROJECT_NAMES[i]))
+
+# `Pkg` would precompile for this process's flags only, as for the test environment;
+# `precompile_env` does it once for every set the pools use.
+function resolve_environment(dir::AbstractString, prof::Profile)
+    original = Base.active_project()
+    try
+        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+            Pkg.activate(dir; io = devnull)
+            Pkg.resolve(; io = devnull)
+            Pkg.instantiate(; io = devnull)
+        end
+    catch e
+        is_interrupt(e) && rethrow()
+        throw(ConfigError(string(
+            "could not build the environment of profile `", prof.name, "` from ",
+            relpath_or_path(prof.environment), ": ", sprint(showerror, e)
+        )))
+    finally
+        Base.set_active_project(original)
+    end
+    return nothing
+end
+
+# When the files a profile's environment was built from were last written: the
+# environment's own, the package's project, the preferences, and the project of every
+# package the built one at `dir` holds by path, which is how a package's siblings in
+# a monorepo come in.
+function environment_stamp(dir::AbstractString, prof::Profile, root::AbstractString)
+    files = String[joinpath(prof.environment, f) for f in
+                   ("Project.toml", "JuliaProject.toml", "Manifest.toml", "JuliaManifest.toml", "LocalPreferences.toml")]
+    push!(files, joinpath(root, "Project.toml"), joinpath(root, "JuliaProject.toml"))
+    isempty(prof.preferences) || push!(files, prof.preferences)
+    manifest = joinpath(dir, "Manifest.toml")
+    if isfile(manifest)
+        for (_, entries) in get(Dict{String, Any}, TOML.parsefile(manifest), "deps")
+            entries isa AbstractVector || continue
+            for entry in entries
+                path = entry isa AbstractDict ? get(entry, "path", nothing) : nothing
+                path isa AbstractString || continue
+                at = normpath(joinpath(dir, path))
+                push!(files, joinpath(at, "Project.toml"), joinpath(at, "JuliaProject.toml"))
+            end
+        end
+    end
+    return Float64[mtime_or_zero(f) for f in files]
 end
 
 """
@@ -836,7 +968,8 @@ function precompile_env(run::Run, p::Plan)
         prof = p.profiles[findfirst(q -> q.name === name, p.profiles)]
         flags = flags_of(prof)
         flags === nothing && continue
-        say(run, "precompiling the test environment for profile ", name)
+        say(run, "precompiling ", isempty(prof.environment) ? "the test environment for" : "the environment of",
+            " profile ", name)
         precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$name`")
     end
     # Named only when there is something to name: `Pkg` narrates the rest, and says
@@ -1245,7 +1378,9 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                     # Why this process exists: a pool worker runs whatever it is
                     # handed, a sandbox runs one unit and goes away again.
                     exclusive ? " · sandbox" : "",
-                    prof.name === DEFAULT_PROFILE ? "" : string(" · profile ", prof.name),
+                    # In a run of several profiles, the default's too: a slot can
+                    # move from one profile's pool to another's.
+                    uses_profiles(run.plan) ? string(" · profile ", prof.name) : "",
                     isempty(prof.julia_args) ? "" : string(" · ", join(prof.julia_args, " "))
                 )
             )
@@ -1355,9 +1490,22 @@ end
 # rather than inherited: a `JULIA_PROJECT` the caller happened to have set would
 # otherwise win over the test environment this run just built.
 function worker_env(run_id, slot_id, project, prof::Profile)
-    env = ["RUNTESTS_RUN_ID" => string(run_id), "RUNTESTS_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(LOAD_PATH, PATHSEP)]
+    load_path = isempty(prof.environment) ? LOAD_PATH : stacked_load_path(LOAD_PATH, Base.active_project())
+    env = ["RUNTESTS_RUN_ID" => string(run_id), "RUNTESTS_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(load_path, PATHSEP)]
     project === nothing || push!(env, "JULIA_PROJECT" => project)
     return append!(env, prof.env)
+end
+
+# The load path of an item of a profile that names an environment: that environment,
+# `@`, over the test environment `test_env`, as `Pkg.test` stacks its sandbox over the
+# active project. The worker loads RuntestsWorkers through the test environment's
+# manifest, and the environment's own packages come first.
+function stacked_load_path(load_path::Vector{String}, test_env::Union{Nothing, String})
+    out = copy(load_path)
+    (test_env === nothing || test_env in out || dirname(test_env) in out) && return out
+    at = findfirst(==("@"), out)
+    insert!(out, at === nothing ? 1 : at + 1, test_env)
+    return out
 end
 
 # Every worker's end is recorded once, by the task that sees its process exit,

@@ -3,7 +3,7 @@ using Runtests.Private: init_run_state, write_status!, finish_run_state!, read_r
             runstate_files, runstate_dir, prune_runstates, new_runstate_path, prepare,
             execute, plan, scan, discover, setup_modules, read_config, Filter, History,
             UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, nitems, RS_STATUS_BYTES,
-            project_revision
+            project_revision, repository_root
 
 function a_plan(pkg=fixture("Basic.jl"))
     testdir = joinpath(pkg, "test")
@@ -736,6 +736,22 @@ end
 
         @test project_revision(mktempdir()) == ""        # not a checkout
         @test project_revision("/nonexistent/path") == ""
+
+        # A package below the root of its checkout, as in a monorepo, has the
+        # checkout's commit.
+        sub = mkpath(joinpath(dir, "lib", "Sub"))
+        @test project_revision(sub) == sha
+        @test repository_root(sub) == dir
+        @test repository_root(dir) == dir
+        @test repository_root(mktempdir()) === nothing
+        # A `gitdir` written relative is relative to the directory `.git` is in, not
+        # to the package.
+        parent = mktempdir()
+        cp(joinpath(dir, ".git"), joinpath(parent, "real.git"))
+        checkout = mkpath(joinpath(parent, "checkout"))
+        write(joinpath(checkout, ".git"), "gitdir: ../real.git\n")
+        @test repository_root(joinpath(checkout, "lib")) == checkout
+        @test project_revision(mkpath(joinpath(checkout, "lib", "Sub"))) == sha
     end
 
     @testset "the run state records the commit it ran from" begin

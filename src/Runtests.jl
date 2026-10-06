@@ -79,8 +79,12 @@ another task or thread, throws and leaves that run going.
 # Keywords
 
 Selection: `name` (`String` for an exact match, `Regex` for a partial one, or a
-set of exact names) and `tags` (a symbol or vector of symbols an item must carry
-all of, or a string expression such as `"!slow"` or `"juliac || serializer"`).
+set of exact names), `tags` (a symbol or vector of symbols an item must carry
+all of, or a string expression such as `"!slow"` or `"juliac || serializer"`; a tag
+no item carries is an error), and `group` (the name of a tag expression `[groups]` of
+`test/TestItems.toml` declares; also `RUNTESTS_GROUP`, which the keyword overrides).
+A run that selects nothing else selects the group named `default`, when there is
+one, and `group = "all"` is the whole suite. Selections narrow together.
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
@@ -126,18 +130,24 @@ end
 # `announce` prints what is being read and what was found, as it happens.
 # `expansions = false` leaves the expansions of templates unchecked, for `chores`,
 # which says itself where they stand.
-function prepare(args; name = nothing, tags = nothing, replay = nothing, announce::Bool = true,
+function prepare(args; name = nothing, tags = nothing, group = nothing, replay = nothing, announce::Bool = true,
                  expansions::Bool = true, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     rs = replay === nothing ? nothing : read_replay(String(replay), target)
     if rs !== nothing
         # The items and settings it recorded, under whatever the call says itself.
-        selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
+        selected = name !== nothing || tags !== nothing || group !== nothing || !isempty(target.paths) || target.line != 0
         selected || (name = Set(it.name for it in rs.items))
         kwargs = merge(recorded_settings(rs), kwargs)
     end
-    filter = Filter(; name, tags, paths = target.paths, line = target.line)
+    # Read before the test files: which directories the profiles' environments are
+    # decides which files are read, and the group what is selected from them.
+    config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
+    claimed = claimed_environments(config_path, toml)
+    selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
+    filter = Filter(; name, tags, paths = target.paths, line = target.line,
+                    group = select_group(read_groups(config_path, toml), config_path, group, selected))
     setups = setup_modules(target.testdir)
     # Printed directly: there is no printer yet, and nothing else writes this early.
     announce && println(
@@ -146,7 +156,15 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
         is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
     t_files = time()
-    files, strays, templates = walk_test_dir(target.testdir)
+    walked = walk_test_dir(target.testdir; claimed)
+    for path in target.paths, (dir, _) in walked.unclaimed
+        (rstrip_path(path) == dir || startswith(path, joinpath(dir, ""))) && throw(NoTestsError(string(
+            relpath_or_path(path, target.root), " is in ", relpath_or_path(dir, target.root),
+            ", which has an environment of its own; a profile with `environment = ",
+            repr(relpath_or_path(dir, target.testdir)), "` runs the tests there"
+        )))
+    end
+    files, strays, templates = walked.tests, walked.strays, walked.templates
     if isempty(files)
         # A stray file, or a template not expanded yet, is the likeliest reason there
         # is nothing to run, so it is what the run says rather than "no test files found".
@@ -162,7 +180,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     end
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
-    items = scan(files, filter, setups; strays, templates, expansions, suite_names)
+    items = scan(files, filter, setups; strays, templates, expansions, suite_names, claimed)
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
@@ -174,11 +192,12 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, announc
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
-    rs === nothing || (cfg = replayed_config(cfg, rs))
+    rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
         strict_order = is_full_run(filter, target),
-        selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
+        selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names,
+        unclaimed = walked.unclaimed
     )
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
@@ -220,13 +239,20 @@ function recorded_settings(rs::RunStateRecord)
 end
 
 # The recorded profiles in place of this checkout's, each preferences file written
-# back out from what was recorded, and the recorded manifest kept for comparison.
-function replayed_config(cfg::RunConfig, rs::RunStateRecord)
+# back out from what was recorded, each environment found in this checkout, under
+# `root`, where the recording's was in its own, and the recorded manifest kept for
+# comparison.
+function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractString)
     profiles = copy(cfg.profiles)
     for (name, prof) in rs.profiles
         prefs = get(rs.preferences, name, "")
         path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
-        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path)
+        env = isempty(prof.environment) || isabspath(prof.environment) ? prof.environment :
+            normpath(joinpath(root, prof.environment))
+        isempty(env) || isdir(env) || throw(ConfigError(
+            "the run state's profile `$name` runs in $(prof.environment), which this checkout does not have"
+        ))
+        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, env)
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
     return RunConfig(; merge(fields, (; profiles, replayed_manifest = recorded_manifest(rs),
@@ -247,7 +273,7 @@ are that run's and those of the runs that started after it. See
 function runtestsf(args...; replay = nothing, kwargs...)
     target = resolve_target(args)
     base = replay === nothing ? nothing : read_replay(String(replay), target; announce = false)
-    names = Set(failing_items(target.root; names = suite_item_names(target), base))
+    names = Set(failing_items(target.root; names = suite_item_names(target; config = get(kwargs, :config, nothing)), base))
     isempty(names) && throw(
         NoTestsError(
             "no test item is failing in the recorded runs" *
@@ -260,12 +286,13 @@ function runtestsf(args...; replay = nothing, kwargs...)
     return runtests(args...; name = names, replay, kwargs...)
 end
 
-# Every item's name in the suite, read as a run reads it: a suite that does not
-# parse throws here as it would there.
-function suite_item_names(target)
-    files, strays, templates = walk_test_dir(target.testdir)
+# Every item's name in the suite, read as a run reads it, the environments profiles
+# name included: a suite that does not parse throws here as it would there.
+function suite_item_names(target; config = nothing)
+    claimed = claimed_environments(config_toml(target.testdir, config)...)
+    files, strays, templates = walk_test_dir(target.testdir; claimed)
     names = String[]
-    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names)
+    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names, claimed)
     return Set(names)
 end
 
@@ -301,11 +328,15 @@ function resolve_target(args)
     narrowing = String[]
     for path in paths
         rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && continue
-        startswith(path, joinpath(t.testdir, "")) || throw(
-            ArgumentError(
-                "$(path) is not under $(t.testdir); Runtests only reads test files from `test/`"
-            )
-        )
+        if !startswith(path, joinpath(t.testdir, ""))
+            # In a monorepo, the likeliest path outside `test/` is another package's.
+            other = find_project(isdir(path) ? path : dirname(path))
+            other === nothing || dirname(other) == t.root || throw(ArgumentError(
+                "$(path) belongs to the package at $(dirname(other)), and $(first(paths)) to the one " *
+                    "at $(t.root): a call runs one package's tests, so give each package a call of its own"
+            ))
+            throw(ArgumentError("$(path) is not under $(t.testdir); Runtests only reads test files from `test/`"))
+        end
         isdir(path) || is_test_file(path) || throw(
             ArgumentError(
                 "$(path) is not a test file; test files are named `*_test.jl` or `*_tests.jl`"
@@ -363,12 +394,13 @@ const PROJECT_NAMES = ("Project.toml", "JuliaProject.toml")
 
 function find_project(dir::AbstractString)
     # `test/` has its own Project.toml, which is an environment and not a project
-    # root, so a path inside it must keep walking up.
+    # root, so a path inside it must keep walking up, as must one inside another
+    # environment of the tests.
     while true
         if basename(dir) != "test"
             for n in PROJECT_NAMES
                 p = joinpath(dir, n)
-                isfile(p) && return p
+                isfile(p) && !is_test_environment(dir, p) && return p
             end
         end
         parent = dirname(dir)
@@ -378,13 +410,32 @@ function find_project(dir::AbstractString)
     return
 end
 
+# Whether `dir`, whose project file is `p`, is an environment of a package's tests
+# rather than a project of its own: a directory under the package's `test/` whose
+# project declares no package, or that a profile of the package names as its
+# `environment`. A package kept under `test/`, as a fixture is, is a project.
+function is_test_environment(dir::AbstractString, p::AbstractString)
+    testdir = dirname(rstrip_path(dir))
+    while basename(testdir) != "test"
+        parent = dirname(testdir)
+        parent == testdir && return false
+        testdir = parent
+    end
+    project_file_in(dirname(testdir)) === nothing && return false
+    project_name_of(p) === nothing && return true
+    return haskey(claimed_environments(config_toml(testdir, nothing)...), rstrip_path(dir))
+end
+
+# A run of a group is not of the whole suite, its default group's included: what a
+# run of the whole suite does not find, a later one takes for renamed or deleted.
 is_full_run(f::Filter, t::Target) =
-    f.name === nothing && f.tags === nothing && f.line == 0 && isempty(t.paths)
+    f.name === nothing && f.tags === nothing && f.group === nothing && f.line == 0 && isempty(t.paths)
 
 function describe(f::Filter, t::Target)
     parts = String[]
     f.name === nothing || push!(parts, f.name isa Set ? plural(length(f.name), "named item") : "name = $(repr(f.name))")
     f.tags === nothing || push!(parts, "tags = $(f.tags)")
+    f.group === nothing || push!(parts, "group `$(f.group.name)` = $(repr(f.group.tags.text)), $(f.group.source)")
     f.line == 0 || push!(parts, "line $(f.line)")
     isempty(t.paths) || push!(parts, "paths " * join(map(p -> relpath_or_path(p, t.root), t.paths), ", "))
     return isempty(parts) ? "the filter" : join(parts, " and ")

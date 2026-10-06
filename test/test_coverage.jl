@@ -103,6 +103,49 @@ end
         """
     end
 
+    @testset "paths are from the root of the checkout, which a package in a subdirectory is below" begin
+        repo = mktempdir()
+        root = joinpath(repo, "lib", "Sub")
+        mkpath(joinpath(root, "src"))
+        write(joinpath(root, "src", "Sub.jl"), "module Sub\nf(x) = x\ninclude(\"other.jl\")\nend\n")
+        write(joinpath(root, "src", "other.jl"), "g(x) = x\n")
+        traces = mktempdir()
+        write(joinpath(traces, "1.info"), "SF:$(joinpath(realpath(root), "src", "Sub.jl"))\nDA:2,1\nend_of_record\n")
+        out = joinpath(root, "lcov.info")
+        sources() = (merge_coverage(traces, root, out); filter(startswith("SF:"), readlines(out)))
+        # Outside a checkout, from the package's root.
+        @test sources() == ["SF:src/Sub.jl", "SF:src/other.jl"]
+        # In one, from the checkout's, whether `.git` is a directory or, in a worktree
+        # or a submodule, a file: the file that ran and the file that did not alike.
+        mkpath(joinpath(repo, ".git"))
+        @test sources() == ["SF:lib/Sub/src/Sub.jl", "SF:lib/Sub/src/other.jl"]
+        @test occursin("SF:lib/Sub/src/Sub.jl\nDA:2,1\n", read(out, String))
+        rm(joinpath(repo, ".git"); recursive = true)
+        write(joinpath(repo, ".git"), "gitdir: ../elsewhere/.git\n")
+        @test sources() == ["SF:lib/Sub/src/Sub.jl", "SF:lib/Sub/src/other.jl"]
+        # A package at the root of its checkout has the paths it always had.
+        rm(joinpath(repo, ".git"))
+        mkpath(joinpath(root, ".git"))
+        @test sources() == ["SF:src/Sub.jl", "SF:src/other.jl"]
+    end
+
+    @testset "a covered run of a package below the root of its checkout" begin
+        repo = mktempdir()
+        mkpath(joinpath(repo, ".git"))
+        dir = joinpath(repo, "lib", "CovSub")
+        mkpath(dirname(dir))
+        mv(covered_package("CovSub"), dir)
+        with_runstate_dir() do _
+            (states, run, p), _ = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false, coverage=true))
+            @test all(==(PASSED), values(states))
+            @test filter(startswith("SF:"), readlines(joinpath(dir, "lcov.info"))) ==
+                ["SF:lib/CovSub/src/CovSub.jl", "SF:lib/CovSub/src/more.jl"]
+            # Written where a package's report always is, at its own root.
+            @test !isfile(joinpath(repo, "lcov.info"))
+            @test closing(run, p) == "coverage: 33.3% of 6 lines in 2 files · lcov.info\n"
+        end
+    end
+
     @testset "a covered run merges its workers' counts into lcov.info at the root" begin
         dir = covered_package("CovRun")
         (states, run, p), out = capture_run(() -> run_states(dir; workers=2, logs=:issues, monitor=false, coverage=true))

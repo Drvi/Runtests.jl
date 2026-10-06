@@ -28,6 +28,7 @@ function plan_block(p::Plan, order)
         println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
                 " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
         print_profiles(io, p)
+        print_unclaimed(io, p)
         print_coverage_setting(io, p.cfg)
         estimated = any(>(0), p.units.est_s)
         if !single_process(p)
@@ -60,12 +61,25 @@ end
 function print_profiles(io::IO, p::Plan)
     for prof in p.profiles
         parts = String[]
+        isempty(prof.environment) || push!(parts, string("environment ", relpath_or_path(prof.environment, p.root)))
         isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
         prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
         isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
         isempty(prof.init.args) || push!(parts, "init expression")
         isempty(prof.test_end.args) || push!(parts, "test end expression")
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
+    end
+    return nothing
+end
+
+# The tests the run leaves out because they are in an environment no profile names:
+# said at its start and at its end, since a run that passes without them reads as a
+# run of them.
+function print_unclaimed(io::IO, p::Plan)
+    for (dir, n) in p.unclaimed
+        println(io, "not run: ", plural(n, "test file"), " in ", relpath_or_path(dir, p.root),
+                ", which has an environment of its own; a profile with `environment = ",
+                repr(relpath_or_path(dir, joinpath(p.root, "test"))), "` runs them")
     end
     return nothing
 end
@@ -608,6 +622,7 @@ function print_run_header(run)
         println(io, "env: ", something(Base.active_project(), "none"))
         print_startup(io, p.startup)
         print_profiles(io, p)
+        print_unclaimed(io, p)
         print_coverage_setting(io, p.cfg)
     end
     print_label_block(run, head, body)
@@ -703,6 +718,7 @@ function print_conclusion(run, ended::Symbol = :finished)
         monitor, coverage = run.monitor, run.coverage
         monitor === nothing || print_memory_summary(io, monitor; indent = "")
         coverage === nothing || print_coverage(io, coverage, p.root)
+        print_unclaimed(io, p)
         if run.runstate !== nothing
             print(io, "run state: ")
             printstyled(io, run.runstate.path; color = :light_black)

@@ -191,8 +191,9 @@ A run's selection: `name` (exact, a `Regex`, or a set of exact names) and `tags`
 vector an item must carry all of, or a [`TagExpr`](@ref)) are matched against items,
 as is the tag expression of `group`, a [`GroupSelection`](@ref); `paths` against
 their files (empty means all); and `line` picks the item defined at or above it.
-Every test file is read whatever the selection: a suite that does not parse is
-broken, not smaller.
+`names_are` is what a set of names is said to be: `"failing item"` for
+[`FailingItems`](@ref), `"named item"` for any other. Every test file is read
+whatever the selection: a suite that does not parse is broken, not smaller.
 """
 struct Filter
     name::Union{Nothing, String, Regex, Set{String}}
@@ -200,16 +201,34 @@ struct Filter
     paths::Vector{String}
     line::Int32
     group::Union{Nothing, GroupSelection}
+    names_are::String
 end
 Filter(; name = nothing, tags = nothing, paths = String[], line = 0, group = nothing) =
-    Filter(_asname(name), _astags(tags), collect(paths), Int32(line), group)
+    Filter(_asname(name), _astags(tags), collect(paths), Int32(line), group,
+           name isa FailingItems ? "failing item" : "named item")
+
+"""
+    FailingItems(names)
+
+The names [`runtestsf`](@ref) hands a run as its `name`: a set of exact names, which
+the run says are the failing items.
+"""
+struct FailingItems
+    names::Set{String}
+end
 
 _asname(n::Union{Nothing, Regex}) = n
-_asname(n::AbstractString) = String(n)
+_asname(f::FailingItems) = f.names
+function _asname(n::AbstractString)
+    isempty(strip(n)) && throw(ArgumentError("`name = $(repr(n))`: test item names are never blank"))
+    return String(n)
+end
 function _asname(n)
     (applicable(iterate, n) && all(x -> x isa AbstractString, n)) || throw(ArgumentError(
         "`name = $(repr(n))`: expected a name, a `Regex`, or a collection of names"
     ))
+    # Empty, it would select nothing, said as "no test items matched".
+    isempty(n) && throw(ArgumentError("`name = $(repr(n))`: names no item; give at least one name"))
     return Set{String}(n)
 end
 
@@ -221,6 +240,8 @@ function _astags(t)
         "`tags = $(repr(t))`: expected a tag name, a collection of tag names, or a tag " *
             "expression written as a string, as in `tags = \"fast && !slow\"`"
     ))
+    # Empty, every item would carry all of them: a selection of everything.
+    isempty(t) && throw(ArgumentError("`tags = $(repr(t))`: names no tag; give at least one tag"))
     return Symbol[_astag(x) for x in t]
 end
 

@@ -166,11 +166,7 @@ mutable struct Monitor
     # leaves all but its last row behind, so the status line is clipped to this.
     # Refreshed with the clock.
     columns::Int
-    # Scratch for the status line's list of running items, refilled rather than
-    # rebuilt: on a terminal the line is redrawn after every line the run prints.
-    # There it is only touched under `run.printer`, which every redraw holds; off a
-    # terminal only the monitor's task builds the line.
-    const running::Vector{String}
+
     # Per slot, the largest resident size sampled for its current process, and that
     # process's pid: a new pid starts a new peak. The monitor's task alone writes
     # both; others read the peaks through `reading`.
@@ -183,11 +179,13 @@ mutable struct Monitor
     const lineio::IO
     const color::Bool
     # `strftime` builds a string per call and the clock moves once a second, while
-    # this line is redrawn after every line the run prints. Touched as `running` is.
+    # this line is redrawn after every line the run prints. On a terminal only under
+    # `run.printer`, which every redraw holds; off one only by the monitor's task.
     clock_at::Int
     clock_text::String
     last_print::Float64
     next_print::Float64      # when the next scheduled report is due
+    done_reported::Int       # the items finished at the last report
     last_mem_pct::Float64    # the machine's memory at the previous check
     const mark_said::Vector{Float64}   # when each of MEMORY_MARKS last reported
     last_phase_printed::RunPhase
@@ -235,8 +233,8 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
         run, stats, fill(Sample(), RING_SAMPLES), 0, Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n)),
         nothing, false, false,
         PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
-        sizehint!(String[], n), zeros(Int64, n), zeros(Int32, n), linebuf,
-        IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0.0,
+        zeros(Int64, n), zeros(Int32, n), linebuf,
+        IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0
     )
 end
@@ -412,16 +410,19 @@ end
 # The run this monitor watches, with its type restored. See the note on the field.
 run_of(m::Monitor) = m.run::Run
 
-# Refilled rather than rebuilt. The only caller is the status line, which reads it
-# at once and under the printer lock, so one buffer for the monitor is enough.
-function running_items!(m::Monitor)
-    dest = m.running
-    empty!(dest)
-    for slot in run_of(m).slots
+# The running item that started first, the one a run that has stopped moving is
+# most likely stuck on, or 0 when none is running. An item's start is written before
+# its slot takes it, so a slot read here holding an item has its start already.
+function oldest_running(m::Monitor)
+    run = run_of(m)
+    oldest, since = ItemIdx(0), Inf32
+    for slot in run.slots
         i = @atomic slot.current
-        i == 0 || push!(dest, run_of(m).plan.items.name[i])
+        i == 0 && continue
+        t = run.statuses.start[i]
+        t < since && ((oldest, since) = (i, t))
     end
-    return dest
+    return oldest
 end
 
 function item_on_pid(m::Monitor, pid::Int32)
@@ -580,12 +581,12 @@ function print_status_line(io::IO, m::Monitor)
         write(io, UInt8('/'))
         print_int(io, cpu_count())
     end
-    # The stage and its age, then the first running item: last, because it is the
+    # The stage and its age, then the oldest running item: last, because it is the
     # only field that changes width.
     print(io, " · ", phase_name(s.phase), " ")
     print_age(io, run.t0 + Float64(s.t) - r.phase_entered)
-    running = running_items!(m)
-    isempty(running) || (print(io, " · "); print_clipped(io, first(running), RUNNING_WIDTH))
+    oldest = oldest_running(m)
+    oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], RUNNING_WIDTH))
     return nothing
 end
 
@@ -747,6 +748,15 @@ function crossed_memory_mark!(m::Monitor, pct::Float64, now::Float64)
     return crossed
 end
 
+# Off a terminal, a report every `PROGRESS_ITEMS` finished items as well as on the
+# clock, but none within `PROGRESS_GAP_S` of the previous report: a run of quick
+# items would otherwise print a line per item, and a slow run none for a long time.
+const PROGRESS_ITEMS = 10
+const PROGRESS_GAP_S = 5.0
+
+progress_due(done::Integer, reported::Integer, now::Float64, last_print::Float64) =
+    done - reported >= PROGRESS_ITEMS && now - last_print >= PROGRESS_GAP_S
+
 function maybe_print(m::Monitor)
     now = time()
     s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
@@ -757,15 +767,17 @@ function maybe_print(m::Monitor)
         return nothing
     end
     # Not a terminal: poll often and report on a clock, and also when the stage
-    # changes or memory nears the edge. The clock is a cadence, so an unscheduled
-    # report does not push the next scheduled one back.
+    # changes, memory nears the edge or enough items have finished. The clock is a
+    # cadence, so an unscheduled report does not push the next scheduled one back.
     phase_changed = s.phase !== m.last_phase_printed
     pressure = s.machine_total > 0 ? 100 * s.machine_used / s.machine_total : 0.0
     near_oom = crossed_memory_mark!(m, pressure, now) != 0
     due = now >= m.next_print
-    (due || phase_changed || near_oom) || return nothing
+    done = @atomic run_of(m).ndone
+    (due || phase_changed || near_oom || progress_due(done, m.done_reported, now, m.last_print)) || return nothing
     due && (m.next_print = max(now, m.next_print) + m.print_interval)
     m.last_print = now
+    m.done_reported = done
     m.last_phase_printed = s.phase
     printline(run_of(m), status_line(m))
     return nothing

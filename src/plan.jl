@@ -249,9 +249,8 @@ function check_order_conflicts(raw, cfg)
 end
 
 # Cheap edit-distance-ish suggestion: a typo'd name should not send anyone hunting.
-function nearest(name::AbstractString, names, k::Int = 2)
+function nearest(name::AbstractString, names, k::Int = 2; cutoff::Int = max(3, length(name) ÷ 3))
     scored = sort!([(levenshtein(name, n), n) for n in names]; by = first)
-    cutoff = max(3, length(name) ÷ 3)
     return [n for (d, n) in Iterators.take(scored, k) if d <= cutoff]
 end
 

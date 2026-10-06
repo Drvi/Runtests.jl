@@ -259,7 +259,7 @@ end
 function say_failure(stream::EventStream, id, e)
     if e isa ScanFailure
         emit_error(stream, "the test files cannot be read as a suite"; id, errors = scan_errors_json(e.errors))
-    elseif e isa ConfigError || e isa NoTestsError
+    elseif e isa ConfigError || e isa NoTestsError || e isa ArgumentError
         emit_error(stream, e.msg; id)
     else
         emit_error(stream, sprint(showerror, e); id)

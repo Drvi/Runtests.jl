@@ -1,13 +1,17 @@
 # Stepping into one test item under Debugger.jl, in this process.
 
 """
-    debug([name]; seed) -> Test.AbstractTestSet
+    debug([item]; seed) -> Test.AbstractTestSet
 
-Step into one test item with Debugger.jl: `using Debugger` first. Without `name` it
-is the last recorded run's most recent failure, the item among those that failed,
-errored or timed out that finished last, with that run's seed, so it draws the
-random numbers it failed with. When no run of the project is recorded, or the last
-one had no failures, there is nothing to step into, and it says so.
+Step into one test item with Debugger.jl: `using Debugger` first. `item` picks it: its
+exact name; a `Regex` that matches the name of that item and no other; or a path, as
+[`runtests`](@ref) takes one, relative to the current directory: `file.jl:line` for
+the item that line is inside, or a test file or directory that holds that item and
+no other. What picks no item, or several, is an error that says what it found.
+Without `item` it is the last recorded run's most recent failure, the item among
+those that failed, errored or timed out that finished last, with that run's seed, so
+it draws the random numbers it failed with. When no run of the project is recorded,
+or the last one had no failures, there is nothing to step into, and it says so.
 
 The item runs here, in this process, as a run would run it: its module and imports,
 the test environment, or the environment its profile names, and the setups, and
@@ -23,8 +27,8 @@ the item draws the random numbers it drew in that run.
 Returns the item's testset. Leaving the debugger before the item has finished
 records an error, since the rest of it did not run.
 """
-function debug(name::Union{Nothing, AbstractString} = nothing; seed::Union{Nothing, Integer} = nothing)
-    return debug_item(debugger_entry(), name === nothing ? nothing : String(name), seed)
+function debug(item::Union{Nothing, AbstractString, Regex} = nothing; seed::Union{Nothing, Integer} = nothing)
+    return debug_item(debugger_entry(), item isa AbstractString ? String(item) : item, seed)
 end
 
 # The extension's entry point. Debugger.jl is a weak dependency, loaded by a session
@@ -42,7 +46,7 @@ end
 
 # `enter(body)` calls the item's body, a function of no arguments, under a debugger.
 # Without a name, the item is the last run's most recent failure.
-function debug_item(enter, name::Union{Nothing, String}, seed::Union{Nothing, Integer})
+function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Nothing, Integer})
     target = interactive_target()
     target === nothing &&
         throw(ConfigError("Runtests.debug looks for test items in a package, and there is no package here"))
@@ -109,22 +113,57 @@ function last_failure(target)
     return (; name = first(names), others = names[2:end], seed = tryparse(UInt64, get(rs.meta, "seed", "")))
 end
 
-# The item called `name`, from the whole suite read the way a run reads it.
-function find_item(target, name::String)
+# The one item `what` picks from the whole suite, read the way a run reads it: an
+# exact name first, then a `Regex` matched against the names, or a path.
+function find_item(target, what::Union{String, Regex})
     claimed = claimed_environments(config_toml(target.testdir, nothing)...)
     files, strays, templates = walk_test_dir(target.testdir; claimed)
     items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, claimed)
-    i = findfirst(it -> it.name == name, items)
-    i === nothing || return items[i]
-    near = [it.name for it in items if occursin(lowercase(name), lowercase(it.name))]
-    throw(
-        NoTestsError(
-            string(
-                "no test item is called ", repr(name),
-                isempty(near) ? "" : string("; did you mean ", join(repr.(first(near, 5)), ", ", " or "), "?")
-            )
-        )
-    )
+    if what isa String
+        i = findfirst(it -> it.name == what, items)
+        i === nothing || return items[i]
+        looks_like_path(what) || throw(NoTestsError(string("no test item is called ", repr(what), near_names(what, items))))
+        picked = items_at_path(target, items, what)
+    else
+        picked = [it for it in items if occursin(what, it.name)]
+    end
+    length(picked) == 1 && return only(picked)
+    isempty(picked) && throw(NoTestsError(string("no test item's name matches ", repr(what))))
+    shown = first(picked, 10)
+    throw(ArgumentError(string(
+        "`debug` steps into one test item, and ", repr(what), " picks ", length(picked), ": ",
+        join((string(repr(it.name), " at ", relpath_or_path(it.file, target.root), ":", it.line) for it in shown), ", "),
+        length(picked) > length(shown) ? ", …" : "", "; give its name, or its `file.jl:line`"
+    )))
+end
+
+# A string `debug` reads as a path rather than a name, once no item has it as its name.
+looks_like_path(s::AbstractString) = endswith(s, ".jl") || occursin(r"\.jl:\d+$", s) || ispath(s)
+
+# The items a path picks, as `runtests` reads one: the item a `file.jl:line` is inside,
+# or every item a file or directory holds.
+function items_at_path(target, items::Vector{RawItem}, path::String)
+    t = resolve_target((path,))
+    t.root == target.root || throw(ArgumentError(
+        "$path is in the package at $(t.root), and this session's package is the one at $(target.root)"
+    ))
+    inpath = [it for it in items if matches_path(t.paths, it.file)]
+    t.line == 0 && return inpath
+    start = maximum((it.line for it in inpath if it.line <= t.line); init = Int32(0))
+    if start == 0
+        file = relpath_or_path(only(t.paths), target.root)
+        throw(NoTestsError(isempty(inpath) ? "$file holds no test items" :
+            "line $(t.line) of $file is above its first test item, at line $(minimum(it.line for it in inpath))"))
+    end
+    return [it for it in inpath if it.line == start]
+end
+
+# The names nearest one no item has, as a hint: a misspelling, or a part of a name.
+function near_names(name::String, items::Vector{RawItem})
+    names = [it.name for it in items]
+    near = unique!([nearest(name, names); [n for n in names if occursin(lowercase(name), lowercase(n))]])
+    isempty(near) && return ""
+    return string("; did you mean ", join(repr.(first(near, 5)), ", ", " or "), "?")
 end
 
 # Said before the debugger takes the terminal: which item and why, whose seed, the

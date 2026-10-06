@@ -195,6 +195,8 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                     e = next_event(s)
                     @test e["event"] == "error"
                     @test occursin(says, e["message"])
+                    # The message, as a person reads it, not the exception's type.
+                    @test !occursin("Error:", e["message"])
                 end
 
                 # One run at a time.

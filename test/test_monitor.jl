@@ -245,6 +245,27 @@ end
             maximum(ps -> ps.peak_total, st.phases)
     end
 
+    @testset "off a terminal, a report every ten finished items, none within five seconds of the last" begin
+        due = Runtests.Private.progress_due
+        @test !due(9, 0, 100.0, 0.0)
+        @test due(10, 0, 100.0, 0.0)
+        @test !due(10, 0, 104.9, 100.0)
+        @test due(10, 0, 105.0, 100.0)
+        # Counted from the last report, whatever made it.
+        @test due(57, 47, 200.0, 190.0)
+        @test !due(56, 47, 200.0, 190.0)
+
+        # Twelve items of 0.7 s on one worker, and a clock that says nothing within the
+        # hour: the tenth item finishes more than five seconds into testing.
+        items = join(("@testitem \"slow $k\" begin\n    sleep(0.7)\n    @test true\nend\n" for k in 1:12), "\n")
+        dir = make_pkg("ProgressLines", "test/a_test.jl" => items)
+        _, out = with(Runtests.Private.TTY_OVERRIDE => false) do
+            capture_run(() -> run_states(dir; workers = 1, monitor = true, monitor_interval = 3600))
+        end
+        counts = [parse(Int, m[1]) for m in eachmatch(r"· INFO · +(\d+)/12", out)]
+        @test any(c -> 10 <= c < 12, counts)
+    end
+
     @testset "the status line says what is happening" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
@@ -295,11 +316,33 @@ end
             @allocated print_status_line(buf, run.monitor)
         end
         @test minimum(draws) == 0
+    end
 
-        # The list of running items is refilled in place rather than rebuilt.
-        before = run.monitor.running
-        Runtests.Private.running_items!(run.monitor)
-        @test run.monitor.running === before
+    @testset "the status line names the item that has been running longest" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        m = run.monitor
+        @test length(run.slots) == 2
+        named(i) = " · " * sprint(io -> Runtests.Private.print_clipped(io, p.items.name[i], Runtests.Private.RUNNING_WIDTH))
+        ItemIdx = Runtests.Private.ItemIdx
+        try
+            # The second slot's item started first, so it is named, whichever slot
+            # comes first.
+            @atomic run.slots[1].current = ItemIdx(1)
+            @atomic run.slots[2].current = ItemIdx(2)
+            run.statuses.start[1], run.statuses.start[2] = 5f0, 2f0
+            @test endswith(status_line(m), named(2))
+            run.statuses.start[1], run.statuses.start[2] = 2f0, 5f0
+            @test endswith(status_line(m), named(1))
+            # A slot between items holds nothing to name.
+            @atomic run.slots[1].current = ItemIdx(0)
+            @test endswith(status_line(m), named(2))
+            @atomic run.slots[2].current = ItemIdx(0)
+            @test !occursin(p.items.name[2], status_line(m))
+        finally
+            foreach(sl -> (@atomic sl.current = ItemIdx(0)), run.slots)
+        end
     end
 
     @testset "a printed line and the status line are one update" begin

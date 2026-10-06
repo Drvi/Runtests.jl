@@ -89,20 +89,103 @@ filtered(paths...; kwargs...) =
     end
 
     @testset "by path: a file, a directory, or a line inside one" begin
-        @test filtered(dir, joinpath(dir, "test", "a_test.jl")) ==
+        @test filtered(joinpath(dir, "test", "a_test.jl")) ==
             ["adds numbers", "multiplies numbers", "solves slowly"]
-        @test filtered(dir, joinpath(dir, "test", "sub")) == ["step one", "step two", "unrelated"]
+        @test filtered(joinpath(dir, "test", "sub")) == ["step one", "step two", "unrelated"]
         # `file.jl:line` is the item that line is inside.
-        @test filtered(dir, string(joinpath(dir, "test", "a_test.jl"), ":6")) == ["multiplies numbers"]
+        @test filtered(string(joinpath(dir, "test", "a_test.jl"), ":6")) == ["multiplies numbers"]
         # Beside another file or directory, the line could pick an item there instead.
         for other in (joinpath(dir, "test", "sub", "b_test.jl"), joinpath(dir, "test", "sub"),
                       string(joinpath(dir, "test", "sub", "b_test.jl"), ":6"))
             e = try
-                filtered(dir, string(joinpath(dir, "test", "a_test.jl"), ":6"), other)
+                filtered(string(joinpath(dir, "test", "a_test.jl"), ":6"), other)
             catch err
                 err
             end
             @test e isa ArgumentError && occursin("without other files or directories", e.msg)
+        end
+    end
+
+    @testset "a line picks the item it is in; other selections keep it or leave nothing" begin
+        at(line) = string(joinpath(dir, "test", "a_test.jl"), ":", line)
+        # Line 10 is inside "solves slowly", which is not :fast. The :fast item above
+        # it is not what the line names, so nothing runs.
+        @test_throws NoTestsError filtered(at(10); tags = :fast)
+        @test filtered(at(10); tags = :math) == ["solves slowly"]
+        @test_throws NoTestsError filtered(at(6); name = "adds numbers")
+        @test filtered(at(6); name = r"numbers") == ["multiplies numbers"]
+    end
+
+    # What `f` throws, or `nothing`.
+    caught(f) = try
+        f()
+        nothing
+    catch err
+        err
+    end
+
+    @testset "several paths select what any of them does; the package or test/ among them, all of it" begin
+        file = joinpath(dir, "test", "a_test.jl")
+        everything = filtered(dir)
+        @test filtered(dir, file) == everything
+        @test filtered(joinpath(dir, "test"), file) == everything
+        @test filtered(file, joinpath(dir, "test")) == everything
+        # A path given twice is one path, and said once.
+        p, _ = prepare((file, file); announce = false)
+        @test p.selection == "paths $(joinpath("test", "a_test.jl"))"
+        # A line picks one item, so the whole suite beside it is a contradiction.
+        e = caught(() -> filtered(dir, "$file:6"))
+        @test e isa ArgumentError && occursin("without other files or directories", e.msg)
+    end
+
+    @testset "a line is one the file has" begin
+        file = joinpath(dir, "test", "a_test.jl")
+        n = countlines(file)
+        for (arg, says) in ("$file:0" => "lines are numbered from 1",
+                            "$file:$(n + 1)" => "has $n lines, so there is no line $(n + 1)",
+                            "$file:99999999999" => "lines, so there is no line")
+            e = caught(() -> filtered(arg))
+            @test e isa ArgumentError && occursin(says, e.msg)
+        end
+        @test filtered("$file:$n") == ["solves slowly"]
+        # Above the file's first item there is no item, and the error says where it is.
+        headed = make_pkg("Headed", "test/h_test.jl" => "# a header\n\n@testitem \"first\" begin\nend\n")
+        e = caught(() -> filtered(joinpath(headed, "test", "h_test.jl") * ":1"))
+        @test e isa NoTestsError
+        @test occursin("line 1 of $(joinpath("test", "h_test.jl")) is above its first test item, at line 3", sprint(showerror, e))
+    end
+
+    @testset "an empty or blank selection is a mistake, not a selection of all or of none" begin
+        for kw in ((; name = ""), (; name = "  "), (; name = String[]), (; name = Set{String}()),
+                   (; tags = Symbol[]), (; tags = String[]))
+            @test caught(() -> filtered(dir; kw...)) isa ArgumentError
+        end
+    end
+
+    @testset "a name the suite does not have is answered with the nearest it does" begin
+        said(f) = (e = caught(f); e isa NoTestsError ? sprint(showerror, e) : repr(e))
+        @test occursin("the suite has no item called \"Adds numbers\" (did you mean \"adds numbers\"?)",
+                       said(() -> filtered(dir; name = "Adds numbers")))
+        msg = said(() -> filtered(dir; name = ["multiplys numbers", "nothing like it"]))
+        @test occursin("\"multiplys numbers\" (did you mean \"multiplies numbers\"?)", msg)
+        @test occursin("\"nothing like it\"", msg)
+        # A name the suite has, that another selection leaves out, needs no hint.
+        @test !occursin("has no item called", said(() -> filtered(dir; name = "adds numbers", tags = :slow)))
+    end
+
+    @testset "a module stands for the whole suite, and is given on its own" begin
+        e = caught(() -> filtered(Runtests, dir))
+        @test e isa ArgumentError && occursin("a module stands for its package's whole suite", e.msg)
+    end
+
+    @testset "a misspelled keyword is answered with the one meant" begin
+        for (kw, meant) in (:tag => "(did you mean `tags`?)", :worker => "(did you mean `workers`?)",
+                            :dryrun => "(did you mean `dry_run`?)", :timout => "(did you mean `timeout`?)")
+            e = caught(() -> prepare((dir,); announce = false, NamedTuple{(kw,)}((1,))...))
+            @test e isa ArgumentError
+            @test occursin("unknown keyword `$kw` $meant", e.msg)
+            # Every keyword it could have been is listed, selections and settings alike.
+            @test all(k -> occursin("`$k`", e.msg), (:name, :tags, :group, :dry_run, :replay, :config, :workers, :seed))
         end
     end
 
@@ -149,12 +232,12 @@ filtered(paths...; kwargs...) =
     end
 
     @testset "name, tags and path narrow together" begin
-        @test filtered(dir, joinpath(dir, "test", "a_test.jl"); tags=:math) ==
+        @test filtered(joinpath(dir, "test", "a_test.jl"); tags=:math) ==
             ["adds numbers", "solves slowly"]
-        @test filtered(dir, joinpath(dir, "test", "a_test.jl"); tags=:math, name=r"^adds") ==
+        @test filtered(joinpath(dir, "test", "a_test.jl"); tags=:math, name=r"^adds") ==
             ["adds numbers"]
         # A path that holds none of the tagged items is no items, not all of them.
-        @test_throws NoTestsError filtered(dir, joinpath(dir, "test", "sub"); tags=:math)
+        @test_throws NoTestsError filtered(joinpath(dir, "test", "sub"); tags=:math)
     end
 
     @testset "selecting one item of a chain selects that item and no other" begin
@@ -163,7 +246,7 @@ filtered(paths...; kwargs...) =
         # selection that reaches one of them does not drag the rest in.
         @test filtered(dir; name="step two") == ["step two"]
         @test filtered(dir; tags=:seq) == ["step one"]
-        @test filtered(dir, string(joinpath(dir, "test", "sub", "b_test.jl"), ":6")) == ["step two"]
+        @test filtered(string(joinpath(dir, "test", "sub", "b_test.jl"), ":6")) == ["step two"]
     end
 
     @testset "what is left of a chain is still one unit" begin

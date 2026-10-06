@@ -92,10 +92,17 @@ end
                 # The keyword decides, so the variable is not read, and cannot fail.
                 @test !read_config(mktempdir(); coverage = false).coverage
             end
-            # A process's coverage is set when it starts, so it takes a worker.
+            # A process's coverage is set when it starts, so it takes a worker. Asked
+            # for in the call, either half of it, it is the call's mistake.
             err = try; read_config(mktempdir(); coverage = true, workers = 0); catch e; e; end
-            @test err isa ConfigError
+            @test err isa ArgumentError
             @test occursin("`workers = 0` runs the items in this one", sprint(showerror, err))
+            with_toml("[run]\ncoverage = true\n") do dir
+                @test (try; read_config(dir; workers = 0); catch e; e; end) isa ArgumentError
+            end
+            with_toml("[run]\ncoverage = true\nworkers = 0\n") do dir
+                @test (try; read_config(dir); catch e; e; end) isa ConfigError
+            end
         end
     end
 
@@ -103,7 +110,7 @@ end
         @test read_config(mktempdir(); testset_name = "integration").testset_name == "integration"
         for bad in ("", 3)
             err = try; read_config(mktempdir(); testset_name = bad); catch e; e; end
-            @test err isa ConfigError
+            @test err isa ArgumentError
             @test occursin("`testset_name` must be a non-empty string", sprint(showerror, err))
         end
     end
@@ -148,8 +155,13 @@ end
                 @test_throws ConfigError read_config(dir)
             end
         end
-        # The same from a keyword, and the message says what is allowed.
+        # The same from a keyword is the call's mistake, and the message says what is allowed.
         with_toml("") do dir
+            for kw in ((; workers = -1), (; timeout = 0), (; retries = -1), (; memory_threshold = 1.5),
+                       (; logs = :loud), (; workers = "most"), (; monitor_interval = -5), (; failfast = 1),
+                       (; verbose = "yes"), (; seed = -1), (; threads = "x"), (; testset_name = ""), (; coverage = "yes"))
+                @test_throws ArgumentError read_config(dir; kw...)
+            end
             @test_throws r"`monitor_interval` must be a number of seconds from 0" read_config(dir; monitor_interval = -1)
             @test read_config(dir; monitor_interval = 0).monitor_interval == 0
             @test_throws r"`retries` must be an integer from 0 to 126, got 127" read_config(dir; retries = 127)

@@ -68,6 +68,23 @@ end)
         @test selected(dir; group = "default") == ["core one", "core slow", "untagged"]
     end
 
+    @testset "a line picks the item it is in, and a group keeps it or leaves nothing" begin
+        at(line) = string(joinpath(dir, "test", "a_test.jl"), ":", line)
+        # Line 10 is inside "gpu one"; a line is a selection, so the default group
+        # does not apply.
+        @test selected(at(10)) == ["gpu one"]
+        # A group named beside it keeps that item or leaves nothing, never the item above.
+        @test thrown(() -> selected(at(10); group = "quick")) isa NoTestsError
+        @test thrown(() -> selected(at(6); group = "quick")) isa NoTestsError
+        @test selected(at(2); group = "quick") == ["core one"]
+        # The environment's group, like the default, is what a call that selects
+        # nothing runs: a line is a selection, so its item runs whatever its group.
+        withenv("RUNTESTS_GROUP" => "quick") do
+            @test selected(at(10)) == ["gpu one"]
+            @test selected(at(2)) == ["core one"]
+        end
+    end
+
     @testset "RUNTESTS_GROUP selects a group, and the keyword wins over it" begin
         withenv("RUNTESTS_GROUP" => "gpu") do
             @test selected(dir) == ["gpu one"]
@@ -108,15 +125,28 @@ end)
         @test selected(dir; group = "default", tags = :slow) == ["core slow"]
         @test selected(dir; group = "default", name = r"^core") == ["core one", "core slow"]
         @test_throws NoTestsError selected(dir; group = "quick", name = "gpu one")
-        withenv("RUNTESTS_GROUP" => "default") do
+    end
+
+    @testset "RUNTESTS_GROUP gives way to any selection the call makes, as the default does" begin
+        withenv("RUNTESTS_GROUP" => "quick") do
+            @test selected(dir; name = "gpu one") == ["gpu one"]
+            @test selected(dir; tags = :slow) == ["core slow"]
+            @test selected(joinpath(dir, "test", "a_test.jl")) == EVERY_ITEM
+            # The keyword is a selection the call makes, and narrows with the others.
+            @test_throws NoTestsError selected(dir; group = "quick", name = "gpu one")
+            # A run of the whole suite is one the call asks for.
+            @test selected(dir; group = "all") == EVERY_ITEM
+        end
+        # Given way to, it is not read: a name the call does not use is not its mistake.
+        withenv("RUNTESTS_GROUP" => "nightly") do
             @test selected(dir; tags = :core) == ["core one", "core slow"]
-            @test_throws NoTestsError selected(dir; name = "gpu one")
         end
     end
 
     @testset "a group that is not declared is an error, naming those that are" begin
+        # From the call it is the call's mistake; from the environment, the setup's.
         err = thrown(() -> selected(dir; group = "gpuu"))
-        @test err isa ConfigError
+        @test err isa ArgumentError
         msg = sprint(showerror, err)
         @test occursin("the `group` keyword asks for group `gpuu`", msg)
         @test occursin("`default`, `gpu`, `quick`", msg)
@@ -125,19 +155,61 @@ end)
             err = thrown(() -> selected(dir))
             @test err isa ConfigError
             @test occursin("`RUNTESTS_GROUP` asks for group `nightly`", sprint(showerror, err))
-            # Whatever else the call selects: a misspelled lane must not run something else.
-            @test thrown(() -> selected(dir; tags = :core)) isa ConfigError
         end
-        # Names are matched exactly, as a TOML key is written.
-        @test thrown(() -> selected(dir; group = "GPU")) isa ConfigError
+        # Names are matched exactly, as a TOML key is written, and a near miss is named.
+        err = thrown(() -> selected(dir; group = "GPU"))
+        @test err isa ArgumentError && occursin("did you mean `gpu`", sprint(showerror, err))
         plain = make_pkg("NoGroups", "test/a_test.jl" => GROUPED)
         err = thrown(() -> selected(plain; group = "gpu"))
-        @test err isa ConfigError && occursin("declares no [groups]", sprint(showerror, err))
+        @test err isa ArgumentError && occursin("declares no [groups]", sprint(showerror, err))
         withenv("RUNTESTS_GROUP" => "gpu") do
             @test thrown(() -> selected(plain)) isa ConfigError
         end
         @test thrown(() -> selected(dir; group = 1)) isa ArgumentError
         @test thrown(() -> selected(dir; group = "")) isa ArgumentError
+    end
+
+    @testset "`default` and `all` are reserved, and always mean something" begin
+        # Undeclared, `default` is what a run selects by default: the whole suite,
+        # in a run that counts as one of the whole suite.
+        plain = make_pkg("NoDefault", "test/a_test.jl" => GROUPED, "test/TestItems.toml" => "[groups]\ngpu = \"gpu\"\n")
+        @test selected(plain; group = "default") == EVERY_ITEM
+        @test isempty(first(prepare((plain,); announce = false, group = "default")).selection)
+        withenv("RUNTESTS_GROUP" => "default") do
+            @test selected(plain) == EVERY_ITEM
+        end
+        bare = make_pkg("NoGroupsAtAll", "test/a_test.jl" => GROUPED)
+        @test selected(bare; group = "default") == EVERY_ITEM
+        # Declared, it is that group.
+        @test selected(dir; group = "default") == ["core one", "core slow", "untagged"]
+        # Neither can be declared under another case: `All` beside `all` would select
+        # something other than the whole suite.
+        for (name, says) in ("all" => "`all` is the whole suite, and is not declared",
+                             "All" => "`all` is reserved, and this differs from it only in case",
+                             "ALL" => "`all` is reserved",
+                             "Default" => "`default` is reserved, and this differs from it only in case")
+            bad = make_pkg("Reserved", "test/a_test.jl" => GROUPED, "test/TestItems.toml" => "[groups]\n$name = \"gpu\"\n")
+            err = thrown(() -> selected(bad))
+            @test err isa ConfigError
+            @test occursin("group `$name` of [groups]", sprint(showerror, err)) && occursin(says, sprint(showerror, err))
+        end
+    end
+
+    @testset "a misspelled group is answered with the one meant" begin
+        hint(path, group) = (e = thrown(() -> selected(path; group)); e isa ArgumentError ? sprint(showerror, e) : repr(e))
+        @test occursin("did you mean `all`?", hint(dir, "ALL"))
+        @test occursin("did you mean `all`?", hint(dir, "All"))
+        @test occursin("did you mean `default`?", hint(dir, "Default"))
+        @test occursin("did you mean `default`?", hint(dir, "deafult"))
+        @test occursin("did you mean `quick`?", hint(dir, "quik"))
+        # Where nothing declares groups, the reserved names are still there to mean.
+        bare = make_pkg("HintsBare", "test/a_test.jl" => GROUPED)
+        @test occursin("declares no [groups] (did you mean `all`?)", hint(bare, "ALL"))
+        # From the environment too, as a ConfigError.
+        withenv("RUNTESTS_GROUP" => "All") do
+            err = thrown(() -> selected(dir))
+            @test err isa ConfigError && occursin("did you mean `all`?", sprint(showerror, err))
+        end
     end
 
     @testset "the run says which group it selected, and what chose it" begin
@@ -186,7 +258,10 @@ end)
         @test selected(dir; config = other, group = "nightly") == ["core slow"]
         # It replaces test/TestItems.toml, so that file's default does not apply.
         @test selected(dir; config = other) == EVERY_ITEM
-        @test thrown(() -> selected(dir; config = other, group = "gpu")) isa ConfigError
+        err = thrown(() -> selected(dir; config = other, group = "gpu"))
+        @test err isa ArgumentError && occursin("which [groups] of", sprint(showerror, err))
+        # `gpu` is not near `nightly`, nor near `all`: no hint is better than a wrong one.
+        @test !occursin("did you mean", sprint(showerror, err))
     end
 
     @testset "a run of a group is not a run of the whole suite" begin

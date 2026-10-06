@@ -81,21 +81,28 @@ Runtests.runtests(dry_run=true)             # inspect the plan without running
 Runtests.runtestsf()                        # items whose latest verdict did not pass
 ```
 
-Paths, names, and tags narrow the selection together. `name` also accepts a vector
-or set of exact names. A `file.jl:line` target must be the only positional target.
-Tag expressions support `!`, `&&`, and `||`; `&&` binds tighter than `||`, and
-parentheses are not supported. A tag that no item in the suite carries is an
-error, so a misspelled tag cannot pass for a selection of nothing or, under `!`,
-of everything.
+Paths, names, tags and a group narrow the selection together. Several paths select
+what any of them does, so the package or its `test/` among them is the whole suite.
+`name` also accepts a vector or set of exact names. A `file.jl:line` target picks the
+item that line is inside, whatever the other selections, which then keep it or leave
+nothing; it is the only positional target, and names a line the file has. Tag
+expressions support `!`, `&&`, and `||`; `&&` binds tighter than `||`, and
+parentheses are not supported.
 
-`group` picks a named selection from [`[groups]`](#testtestitemstoml), and
-`RUNTESTS_GROUP` does the same from the environment, for a CI matrix; the keyword
-wins. A group named `default` is what a run selects when nothing else selects, and
-`group="all"` is the whole suite.
+A selection that cannot mean what was intended is an error rather than a selection
+of everything or of nothing: an empty `name` or `tags`, a tag no item in the suite
+carries, a name it does not have, a group `[groups]` does not declare, a misspelled
+keyword. Each error names the nearest thing that does exist.
+
+`group` picks a named selection from [`[groups]`](#groups). A call that selects
+nothing else runs the group `RUNTESTS_GROUP` names, for a CI matrix, and otherwise
+`default`: the group of that name when `[groups]` declares one, and the whole suite
+when it does not. `group="all"` is always the whole suite.
 
 `runtestsf()` remembers each item's latest verdict across runs. Rerunning one
 failure does not forget other failures, and renamed or deleted items are left
-out. To reproduce a recorded run's settings and seed, use
+out. Every other selection narrows the failing items, `name` included, so nothing
+that is not failing runs. To reproduce a recorded run's settings and seed, use
 [`replay`](#run-state).
 
 A normal run returns a `RunTestSet`; a dry run returns `nothing`. Outside an
@@ -108,8 +115,8 @@ Problems discovered before execution also throw:
 |:------|:------|
 | `Runtests.ScanFailure` | Invalid test files, duplicate names, or missing or stale template expansions. |
 | `Runtests.NoTestsError` | No test files, no matching items, or no recorded failures for `runtestsf()`. |
-| `Runtests.ConfigError` | Invalid settings, profiles, groups, or test setup configuration, an undeclared group, or a profile's environment that does not resolve. |
-| `ArgumentError` | Invalid arguments, such as a malformed tag expression, a tag no item carries, or a path outside `test/` or in another package. |
+| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, another config file or an environment variable: an invalid setting, profile or group, an undeclared group in `RUNTESTS_GROUP`, or a profile's environment that does not resolve. |
+| `ArgumentError` | A mistake in the call: a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a tag no item carries, an undeclared group, or a path outside `test/`, in another package, or at a line the file does not have. |
 
 See [Configuration](#testtestitemstoml) for worker counts, timeouts, output,
 coverage, and other run options.
@@ -393,11 +400,18 @@ precompilation for the profile's preferences.
 `[groups]` names tag expressions, written as `tags` takes them. `runtests(group="gpu")`
 or `RUNTESTS_GROUP=gpu` runs the items an expression selects, and the run's header
 says which group it was and what picked it: the keyword, the variable, or nothing
-else selecting, for `default`. Any other selection, a path, `name`, `tags` or
-`group`, replaces `default`; `tags` and `group` given together both apply.
-`group="all"` is the whole suite and is not declared. A name `[groups]` does not
-declare is an error that lists the ones it does, and so is an expression that names
-a tag no item carries. `Runtests.chores()` checks every group.
+else selecting, for `default`. `RUNTESTS_GROUP` and `default` apply only to a call
+that selects nothing else: a path, a line, `name`, `tags` or `group` takes their
+place, so an item asked for runs whatever group it is in. The `group` keyword is a
+selection like the others, and narrows together with them.
+
+Two names are reserved. `all` is the whole suite and is not declared. `default` is
+what a run selects by default: the group declared under that name, and the whole
+suite when none is. A name that differs from either only in case is an error, and a
+misspelled group is answered with the one meant (`ALL` with `all`). A name
+`[groups]` does not declare is an error that lists the ones it does, and so is an
+expression that names a tag no item carries. `Runtests.chores()` checks every
+group.
 
 A run of a group, `default` included, is a selection like any other: `[order]` may
 name items outside it, and it is not a run of the whole suite, which `group="all"`
@@ -449,7 +463,7 @@ block each say how many test files it holds.
 | `verbose` | `false` | Print results and output for passing items too. |
 | `memory_threshold` | `0.9` | Fraction of machine memory in use at which new items wait; must be in `(0, 1]`. |
 | `monitor` | `true` | Monitor memory and display progress. |
-| `monitor_interval` | `30` | Seconds between progress lines outside a terminal; `0` prints at each sample, five times a second. |
+| `monitor_interval` | `30` | Seconds between progress lines outside a terminal, which also print every 10 finished items; `0` prints at each sample, five times a second. |
 | `full_stacktraces` | `false` | Include Runtests' internal frames in failure backtraces. |
 | `full_names` | `false` | Print long names in full instead of [unique prefixes](#the-plan). |
 | `testset_name` | `"Runtests"` | Summary testset name; useful for several runs inside one `@testset`. |
@@ -458,7 +472,7 @@ block each say how many test files it holds.
 | `dry_run` | `false` | Print the plan without executing tests. |
 | `replay` | `nothing` | Path to a recorded [run state](#run-state). |
 | `config` | `test/TestItems.toml` | Config file to read; an explicit path is relative to the current directory. |
-| `group` | `RUNTESTS_GROUP`, else `default` | A [group](#groups) to run; `"all"` for the whole suite. |
+| `group` | `RUNTESTS_GROUP`, else `default`, when nothing else selects | A [group](#groups) to run; `"all"` for the whole suite. |
 
 An interactive run with at most one worker defaults to `logs=:eager`. All options
 above except `dry_run`, `replay`, `config`, and `group` can also go under `[run]`; use TOML
@@ -579,8 +593,9 @@ Workers, test items and the run itself each get lines of one shape:
 ⚫ is a worker starting or ending, 🔵 an item starting, 🟢 an item that passed, 🔴
 one that failed, errored or timed out, and 🟡 one skipped or never reached. ⚪ is
 the run's progress line: on a terminal it stays at the bottom and is redrawn as the
-run goes; otherwise it is printed every `monitor_interval` seconds, when the run
-moves from setup to testing, and when the machine's memory crosses 90%.
+run goes; otherwise it is printed every `monitor_interval` seconds, every 10 finished
+items but no sooner than 5 seconds after the previous one, when the run moves from
+setup to testing, and when the machine's memory crosses 90%.
 
 An item that did not pass gets its results and captured output right after its
 `DONE` line:
@@ -675,7 +690,16 @@ julia> using Debugger
 julia> Runtests.debug()                 # the last run's most recent failure
 
 julia> Runtests.debug("adds numbers")   # seed = … to draw the random numbers a run drew
+
+julia> Runtests.debug(r"^adds")         # the one item whose name matches
+
+julia> Runtests.debug("test/math_test.jl:12")   # the item line 12 is inside
 ```
+
+`debug` steps into exactly one item: one an exact name, a `Regex` or a path picks. A
+path is read as `runtests` reads one, relative to the current directory: a
+`file.jl:line`, or a file or directory that holds one item. What picks no item, or
+several, is an error that lists what it found.
 
 Without a name it steps into the failure the last run recorded most recently, with
 that run's seed, and names the run's other failures; if the last run passed, there

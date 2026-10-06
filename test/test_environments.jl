@@ -241,7 +241,10 @@ end
             msg = message_of(() -> plan_of(joinpath(paths, "test", "vendor", "v_tests.jl")))
             @test occursin("$(joinpath("test", "vendor", "v_tests.jl")) is in $(joinpath("test", "vendor")), which " *
                            "has an environment of its own; a profile with `environment = \"vendor\"` runs the tests there", msg)
-            @test occursin("environment = \"vendor\"", message_of(() -> plan_of(joinpath(paths, "test", "vendor"))))
+            # Given the directory itself, it says so of the directory.
+            msg = message_of(() -> plan_of(joinpath(paths, "test", "vendor")))
+            @test occursin("$(joinpath("test", "vendor")) has an environment of its own; a profile with `environment = \"vendor\"`", msg)
+            @test !occursin(" is in ", msg)
         end
 
         @testset "item names are one namespace across environments" begin

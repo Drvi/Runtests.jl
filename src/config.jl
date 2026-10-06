@@ -82,13 +82,29 @@ const RUN_KEYS = (
     :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
     :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
 )
+# The keywords of `runtests` that are not run settings: what it selects, and what it
+# does with the selection.
+const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config)
+
+# A keyword `runtests` does not take, with the nearest it does: a misspelled one would
+# otherwise be the one setting a run quietly goes without.
+function unknown_keyword(k::Symbol)
+    # Keywords are short, and three edits turn `tag` into `name`: one in three letters.
+    near = nearest(String(k), String[String(x) for x in (CALL_KEYS..., RUN_KEYS...)]; cutoff = max(1, length(String(k)) ÷ 3))
+    return ArgumentError(string(
+        "unknown keyword `", k, "`", isempty(near) ? "" : string(" (did you mean ", join(("`$n`" for n in near), " or "), "?)"),
+        "; `runtests` selects with ", join(("`$x`" for x in CALL_KEYS[1:3]), ", "), ", takes ",
+        join(("`$x`" for x in CALL_KEYS[4:end]), ", "), ", and the run settings ", join(("`$x`" for x in RUN_KEYS), ", ")
+    ))
+end
+
 const ORDER_KEYS = (:first, :last)
 const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :environment)
 const TOP_KEYS = (:run, :order, :profiles, :groups)
 const LOG_MODES = (:eager, :batched, :issues)
 
-# The group a run selects when nothing else selects, and the name of the whole suite,
-# which no `[groups]` entry may take.
+# The group a run selects when nothing else selects, the whole suite unless declared,
+# and the name of the whole suite, which no `[groups]` entry may take.
 const DEFAULT_GROUP = "default"
 const ALL_GROUP = "all"
 
@@ -179,39 +195,43 @@ end
 
 function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
     for k in keys(kwargs)
-        k in RUN_KEYS || throw(ConfigError("unknown keyword `$k`; the run settings are $(join(RUN_KEYS, ", "))"))
+        k in RUN_KEYS || throw(unknown_keyword(k))
     end
+    # A value the call gave is the call's mistake; one from the file or the
+    # environment is the configuration's.
+    given(keys...) = any(k -> get(kwargs, k, nothing) !== nothing, keys)
+    bad(msg, keys...) = given(keys...) ? ArgumentError(msg) : ConfigError(msg)
     run = section(path, toml, "run", RUN_KEYS)
     # A keyword wins over the file, and the file over the default.
     pick(key, default) = something(get(kwargs, key, nothing), get(run, string(key), default))
     seconds(key, x) = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
-        throw(ConfigError("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))"))
+        throw(bad("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))", key))
     # 0 prints at every sample, five times a second: a test's way to make the
     # monitor print as often as it can.
     interval(x) = (is_number(x) && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
-        throw(ConfigError("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))"))
+        throw(bad("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))", :monitor_interval))
     flag(key, default) = (v = pick(key, default); v isa Bool ? v :
-        throw(ConfigError("`$key` must be true or false, got $(repr(v))")))
+        throw(bad("`$key` must be true or false, got $(repr(v))", key)))
 
-    threads = threads_spec("threads", pick(:threads, "2,1"))
+    threads = threads_spec("threads", pick(:threads, "2,1"), given(:threads) ? ArgumentError : ConfigError)
     w = pick(:workers, "auto")
     # A worker is a slot, and slots are numbered in a `SlotIdx`.
-    ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(ConfigError(
-        "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))"
+    ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(bad(
+        "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))", :workers
     ))
     workers = w isa Integer ? Int(w) : auto_workers(threads, nunits)
     logs = Symbol(pick(:logs, default_logs(workers)))::Symbol
-    logs in LOG_MODES || throw(ConfigError("`logs` must be one of $(LOG_MODES), got $(repr(logs))"))
+    logs in LOG_MODES || throw(bad("`logs` must be one of $(LOG_MODES), got $(repr(logs))", :logs))
     timeout = seconds(:timeout, pick(:timeout, 30 * 60))
     retries = pick(:retries, 0)
     (is_whole_number(retries) && 0 <= retries <= MAX_RETRIES) ||
-        throw(ConfigError("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))"))
+        throw(bad("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))", :retries))
     mt = pick(:memory_threshold, 0.9)
-    (is_number(mt) && 0 < mt <= 1) || throw(ConfigError("`memory_threshold` must be in (0, 1], got $(repr(mt))"))
+    (is_number(mt) && 0 < mt <= 1) || throw(bad("`memory_threshold` must be in (0, 1], got $(repr(mt))", :memory_threshold))
     failfast = flag(:failfast, false)
     seed = pick(:seed, 0)
     (is_whole_number(seed) && 0 <= seed <= typemax(UInt64)) ||
-        throw(ConfigError("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))"))
+        throw(bad("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))", :seed))
     order = section(path, toml, "order", ORDER_KEYS)
     # A keyword, then the environment, then the file: CI switches coverage on for a
     # job without editing the project. The environment is read only when the keyword
@@ -223,14 +243,14 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         env_coverage !== nothing ? (env_coverage, "`RUNTESTS_COVERAGE`") :
             haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
     end
-    coverage isa Bool || throw(ConfigError("`coverage` must be true or false, got $(repr(coverage))"))
-    coverage && workers == 0 && throw(ConfigError(
+    coverage isa Bool || throw(bad("`coverage` must be true or false, got $(repr(coverage))", :coverage))
+    coverage && workers == 0 && throw((given(:coverage, :workers) ? ArgumentError : ConfigError)(
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
             "whose coverage was fixed when it started; use one worker or more"
     ))
     testset_name = pick(:testset_name, "Runtests")
     (testset_name isa AbstractString && !isempty(testset_name)) ||
-        throw(ConfigError("`testset_name` must be a non-empty string, got $(repr(testset_name))"))
+        throw(bad("`testset_name` must be a non-empty string, got $(repr(testset_name))", :testset_name))
 
     return RunConfig(;
         workers, threads, timeout_s = timeout,
@@ -254,9 +274,9 @@ end
 
 # What `--threads` takes: default threads, `auto` or at least one, then optionally
 # interactive ones, `auto` or any number. Checked here, or the first worker dies of it.
-function threads_spec(what, x)
+function threads_spec(what, x, err = ConfigError)
     s = x isa Integer ? string(x) : x
-    (s isa AbstractString && occursin(r"^(auto|[1-9][0-9]*)(,(auto|[0-9]+))?$", s)) || throw(ConfigError(
+    (s isa AbstractString && occursin(r"^(auto|[1-9][0-9]*)(,(auto|[0-9]+))?$", s)) || throw(err(
         "`$what` must be what `--threads` takes (\"4\", \"4,1\", \"auto\"), got $(repr(x))"
     ))
     return String(s)
@@ -369,9 +389,10 @@ end
     read_groups(path, toml) -> Dict{String, TagExpr}
 
 The `[groups]` table: names for tag expressions, each written as a string as `tags`
-takes one, which a run selects by with the `group` keyword or `RUNTESTS_GROUP`.
-`$DEFAULT_GROUP` is what a run selects when nothing else selects; `$ALL_GROUP` is the
-whole suite, and is not declared.
+takes one, which a run selects by with the `group` keyword or `RUNTESTS_GROUP`. Two
+names are reserved: `$DEFAULT_GROUP` is what a run selects when nothing else selects,
+the whole suite unless declared here, and `$ALL_GROUP` is the whole suite, and is not
+declared. A name that differs from either only in case is an error.
 """
 function read_groups(path, toml)
     tbl = get(Dict{String, Any}, toml, "groups")
@@ -380,6 +401,13 @@ function read_groups(path, toml)
     for (name, value) in tbl
         what = "group `$name` of [groups] in $(relpath_or_path(path))"
         name == ALL_GROUP && throw(ConfigError("$what: `$ALL_GROUP` is the whole suite, and is not declared"))
+        # Told apart by case alone, `All` and `all` would select different items.
+        reserved = lowercase(name)
+        reserved in (ALL_GROUP, DEFAULT_GROUP) && name != DEFAULT_GROUP && throw(ConfigError(string(
+            what, ": `", reserved, "` is reserved, and this differs from it only in case; ",
+            reserved == ALL_GROUP ? "`all` is the whole suite, and is not declared" :
+                "declare the group a run selects by default as `default`"
+        )))
         value isa AbstractString || throw(ConfigError(
             "$what must be a tag expression written as a string, as in `$name = \"fast && !slow\"`, got $(repr(value))"
         ))
@@ -396,39 +424,49 @@ end
 """
     select_group(groups, path, requested, selected) -> Union{Nothing, GroupSelection}
 
-The group a run selects by: the `group` keyword, `requested`, else `RUNTESTS_GROUP`,
-else, for a run that selects nothing else (`selected` false), the `$DEFAULT_GROUP`
-group when `[groups]` of the config file `path` declares one. `nothing` for no group,
-and for `$ALL_GROUP`, which is the whole suite. A name `[groups]` does not declare is
-an error, as a misspelled option is.
+The group a run selects by: the `group` keyword, `requested`; else, for a run that
+selects nothing else (`selected` false), the group `RUNTESTS_GROUP` names, else
+`$DEFAULT_GROUP`. `nothing` for the whole suite: `$ALL_GROUP`, and `$DEFAULT_GROUP`
+when `[groups]` of the config file `path` does not declare it. A name `[groups]` does
+not declare is an error that says the nearest it does: an `ArgumentError` from the
+keyword, a `ConfigError` from the environment.
 """
 function select_group(groups::Dict{String, TagExpr}, path::AbstractString, requested, selected::Bool)
     if requested !== nothing
         (requested isa Union{AbstractString, Symbol} && !isempty(string(requested))) || throw(ArgumentError(
-            "`group = $(repr(requested))`: expected the name of a group of [groups], or \"$ALL_GROUP\""
+            "`group = $(repr(requested))`: expected the name of a group of [groups], \"$ALL_GROUP\" or \"$DEFAULT_GROUP\""
         ))
         name, asker = String(string(requested)), "the `group` keyword"
     else
+        # Like the default, the environment's group is what a run selects when the
+        # call selects nothing: a name or a line asked for runs whatever group it is in.
+        selected && return nothing
         env = strip(get(ENV, "RUNTESTS_GROUP", ""))
-        if !isempty(env)
-            name, asker = String(env), "`RUNTESTS_GROUP`"
-        elseif !selected && haskey(groups, DEFAULT_GROUP)
-            return GroupSelection(DEFAULT_GROUP, groups[DEFAULT_GROUP], "the default", path)
-        else
-            return nothing
-        end
+        name, asker = isempty(env) ? (DEFAULT_GROUP, "") : (String(env), "`RUNTESTS_GROUP`")
     end
     name == ALL_GROUP && return nothing
-    haskey(groups, name) && return GroupSelection(name, groups[name], string("from ", asker), path)
+    haskey(groups, name) &&
+        return GroupSelection(name, groups[name], isempty(asker) ? "the default" : string("from ", asker), path)
+    name == DEFAULT_GROUP && return nothing
     file = relpath_or_path(path)
-    isempty(groups) && throw(ConfigError("$asker asks for group `$name`, and $file declares no [groups]"))
     declared = sort!(collect(keys(groups)))
-    near = nearest(name, declared)
-    throw(ConfigError(string(
-        asker, " asks for group `", name, "`, which [groups] of ", file, " does not declare; it declares ",
-        join(("`$g`" for g in declared), ", "), ", and `$ALL_GROUP` is the whole suite",
-        isempty(near) ? "" : string(" (did you mean ", join(("`$g`" for g in near), " or "), "?)")
-    )))
+    near = near_group_names(name, [declared; ALL_GROUP; haskey(groups, DEFAULT_GROUP) ? String[] : [DEFAULT_GROUP]])
+    hint = isempty(near) ? "" : string(" (did you mean ", join(("`$g`" for g in near), " or "), "?)")
+    msg = isempty(groups) ? string(asker, " asks for group `", name, "`, and ", file, " declares no [groups]", hint) :
+        string(asker, " asks for group `", name, "`, which [groups] of ", file, " does not declare", hint,
+               "; it declares ", join(("`$g`" for g in declared), ", "), ", and `$ALL_GROUP` is the whole suite")
+    throw(requested !== nothing ? ArgumentError(msg) : ConfigError(msg))
+end
+
+# The names among `candidates` that `name` most likely meant, without regard to case:
+# one that differs only in case first, else the nearest by spelling.
+function near_group_names(name::AbstractString, candidates::Vector{String})
+    low = lowercase(name)
+    same = [c for c in candidates if lowercase(c) == low]
+    isempty(same) || return same
+    lows = lowercase.(candidates)
+    # Group names are short: one edit in three letters, or `gpu` would suggest `all`.
+    return [candidates[findfirst(==(n), lows)] for n in nearest(low, lows; cutoff = max(1, length(low) ÷ 3))]
 end
 
 """

@@ -66,6 +66,8 @@ environment is used.
 
 `paths` narrow what is read: a directory, a test file, or `file.jl:42` to select
 the item that line is inside, which is given without other files or directories.
+Several paths select what any of them does, so the package or its `test/` among them
+is the whole suite.
 
 Returns the run's testset, a [`RunTestSet`](@ref) named `testset_name` (`"Runtests"`
 unless given), holding one testset per test file. Inside an enclosing `@testset`
@@ -80,11 +82,13 @@ another task or thread, throws and leaves that run going.
 
 Selection: `name` (`String` for an exact match, `Regex` for a partial one, or a
 set of exact names), `tags` (a symbol or vector of symbols an item must carry
-all of, or a string expression such as `"!slow"` or `"juliac || serializer"`; a tag
-no item carries is an error), and `group` (the name of a tag expression `[groups]` of
-`test/TestItems.toml` declares; also `RUNTESTS_GROUP`, which the keyword overrides).
-A run that selects nothing else selects the group named `default`, when there is
-one, and `group = "all"` is the whole suite. Selections narrow together.
+all of, or a string expression such as `"!slow"` or `"juliac || serializer"`), and
+`group` (the name of a tag expression `[groups]` of `test/TestItems.toml` declares,
+or `"all"`, the whole suite, or `"default"`). The selections a call gives narrow
+together. A call that gives none selects the group `RUNTESTS_GROUP` names, when it is
+set, and otherwise `default`: the group of that name when `[groups]` declares one,
+and the whole suite when it does not. A name, tag or group the suite does not have
+is an error that says the nearest it does.
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
@@ -104,10 +108,12 @@ downloaded from CI, say) and runs it again: the same items, settings, profiles
 and seed, with any keyword given here winning, and a warning naming each package
 whose version differs from the one recorded.
 
-Every keyword can also be set in `test/TestItems.toml`, which additionally
-declares sandbox profiles and forced ordering; an explicit keyword wins. `config`
-names another file to read in its place, relative to the current directory, which
-has to exist; nothing but this keyword makes a run read one.
+The execution and output settings can also be set under `[run]` in
+`test/TestItems.toml`, which also declares profiles, groups and forced ordering; a
+keyword wins. `config` names another file to read in its place, relative to the
+current directory, which has to exist; nothing but this keyword makes a run read
+one. A mistake in the call, such as a misspelled keyword or a value out of range, is
+an `ArgumentError`; one in a file or an environment variable is a `ConfigError`.
 """
 function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, kwargs...)
     return exclusively() do
@@ -158,9 +164,10 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     t_files = time()
     walked = walk_test_dir(target.testdir; claimed)
     for path in target.paths, (dir, _) in walked.unclaimed
-        (rstrip_path(path) == dir || startswith(path, joinpath(dir, ""))) && throw(NoTestsError(string(
-            relpath_or_path(path, target.root), " is in ", relpath_or_path(dir, target.root),
-            ", which has an environment of its own; a profile with `environment = ",
+        itself = rstrip_path(path) == dir
+        (itself || startswith(path, joinpath(dir, ""))) && throw(NoTestsError(string(
+            itself ? "" : string(relpath_or_path(path, target.root), " is in "), relpath_or_path(dir, target.root),
+            itself ? " has" : ", which has", " an environment of its own; a profile with `environment = ",
             repr(relpath_or_path(dir, target.testdir)), "` runs the tests there"
         )))
     end
@@ -181,7 +188,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
     items = scan(files, filter, setups; strays, templates, expansions, suite_names, claimed)
-    isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
+    isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target) * name_hint(filter.name, suite_names)))
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
         plural(length(unique(i -> i.file, items)), "file"),
@@ -202,6 +209,19 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
     return p, target
+end
+
+# For a name, or names, that the suite does not have: the nearest it does, since a
+# selection that matched nothing is most often a misspelling.
+function name_hint(name, suite_names::Vector{String})
+    wanted = name isa String ? [name] : name isa Set{String} ? sort!(collect(name)) : String[]
+    unknown = [n for n in wanted if !(n in suite_names)]
+    isempty(unknown) && return ""
+    told = map(unknown) do n
+        near = nearest(n, suite_names)
+        isempty(near) ? repr(n) : string(repr(n), " (did you mean ", join(repr.(near), " or "), "?)")
+    end
+    return string("; the suite has no item called ", join(told, ", "))
 end
 
 # `replay`: a run state (one downloaded from CI, say) to run again. Only when asked:
@@ -269,8 +289,11 @@ item leaves that item's verdict as it was. Only items the suite still has run: o
 renamed or deleted since it failed has nothing to run. With `replay`, the verdicts
 are that run's and those of the runs that started after it. See
 [`failing_items`](@ref).
+
+Every other selection narrows the failing items: `name` keeps those it matches, as
+paths, a `file.jl:line`, `tags` and `group` do, so nothing that is not failing runs.
 """
-function runtestsf(args...; replay = nothing, kwargs...)
+function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
     target = resolve_target(args)
     base = replay === nothing ? nothing : read_replay(String(replay), target; announce = false)
     names = Set(failing_items(target.root; names = suite_item_names(target; config = get(kwargs, :config, nothing)), base))
@@ -280,10 +303,16 @@ function runtestsf(args...; replay = nothing, kwargs...)
                 (isempty(runstate_files(target.root)) ? " (no run state found for this project)" : "")
         )
     )
-    println(
-        stdout, label_prefix(), "running ", plural(length(names), "failing item")
-    )
-    return runtests(args...; name = names, replay, kwargs...)
+    if name !== nothing
+        want = Filter(; name).name
+        kept = Set(n for n in names if matches_name(want, n))
+        isempty(kept) && throw(NoTestsError(string(
+            "none of the ", plural(length(names), "failing item"), " matches name = ", repr(name), ": ",
+            join(repr.(first(sort!(collect(names)), 10)), ", "), length(names) > 10 ? ", …" : ""
+        )))
+        names = kept
+    end
+    return runtests(args...; name = FailingItems(names), replay, kwargs...)
 end
 
 # Every item's name in the suite, read as a run reads it, the environments profiles
@@ -313,21 +342,26 @@ end
 function resolve_target(args)
     isempty(args) && return target_from_dir(default_search_dir())
     length(args) == 1 && args[1] isa Module && return target_from_dir(_pkgdir(args[1]))
-    paths = String[]; line = Int32(0)
+    any(a -> a isa Module, args) && throw(ArgumentError(
+        "a module stands for its package's whole suite, so it is given on its own: got $(join(map(repr, args), ", "))"
+    ))
+    paths = String[]; line = Int32(0); line_arg = ""
     for a in args
         a isa AbstractString || throw(ArgumentError("Runtests.runtests takes paths or a module, got $(repr(a))"))
         path, ln = split_line_suffix(String(a))
-        ln == 0 || (line = ln)
+        ln == 0 || (line = ln; line_arg = String(a))
         push!(paths, abspath(path))
     end
     for path in paths
         ispath(path) || throw(ArgumentError("no such file or directory: $path"))
     end
     t = target_from_dir(isdir(first(paths)) ? first(paths) : dirname(first(paths)))
-    # Naming the project or its test directory means "everything", not a narrowing.
+    # Naming the project or its test directory means "everything": beside other
+    # paths too, since several paths select what any of them does.
+    whole = false
     narrowing = String[]
     for path in paths
-        rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && continue
+        rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && (whole = true; continue)
         if !startswith(path, joinpath(t.testdir, ""))
             # In a monorepo, the likeliest path outside `test/` is another package's.
             other = find_project(isdir(path) ? path : dirname(path))
@@ -342,15 +376,21 @@ function resolve_target(args)
                 "$(path) is not a test file; test files are named `*_test.jl` or `*_tests.jl`"
             )
         )
-        push!(narrowing, path)
+        path in narrowing || push!(narrowing, path)
     end
     # The line picks one item, the last to start at or above it among those the paths
     # select: beside another file or directory, it could pick one there.
-    line == 0 || length(narrowing) == 1 || throw(ArgumentError(
+    line == 0 || (length(narrowing) == 1 && !whole) || throw(ArgumentError(
         "a `file.jl:line` target picks the item at that line, so it is given without other " *
         "files or directories: got $(join(map(repr, args), ", "))"
     ))
-    return Target(t.root, t.project, t.testdir, narrowing, line)
+    if line != 0
+        n = countlines(only(narrowing))
+        line <= n || throw(ArgumentError(
+            "`$line_arg`: $(relpath_or_path(only(narrowing), t.root)) has $(plural(n, "line")), so there is no line $line"
+        ))
+    end
+    return Target(t.root, t.project, t.testdir, whole ? String[] : narrowing, line)
 end
 
 rstrip_path(p::AbstractString) = rstrip(p, PATH_SEPARATORS)
@@ -365,7 +405,10 @@ function split_line_suffix(path::AbstractString)
     m = match(r"^(.*\.jl):(\d+)$", path)
     m === nothing && return String(path), Int32(0)
     # Neither group is optional, so a match has both.
-    return String(m[1]::AbstractString), parse(Int32, m[2]::AbstractString)
+    # Too large to be a line is past the end of any file, which is said as such.
+    line = something(tryparse(Int32, m[2]::AbstractString), typemax(Int32))
+    line == 0 && throw(ArgumentError("`$path`: lines are numbered from 1"))
+    return String(m[1]::AbstractString), line
 end
 
 # Not the active project: under `Pkg.test` that is a temporary environment, and the
@@ -433,7 +476,7 @@ is_full_run(f::Filter, t::Target) =
 
 function describe(f::Filter, t::Target)
     parts = String[]
-    f.name === nothing || push!(parts, f.name isa Set ? plural(length(f.name), "named item") : "name = $(repr(f.name))")
+    f.name === nothing || push!(parts, f.name isa Set ? plural(length(f.name), f.names_are) : "name = $(repr(f.name))")
     f.tags === nothing || push!(parts, "tags = $(f.tags)")
     f.group === nothing || push!(parts, "group `$(f.group.name)` = $(repr(f.group.tags.text)), $(f.group.source)")
     f.line == 0 || push!(parts, "line $(f.line)")

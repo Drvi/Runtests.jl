@@ -246,6 +246,47 @@ call(body) = body()
             @test err isa NoTestsError
             @test occursin("did you mean \"declares and tests\"", sprint(showerror, err))
         end
+
+        @testset "a name, a Regex or a path picks one item, and what picks none or several says so" begin
+            target = Runtests.Private.interactive_target()
+            find(t, what) = Runtests.Private.find_item(t, what)
+            caught(f) = try
+                f()
+                nothing
+            catch e
+                e
+            end
+            # A Regex that matches one name, and a line inside an item.
+            @test find(target, r"^draws").name == "draws and fails"
+            @test find(target, "$STEPPED_FILE:$(line_of("@testitem \"throws\"") + 1)").name == "throws"
+            # Several, and none.
+            e = caught(() -> find(target, r"fails"))
+            @test e isa ArgumentError
+            @test occursin("picks 2: \"fails\" at $(joinpath("test", "s_test.jl")):", e.msg) && occursin("\"draws and fails\"", e.msg)
+            @test occursin("give its name, or its `file.jl:line`", e.msg)
+            @test caught(() -> find(target, r"^nothing like it")) isa NoTestsError
+            @test caught(() -> find(target, STEPPED_FILE)) isa ArgumentError
+            # A file or a directory with one item is that item; a line above the
+            # first is none, and says where the first is.
+            other = make_pkg("DebugPaths", "test/one_test.jl" => "# a header\n\n@testitem \"only one\" begin\nend\n",
+                             "test/two_test.jl" => "@testitem \"a\" begin\nend\n@testitem \"b\" begin\nend\n")
+            t = Runtests.Private.resolve_target((other,))
+            @test find(t, joinpath(other, "test", "one_test.jl")).name == "only one"
+            e = caught(() -> find(t, joinpath(other, "test", "one_test.jl") * ":1"))
+            @test e isa NoTestsError && occursin("above its first test item, at line 3", sprint(showerror, e))
+            e = caught(() -> find(t, joinpath(other, "test")))
+            @test e isa ArgumentError && occursin("picks 3", e.msg)
+            # A path into another package than the session's.
+            e = caught(() -> find(target, joinpath(other, "test", "one_test.jl")))
+            @test e isa ArgumentError && occursin("this session's package", e.msg)
+            # The debugger is handed the item a Regex picks.
+            entered = Ref("")
+            Runtests.Private.debug_item(r"^throws$", nothing) do body
+                entered[] = String(nameof(body))
+                nothing
+            end
+            @test !isempty(entered[])
+        end
     end
 end
 

@@ -418,7 +418,13 @@ function scan(
         append!(suite_names, (it.name for it in items))
         append!(suite_names, (r.name for r in rejected))
     end
-    filter.line > 0 && (items = select_by_line(items, filter.line))
+    if filter.line > 0
+        # The item the line is in, among every item of its file, selected or not: the
+        # rest of the selection keeps that item or leaves nothing, never the one above.
+        at = item_start(items, rejected, filter.paths, filter.line)
+        at == 0 && throw(NoTestsError(above_first_item(items, rejected, filter.paths, filter.line)))
+        items = RawItem[it for it in items if it.line == at && matches_path(filter.paths, it.file)]
+    end
     return items
 end
 
@@ -499,12 +505,23 @@ default_scan_tasks() = clamp(2 * Threads.nthreads(), 1, 36)
 
 # `runtests("file.jl:42")` means the item that line is inside: the last one that
 # starts at or before it.
-function select_by_line(items::Vector{RawItem}, line::Int32)
-    best = nothing
-    for it in items
-        it.line <= line && (best === nothing || it.line > best.line) && (best = it)
+# A line above every item of its file, said as such rather than as a selection that
+# matched nothing.
+function above_first_item(items::Vector{RawItem}, rejected::Vector{ItemName}, paths::Vector{String}, line::Int32)
+    file = relpath_or_path(first(paths))
+    starts = [x.line for x in Iterators.flatten((items, rejected)) if matches_path(paths, x.file)]
+    isempty(starts) && return "$file holds no test items"
+    return "line $line of $file is above its first test item, at line $(minimum(starts))"
+end
+
+# Where the item that `line` is inside starts: the last of the items in `paths`, the
+# selected and the `rejected`, to start at or above it; 0 above the first.
+function item_start(items::Vector{RawItem}, rejected::Vector{ItemName}, paths::Vector{String}, line::Int32)
+    best = Int32(0)
+    for x in Iterators.flatten((items, rejected))
+        x.line <= line && x.line > best && matches_path(paths, x.file) && (best = x.line)
     end
-    return best === nothing ? RawItem[] : [best]
+    return best
 end
 
 # Over every item in the suite, selected or not: a name that is unique only

@@ -1,6 +1,6 @@
 using Runtests.Private: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
             is_test_file, NO_CHAIN, DEFAULT_PROFILE,
-            USE_RUN_DEFAULT, select_by_line
+            USE_RUN_DEFAULT
 
 const BASIC = fixture("Basic.jl")
 

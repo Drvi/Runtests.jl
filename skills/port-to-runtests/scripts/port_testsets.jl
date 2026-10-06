@@ -355,6 +355,11 @@ function testset_options(@nospecialize ex)
     return String[string(a) for a in args[1:(end - 1)] if !(a isa String || (a isa Expr && a.head === :string))]
 end
 
+# A path relative to `base`, written with `/` on every system: the report names files
+# this way, as it names `test/qa/` and `.scripts/`, and paths from every source are
+# compared with each other.
+posix_relpath(path, base) = Sys.iswindows() ? replace(relpath(path, base), '\\' => '/') : relpath(path, base)
+
 # The file a statement `include`s, as a path relative to `testdir`, when the
 # statement is `include(p)` and `p` is known without running anything.
 function include_target(@nospecialize(ex), dir, testdir)
@@ -362,7 +367,7 @@ function include_target(@nospecialize(ex), dir, testdir)
     arg === nothing && return nothing
     p = static_value(arg, Dict{Symbol, Any}(), dir)
     p isa AbstractString || return nothing
-    return relpath(normpath(isabspath(p) ? p : joinpath(dir, p)), testdir)
+    return posix_relpath(normpath(isabspath(p) ? p : joinpath(dir, p)), testdir)
 end
 
 # `dry`: only the names the items would have, before `collide` is known: the names
@@ -997,7 +1002,7 @@ function add_file!(s::Suite, @nospecialize(arg), dir, ctx::Context, src)
         push!(s.notes, "runtests.jl includes a file this cannot name; port it by hand: $(snippet(src))")
         return nothing
     end
-    file = relpath(normpath(isabspath(p) ? p : joinpath(dir, p)), s.testdir)
+    file = posix_relpath(normpath(isabspath(p) ? p : joinpath(dir, p)), s.testdir)
     path = joinpath(s.testdir, file)
     if !(file in s.runners) && isfile(path) && only_runs_files(path)
         # `@safetestset "A" include("a_item.jl")` and nothing else: read as runtests.jl is.
@@ -1304,7 +1309,7 @@ function sciml_folders!(s::Suite, ctx::Context, everything::Bool)
         (everything || (g != "QA" && get(conf, "in_all", true) == true)) || push!(s.exclude, tag)
         for f in sort(readdir(joinpath(testdir, rel)))
             endswith(f, ".jl") && isfile(joinpath(testdir, rel, f)) || continue
-            push!(s.entries, Entry(joinpath(rel, f), true, "$g/$(replace(chopsuffix(f, ".jl"), r"_tests?$" => ""))",
+            push!(s.entries, Entry(string(rel, "/", f), true, "$g/$(replace(chopsuffix(f, ".jl"), r"_tests?$" => ""))",
                                    String[], [ctx.tags; tag], ctx.skip))
         end
     end
@@ -1386,7 +1391,7 @@ function julia_files(testdir)
         filter!(d -> !startswith(d, '.') && d != "testsetups" && d != "testtemplates" &&
                      !any(p -> isfile(joinpath(dir, d, p)), ("Project.toml", "JuliaProject.toml")), dirs)
         for f in files
-            endswith(f, ".jl") && push!(out, relpath(joinpath(dir, f), testdir))
+            endswith(f, ".jl") && push!(out, posix_relpath(joinpath(dir, f), testdir))
         end
     end
     return out
@@ -1529,7 +1534,7 @@ function port_suite(testdir)
     for (f, e) in jobs
         out = port_file(testdir, f; options(e, ownsetup)..., helper_setups, helper_imports, ported, taken, log, collide)
         from = e === nothing ? "runtests.jl" : f
-        out === nothing ? push!(log, "$from: holds no tests once ported") : push!(moves, from => relpath(out, testdir))
+        out === nothing ? push!(log, "$from: holds no tests once ported") : push!(moves, from => posix_relpath(out, testdir))
         # runtests.jl's own definitions, for the files that ran in Main after them.
         if e === nothing
             name = camel(chopsuffix(f, ".jl")) * "Setup"
@@ -1541,7 +1546,7 @@ function port_suite(testdir)
         log = [replace(l, Regex("^" * ownfile * ":") => "runtests.jl:") for l in log]
     end
     for (file, (setup, _)) in sort!(collect(helpers); by = first)
-        push!(moves, file => joinpath("testsetups", setup * ".jl"))
+        push!(moves, file => string("testsetups/", setup, ".jl"))
     end
     tagged = unique(reduce(vcat, (e.tags for e in tests); init = Symbol[]))
     excluded = unique(filter(in(tagged), s.exclude))
@@ -1559,7 +1564,7 @@ function port_suite(testdir)
     end
     # A file that only ran others has nothing left to run.
     for f in s.runners
-        to = joinpath(".scripts", f)
+        to = string(".scripts/", f)
         mkpath(dirname(joinpath(testdir, to)))
         cp(joinpath(testdir, f), joinpath(testdir, to); force = true)
         push!(moves, f => to)
@@ -1569,7 +1574,7 @@ function port_suite(testdir)
     accounted = Set([seen..., "runtests.jl"])
     for f in julia_files(testdir)
         (f in accounted || any(m -> last(m) == f, moves)) && continue
-        to = joinpath(".scripts", f)
+        to = string(".scripts/", f)
         mkpath(dirname(joinpath(testdir, to)))
         cp(joinpath(testdir, f), joinpath(testdir, to); force = true)
         push!(moves, f => to)

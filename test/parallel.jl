@@ -15,7 +15,9 @@ struct FileResult
     status::String     # how it ended, when it did not end well
     seconds::Float64
     output::String
+    note::String       # what held its output after it exited, when something did
 end
+FileResult(file, ok, status, seconds, output) = FileResult(file, ok, status, seconds, output, "")
 
 # Memory while the files run, sampled twice a second: each file's process tree (its
 # process and every worker it starts) at its largest, and the suite's and the
@@ -137,7 +139,8 @@ end
 
 function run_file_in_subprocess(
         runner::AbstractString, file::AbstractString;
-        limit::Real = FILE_LIMIT_SECONDS, memory::Union{Nothing, MemoryLog} = nothing
+        limit::Real = FILE_LIMIT_SECONDS, memory::Union{Nothing, MemoryLog} = nothing,
+        release::Real = LOG_RELEASE_SECONDS
     )
     log = tempname()
     t0 = time()
@@ -163,10 +166,76 @@ function run_file_in_subprocess(
     memory === nothing || @lock memory.lock delete!(memory.pids, pid)
     close(io)
     seconds = time() - t0
-    output = isfile(log) ? read(log, String) : ""
-    rm(log; force = true)
+    output, note, released = collect_log(log, pid; release)
     status = hung ? string("hung: still running after the ", round(Int, limit), "s limit (RUNTESTS_TEST_FILE_TIMEOUT)") : exit_status(proc)
-    return FileResult(file, isempty(status), status, seconds, output)
+    isempty(status) && !released && (status = string("its output still held ", round(Int, release), "s after it exited"))
+    return FileResult(file, isempty(status), status, seconds, output, note)
+end
+
+# Windows deletes no file that a process has open, and every process a child starts
+# has the child's output open: each new process is handed the inheritable handles of
+# the process that starts it, its standard streams among them, whatever it was told
+# to write to. So a log that cannot be deleted once the child has exited is held by
+# a process the child left running, or by something else reading the new file. What
+# lets go within this many seconds is named in the file's result; what does not
+# fails the file.
+const LOG_RELEASE_SECONDS = 120
+
+# The child's output once nothing holds the log, a note naming what held it after the
+# child exited, if anything did, and whether it let go within `release` seconds. A
+# log still held then is left where it is.
+function collect_log(log::AbstractString, pid::Int32; release::Real = LOG_RELEASE_SECONDS)
+    t0 = time()
+    holders = nothing
+    while true
+        # Read each time: whatever holds it can still be writing to it.
+        output = isfile(log) ? read(log, String) : ""
+        held = try
+            rm(log; force = true)
+            false
+        catch e
+            (e isa Base.IOError && e.code == Base.UV_EBUSY) || rethrow()
+            true
+        end
+        seconds = time() - t0
+        held || return output, held_note(holders, seconds, true), true
+        holders === nothing && (holders = leftover_processes(pid))
+        seconds < release || return output, held_note(holders, seconds, false), false
+        sleep(0.5)
+    end
+end
+
+held_note(::Nothing, _, _) = ""
+held_note(holders::Vector{String}, seconds, released) = string(
+    "its output was held ", released ? "for " : "still after ", round(seconds; digits = 1), "s after it exited; ",
+    isempty(holders) ? "no process it started was running then" : "these processes it started were running then:",
+    join(("\n    " * h for h in holders))
+)
+
+# The processes descended from `pid`, which has exited, a line each, with the command
+# that started each where Windows says it. Windows keeps the pid of a process's
+# parent after the parent has exited, so they are still found by it.
+function leftover_processes(pid::Int32)
+    pid == 0 && return String[]
+    pids = filter(!=(pid), Runtests.Private.Platform.process_tree([pid]))
+    isempty(pids) && return String[]
+    lines = Sys.iswindows() ? command_lines(pids) : String[]
+    return isempty(lines) ? [string("pid ", p) for p in pids] : lines
+end
+
+function command_lines(pids)
+    script = string(
+        "Get-CimInstance Win32_Process | Where-Object { @(", join(pids, ","), ") -contains \$_.ProcessId } | ",
+        "ForEach-Object { 'pid ' + \$_.ProcessId + ', parent ' + \$_.ParentProcessId + ', started ' + ",
+        "\$_.CreationDate + ': ' + \$_.CommandLine }"
+    )
+    lines = try
+        readlines(`powershell -NoProfile -NonInteractive -Command $script`)
+    catch e
+        e isa InterruptException && rethrow()
+        String[]
+    end
+    return [length(l) > 300 ? string(first(l, 300), " …") : l for l in lines if !isempty(strip(l))]
 end
 
 function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::Int)
@@ -204,6 +273,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
                         lpad(string(round(r.seconds; digits = 1), "s"), 6), "  ",
                         memory_text(memory, r.file), "\n"; color = :green
                     )
+                    isempty(r.note) || printstyled(stdout, "  ", r.note, "\n"; color = :yellow)
                 else
                     printstyled(
                         stdout, "\n", "="^78, "\n", rpad(r.file, 52),
@@ -212,6 +282,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
                     )
                     print(stdout, r.output)
                     endswith(r.output, "\n") || println(stdout)
+                    isempty(r.note) || println(stdout, r.note)
                 end
                 flush(stdout)
             end

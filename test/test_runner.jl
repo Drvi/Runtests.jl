@@ -4,12 +4,12 @@
 @testset "parallel test runner" begin
     runner = joinpath(@__DIR__, "runtests.jl")
 
-    function run_snippet(code::AbstractString; limit = FILE_LIMIT_SECONDS)
+    function run_snippet(code::AbstractString; limit = FILE_LIMIT_SECONDS, release = LOG_RELEASE_SECONDS)
         dir = mktempdir()
         file = joinpath(dir, "snippet_test_file.jl")
         write(file, code)
         try
-            return run_file_in_subprocess(runner, file; limit)
+            return run_file_in_subprocess(runner, file; limit, release)
         finally
             rm(dir; force=true, recursive=true)
         end
@@ -56,6 +56,42 @@
         @test !r.ok
         # Windows has no signals: `abort` ends the process with exit code 3.
         @test occursin(Sys.iswindows() ? "exit code 3" : "killed by signal", r.status)
+    end
+
+    @testset "a process a file leaves running holds its output on Windows, and is named" begin
+        # Detached, so that the file's process ending does not end it too. Windows
+        # deletes no file a process has open, and the process has the file's output
+        # open; elsewhere the output goes at once and nothing is said.
+        dir = mktempdir()
+        leave_running(seconds, pidfile) = """
+            p = run(detach(`\$(Base.julia_cmd()) --startup-file=no -e "sleep($seconds)"`); wait = false)
+            write($(repr(pidfile)), string(getpid(p)))
+            @testset "leaves a process running" begin\n    @test true\nend
+            """
+        try
+            r = run_snippet(leave_running(10, joinpath(dir, "short")))
+            @test r.ok
+            if Sys.iswindows()
+                @test occursin("its output was held for", r.note)
+                @test occursin("sleep(10)", r.note)
+            else
+                @test isempty(r.note)
+            end
+            r = run_snippet(leave_running(600, joinpath(dir, "long")); release = 3)
+            if Sys.iswindows()
+                @test !r.ok
+                @test occursin("its output still held 3s after it exited", r.status)
+                @test occursin("sleep(600)", r.note)
+            else
+                @test r.ok
+            end
+        finally
+            for f in ("short", "long")
+                isfile(joinpath(dir, f)) || continue
+                ccall(:uv_kill, Cint, (Cint, Cint), parse(Cint, read(joinpath(dir, f), String)), Base.SIGKILL)
+            end
+            rm(dir; force = true, recursive = true)
+        end
     end
 
     @testset "the summary names every file that failed, and throws" begin

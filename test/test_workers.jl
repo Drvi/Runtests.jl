@@ -360,6 +360,36 @@ end
         end
     end
 
+    @testset "waiting for a process to exit wakes when it exits, and gives up at the limit" begin
+        quick = run(`$(Base.julia_cmd()) --startup-file=no -e "sleep(1)"`; wait = false)
+        t = @elapsed exited = RuntestsWorkers.wait_exit(quick, 120)
+        @test exited && process_exited(quick)
+        @test t < 60   # woken by the exit, not by the limit
+        slow = run(`$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`; wait = false)
+        try
+            t = @elapsed exited = RuntestsWorkers.wait_exit(slow, 1)
+            @test !exited && 1 <= t < 60
+        finally
+            kill(slow, Base.SIGKILL)
+            wait(slow)
+        end
+    end
+
+    @testset "killed from an exit hook, a worker is signalled and its connection left open" begin
+        # Closing the connection waits for the event loop, which an exit hook may not
+        # get again; the exit closes it.
+        w = Worker(; threads="1", redirect_io=IOBuffer())
+        try
+            RuntestsWorkers.kill!(w; exiting = true)
+            @test isopen(w.socket)
+            @test w.terminated && w.ended_by === :interrupt
+            @test RuntestsWorkers.wait_exit(w.process, 30)
+        finally
+            close(w.socket)
+            wait(w)
+        end
+    end
+
     @testset "these tests leave no worker running" begin
         @test @lock(RuntestsWorkers.LIVE_LOCK, count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)) == 0
     end

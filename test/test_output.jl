@@ -341,4 +341,21 @@ using RuntestsWorkers: RuntestsWorkers
         @test Runtests.Private.flush_dying_log!(slot) === nothing
         @test isempty(slot.dying_lines)
     end
+
+    @testset "what an exit hook writes is written before it returns, to a pipe or not" begin
+        # The exit hook writes the closing block this way: on Unix straight to the
+        # pipe's descriptor, without libuv, and every byte of it.
+        p = Pipe()
+        Base.link_pipe!(p; reader_supports_async = true, writer_supports_async = true)
+        # Less than any pipe holds: a full pipe makes it wait on the reader, which
+        # cannot run while it does.
+        text = repeat("a line of the closing block\n", 50)
+        reader = @async read(p.out, String)
+        Runtests.Private.write_now(p.in, text)
+        close(p.in)
+        @test fetch(reader) == text
+        io = IOBuffer()
+        Runtests.Private.write_now(io, "anywhere else\n")
+        @test String(take!(io)) == "anywhere else\n"
+    end
 end

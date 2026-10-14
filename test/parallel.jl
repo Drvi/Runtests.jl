@@ -209,13 +209,23 @@ held_note(_, ::Nothing, _, _, _) = ""
 held_note(pid, holders::Vector{String}, seconds, released, output) = string(
     "its output was held ", released ? "for " : "still after ", round(seconds; digits = 1), "s after it (pid ", pid,
     ") exited; ", isempty(holders) ? "no process it started was running then" : "these processes it started were running then:",
-    join(("\n    " * h for h in holders)), join(("\n  " * l for l in said_running(output)))
+    join(("\n    " * h for h in holders)), join(("\n  " * l for l in cleanup_warnings(output)))
 )
 
-# The lines in which the child said what it had left running (`print_running` in
-# runtests.jl).
-said_running(output::AbstractString) =
-    [l for l in eachsplit(output, '\n') if startswith(l, "[tests] ") && occursin(" processes running ", l)]
+# Julia's warnings that it could not delete a temporary path at exit, each whole and
+# without colours. Julia then leaves the deleting to a process of its own, started
+# with the exiting process's output, which waits a second after the exit.
+function cleanup_warnings(output::AbstractString)
+    lines = String[]
+    inside = false
+    for l in eachsplit(output, '\n')
+        plain = replace(l, r"\e\[[0-9;]*m" => "")
+        inside |= occursin("Failed to clean up temporary path", plain)
+        inside && push!(lines, plain)
+        inside && startswith(plain, "└") && (inside = false)
+    end
+    return first(lines, 30)
+end
 
 # The processes descended from `pid`, which has exited, a line each, with the command
 # that started each where Windows says it. Windows keeps the pid of a process's

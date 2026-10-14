@@ -77,8 +77,6 @@
             if Sys.iswindows()
                 @test occursin("its output was held for", r.note)
                 @test named(r.note, joinpath(dir, "short"))
-                # What the file itself said it left running, once its tests were done.
-                @test occursin("processes running after the tests: ", r.note)
             else
                 @test isempty(r.note)
             end
@@ -97,6 +95,25 @@
             end
             rm(dir; force = true, recursive = true)
         end
+    end
+
+    @testset "Julia's warning that it could not delete a temporary path is picked out whole" begin
+        # As the logger prints it in colour: Julia then deletes the path from a
+        # process of its own, which holds the file's output a moment longer.
+        y, g, off = "\e[33m\e[1m", "\e[90m", "\e[22m\e[39m"
+        out = string(
+            "Test Summary: ...\n",
+            y, "┌ ", off, y, "Warning: ", off, "Failed to clean up temporary path \"C:\\\\Temp\\\\jl_x\"\n",
+            y, "│ ", off, "IOError: unlink(\"C:\\\\Temp\\\\jl_x\\\\a.dll\"): permission denied (EACCES)\n",
+            y, "└ ", off, g, "@ Base.Filesystem file.jl:657", "\e[39m\n",
+            "after\n"
+        )
+        @test cleanup_warnings(out) == [
+            "┌ Warning: Failed to clean up temporary path \"C:\\\\Temp\\\\jl_x\"",
+            "│ IOError: unlink(\"C:\\\\Temp\\\\jl_x\\\\a.dll\"): permission denied (EACCES)",
+            "└ @ Base.Filesystem file.jl:657",
+        ]
+        @test isempty(cleanup_warnings("Test Summary: ...\n"))
     end
 
     @testset "the summary names every file that failed, and throws" begin

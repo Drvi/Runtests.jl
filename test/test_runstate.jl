@@ -110,8 +110,11 @@ end
                 # What a file manager leaves behind is no reason to keep a directory.
                 write(joinpath(dirname(gone[1]), ".DS_Store"), "")
                 # A run of another project reads its own directory and leaves these be.
+                # On a worker: run here, the package would be compiled into the depot
+                # above and stay loaded in this process, and Windows deletes no loaded
+                # library, so the depot would outlive the process.
                 kept = make_pkg("Kept", one_item)
-                capture_run(() -> run_states(kept; workers = 0, logs = :issues, monitor = false))
+                capture_run(() -> run_states(kept; workers = 1, logs = :issues, monitor = false))
                 @test all(isfile, gone)
                 # A dry run of chores says what it would delete, and deletes nothing.
                 _, out = capture_run(() -> Runtests.chores(kept; dry_run = true))

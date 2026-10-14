@@ -90,22 +90,6 @@ print_environment() = println(
     get(ENV, "CI", "") == "true" ? " · CI" : ""
 )
 
-# This process's descendants that are still running, on a line the runner looks for
-# (see `said_running`), with the time to the millisecond.
-function print_running(when::AbstractString)
-    me = getpid()
-    pids = filter(!=(me), Runtests.Private.Platform.process_tree([me]))
-    workers = RuntestsWorkers.live_worker_pids()
-    t = time()
-    println(
-        stderr, "[tests] ", Libc.strftime("%H:%M:%S", t), ".", lpad(floor(Int, 1000 * (t - floor(t))), 3, '0'),
-        " processes running ", when, ": ",
-        isempty(pids) ? "none" : join((p in workers ? string(p, " (a worker)") : string(p) for p in pids), ", ")
-    )
-    flush(stderr)
-    return nothing
-end
-
 if !isempty(ARGS)
     # A child, or someone running one file by hand. The hook makes the signal a
     # hung file is sent print every task's backtrace, which is where it is stuck.
@@ -119,14 +103,7 @@ if !isempty(ARGS)
         flush(stderr)
         ccall(:jl_print_task_backtraces, Cvoid, (Cint,), 0)
     end
-    # What the file left running, for the runner to show when something held the
-    # file's output after this process exited. Registered first, the hook runs last.
-    atexit(() -> print_running("after the exit hooks"))
-    try
-        foreach(run_file, ARGS)
-    finally
-        print_running("after the tests")
-    end
+    foreach(run_file, ARGS)
 elseif default_jobs() <= 1
     print_environment()
     @testset "Runtests" begin

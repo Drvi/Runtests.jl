@@ -5,7 +5,8 @@
 
 using Runtests.Private: prepare, nitems, read_config, claimed_environments, config_toml, ConfigError,
     ScanFailure, NoTestsError, environment_project, write_environment, replayed_config, read_run_state,
-    runstate_files, failing_items, suite_item_names, resolve_target, list_items, Profile, PASSED, FAILED
+    runstate_files, failing_items, suite_item_names, resolve_target, list_items, Profile, PASSED, FAILED,
+    init_run_state, finish_run_state!
 using RuntestsWorkers: state_of
 using Runtests.Private: TOML
 
@@ -309,6 +310,28 @@ end
             only_there = make_pkg("EnvOnlyThere", "test/qa/Project.toml" => "[deps]\n",
                                   "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n")
             @test_throws NoTestsError plan_of(only_there)
+        end
+
+        @testset "a replay reads the ones its recorded profiles ran in" begin
+            # The recorded profiles stand in for this checkout's, so a directory one of
+            # them ran in is read whatever TestItems.toml says now.
+            replayed = make_pkg(
+                "EnvReplayClaims",
+                "test/main_tests.jl" => "@testitem \"main\" begin\n    @test true\nend\n",
+                "test/qa/Project.toml" => "[deps]\n",
+                "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test true\nend\n",
+                "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n",
+            )
+            with_runstate_dir() do states
+                path = joinpath(states, "recorded.runstate")
+                finish_run_state!(init_run_state(path, plan_of(replayed)))
+                write(joinpath(replayed, "test", "TestItems.toml"), "")
+                @test sort(plan_of(replayed; replay = path).items.name) == ["main", "qa"]
+                # A recorded item the suite no longer has cannot run again, and is named.
+                rm(joinpath(replayed, "test", "main_tests.jl"))
+                p = @test_logs (:warn, r"the run state recorded.*\"main\"") match_mode=:any plan_of(replayed; replay = path)
+                @test p.items.name == ["qa"]
+            end
         end
     end
 

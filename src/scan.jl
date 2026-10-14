@@ -35,41 +35,35 @@ function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = 
     isdir(testdir) || return (; tests, strays, templates, unclaimed)
     templates_dir = joinpath(testdir, TESTTEMPLATES_DIR)
     projects = String[]
-    for (dir, dirs, names) in walkdir(testdir; topdown = true)
-        # `walkdir` reads `dirs` as soon as this task yields, so nothing in the
-        # filter may yield: the projects it skips are counted after the walk.
-        filter!(dirs) do d
-            (startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && d == TESTTEMPLATES_DIR)) && return false
-            path = joinpath(dir, d)
-            any(n -> isfile(joinpath(path, n)), PROJECT_NAMES) || return true
-            haskey(claimed, path) && return true
-            push!(projects, path)
-            return false
-        end
-        for n in names
-            startswith(n, '.') && continue
-            if is_test_file(n)
-                push!(tests, joinpath(dir, n))
-            elseif is_template_file(n)
-                push!(strays, misplaced_template_error(joinpath(dir, n)))
-            elseif endswith(n, ".jl") && !(n == RUNTESTS_FILE && dir == testdir)
-                push!(strays, stray_error(joinpath(dir, n)))
-            end
+    # A directory with a project of its own is not read, unless a profile claims it:
+    # told from the listing the walk reads anyway, and counted after the walk.
+    function enter(dir, entries)
+        dir == testdir && return true
+        any(e -> !entry_isdir(e) && entry_name(e) in PROJECT_NAMES, entries) || return true
+        haskey(claimed, dir) && return true
+        push!(projects, dir)
+        return false
+    end
+    descend(dir, d) = !(startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && d == TESTTEMPLATES_DIR))
+    walk_dirs(testdir; enter, descend) do dir, n
+        startswith(n, '.') && return
+        if is_test_file(n)
+            push!(tests, joinpath(dir, n))
+        elseif is_template_file(n)
+            push!(strays, misplaced_template_error(joinpath(dir, n)))
+        elseif endswith(n, ".jl") && !(n == RUNTESTS_FILE && dir == testdir)
+            push!(strays, stray_error(joinpath(dir, n)))
         end
     end
-    isdir(templates_dir) && for (dir, dirs, names) in walkdir(templates_dir; topdown = true)
-        filter!(d -> !startswith(d, '.'), dirs)
-        for n in names
-            path = joinpath(dir, n)
-            if startswith(n, '.') || !endswith(n, ".jl")
-                continue
-            elseif !is_template_file(n)
-                push!(strays, ScanError(path, 0, NOT_A_TEMPLATE))
-            elseif dir == templates_dir
-                push!(templates, path)
-            else
-                push!(strays, misplaced_template_error(path))
-            end
+    isdir(templates_dir) && walk_dirs(templates_dir; descend = (_, d) -> !startswith(d, '.')) do dir, n
+        (startswith(n, '.') || !endswith(n, ".jl")) && return
+        path = joinpath(dir, n)
+        if !is_template_file(n)
+            push!(strays, ScanError(path, 0, NOT_A_TEMPLATE))
+        elseif dir == templates_dir
+            push!(templates, path)
+        else
+            push!(strays, misplaced_template_error(path))
         end
     end
     for path in projects
@@ -82,13 +76,58 @@ end
 
 # The test files under `dir`, hidden ones aside, for saying how many a run leaves out.
 function count_test_files(dir::AbstractString)
-    n = 0
-    for (_, dirs, names) in walkdir(dir; topdown = true)
-        filter!(d -> !startswith(d, '.'), dirs)
-        n += count(f -> !startswith(f, '.') && is_test_file(f), names)
+    n = Ref(0)
+    walk_dirs(dir; descend = (_, d) -> !startswith(d, '.')) do _, f
+        !startswith(f, '.') && is_test_file(f) && (n[] += 1)
     end
-    return n
+    return n[]
 end
+
+"""
+    walk_dirs(file, root; enter = (dir, entries) -> true, descend = (dir, name) -> true)
+
+Call `file(dir, name)` for each file in `root`, and in each directory under it that
+`descend(parent, name)` lets the walk go to and whose listing `enter(dir, entries)`
+then takes; a link counts as a file, as `walkdir` takes it. A directory is listed
+once, with each entry's type from the listing, and nothing is `stat`ed, collected or
+joined into a path but the directories the walk goes on to.
+
+The walk's own, not `walkdir`'s, whose producer task reads the directories it has
+handed out to decide where to go next: taken out of that list in place by a task on
+another thread, as `chores` reads the suite, they were still gone into.
+"""
+function walk_dirs(file, root::AbstractString; enter = (_, _) -> true, descend = (_, _) -> true)
+    pending = [String(root)]
+    while !isempty(pending)
+        dir = pop!(pending)
+        entries = dir_listing(dir)
+        enter(dir, entries) || continue
+        for e in entries
+            name = entry_name(e)
+            if entry_isdir(e)
+                descend(dir, name) && push!(pending, joinpath(dir, name))
+            else
+                file(dir, name)
+            end
+        end
+    end
+    return nothing
+end
+
+# The entries of `dir`, unsorted, each with its type as the listing has it, which a
+# directory a link points at is not. `_readdirx` is internal to Base, and `walkdir`'s
+# own way of reading a directory without a `stat` an entry, which took a walk of
+# 10,000 files from 9 ms to 39. Without it, one `lstat` an entry.
+@static if isdefined(Base.Filesystem, :_readdirx)
+    dir_listing(dir::AbstractString) = Base.Filesystem._readdirx(dir; sort = false)
+    entry_name(e::Base.Filesystem.DirEntry) = e.name
+    entry_isdir(e::Base.Filesystem.DirEntry) = !islink(e) && isdir(e)
+else
+    dir_listing(dir::AbstractString) = stat_listing(dir)
+end
+stat_listing(dir::AbstractString) = Tuple{String, Bool}[(n, isdir(lstat(joinpath(dir, n)))) for n in readdir(dir; sort = false)]
+entry_name(e::Tuple{String, Bool}) = e[1]
+entry_isdir(e::Tuple{String, Bool}) = e[2]
 
 # The profile whose environment holds `path`, the innermost when several do, or the
 # default profile when none does.
@@ -162,6 +201,7 @@ function scan_file!(
     line = Int32(0)
     # By index: iterating the untyped statements would box every step.
     statements = Meta.parseall(src; filename = path).args
+    starts = line_starts(src)
     for k in eachindex(statements)
         a = statements[k]
         if a isa LineNumberNode
@@ -171,22 +211,54 @@ function scan_file!(
             push!(errors, ScanError(path, line, msg isa AbstractString ? msg : sprint(showerror, msg)))
             return
         else
-            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, profile)
+            # A statement's text runs to the line before the next one starts.
+            next_line = k < lastindex(statements) && statements[k + 1] isa LineNumberNode ?
+                Int((statements[k + 1]::LineNumberNode).line) : 0
+            hash = text_hash(src, starts, Int(line), next_line)
+            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, profile, hash)
         end
     end
     return
+end
+
+# The byte at which each line of `src` starts.
+function line_starts(src::String)
+    starts = [1]
+    for (k, c) in enumerate(codeunits(src))
+        c == UInt8('\n') && push!(starts, k + 1)
+    end
+    return starts
+end
+
+# CRC32c of lines `first_line` up to `next_line` of `src`, the end of the file when
+# `next_line` is 0, without the blank space that ends them and without carriage
+# returns, so that a checkout with Windows line endings hashes as one without.
+function text_hash(src::String, starts::Vector{Int}, first_line::Int, next_line::Int)
+    1 <= first_line <= length(starts) || return UInt32(0)
+    lo = starts[first_line]
+    hi = first_line < next_line <= length(starts) ? starts[next_line] - 1 : ncodeunits(src)
+    cu = codeunits(src)
+    while hi >= lo && cu[hi] in (UInt8(' '), UInt8('\t'), UInt8('\n'), UInt8('\r'))
+        hi -= 1
+    end
+    hi < lo && return UInt32(0)
+    if UInt8('\r') in view(cu, lo:hi)
+        return crc32c(filter(!=(UInt8('\r')), cu[lo:hi]))
+    end
+    return GC.@preserve src Base.unsafe_crc32c(pointer(src, lo), Csize_t(hi - lo + 1), UInt32(0))
 end
 
 ### Header parsing #########################################################
 
 # One method whatever the statement is, so that the call is direct, not a dispatch
 # that boxes every argument once per item.
-function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, profile)
+function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, profile,
+                           hash::UInt32 = UInt32(0))
     if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
         push!(errors, ScanError(path, line, not_an_item(ex)))
         return
     end
-    item = parse_testitem(ex, path, line, errors, known_setups, profile)
+    item = parse_testitem(ex, path, line, errors, known_setups, profile; hash)
     item === nothing && return
     union!(tags, item.tags)
     if !(matches_path(filter.paths, path) && matches_name(filter.name, item.name) &&
@@ -222,7 +294,8 @@ end
 
 # `default_profile` is the profile of the environment the item's file is in: one a
 # `sandbox` keyword may repeat but not change.
-function parse_testitem(ex::Expr, path, line, errors, known_setups, default_profile::Symbol = DEFAULT_PROFILE)
+function parse_testitem(ex::Expr, path, line, errors, known_setups, default_profile::Symbol = DEFAULT_PROFILE;
+                        hash::UInt32 = UInt32(0))
     # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
     numbered = lo <= hi && ex.args[lo] isa LineNumberNode
@@ -311,7 +384,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, default_prof
     collect_setups!(setups, body, known_setups)
     return RawItem(
         name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
-        timeout, retries, failfast, chain, profile, exclusive
+        timeout, retries, failfast, chain, profile, exclusive, hash
     )
 end
 

@@ -21,12 +21,14 @@ Look after a package's suite: do what needs no person, then say what does.
   what its code computes can change while its text does not; a dry run reads the
   expansions' stamps instead and runs nothing. An expansion edited by hand, and a
   test file in a template's way that `chores` did not write, are left to a person.
-- run states: this machine's are kept as a run keeps them, the newest $(KEEP_RUNS)
-  and any older one a failing item's last verdict is in. Of those, one is deleted
-  only when it holds nothing about an item the suite has now: a dry run, a run
-  stopped before any item finished, or one whose items have all been renamed or
-  deleted since. One recorded elsewhere, a CI artifact say, and one that cannot be
-  read are never deleted.
+- run states: this machine's are pruned as a run prunes them, the same ones and no
+  others (see [`prunable_runstates`](@ref)), with their logs; and those of a format
+  older than any this version reads are deleted. One recorded elsewhere, a CI
+  artifact say, and one that cannot be read otherwise are never deleted.
+- checkouts that are gone: when the project keeps its run states in the default
+  location, the run states there of every checkout that no longer exists, as
+  [`sweep_runstate_dirs`](@ref) finds them, the directories that held them with them.
+  Nothing else deletes them: a run reads its own directory and no other.
 
 Returns whether nothing is left to do. Having done the rest, it throws a
 [`ChoresError`](@ref) when something is left that a person has to fix, and otherwise
@@ -47,6 +49,9 @@ function run_chores(args, dry_run::Bool, config)
     fix = !dry_run
     todo = problems = 0
     body = styled() do io
+        # The checkouts that are gone are no other step's business, and reading the
+        # default location takes its own time: in a task of its own from the start.
+        gone = chore_task(io -> chore_gone_checkouts!(io, fix))
         # Setups first, as expanding a template loads them, and the suite after the
         # templates, so that it is read with their new expansions.
         n, bad = chore_setups!(io, target, fix)
@@ -55,12 +60,16 @@ function run_chores(args, dry_run::Bool, config)
         n, bad = chore_templates!(io, target, fix)
         todo += n
         problems += bad
-        bad, names = check_suite!(io, target)
+        # The checks that read the suite read it at the same time, each in a task.
+        suite = chore_task(io -> check_suite!(io, target))
+        named = [chore_task(io -> check_named_config!(io, target, path)) for path in configs]
+        (bad, names) = said!(io, suite)
         problems += bad
-        for path in configs
-            problems += check_named_config!(io, target, path)
+        for t in named
+            problems += said!(io, t)
         end
         todo += chore_runstates!(io, target, fix, names)
+        todo += said!(io, gone)
         if problems > 0
             fix && todo > 0 && print(io, "done: ", todo, " · ")
             print(io, "to fix by hand: ", problems)
@@ -84,6 +93,14 @@ end
 # expansions of templates are the templates step's to report.
 function check_suite!(io::IO, target)
     config = joinpath(target.testdir, "TestItems.toml")
+    # A package with no test files of any kind, a fixture package in another's
+    # `test/` say, has no suite for chores to keep: nothing to do, where a run of it
+    # has nothing to run and says so.
+    walked = walk_test_dir(target.testdir; claimed = claimed_environments(config_toml(target.testdir, nothing)...))
+    if all(isempty, (walked.tests, walked.strays, walked.templates, walked.unclaimed))
+        println(io, "test items: none, no test files under ", relpath_or_path(target.testdir, target.root))
+        return 0, Set{String}()
+    end
     try
         p, _ = prepare((target.root,); announce = false, expansions = false, group = ALL_GROUP)
         println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
@@ -156,18 +173,48 @@ end
 
 # Every group of `[groups]` as a run selecting it would read it, since a lane of CI
 # that selects one finds a tag no item carries, or nothing to run, only when it
-# runs. The number of groups wrong.
+# runs. Each reads the suite, in a task of its own. The number of groups wrong.
 function check_groups!(io::IO, target, groups::Dict{String, TagExpr}; config = nothing)
-    bad = 0
-    for name in sort!(collect(keys(groups)))
-        try
+    checks = map(sort!(collect(keys(groups)))) do name
+        Threads.@spawn try
             prepare((target.root,); config, announce = false, expansions = false, group = name)
+            nothing
         catch e
             e isa ConfigError || e isa NoTestsError || rethrow()
-            bad += print_problem(io, "groups", e isa ConfigError ? e.msg : "group `$name` selects no test item")
+            e isa ConfigError ? e.msg : "group `$name` selects no test item"
         end
     end
+    bad = 0
+    for t in checks
+        msg = fetch_result(t)
+        msg === nothing || (bad += print_problem(io, "groups", msg))
+    end
     return bad
+end
+
+# A step of the chores in a task of its own: what it says, styled as the report is,
+# and what it returns. `said!` prints the first and returns the second, once the task
+# is done, so the report reads in the order of its steps whatever order they end in.
+chore_task(f) = Threads.@spawn begin
+    out = Ref{Any}(nothing)
+    text = styled(io -> (out[] = f(io)))
+    (text, out[])
+end
+
+function said!(io::IO, t::Task)
+    text, out = fetch_result(t)
+    print(io, text)
+    return out
+end
+
+# What a task returned, or what it threw, as itself rather than wrapped.
+function fetch_result(t::Task)
+    try
+        return fetch(t)
+    catch e
+        e isa TaskFailedException && throw(e.task.result)
+        rethrow()
+    end
 end
 
 # `label: msg`, a message of several lines indented under its first. Counts as one.
@@ -201,61 +248,47 @@ function chore_setups!(io::IO, target, fix::Bool)
     return (length(pending), 0)
 end
 
-# Deletes, under `fix`, the run states `stale_runstates` names; their number.
+# Deletes, under `fix`, the run states pruning would, and those of an older format;
+# their number.
 function chore_runstates!(io::IO, target, fix::Bool, names)
     files = runstate_files(target.root)
     print(io, "run states: ")
     isempty(files) && (println(io, "none"); return 0)
     print(io, length(files), " in ")
     printstyled(io, relpath_or_path(runstate_dir(target.root), target.root); color = :light_black)
-    stale = stale_runstates(target.root, names)
-    if isempty(stale)
+    stale = prunable_runstates(target.root; names)
+    old = old_format_runstates(target.root)
+    if isempty(stale) && isempty(old)
         println(io, ", none to delete")
         return 0
     end
     # Another process may be reading one, or have deleted it, already.
-    fix && foreach(stale) do f
-        try
-            rm(f; force = true)
-        catch e
-            e isa Base.IOError || rethrow()
-        end
+    fix && foreach(remove_runstate, [stale; old])
+    said = String[]
+    isempty(stale) || push!(said, string(
+        length(stale), " of this machine's ", fix ? "deleted" : "to delete",
+        ": beyond the newest ", KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not"
+    ))
+    isempty(old) || push!(said, string(
+        length(old), " of an older format, which this version of Runtests does not read, ", fix ? "deleted" : "to delete"
+    ))
+    println(io, ", ", join(said, "; "))
+    return length(stale) + length(old)
+end
+
+# Deletes, under `fix`, the run states of checkouts that are gone; their number. Only
+# where this project's own are, the default location: one that `RUNTESTS_RUNSTATE_DIR`
+# names is a CI job's, or shared, and the sweep has no business there.
+function chore_gone_checkouts!(io::IO, fix::Bool)
+    isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", "")) || return 0
+    gone = sweep_runstate_dirs(; fix)
+    print(io, "checkouts that are gone: ")
+    if isempty(gone)
+        println(io, "none with run states to delete")
+        return 0
     end
-    println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete",
-            ": beyond the newest ", KEEP_RUNS, " with no failing item's verdict in them",
-            names === nothing ? "" : ", or with nothing about an item the suite has")
-    return length(stale)
+    n = sum(g -> length(g.runstates), gone)
+    println(io, plural(length(gone), "directory", "directories"), " in ", relpath_or_path(runstate_root()), ", ",
+            plural(n, "run state"), fix ? " deleted" : " to delete")
+    return max(n, 1)
 end
-
-"""
-    stale_runstates(root, names = nothing) -> Vector{String}
-
-The run states `chores` deletes, oldest first, all of them this machine's and this
-project's: those that hold nothing about any of `names`, the suite's test items,
-however new, and of the rest those a run's own pruning deletes, beyond the newest
-`KEEP_RUNS` and with no failing item's last verdict in them (`removable_runs`).
-Without `names` nothing says what the suite has, and only the second go. One
-recorded elsewhere, one of another project, and one that cannot be read are never
-among them: nothing shows they are this machine's to delete. Nor is one a run is
-still writing (`is_live`).
-"""
-function stale_runstates(root::AbstractString, names::Union{Nothing, AbstractSet{String}} = nothing)
-    here = run_host()
-    ours(rs) = get(rs.meta, "host", "") == here
-    runs = project_runs(root)
-    useless = names === nothing ? Set{String}() :
-        Set(f for (f, rs) in runs if ours(rs) && !is_live(rs) && !holds_any(rs, names))
-    # The rest as they stand once those are deleted: those count neither among the
-    # newest `KEEP_RUNS` nor as holding a verdict that keeps another.
-    rest = filter(((f, _),) -> !(f in useless), runs)
-    mine = [f for (f, rs) in rest if ours(rs)]
-    live = Set(f for (f, rs) in rest if is_live(rs))
-    beyond = Set(removable_runs(rest, filter(!in(live), mine[1:max(0, length(mine) - KEEP_RUNS)])))
-    return [f for (f, _) in runs if f in useless || f in beyond]
-end
-
-# Whether a run recorded anything about one of `names`: an item it ran, to an end
-# or part way, which is what every reader of a run state takes from it. Paired by
-# `zip`, since a damaged file can hold fewer statuses than items or the other way.
-holds_any(rs::RunStateRecord, names) =
-    any(((it, st),) -> st.state !== UNSEEN && it.name in names, zip(rs.items, rs.statuses))

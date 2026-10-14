@@ -1,6 +1,6 @@
 using Runtests.Private: prepare, init_run_state, finish_run_state!, write_status!, new_runstate_path,
-                    read_run_state, failing_items, history, recent_runs, prune_runstates, stale_runstates,
-                    runstate_files, is_live, KEEP_RUNS, LIVE_S, PASSED, FAILED, RUNNING, nitems
+                    read_run_state, failing_items, history, prune_runstates, prunable_runstates,
+                    runstate_files, is_live, KEEP_RUNS, LIVE_S, PASSED, FAILED, RUNNING, UNSEEN, nitems
 
 const SHARED_REPO = dirname(@__DIR__)
 
@@ -53,7 +53,6 @@ end
             h = history(pkg)
             @test haskey(h.failed, "a") && !haskey(h.failed, "c")
             @test h.seconds["b"] == 3.0
-            @test last(only(recent_runs(pkg, 1))).path == finished.path
             # Once it has died, what it held as running is what it was running when it did.
             died!(going)
             @test !is_live(read_run_state(going.path))
@@ -89,16 +88,19 @@ end
             p, _ = prepare((pkg,); announce = false)
             # Started before every run the pruning keeps, and still going.
             going = shared_run(pkg, p, ["a" => PASSED]; ago = 1000, finish = false)
+            logs = mkpath(Runtests.Private.logs_dir(going.path))
+            write(joinpath(logs, "item_1_1.log"), "still being written\n")
             for k in 1:(KEEP_RUNS + 3)
                 shared_run(pkg, p, ["a" => PASSED, "b" => PASSED]; ago = 900 - k)
             end
-            @test !(going.path in stale_runstates(pkg, Set(["a", "b"])))
+            @test !(going.path in prunable_runstates(pkg; names = Set(["a", "b"])))
             prune_runstates(pkg)
-            @test isfile(going.path)
+            @test isfile(going.path) && isfile(joinpath(logs, "item_1_1.log"))
             @test length(runstate_files(pkg)) == KEEP_RUNS + 1
             died!(going)
             prune_runstates(pkg)
             @test !isfile(going.path) && length(runstate_files(pkg)) == KEEP_RUNS
+            @test !isdir(logs)   # with its run state, once that goes
             finish_run_state!(going)
         end
     end
@@ -120,6 +122,25 @@ end
             rs = read_run_state(rsf.path)
             @test rs.complete && rs.cancelled && !is_live(rs)
             @test timedwait(() -> istaskdone(beats), 10) === :ok && !istaskfailed(beats)
+        end
+    end
+
+    @testset "a run that ends before its first item finishes its run state" begin
+        pkg = make_pkg("SharedAborted",
+            "test/testsetups/Broken.jl" => "module Broken\nerror(\"this setup does not load\")\nend\n",
+            "test/t_test.jl" => "@testitem \"a\" begin\n    using Broken\n    @test true\nend\n")
+        artifacts = mktempdir()
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir(), "RUNTESTS_ARTIFACT_DIR" => artifacts) do
+            @test_throws Runtests.ConfigError capture_run(() -> Runtests.runtests(pkg; workers = 1))
+            path = only(runstate_files(pkg))
+            rs = read_run_state(path)
+            # Finished, so no reader waits for it and its beats are over.
+            @test rs.complete && rs.aborted && !rs.cancelled && !is_live(rs)
+            @test all(st -> st.state === UNSEEN, rs.statuses)
+            # Why it ended is kept beside it, and goes where the run's evidence goes.
+            @test occursin("this setup does not load", read(joinpath(Runtests.Private.logs_dir(path), "setup.log"), String))
+            @test isfile(joinpath(artifacts, basename(path)))
+            @test isfile(joinpath(artifacts, basename(Runtests.Private.logs_dir(path)), "setup.log"))
         end
     end
 
@@ -160,9 +181,10 @@ end
             using Runtests
             Runtests.runtests($(repr(pkg)); workers = 0, monitor = false)
             """
+        artifacts = mktempdir()
         cmd = addenv(`$(Base.julia_cmd()) --project=$(SHARED_REPO) --startup-file=no -e $script`,
                      "JULIA_LOAD_PATH" => join([SHARED_REPO, joinpath(SHARED_REPO, "test"), ""], Runtests.Private.PATHSEP),
-                     "RUNTESTS_RUNSTATE_DIR" => dir)
+                     "RUNTESTS_RUNSTATE_DIR" => dir, "RUNTESTS_ARTIFACT_DIR" => artifacts)
         logs = [Base.BufferStream() for _ in 1:nruns]
         procs = [run(pipeline(cmd; stdout = logs[k], stderr = logs[k]); wait = false) for k in 1:nruns]
         # Read as a planner and `runtestsf` would, the whole time they write: nothing
@@ -193,6 +215,10 @@ end
             @test length(ran) == nruns
             @test all(rs -> rs.complete && !is_live(rs) && all(st -> st.state === PASSED, rs.statuses), ran)
             @test length(runs) <= KEEP_RUNS + nruns
+            # Each run copied its own run state, finished, and none of the history.
+            copied = filter(endswith(".runstate"), readdir(artifacts))
+            @test sort(copied) == sort([basename(rs.path) for rs in ran])
+            @test all(f -> read_run_state(joinpath(artifacts, f)).complete, copied)
         end
     end
 end

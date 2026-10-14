@@ -169,6 +169,10 @@ filtered(paths...; kwargs...) =
         msg = said(() -> filtered(dir; name = ["multiplys numbers", "nothing like it"]))
         @test occursin("\"multiplys numbers\" (did you mean \"multiplies numbers\"?)", msg)
         @test occursin("\"nothing like it\"", msg)
+        # Beside a name the suite has, one it does not would be left out without a word.
+        msg = said(() -> filtered(dir; name = ["adds numbers", "multiplys numbers"]))
+        @test occursin("\"multiplys numbers\" (did you mean \"multiplies numbers\"?)", msg)
+        @test !occursin("\"adds numbers\"", msg)
         # A name the suite has, that another selection leaves out, needs no hint.
         @test !occursin("has no item called", said(() -> filtered(dir; name = "adds numbers", tags = :slow)))
     end
@@ -317,4 +321,21 @@ filtered(paths...; kwargs...) =
         )
         @test filtered(ordered; tags=:fast) == ["adds numbers", "multiplies numbers"]
     end
+end
+
+@testset "an item's name given as a path says how to give it" begin
+    err = try
+        Runtests.Private.resolve_target(("adds numbers",))
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("no such file or directory", err.msg) && occursin("give `name = \"adds numbers\"`", err.msg)
+    # What looks like a path is a path that is not there, and nothing else.
+    err = try
+        Runtests.Private.resolve_target((joinpath("test", "missing_test.jl"),))
+    catch e
+        e
+    end
+    @test err isa ArgumentError && !occursin("name =", err.msg)
 end

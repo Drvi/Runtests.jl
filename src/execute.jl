@@ -20,6 +20,9 @@ mutable struct Slot
     started_at::Float64      # when this slot's current process came up
     worker_items::Int        # items the current process has run, for its EXIT line
     @atomic current::ItemIdx      # the item this slot is running, 0 when idle
+    # The attempt at `current` in flight. Whoever records that attempt's outcome
+    # clears `current`: the slot, or `record_stopped_item!` when the run stops.
+    @atomic attempt::Int8
     # A process killed for a timeout prints its signal and backtrace after its item
     # has stopped capturing. Those lines belong in `dying_log`, the log of the item
     # that was running (empty otherwise), and wait in `dying_lines` until the
@@ -225,6 +228,9 @@ const MAX_BACKPRESSURE_SECONDS = 30.0
 
 function wait_while_paused(q::Queues, slot::Slot)
     is_paused(q) || return nothing
+    # Between units the worker is idle, and what its items left behind is what the
+    # hold waits to see go: a worker left alone may not collect it for a long time.
+    (@atomic slot.recycle) || collect_garbage(@atomic slot.worker)
     deadline = time() + MAX_BACKPRESSURE_SECONDS
     # A slot asked to replace its worker does it now, which frees memory sooner
     # than waiting does.
@@ -235,6 +241,18 @@ function wait_while_paused(q::Queues, slot::Slot)
         set_paused!(q, false)
         @warn "Runtests: memory has stayed tight for $(round(Int, MAX_BACKPRESSURE_SECONDS))s; " *
             "continuing rather than stalling the run" maxlog = 1
+    end
+    return nothing
+end
+
+# Asks a worker to collect its garbage, without waiting for it to finish. A worker
+# answers requests one at a time, so one running an item gets to it afterwards.
+function collect_garbage(w::Union{Nothing, RuntestsWorkers.Worker})
+    w === nothing && return nothing
+    try
+        RuntestsWorkers.remote_eval(w, :(GC.gc(true)))
+    catch e
+        is_interrupt(e) && rethrow()
     end
     return nothing
 end
@@ -274,8 +292,16 @@ mutable struct Run
     const slots::Vector{Slot}
     const project_name::String
     const runid::String
-    const logdir::String
-    const logprefix::String   # `logdir` and the part of a log's name that never varies
+    # The run's own temporary directory: coverage counts, which the run merges into
+    # `lcov.info`, and the items' logs when there is no run state to keep them by.
+    const scratch::String
+    # Where the items' logs go: beside the run state, which they share a lifetime with
+    # (see `logs_dir`), once it is open; `scratch` until then.
+    logdir::String
+    logprefix::String   # `logdir` and the part of a log's name that never varies
+    # Where `RUNTESTS_ARTIFACT_DIR` had the run copy its run state and logs, once it
+    # has; empty otherwise.
+    exported::String
     # The name column, chosen once from every name the run will print, and each
     # item's name as it is written there (see `item_names`).
     const name_width::Int32
@@ -345,16 +371,16 @@ function execute(p::Plan, target)
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
-    logdir = mktempdir(; prefix = "runtests_")
+    scratch = mktempdir(; prefix = "runtests_")
     names, column = item_names(p, name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)))
     run = Run(
-        p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
-        joinpath(logdir, "item_"), column, names,
+        p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch,
+        joinpath(scratch, "item_"), "", column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[]
     )
     run.events === nothing || (run.events.run = run)
-    cfg.coverage && mkpath(coverage_dir(logdir))
+    cfg.coverage && mkpath(coverage_dir(scratch))
     # Ctrl-C caught by any task the run starts is thrown into this one, which is
     # where the run knows how to stop.
     outer = @atomic RuntestsWorkers.INTERRUPT_TARGET.task
@@ -365,7 +391,7 @@ function execute(p::Plan, target)
         push!(
             run.slots, Slot(
                 SlotIdx(s), p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, ItemIdx(0), "", String[], false
+                nothing, 0.0, 0, ItemIdx(0), Int8(0), "", String[], false
             )
         )
     end
@@ -386,7 +412,6 @@ function execute(p::Plan, target)
 end
 
 function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
-    cfg = p.cfg
     return with_logger(RunLogger(current_logger(), run)) do
         with_test_env(target, run) do
             # Before the run state: a profile's environment that does not resolve
@@ -395,67 +420,91 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
             # Opened once the test environment is active: its manifest is part of
             # what the file records.
             @atomic run.runstate = open_runstate(p, run.t0)
-            check_replayed_environment(run)
-            with_load_path(setup_path) do
-                precompile_phase(run, p, target)
-                # From the start of the run, as the monitor's setup stage is, so the
-                # header and the closing block give the same figure.
-                p.startup.setup = time() - run.t0
-                # Printed once setup is done, so it can say what setup cost.
-                print_run_header(run)
-                set_phase!(run.monitor, PHASE_TEST)
-                interrupted = false
-                ensure_exit_report()
-                LIVE_RUN[] = run
-                limit = stall_limit(p)
-                @atomic run.last_finish = time()
-                watchdog = start_watchdog(run, limit)
-                try
-                    if cfg.workers == 0
-                        run_in_process(run, target)
-                    else
-                        run_on_workers(run, target)
-                    end
-                    # Stopped with nothing in flight to interrupt: the slots saw their
-                    # workers go and ended on their own.
-                    (@atomic run.stalled) && throw(RunStalled(limit))
-                catch e
-                    stalled = @atomic run.stalled
-                    if is_interrupt(e) || stalled
-                        interrupted = true
-                        shielded(() -> kill_workers!(run))
-                    end
-                    stalled ? throw(RunStalled(limit)) : rethrow()
-                finally
-                    # Shielded: after a cancellation every wait in this task throws
-                    # again, and this has to finish.
+            keep_logs_by_runstate!(run)
+            # Until the first item can start, a throw ends the run here, and its file
+            # must say so: unfinished, its beats would keep it looking alive for as
+            # long as this process lasts. Why it ended goes beside it.
+            testing = Ref(false)
+            try
+                run_testing(run, p, target, setup_path, testing)
+            catch e
+                if !testing[]
                     shielded() do
-                        close(watchdog)
-                        # Reaching here at all means the run unwound, so the exit
-                        # hook has nothing left to close.
-                        LIVE_RUN[] = nothing
-                        set_phase!(run.monitor, PHASE_REPORT)
-                        stop_monitor!(run.monitor)
-                        shutdown!(run)
-                        record_cpu_end!(run.monitor)
-                        # Every worker has exited, so every tracefile there will be
-                        # is written.
-                        cfg.coverage && (run.coverage = collect_coverage(run))
-                        run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
-                        finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
-                        # A replay deletes no run state, the one it runs least of all.
-                        if isempty(p.cfg.replayed_from)
-                            prune_runstates(p.root)
-                            sweep_runstate_dirs()
-                        end
-                        # The exception on its way out stops the report from being
-                        # made, so what the run got through is said here or nowhere.
-                        interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
+                        write_run_log(run, "setup.log", sprint(showerror, e))
+                        finish_run_state!(run.runstate; aborted = true)
+                        tidy_logs(run)
+                        export_run!(run)
                     end
                 end
-                run
+                rethrow()
             end
         end
+    end
+end
+
+# Setup, then the items. `testing` is set once the items' own `finally` is in place
+# to finish the run state.
+function run_testing(run::Run, p::Plan, target, setup_path::AbstractString, testing::Ref{Bool})
+    cfg = p.cfg
+    check_replayed_environment(run)
+    return with_load_path(setup_path) do
+        precompile_phase(run, p, target)
+        # From the start of the run, as the monitor's setup stage is, so the
+        # header and the closing block give the same figure.
+        p.startup.setup = time() - run.t0
+        # Printed once setup is done, so it can say what setup cost.
+        print_run_header(run)
+        set_phase!(run.monitor, PHASE_TEST)
+        interrupted = false
+        ensure_exit_report()
+        LIVE_RUN[] = run
+        limit = stall_limit(p)
+        @atomic run.last_finish = time()
+        watchdog = start_watchdog(run, limit)
+        testing[] = true
+        try
+            if cfg.workers == 0
+                run_in_process(run, target)
+            else
+                run_on_workers(run, target)
+            end
+            # Stopped with nothing in flight to interrupt: the slots saw their
+            # workers go and ended on their own.
+            (@atomic run.stalled) && throw(RunStalled(limit))
+        catch e
+            stalled = @atomic run.stalled
+            if is_interrupt(e) || stalled
+                interrupted = true
+                shielded(() -> kill_workers!(run))
+            end
+            stalled ? throw(RunStalled(limit)) : rethrow()
+        finally
+            # Shielded: after a cancellation every wait in this task throws
+            # again, and this has to finish.
+            shielded() do
+                close(watchdog)
+                # Reaching here at all means the run unwound, so the exit
+                # hook has nothing left to close.
+                LIVE_RUN[] = nothing
+                set_phase!(run.monitor, PHASE_REPORT)
+                stop_monitor!(run.monitor)
+                shutdown!(run)
+                record_cpu_end!(run.monitor)
+                # Every worker has exited, so every tracefile there will be
+                # is written.
+                cfg.coverage && (run.coverage = collect_coverage(run))
+                run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
+                finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
+                tidy_logs(run)
+                export_run!(run)
+                # A replay deletes no run state, the one it runs least of all.
+                isempty(p.cfg.replayed_from) && prune_runstates(p.root; names = Set(p.suite_names))
+                # The exception on its way out stops the report from being
+                # made, so what the run got through is said here or nowhere.
+                interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
+            end
+        end
+        run
     end
 end
 
@@ -469,7 +518,11 @@ active afterwards. The environment is:
    `Pkg.test`, which has built an environment with the test dependencies;
 2. the active one, when it is the package's own `test/Project.toml`, because
    activating that is a deliberate choice;
-3. otherwise a test environment built by `TestEnv`, cached for the session.
+3. the package's `test/Project.toml`, when the package lists it in its
+   `[workspace]`, as `Pkg.test` does;
+4. otherwise a test environment built by `TestEnv`.
+
+The last two are cached for the session.
 
 Never the package's plain project, which lacks the test-only dependencies.
 """
@@ -508,11 +561,12 @@ function test_env_for(target, announce = nothing)
     return env
 end
 
-# Generated test environments, kept for the session and keyed by project file:
-# building one costs a resolve, and a new environment makes Julia precompile again,
-# which at the REPL is the difference between a second and a minute. The stamp is
-# what it was generated from, so a test dependency added mid-session rebuilds it.
-const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Float64}}}()
+# Test environments, kept for the session and keyed by project file: building one
+# costs a resolve, seconds at the REPL. It costs no compilation: caches are keyed by
+# package versions and flags, not by environment, so a new environment with the same
+# versions reuses them. The stamp is what it was generated from, so a test dependency
+# added mid-session rebuilds it.
+const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Tuple{String, Float64}}}}()
 const TEST_ENVS_LOCK = ReentrantLock()
 
 function test_env(target, announce = nothing)
@@ -531,10 +585,18 @@ function test_env(target, announce = nothing)
             # only; `precompile_env` does it once for every set of flags the pools
             # use, and the time reported against this stays the resolve's.
             withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-                Pkg.activate(proj; io = devnull)
-                TestEnv.activate()
+                testproj = joinpath(target.testdir, "Project.toml")
+                if in_package_workspace(testproj, proj)
+                    # It shares the package's manifest, so `Pkg.test` runs it as it
+                    # is, without a sandbox.
+                    Pkg.activate(testproj; io = devnull)
+                    Pkg.instantiate(; allow_autoprecomp = false)
+                else
+                    Pkg.activate(proj; io = devnull)
+                    TestEnv.activate()
+                end
             end
-            # What `TestEnv.activate` made active: a project, or it would have thrown.
+            # What activating made active: a project, or it would have thrown.
             env = Base.active_project()::String
             # Stamped *after* generating it: resolving writes the package's manifest,
             # so a stamp taken beforehand never matches again and every call would
@@ -555,17 +617,26 @@ function test_env(target, announce = nothing)
     end
 end
 
+# The package's project and the test project, each with the manifest Julia reads for
+# it: `Manifest-v1.x.toml` before `Manifest.toml`, a workspace's shared one. Paths
+# as well as times, so a manifest that takes over from another changes the stamp.
 function env_stamp(target)
-    root = dirname(abspath(target.project))
-    return (
-        mtime_or_zero(target.project),
-        mtime_or_zero(joinpath(root, "Manifest.toml")),
-        mtime_or_zero(joinpath(target.testdir, "Project.toml")),
-        mtime_or_zero(joinpath(target.testdir, "Manifest.toml")),
-    )
+    proj = abspath(target.project)
+    testproj = joinpath(target.testdir, "Project.toml")
+    stamped(path) = (path, mtime_or_zero(path))
+    manifest(project) = something(isfile(project) ? Base.project_file_manifest_path(project) : nothing, "")
+    return (stamped(proj), stamped(manifest(proj)), stamped(testproj), stamped(manifest(testproj)))
 end
 
 mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
+
+# Whether the package lists `test/` in its own `[workspace]`, by the rule Julia's
+# loader uses to find a workspace member's manifest.
+function in_package_workspace(testproj, proj)
+    isfile(testproj) || return false
+    base = Base.base_project(testproj)
+    return base !== nothing && samefile(base, proj)
+end
 
 # `Pkg.test` runs `test/runtests.jl` in an environment it built for the purpose.
 # The file being evaluated is how we can tell.
@@ -579,7 +650,17 @@ end
 # run state was recorded in. Every package whose version differs is named: it is
 # the first thing to rule out when a replay does not fail the way the original did.
 function check_replayed_environment(run::Run)
-    recorded = run.plan.cfg.replayed_manifest
+    cfg = run.plan.cfg
+    if !isempty(cfg.julia_flags)
+        here = join(nondefault_flags(code_flags()), " ")
+        say(run, string("the workers compile with the Julia flags the run state recorded, ",
+                        join(nondefault_flags(cfg.julia_flags), " "), ", where this process has ",
+                        isempty(here) ? "none of them" : here))
+        cfg.workers == 0 && @warn "Runtests: the run state was recorded with the Julia flags " *
+            "$(join(cfg.julia_flags, " ")), and `workers = 0` runs the items in this process, which has " *
+            "$(join(code_flags(), " ")); give it one worker or more to run them as they were run"
+    end
+    recorded = cfg.replayed_manifest
     isempty(recorded) && return nothing
     env = Base.active_project()
     here = manifest_versions(read_text(env === nothing ? nothing : Base.project_file_manifest_path(env)))
@@ -628,6 +709,88 @@ function open_runstate(p::Plan, start::Float64)
         @warn "Runtests: could not open a run state file; continuing without one" exception = e
         return nothing
     end
+end
+
+# The items' logs go beside the run state once it is open, so that they last as long
+# as it does. Without one, or without a directory there, they stay in `scratch`.
+function keep_logs_by_runstate!(run::Run)
+    rsf = @atomic run.runstate
+    rsf === nothing && return nothing
+    dir = logs_dir(rsf.path)
+    try
+        mkpath(dir)
+    catch e
+        is_interrupt(e) && rethrow()
+        @warn "Runtests: could not make $(dir) for the items' logs; they go with the run" exception = e
+        return nothing
+    end
+    run.logdir = dir
+    run.logprefix = joinpath(dir, "item_")
+    return nothing
+end
+
+# `text` as `name` in the run's log directory; never a reason to fail the run.
+function write_run_log(run::Run, name::AbstractString, text::AbstractString)
+    try
+        write(joinpath(run.logdir, name), text)
+    catch e
+        is_interrupt(e) && rethrow()
+    end
+    return nothing
+end
+
+function write_failure_report(run::Run, i::ItemIdx, attempt::Integer, testset)
+    failures = collect_failures(testset)
+    isempty(failures) && return nothing
+    text = sprint() do io
+        for r in failures
+            show(io, r)
+            println(io)
+        end
+    end
+    write_run_log(run, basename(failure_path(run.logprefix, i, attempt)), strip_root(text, run.plan.root))
+    return nothing
+end
+
+"""
+    export_run!(run)
+
+Copy the run's run state and its logs into the directory `RUNTESTS_ARTIFACT_DIR`
+names, when it names one: what a CI job uploads as the evidence of its own run,
+apart from the run-state directory, whose history it caches for the next run. Called
+once the run state is finished, however the run ended. Never a reason to fail it.
+"""
+function export_run!(run::Run)
+    dir = get(ENV, "RUNTESTS_ARTIFACT_DIR", "")
+    rsf = @atomic run.runstate
+    (isempty(dir) || rsf === nothing) && return nothing
+    try
+        dir = abspath(dir)
+        mkpath(dir)
+        cp(rsf.path, joinpath(dir, basename(rsf.path)); force = true)
+        logs = logs_dir(rsf.path)
+        isdir(logs) && cp(logs, joinpath(dir, basename(logs)); force = true)
+        run.exported = dir
+    catch e
+        is_interrupt(e) && rethrow()
+        @warn "Runtests: could not copy the run state and logs to `RUNTESTS_ARTIFACT_DIR` ($dir)" exception = e
+    end
+    return nothing
+end
+
+# A log an attempt left empty says nothing, and a directory of them is noise; what
+# is left is what the items printed, and the reports of those that did not pass.
+function tidy_logs(run::Run)
+    run.logdir == run.scratch && return nothing
+    try
+        for f in readdir(run.logdir; join = true)
+            isfile(f) && filesize(f) == 0 && rm(f; force = true)
+        end
+        isempty(readdir(run.logdir)) && rm(run.logdir; force = true)
+    catch e
+        is_interrupt(e) && rethrow()
+    end
+    return nothing
 end
 
 """
@@ -1172,17 +1335,21 @@ Record the item this slot was running when the run was stopped: it neither faile
 nor finished, and is counted with the items the run never reached.
 """
 function record_stopped_item!(run::Run, slot::Slot)
-    i = slot.current
+    i = @atomic slot.current
     i == ItemIdx(0) && return nothing
-    # The slot may have recorded it already, on its way out of a dispatch that
-    # failed for a reason of its own.
-    run.statuses.state[i] === UNSEEN || return nothing
-    attempt = max(run.statuses.attempt[i], Int8(1))
-    if @atomic run.stalled
-        record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
-    else
-        record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+    attempt = max(@atomic(slot.attempt), Int8(1))
+    # The slot may have recorded this attempt already, on its way out of a dispatch
+    # that failed for a reason of its own; an earlier attempt's outcome is no reason
+    # to leave this one unrecorded.
+    st = run.statuses
+    if !(st.state[i] !== UNSEEN && st.attempt[i] >= attempt)
+        if @atomic run.stalled
+            record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
+        else
+            record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+        end
     end
+    @atomic slot.current = ItemIdx(0)
     return nothing
 end
 
@@ -1346,7 +1513,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
         w = try
             RuntestsWorkers.Worker(;
                 julia_args = run.plan.cfg.coverage ?
-                    [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.logdir))] : prof.julia_args,
+                    [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args,
                 threads = prof.threads,
                 extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, slot.profile.name, Base.active_project()), slot.profile),
                 dir = target.root,
@@ -1619,6 +1786,7 @@ function report_unfinished_run()
         # They are frozen where they were, and each still names its item.
         foreach(slot -> record_stopped_item!(run, slot), run.slots)
         finish_run_state!(run.runstate; cancelled = true, exiting = true)
+        export_run!(run)
         if trylock(run.printer)
             try
                 clear_status_line(run.monitor)
@@ -1819,15 +1987,19 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     spec = item_spec(run, i, slot, attempt)
     run.statuses.seq[i] = Int16(min(slot.worker_items + 1, typemax(Int16)))
     began!(run, i, slot.id, attempt, w.pid)
+    @atomic slot.attempt = attempt
     @atomic slot.current = i
     result = try
         dispatch(run, w, spec, item_timeout(p, i), slot)
     catch e
         # An interrupt leaves it set: the slot is unwinding, and what it was
-        # running is the one thing `record_stopped_item!` needs from it.
+        # running is the one thing `record_stopped_item!` needs from it. So does
+        # one that comes while the failure is handled, which waits for the worker
+        # to exit: the item is the slot's until its outcome is recorded.
         is_interrupt(e) && rethrow()
+        survived = handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
         @atomic slot.current = ItemIdx(0)
-        return handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
+        return survived
     end
     @atomic slot.current = ItemIdx(0)
     slot.worker_items += 1
@@ -1894,10 +2066,11 @@ Base.showerror(io::IO, e::TestEndFailure) = print(
     sprint(showerror, e.cause)
 )
 
-# A `test_end` that recorded nothing leaves the item's result alone; one that failed
-# becomes a testset nested in the item's. The item's timings stay the item's.
+# A `test_end` that recorded nothing leaves the item's result alone; one that did
+# becomes a testset nested in the item's. A testset keeps passes as a count, not in
+# its results. The item's timings stay the item's.
 function merge_test_end(res::ItemResult, endres::ItemResult)
-    isempty(endres.testset.results) && return res
+    isempty(endres.testset.results) && Test.get_test_counts(endres.testset).passes == 0 && return res
     push!(res.testset.results, endres.testset)
     state = severity(endres.state) > severity(res.state) ? endres.state : res.state
     return ItemResult(res.index, state, res.testset, res.stats)
@@ -1919,6 +2092,11 @@ function fetch_within(fut, seconds::Real, on_timeout::Exception)
         close(timer)
     end
 end
+
+# Whether the run's stop recorded the slot's item while the slot waited for its
+# worker: the exit hook records what each slot holds, and the run has said how it
+# ended by the time the slot goes on.
+stopped_meanwhile(slot::Slot) = @atomic(slot.current) == ItemIdx(0)
 
 # Whether the worker survived: `false` when it is gone and the rest of the unit
 # cannot be trusted, `true` when the item failed on a process still fit to use.
@@ -1942,6 +2120,7 @@ function handle_dispatch_failure!(
             flush_dying_log!(slot)
         end
         @atomic slot.worker = nothing
+        stopped_meanwhile(slot) && return false
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
             string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker"));
@@ -1959,6 +2138,10 @@ function handle_dispatch_failure!(
         how = ""
         if w !== nothing
             wait(w)   # its exit status is known once its process is reaped
+            if stopped_meanwhile(slot)
+                @atomic slot.worker = nothing
+                return false
+            end
             how = died_how(run, slot, w)
             print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
         end
@@ -1992,7 +2175,7 @@ function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
         p.items.code[i], p.items.skip[i],
         p.items.failfast[i] == -1 ? p.cfg.item_failfast : p.items.failfast[i] == 1,
         run.project_name, slot.profile.name, attempt, p.cfg.full_stacktraces, logpath,
-        item_seed(p.cfg.seed, p.items.name[i])
+        item_seed(p.items.seed[i], p.items.name[i])
     )
 end
 
@@ -2047,6 +2230,9 @@ function record!(
     st.elapsed[i] = synthetic ? max(0.0, ended - run.t0 - st.start[i]) : stats.elapsed_ns / 1.0e9
     st.compile[i] = stats.compile_ns / 1.0e9
     st.testsets[i] = testset
+    # What the run prints of a failure, kept beside the item's output for whoever
+    # reads the run state later; a cancel or a skip has nothing of its own to say.
+    is_non_pass(state) && state !== CANCELLED && write_failure_report(run, i, attempt, testset)
     write_status!(
         run.runstate, i, state, attempt, slot;
         start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],

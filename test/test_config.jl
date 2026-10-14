@@ -106,6 +106,40 @@ end
         end
     end
 
+    @testset "every run setting reads RUNTESTS_<KEY>, under a keyword and over the file" begin
+        mktempdir() do dir
+            write(joinpath(dir, "TestItems.toml"), "[run]\nworkers = 3\nretries = 1\n")
+            vars = ("RUNTESTS_WORKERS" => "5", "RUNTESTS_TIMEOUT" => "90", "RUNTESTS_FAILFAST" => "yes",
+                    "RUNTESTS_SEED" => "0x10", "RUNTESTS_LOGS" => "batched", "RUNTESTS_THREADS" => "3,1")
+            withenv(vars...) do
+                cfg = read_config(dir)
+                @test (cfg.workers, cfg.timeout_s, cfg.failfast, cfg.seed, cfg.logs, cfg.threads) == (5, 90, true, 0x10, :batched, "3,1")
+                @test cfg.retries == 1                            # the file's, with no variable
+                @test read_config(dir; workers = 2).workers == 2  # a keyword wins
+                @test issetequal(cfg.env_settings, collect(vars))
+                @test !any(v -> first(v) == "RUNTESTS_WORKERS", read_config(dir; workers = 2).env_settings)
+            end
+            # A bad value names its variable, which nothing else in the project shows.
+            withenv("RUNTESTS_WORKERS" => "many") do
+                err = try read_config(dir) catch e e end
+                @test err isa ConfigError && occursin("`workers` must be", err.msg) && occursin("RUNTESTS_WORKERS", err.msg)
+            end
+            withenv("RUNTESTS_VERBOSE" => "maybe") do
+                @test_throws ConfigError read_config(dir)
+            end
+        end
+    end
+
+    @testset "a seed given is the seed, 0 among them, and none given is a random one" begin
+        mktempdir() do dir
+            @test read_config(dir; seed = 0).seed == 0
+            @test read_config(dir; seed = 0x1234).seed == 0x1234
+            @test read_config(dir).seed != read_config(dir).seed
+            write(joinpath(dir, "TestItems.toml"), "[run]\nseed = 0\n")
+            @test read_config(dir).seed == 0
+        end
+    end
+
     @testset "a testset name is a non-empty string" begin
         @test read_config(mktempdir(); testset_name = "integration").testset_name == "integration"
         for bad in ("", 3)
@@ -311,6 +345,8 @@ end
         @test auto_workers("2", 0) >= 1
         @test auto_workers("2", 1) == 1          # never more workers than there is work
         @test auto_workers("2", 100) <= 8
+        # A worker with a thread per CPU fills the machine on its own.
+        @test auto_workers("auto", 100) == 1 && auto_workers("auto,1", 100) == 1
     end
 end
 

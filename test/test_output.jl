@@ -314,7 +314,7 @@ using RuntestsWorkers: RuntestsWorkers
         slot = Runtests.Private.Slot(
             Runtests.Private.SlotIdx(1),
             Runtests.Private.Profile(Runtests.Private.DEFAULT_PROFILE), nothing, 0.0, 0, Runtests.Private.ItemIdx(0),
-            path, String[], false
+            Int8(0), path, String[], false
         )
         for i in 1:3
             Runtests.Private.keep_dying_line!(slot, "signal $i")

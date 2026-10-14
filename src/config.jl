@@ -14,6 +14,8 @@ same profile can share a worker; items with different profiles cannot.
 struct Profile
     name::Symbol
     julia_args::Vector{String}
+    # The workers' `--threads`; empty when the profile sets none and takes the run's,
+    # which `run_profile` fills in. A run state records it as it was set.
     threads::String
     env::Vector{Pair{String, String}}
     init::Expr
@@ -58,6 +60,9 @@ Base.@kwdef struct RunConfig
     coverage::Bool = false
     # What set `coverage`, for the run to say, or empty for the default.
     coverage_source::String = ""
+    # The `RUNTESTS_<KEY>` variables that set something, with their values, for the
+    # run to say: nothing else in the project shows them.
+    env_settings::Vector{Pair{String, String}} = Pair{String, String}[]
     monitor::Bool = true
     monitor_interval::Int = 30
     profiles::Dict{Symbol, Profile} = Dict(DEFAULT_PROFILE => Profile(DEFAULT_PROFILE))
@@ -68,6 +73,13 @@ Base.@kwdef struct RunConfig
     # Every item's random numbers start from this and its name, so a run with the
     # same seed draws the same numbers in each item, whatever ran before it.
     seed::UInt64 = 0
+    # Items that draw from a seed of their own rather than `seed`: the failures
+    # `runtestsf` runs again, each with the seed it failed with.
+    item_seeds::Dict{String, UInt64} = Dict{String, UInt64}()
+    # The flags that change compiled code (see `code_flags`) the workers run with when
+    # they are not this process's: a replay's, as its run state recorded them. Empty
+    # for this process's own, which the workers inherit.
+    julia_flags::Vector{String} = String[]
     # The manifest a replayed run state was recorded against, or empty: the run
     # says how its own environment differs.
     replayed_manifest::String = ""
@@ -193,6 +205,21 @@ function env_flag(name::AbstractString)
     throw(ConfigError("`$name` must be true or false (or 1, 0, yes, no), got $(repr(ENV[name]))"))
 end
 
+# The run settings that are true or false, read from a variable as `env_flag` reads it.
+const FLAG_SETTINGS = (:failfast, :item_failfast, :verbose, :monitor, :full_stacktraces, :full_names, :coverage)
+
+# The variable that sets the run setting `key`: `RUNTESTS_WORKERS` for `workers`.
+env_setting_name(key::Symbol) = string("RUNTESTS_", uppercase(String(key)))
+
+# The value of a run setting as a variable gives it: a flag, the text of a setting
+# that is text, and otherwise a number where it reads as one and else the text, which
+# the setting's own check then refuses by name.
+function env_setting(key::Symbol, name::String, text::String)
+    key in FLAG_SETTINGS && return env_flag(name)
+    (key in (:threads, :logs, :testset_name) || (key === :workers && text == "auto")) && return text
+    return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
+end
+
 function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
@@ -200,10 +227,29 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     # A value the call gave is the call's mistake; one from the file or the
     # environment is the configuration's.
     given(keys...) = any(k -> get(kwargs, k, nothing) !== nothing, keys)
-    bad(msg, keys...) = given(keys...) ? ArgumentError(msg) : ConfigError(msg)
     run = section(path, toml, "run", RUN_KEYS)
-    # A keyword wins over the file, and the file over the default.
-    pick(key, default) = something(get(kwargs, key, nothing), get(run, string(key), default))
+    # A keyword wins over the environment, the environment over the file, and the file
+    # over the default: CI sets a job's settings without editing the project. A
+    # variable is read only when no keyword decides, so a bad value there fails only a
+    # run it would have set.
+    from_env = Pair{String, String}[]
+    function pick(key, default)
+        v = get(kwargs, key, nothing)
+        v === nothing || return v
+        name = env_setting_name(key)
+        text = String(strip(get(ENV, name, "")))
+        if !isempty(text)
+            push!(from_env, name => text)
+            return env_setting(key, name, text)
+        end
+        return get(run, string(key), default)
+    end
+    # A value from a variable is said with its variable, which is all that shows it.
+    function bad(msg, keys...)
+        given(keys...) && return ArgumentError(msg)
+        vars = [n for k in keys for (n, _) in from_env if n == env_setting_name(k)]
+        return ConfigError(isempty(vars) ? msg : string(msg, " (from `", join(vars, "`, `"), "`)"))
+    end
     seconds(key, x) = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(bad("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))", key))
     # 0 prints at every sample, five times a second: a test's way to make the
@@ -229,20 +275,15 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     mt = pick(:memory_threshold, 0.9)
     (is_number(mt) && 0 < mt <= 1) || throw(bad("`memory_threshold` must be in (0, 1], got $(repr(mt))", :memory_threshold))
     failfast = flag(:failfast, false)
-    seed = pick(:seed, 0)
-    (is_whole_number(seed) && 0 <= seed <= typemax(UInt64)) ||
+    # Absent, a random one: 0 is a seed like any other.
+    seed = pick(:seed, nothing)
+    (seed === nothing || (is_whole_number(seed) && 0 <= seed <= typemax(UInt64))) ||
         throw(bad("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))", :seed))
     order = section(path, toml, "order", ORDER_KEYS)
-    # A keyword, then the environment, then the file: CI switches coverage on for a
-    # job without editing the project. The environment is read only when the keyword
-    # does not decide, so a bad value there fails only a run it would have set.
-    coverage, coverage_source = if get(kwargs, :coverage, nothing) !== nothing
-        (kwargs[:coverage], "the `coverage` keyword")
-    else
-        env_coverage = env_flag("RUNTESTS_COVERAGE")
-        env_coverage !== nothing ? (env_coverage, "`RUNTESTS_COVERAGE`") :
-            haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
-    end
+    coverage = pick(:coverage, false)
+    coverage_source = given(:coverage) ? "the `coverage` keyword" :
+        any(((n, _),) -> n == "RUNTESTS_COVERAGE", from_env) ? "`RUNTESTS_COVERAGE`" :
+        haskey(run, "coverage") ? relpath_or_path(path) : ""
     coverage isa Bool || throw(bad("`coverage` must be true or false, got $(repr(coverage))", :coverage))
     coverage && workers == 0 && throw((given(:coverage, :workers) ? ArgumentError : ConfigError)(
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
@@ -261,13 +302,13 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         memory_threshold = Float64(mt), monitor = flag(:monitor, true),
         full_stacktraces = flag(:full_stacktraces, false),
         full_names = flag(:full_names, false),
-        testset_name = String(testset_name), coverage, coverage_source,
+        testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml, threads),
+        profiles = read_profiles(path, toml),
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
-        seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed),
+        seed = seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed),
         config_file = String(config_file)
     )
 end
@@ -288,7 +329,7 @@ end
 default_logs(workers::Integer, interactive::Bool = isinteractive()) =
     interactive && workers <= 1 ? :eager : :issues
 
-function read_profiles(path, toml, default_threads::String)
+function read_profiles(path, toml)
     profiles = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
@@ -308,7 +349,7 @@ function read_profiles(path, toml, default_threads::String)
         sort!(env; by = first)
         profiles[Symbol(name)] = Profile(
             Symbol(name), args,
-            threads_spec("threads of [$label]", get(p, "threads", default_threads)), env,
+            haskey(p, "threads") ? threads_spec("threads of [$label]", p["threads"]) : "", env,
             parse_expr(path, name, "init", string_setting(path, p, "init", label)),
             parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
             profile_preferences(path, name, get(p, "preferences", "")),
@@ -317,9 +358,15 @@ function read_profiles(path, toml, default_threads::String)
     end
     check_environment_owners(path, Pair{Symbol, String}[n => p.environment for (n, p) in profiles if !isempty(p.environment)])
     haskey(profiles, DEFAULT_PROFILE) ||
-        (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = default_threads))
+        (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = ""))
     return profiles
 end
+
+# The profile as its workers start: with its own `--threads`, or the run's when it
+# sets none.
+run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
+    Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment) :
+    prof
 
 """
     profile_environment(config_path, name, value) -> String
@@ -505,16 +552,40 @@ function parse_expr(path, profile, key, str::AbstractString)
     return Expr(:block, ex.args...)
 end
 
+"""
+    code_flags(opts = Base.JLOptions()) -> Vector{String}
+
+The flags of a process that change the code it compiles, each written out whatever
+its value: bounds checking, optimization and debug levels, inlining, and
+deprecation warnings. A worker inherits its coordinator's through `Base.julia_cmd`,
+so they are what a run state records of how its items were compiled, and what a
+replay gives its workers.
+"""
+function code_flags(o = Base.JLOptions())
+    bounds = o.check_bounds == 1 ? "yes" : o.check_bounds == 2 ? "no" : "auto"
+    depwarn = o.depwarn == 1 ? "yes" : o.depwarn == 2 ? "error" : "no"
+    return ["--check-bounds=$bounds", "-O$(o.opt_level)", "-g$(o.debug_level)",
+            "--inline=$(o.can_inline == 0 ? "no" : "yes")", "--depwarn=$depwarn"]
+end
+
+# `code_flags` of a process started with none of them.
+const DEFAULT_CODE_FLAGS = ("--check-bounds=auto", "-O2", "-g1", "--inline=yes", "--depwarn=no")
+
+# The flags a run's workers compile with, and of them those a plain `julia` would not.
+run_code_flags(cfg::RunConfig) = isempty(cfg.julia_flags) ? code_flags() : cfg.julia_flags
+nondefault_flags(flags) = String[f for f in flags if !(f in DEFAULT_CODE_FLAGS)]
+
 # A guess, not a measurement: too many workers is an OOM kill, and each extra one
 # compiles the same code again.
 const ASSUMED_WORKER_RSS = 4 * 2^30
 
 function auto_workers(threads::String, nunits::Int)
-    per_worker = something(tryparse(Int, first(split(threads, ','))), 2)
     # The CPUs this process may use: fewer than the machine's under a container
     # quota, and oversubscribing them turns timeouts flaky. 1.12 has only the
     # machine's count.
     cpus = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
+    # `auto` gives each worker a thread per CPU.
+    per_worker = (t = first(split(threads, ','))) == "auto" ? cpus : something(tryparse(Int, t), 2)
     by_cpu = max(1, cpus ÷ max(1, per_worker))
     by_mem = max(1, Int(Sys.total_memory() ÷ ASSUMED_WORKER_RSS))
     n = clamp(min(by_cpu, by_mem), 1, 8)

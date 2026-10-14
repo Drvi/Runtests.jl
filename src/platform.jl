@@ -10,7 +10,8 @@ module Platform
 using RuntestsWorkers: is_interrupt
 
 export process_rss, child_pids, machine_memory, available_fraction, cpu_load, cpu_count,
-    cpu_ticks, process_cpu_seconds, platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
+    cpu_ticks, process_cpu_seconds, platform_selfcheck!, ensure_checked!, PER_PROCESS_OK,
+    local_host_name
 
 const PER_PROCESS_OK = Ref(false)
 
@@ -45,6 +46,27 @@ function children_macos(pid::Integer)
     n = ccall(:proc_listchildpids, Cint, (Cint, Ptr{Int32}, Cint), pid, buf, Cint(sizeof(buf)))
     n <= 0 && return Int32[]
     return buf[1:min(Int(n), length(buf))]
+end
+
+# The name macOS gives the machine, `LocalHostName`, which stays when the hostname
+# follows the network; "" when it gives none, and elsewhere. Asked of the system
+# rather than of `scutil`, whose process would cost a run milliseconds.
+const SYSTEM_CONFIGURATION = "/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration"
+const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+
+function local_host_name()
+    @static if Sys.isapple()
+        name = ccall((:SCDynamicStoreCopyLocalHostName, SYSTEM_CONFIGURATION), Ptr{Cvoid}, (Ptr{Cvoid},), C_NULL)
+        name == C_NULL && return ""
+        buf = zeros(UInt8, 256)
+        # 0x08000100 is kCFStringEncodingUTF8.
+        ok = ccall((:CFStringGetCString, CORE_FOUNDATION), UInt8, (Ptr{Cvoid}, Ptr{UInt8}, Clong, UInt32),
+                   name, buf, length(buf), 0x08000100)
+        ccall((:CFRelease, CORE_FOUNDATION), Cvoid, (Ptr{Cvoid},), name)
+        return ok == 0 ? "" : unsafe_string(pointer(buf))
+    else
+        return ""
+    end
 end
 
 ### Linux ##################################################################

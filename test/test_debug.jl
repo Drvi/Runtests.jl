@@ -177,7 +177,7 @@ call(body) = body()
             end
         end
 
-        @testset "without a name, it is the last run's most recent failure, with the run's seed" begin
+        @testset "without a name, it is the most recent failure, with the seed it failed with" begin
             debug_last() = try
                 Runtests.Private.debug_item(call, nothing, nothing)
             catch e
@@ -187,6 +187,10 @@ call(body) = body()
                 err = debug_last()
                 @test err isa NoTestsError
                 @test occursin("no run of this project is recorded", sprint(showerror, err))
+                run_states(STEPPED; workers=0, name="declares and tests", logs=:issues, monitor=false)
+                err = debug_last()
+                @test err isa NoTestsError
+                @test occursin("no test item of this project is failing", sprint(showerror, err))
 
                 # Two failures: the one that finished last is stepped into, and the
                 # other is named for the asking.
@@ -196,8 +200,8 @@ call(body) = body()
                 end
                 latest, other = sort(["fails", "throws"]; by=ended, rev=true)
                 _, out = capture_run(debug_last)
-                @test occursin("debugging $(repr(latest)) in this process · the last run's most recent failure", out)
-                @test occursin("the run's other failures: $(repr(other))", out)
+                @test occursin("debugging $(repr(latest)) in this process · the most recent failure", out)
+                @test occursin("the other failing items: $(repr(other))", out)
 
                 # Stepped into with the seed of the run it failed in, an item draws the
                 # random numbers it drew there.
@@ -207,16 +211,20 @@ call(body) = body()
                         ran = read(ENV["RUNTESTS_DRAW"], String)
                         _, out = capture_run(debug_last)
                         @test read(ENV["RUNTESTS_DRAW"], String) == ran
-                        @test occursin("the run's seed 0x0000000000000007", out)
+                        @test occursin("the seed it failed with 0x0000000000000007", out)
+                        # Named, a failing item is stepped into with its seed too.
+                        _, out = capture_run(() -> Runtests.Private.debug_item(call, "draws and fails", nothing))
+                        @test read(ENV["RUNTESTS_DRAW"], String) == ran
+                        @test occursin("the seed it failed with 0x0000000000000007", out)
                     end
                 end
 
-                # The last run passed: the failures of the runs before it are not
-                # stepped into, since they may be fixed.
+                # A newer run of another item that passed changes nothing: what is still
+                # failing is there to step into, with the seed it failed with.
                 run_states(STEPPED; workers=0, name="declares and tests", logs=:issues, monitor=false)
-                err = debug_last()
-                @test err isa NoTestsError
-                @test occursin("had no failures", sprint(showerror, err))
+                _, out = capture_run(debug_last)
+                @test occursin("debugging \"draws and fails\" in this process · the most recent failure", out)
+                @test occursin("the seed it failed with 0x0000000000000007", out)
             end
         end
 
@@ -358,7 +366,7 @@ using Debugger
                 typed_into_debugger(() -> Runtests.debug(), "c\r")
             end
             @test RuntestsWorkers.state_of(ts) === FAILED
-            @test occursin("debugging \"fails\" in this process · the last run's most recent failure", out)
+            @test occursin("debugging \"fails\" in this process · the most recent failure", out)
         end
     end
 end

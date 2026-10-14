@@ -60,12 +60,24 @@ Before running Runtests on a copy of the package, set `RUNTESTS_RUNSTATE_DIR` to
 scratch directory. A copy has the package's identity, so without that its runs, and
 the pruning `chores` does, go into the package's own run history.
 
+If the package depends on private packages, the user's startup file often sets
+`JULIA_PKG_SERVER` to a private package server (look in
+`~/.julia/config/startup.jl`). `--startup-file=no` skips that file, and Pkg then tries
+to clone the private packages with git and stops at a password prompt. Set the same
+`JULIA_PKG_SERVER` in the environment of every command instead of using the startup
+file: it also loads tools such as Revise into the runs.
+
 Check: `julia --project=$RT -e 'using Runtests; print(pkgdir(Runtests))'` prints a path.
 
 ## 2. Record what the suite does now
 
 1. Read `test/runtests.jl` and everything it includes. Find the suite's shape in
    reference/source-shapes.md.
+   If the checkout was just updated, for example after an earlier port was stashed,
+   its manifests can still describe the old test dependencies. Manifests are often
+   not tracked by git, so `git status` does not show it. Run `Pkg.resolve()` in the
+   package's project before the baseline, or `Pkg.test` stops with "is a direct
+   dependency, but does not appear in the manifest".
 2. Runtests needs Julia 1.12 or later. Read `[compat] julia` in `Project.toml` and the
    CI matrix in `.github/workflows/`. If the tests must keep running on an older
    Julia, stop and ask the user: a package whose tests use Runtests cannot run them
@@ -90,6 +102,13 @@ Check: `julia --project=$RT -e 'using Runtests; print(pkgdir(Runtests))'` prints
 
    From this summary, record how many checks passed, failed, errored and were broken,
    and which checks did not pass. Those stay as they are: a port fixes nothing.
+   A ReTestItems suite prints these totals itself, per file, so its `Pkg.test` run is
+   the baseline.
+
+The baseline reads test files until it ends. A `runtests.jl` that runs another
+package's tests after its own, with `Pkg.test`, reads that suite last. So do not edit
+the checkout while the baseline runs: port in a scratch copy, as step 4 does, and
+move the result in after the baseline is done.
 
 Check: you have the baseline totals and the list of checks that did not pass.
 
@@ -116,6 +135,13 @@ test = ["Test", "Runtests", "RuntestsWorkers"]   # the existing entries, plus th
 If the tests run Aqua's `test_all` or `test_deps_compat`, also add
 `Runtests = "0.1"` and `RuntestsWorkers = "0.1"` under `[compat]`. Aqua asks every
 test dependency for a compat bound.
+
+For a trial against a local checkout of Runtests, a path works:
+`Runtests = {path = "../../Runtests"}`, relative to the project file. The Runtests
+project brings RuntestsWorkers by its own `[sources]`. But a path names that local
+checkout only. CI, and every script that checks the package out somewhere else, such
+as a git worktree in a temporary directory, need the URL form. Tell the user which one
+the port uses.
 
 Check: `julia --project=. -e 'using Pkg; Pkg.test()'` resolves the new test
 environment and runs the original suite as before.
@@ -226,8 +252,13 @@ file's history follows it; a helper moves the same way, as in
 `git mv test/helpers.jl test/testsetups/HelpersSetup.jl`. For `replaced a_tests.jl`,
 copy the file. Then copy `runtests.jl` and the rest of `testsetups/`.
 
-A suite already made of ReTestItems or TestItemRunner items needs no converter: see
-reference/source-shapes.md.
+A suite of ReTestItems items needs no converter, but the changes around its items are
+many and mechanical. Run `port_retestitems.jl`, next to the converter, on a scratch
+copy of the test directory: `julia …/port_retestitems.jl $W/test`. It moves every `@testsetup` to
+`testsetups/`, turns `setup = [...]` into `using`, unquotes `skip`, and lists what is
+left for a person, such as the keywords of the old `runtests` call
+(reference/source-shapes.md). A TestItemRunner suite is ported by hand, by the table
+there.
 
 Check: every file in the converter's list of moves is in place, and every entry of
 its "for a person to look at" list has been handled.
@@ -276,7 +307,9 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 
 `chores` turns each setup into a package: `testsetups/A/src/A.jl`, plus a
 `Project.toml` listing what it imports, taken from the test environment. It also
-expands templates and checks the suite. When something has to be fixed by hand it
+expands templates and checks the suite. A setup that step 4 moved with `git mv` is
+moved again, so point the staged rename at its new place:
+`git rm --cached test/testsetups/A.jl; git add test/testsetups/A/src/A.jl`. When something has to be fixed by hand it
 throws `ChoresError`: fix it and run `chores` again. Run it again whenever a setup
 starts importing something new.
 

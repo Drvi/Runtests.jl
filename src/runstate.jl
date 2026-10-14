@@ -12,7 +12,7 @@
 #   meta        key/value pairs of strings: platform, invocation, environment
 #   profiles    name, julia args, threads, env, init, test_end, preferences path and content
 #   units       n_units x 16 B: item span, profile, exclusive, chain
-#   items       n_items x 16 B: name, file, line, unit
+#   items       n_items x 32 B: name, file, line, unit, source hash, seed
 #   environment the test environment's Manifest.toml, zlib-compressed: its length,
 #               the compressed length, then the compressed bytes
 #   statuses    n_items x 32 B, fixed stride, overwritten in place
@@ -26,12 +26,21 @@
 # The manifest is most of a file's bytes, and only a replay reads it, so it is
 # stored compressed and inflated only when asked for (`recorded_manifest`): the
 # reads that plan every run pay nothing for it.
+#
+# Beside the file, a directory of the same name ending in `.logs` (`logs_dir`) holds
+# what the items printed, `item_<index>_<attempt>.log`, the failure report of each
+# attempt that did not pass, `item_<index>_<attempt>.failure.txt`, and `setup.log`
+# for a run that ended before its first item. It is made with the file and deleted
+# only with it.
 
 using CRC32c: crc32c
 using Zlib_jll: libz
 
 const RS_MAGIC = 0x544e5552   # "RUNT" on disk
-const RS_VERSION = UInt32(7)
+const RS_VERSION = UInt32(8)
+# Every version this one reads. A new version keeps a reader for the one before it:
+# a run state the reader passes over is history lost to the next run.
+const RS_READABLE = (UInt32(7), UInt32(8))
 # 40 bytes of counts and times, then nine section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
@@ -42,6 +51,8 @@ const RS_EVENT_BYTES = 32
 const RS_FLAG_COMPLETE = UInt32(1) << 0
 const RS_FLAG_DRY_RUN = UInt32(1) << 1
 const RS_FLAG_CANCELLED = UInt32(1) << 2
+# The run ended before its first item: its setup failed, or it was stopped there.
+const RS_FLAG_ABORTED = UInt32(1) << 3
 
 const EVENT_ATTEMPT = UInt8(1)       # an attempt at an item ended
 const EVENT_WORKER_UP = UInt8(2)     # a worker process started
@@ -125,6 +136,18 @@ header_offset(field::Symbol) = Int(fieldoffset(Header, Base.fieldindex(Header, f
 
 # One item's place in the plan, and one unit's, as they sit on disk.
 struct ItemRecord
+    name::UInt32
+    file::UInt32
+    line::UInt32
+    unit::UInt32
+    hash::UInt32   # see `RawItem`
+    pad::UInt32
+    seed::UInt64   # the seed the item's numbers came from, mixed with its name
+end
+@assert sizeof(ItemRecord) == 32
+
+# An item as version 7 stored it: no source hash, and the run's seed for every item.
+struct ItemRecord7
     name::UInt32
     file::UInt32
     line::UInt32
@@ -271,9 +294,12 @@ function run_meta(p::Plan)
         "runtests_revision" => (dir = pkgdir(@__MODULE__); dir === nothing ? "" : project_revision(dir)),
         "host" => run_host(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
         # The process writing the file, and the machine by its own name: see `writer_gone`.
-        "pid" => string(getpid()), "hostname" => gethostname(),
+        "pid" => string(getpid()), "hostname" => machine_name(),
         "memory_bytes" => string(Sys.total_memory()),
         "coordinator_threads" => string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
+        # How the workers compiled the items: this process's flags, which they inherit,
+        # or a replay's.
+        "julia_flags" => join(run_code_flags(cfg), " "),
         "environment_variables" => environment_variables(),
         "project_id" => project_id(p.root), "revision" => project_revision(p.root),
         "selection" => p.selection,
@@ -321,7 +347,9 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         for a in prof.julia_args
             write(profiles, intern!(strings, a))
         end
-        write(profiles, intern!(strings, prof.threads))
+        # As configured, empty for the run's: a replay asked for other threads gives
+        # them to the profiles that take the run's.
+        write(profiles, intern!(strings, p.cfg.profiles[prof.name].threads))
         write(profiles, UInt32(length(prof.env)))
         for (k, v) in prof.env
             write(profiles, intern!(strings, k))
@@ -352,7 +380,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     for i in 1:nitems(p)
         iref[] = ItemRecord(
             intern!(strings, p.items.name[i]), intern!(strings, itemfile(p, i)),
-            UInt32(p.items.line[i]), UInt32(p.items.unit[i])
+            UInt32(p.items.line[i]), UInt32(p.items.unit[i]), p.items.hash[i], UInt32(0), p.items.seed[i]
         )
         write_record(items, iref)
     end
@@ -499,8 +527,10 @@ end
 
 # `exiting`, from the exit hook, which waits on no task: there the beat is stopped and
 # not waited for, and one that comes after the file is closed writes nothing. Waited
-# for otherwise, so that nothing is written once this returns.
-function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false, exiting::Bool = false)
+# for otherwise, so that nothing is written once this returns. `aborted` for a run that
+# ended before its first item.
+function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false, exiting::Bool = false,
+                           aborted::Bool = false)
     rsf === nothing && return nothing
     beating = rsf.heartbeat[]
     if beating !== nothing
@@ -508,7 +538,8 @@ function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = 
         close(first(beating))
         exiting || wait(last(beating))
     end
-    update!(io -> write(io, RS_FLAG_COMPLETE | (cancelled ? RS_FLAG_CANCELLED : UInt32(0))), rsf, header_offset(:flags))
+    flags = RS_FLAG_COMPLETE | (cancelled ? RS_FLAG_CANCELLED : UInt32(0)) | (aborted ? RS_FLAG_ABORTED : UInt32(0))
+    update!(io -> write(io, flags), rsf, header_offset(:flags))
     update!(io -> write(io, time()), rsf, header_offset(:end_unix))
     @lock rsf.lock close(rsf.io)
     return nothing
@@ -521,6 +552,8 @@ struct RunStateItem
     file::String
     line::Int32
     unit::Int32
+    hash::UInt32   # 0 when not recorded
+    seed::UInt64
 end
 
 struct RunStateUnit
@@ -574,6 +607,7 @@ struct RunStateRecord
     complete::Bool
     dry_run::Bool
     cancelled::Bool
+    aborted::Bool       # ended before its first item; see `RS_FLAG_ABORTED`
     start_unix::Float64
     end_unix::Float64
     meta::Dict{String, String}
@@ -610,7 +644,7 @@ is_live(rs::RunStateRecord; now::Real = time()) = !rs.complete && now - rs.mtime
 # the CI runners that take turns being it and whose pids mean nothing here, and its
 # pid is free. A pid another process has taken since says nothing either way.
 function writer_gone(rs::RunStateRecord)
-    get(rs.meta, "hostname", "") == gethostname() || return false
+    get(rs.meta, "hostname", "") in (machine_name(), gethostname()) || return false
     pid = tryparse(Int32, get(rs.meta, "pid", ""))
     pid === nothing && return false
     return ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == Base.UV_ESRCH
@@ -635,7 +669,7 @@ function read_run_state(path::AbstractString)
     total = length(bytes)
     try
         h = read_record(io, Header)
-        (h.magic == RS_MAGIC && h.version == RS_VERSION) || return nothing
+        (h.magic == RS_MAGIC && h.version in RS_READABLE) || return nothing
         n_items = bounded(h.n_items, total)
 
         seek(io, Int(h.off_strings))
@@ -661,9 +695,17 @@ function read_run_state(path::AbstractString)
         end
 
         seek(io, Int(h.off_items))
+        run_seed = something(tryparse(UInt64, get(meta, "seed", "")), UInt64(0))
         items = map(1:min(bounded(read(io, UInt32), total), n_items)) do _
-            r = read_record(io, ItemRecord)
-            RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit))
+            if h.version == 7
+                r7 = read_record(io, ItemRecord7)
+                RunStateItem(lookup(strings, r7.name), lookup(strings, r7.file), Int32(r7.line), Int32(r7.unit),
+                             UInt32(0), run_seed)
+            else
+                r = read_record(io, ItemRecord)
+                RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit),
+                             r.hash, r.seed)
+            end
         end
 
         # Kept as stored: inflating it is for whoever asks for it.
@@ -709,7 +751,7 @@ function read_run_state(path::AbstractString)
         end
         return RunStateRecord(
             String(path), h.version, h.flags & RS_FLAG_COMPLETE != 0,
-            h.flags & RS_FLAG_DRY_RUN != 0, h.flags & RS_FLAG_CANCELLED != 0,
+            h.flags & RS_FLAG_DRY_RUN != 0, h.flags & RS_FLAG_CANCELLED != 0, h.flags & RS_FLAG_ABORTED != 0,
             h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
             units, items, statuses, memory, events, truncated, written
         )
@@ -849,13 +891,15 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     took = rs.end_unix > rs.start_unix ? string(", took ", fmt_seconds(rs.end_unix - rs.start_unix)) : ""
     # A damaged file's start is no time a clock can show.
     started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
-    println(io, "  started ", started, took, rs.cancelled ? ", cancelled" : "")
+    println(io, "  started ", started, took, rs.cancelled ? ", cancelled" : "", rs.aborted ? ", ended before its first item" : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
+    flags = nondefault_flags(split(m("julia_flags")))
     println(io, "  seed ", m("seed"), " · workers ", m("workers"), " · threads ", m("threads"), " · timeout ", m("timeout"),
-        "s · retries ", m("retries"), isempty(m("selection")) ? "" : string(" · selected ", m("selection")))
+        "s · retries ", m("retries"), isempty(flags) ? "" : string(" · ", join(flags, " ")),
+        isempty(m("selection")) ? "" : string(" · selected ", m("selection")))
     manifest = recorded_manifest(rs)
     isempty(manifest) || println(io, "  environment recorded: ",
         count(l -> startswith(l, "[[deps."), eachline(IOBuffer(manifest))), " packages in its manifest")
@@ -866,9 +910,13 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     # Paired by `zip`: a damaged file can hold fewer items than statuses.
     bad = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if is_non_pass(st.state) || st.state === RUNNING]
     isempty(bad) || println(io, "  not passed:")
+    prefix = joinpath(logs_dir(rs.path), "item_")
     for (it, st) in bad
         println(io, "    ", rpad(repr(it.name), 30), " ", rpad(string(st.state), 12), " attempt ", st.attempt,
             " · worker ", st.slot, " (pid ", st.pid, ") · ", fmt_seconds(st.elapsed), " · ", it.file, ":", it.line)
+        i = findfirst(x -> x === it, rs.items)
+        kept = filter(isfile, [failure_path(prefix, i, max(st.attempt, 1)), item_log_path(prefix, i, max(st.attempt, 1))])
+        isempty(kept) || println(io, "      ", join(kept, " · "))
     end
     downs = filter(e -> e.kind === :worker_down && e.ended_by !== :close, rs.events)
     isempty(downs) || println(io, "  workers that did not end normally:")
@@ -881,6 +929,8 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
             " (", how, ") · had run ", length(ran), isempty(ran) ? "" : string(": ", join(repr.(last(ran, 5)), ", "), length(ran) > 5 ? ", …" : ""))
     end
     print(io, "  run it again with Runtests.runtests(replay = ", repr(rs.path), ")")
+    any(((it, st),) -> is_non_pass(st.state) && st.state !== CANCELLED, zip(rs.items, rs.statuses)) &&
+        print(io, ", or its failing items with Runtests.runtestsf(replay = ", repr(rs.path), ")")
 end
 
 ### Where run states live ##################################################
@@ -896,7 +946,40 @@ this machine's.
 """
 function run_host()
     host = get(ENV, "RUNTESTS_HOST", "")
-    return isempty(host) ? gethostname() : host
+    return isempty(host) ? machine_name() : host
+end
+
+"""
+    machine_name() -> String
+
+This machine's name: the one macOS gives it, `LocalHostName`, and elsewhere its
+hostname. On macOS the hostname follows the network, a DHCP name on one and
+`name.local` on another, and one machine would keep its run states under several
+names, pruning those of each only while it has that name.
+"""
+function machine_name()
+    isempty(MACHINE_NAME[]) || return MACHINE_NAME[]
+    given = try
+        Platform.local_host_name()
+    catch e
+        is_interrupt(e) && rethrow()
+        ""
+    end
+    name = isempty(given) ? gethostname() : given
+    # Kept for the session, but not while precompiling, which would put the name of
+    # the machine that built the package image into it, for every machine to read.
+    ccall(:jl_generating_output, Cint, ()) == 0 && (MACHINE_NAME[] = name)
+    return name
+end
+const MACHINE_NAME = Ref("")
+
+# Whether this machine recorded a run state, and so may prune it: by `run_host`, or,
+# with no `RUNTESTS_HOST`, by the hostname the machine had when it wrote it, which on
+# macOS can be another than the name it has now.
+function recorded_here(rs::RunStateRecord)
+    host = get(rs.meta, "host", "")
+    host == run_host() && return true
+    return isempty(get(ENV, "RUNTESTS_HOST", "")) && host == gethostname()
 end
 
 """
@@ -994,22 +1077,57 @@ const HISTORY_RUNS = 5
 # runs; one set by `RUNTESTS_RUNSTATE_DIR` can hold several.
 of_project(rs::RunStateRecord, project::AbstractString) = get(rs.meta, "project_id", "") == project
 
-# Only the run states this machine recorded for this project are pruned: the newest
-# `keep` of them stay, and of the rest each that can go without changing which
-# items are failing goes (`removable_runs`). One recorded elsewhere, a CI artifact
-# downloaded into the directory say, one of another project, and one that cannot be
-# read are never deleted: nothing shows they are ours. Nor is one still being
-# written (`is_live`), by a run that started long before the newest `keep`.
-function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
-    here = run_host()
+"""
+    prunable_runstates(root; keep = KEEP_RUNS, names = nothing) -> Vector{String}
+
+The run states that pruning deletes, oldest first, at the end of a run and in
+`chores` alike: of those this machine recorded for this project, beyond the newest
+`keep`, each whose deletion changes no fact of an item of `names`, the suite's items
+(see [`removable_runs`](@ref)). One recorded elsewhere, a CI artifact downloaded
+into the directory say, one of another project, and one that cannot be read are
+never among them: nothing shows they are ours. Nor is one still being written
+(`is_live`), by a run that started long before the newest `keep`.
+"""
+function prunable_runstates(root::AbstractString; keep::Int = KEEP_RUNS, names = nothing)
     runs = project_runs(root)
-    ours = [f for (f, rs) in runs if get(rs.meta, "host", "") == here]
+    ours = [f for (f, rs) in runs if recorded_here(rs)]
+    length(ours) < length(runs) && warn_unnamed_ci_host(runstate_dir(root))
     live = Set(f for (f, rs) in runs if is_live(rs))
-    for f in removable_runs(runs, filter(!in(live), ours[1:max(0, length(ours) - keep)]))
-        try
-            rm(f; force = true)
-        catch
-        end
+    return removable_runs(runs, filter(!in(live), ours[1:max(0, length(ours) - keep)]); names)
+end
+
+# Delete what `prunable_runstates` names, each with its logs.
+function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS; names = nothing)
+    foreach(remove_runstate, prunable_runstates(root; keep, names))
+    return nothing
+end
+
+# On CI each job is a new machine to its hostname, so a directory of run states that a
+# cache brings back from job to job gains files and never loses any, unless
+# `RUNTESTS_HOST` names the machine the jobs take turns being. Said once a session for
+# each directory, when it holds run states of other machines.
+const WARNED_HOSTS = Set{String}()
+function warn_unnamed_ci_host(dir::AbstractString)
+    get(ENV, "CI", "") in ("true", "1") && isempty(get(ENV, "RUNTESTS_HOST", "")) || return nothing
+    first_time = @lock WARNED_FORMATS_LOCK (dir in WARNED_HOSTS ? false : (push!(WARNED_HOSTS, dir); true))
+    first_time || return nothing
+    @warn "Runtests: $(relpath_or_path(dir)) holds run states of other machines, and `RUNTESTS_HOST` is not set: " *
+        "on CI each job is a new machine, and what a cache brings back is never pruned. Set `RUNTESTS_HOST` to " *
+        "one name for the jobs that share the cache"
+    return nothing
+end
+
+# The directory of a run state's logs.
+logs_dir(path::AbstractString) = string(chopsuffix(path, ".runstate"), ".logs")
+
+# A run state and its logs, which go together. Another process may be reading them,
+# or have deleted them already.
+function remove_runstate(path::AbstractString)
+    try
+        rm(path; force = true)
+        rm(logs_dir(path); force = true, recursive = true)
+    catch e
+        is_interrupt(e) && rethrow()
     end
     return nothing
 end
@@ -1020,12 +1138,70 @@ end
 function project_runs(root::AbstractString)
     project = project_id(root)
     runs = Pair{String, RunStateRecord}[]
+    others = Dict{UInt32, Int}()   # format => how many files of a format this version does not read
     for f in runstate_files(root)
         rs = read_run_state(f)
-        (rs === nothing || !of_project(rs, project)) && continue
-        push!(runs, f => rs)
+        if rs === nothing
+            v = runstate_version(f)
+            v === nothing || v in RS_READABLE || (others[v] = get(others, v, 0) + 1)
+            continue
+        end
+        of_project(rs, project) && push!(runs, f => rs)
     end
+    isempty(others) || warn_other_formats(runstate_dir(root), others)
     return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
+end
+
+"""
+    runstate_version(path) -> Union{Nothing, UInt32}
+
+The format a run state file says it is in, from its first eight bytes; `nothing`
+for a file that is not a run state.
+"""
+function runstate_version(path::AbstractString)
+    try
+        return open(path) do io
+            read(io, UInt32) == RS_MAGIC ? read(io, UInt32) : nothing
+        end
+    catch e
+        is_interrupt(e) && rethrow()
+        return nothing
+    end
+end
+
+# The directories already warned about, once a session each: every read of the
+# history comes past the same files.
+const WARNED_FORMATS = Set{String}()
+const WARNED_FORMATS_LOCK = ReentrantLock()
+
+# A run state this version does not read is history the run goes without, which is
+# said rather than left to be found out.
+function warn_other_formats(dir::AbstractString, others::Dict{UInt32, Int})
+    first_time = @lock WARNED_FORMATS_LOCK (dir in WARNED_FORMATS ? false : (push!(WARNED_FORMATS, dir); true))
+    first_time || return nothing
+    older = sum((n for (v, n) in others if v < first(RS_READABLE)); init = 0)
+    newer = sum((n for (v, n) in others if v > last(RS_READABLE)); init = 0)
+    what = String[]
+    older > 0 && push!(what, string(plural(older, "run state"), " of an older format, which `Runtests.chores()` deletes"))
+    newer > 0 && push!(what, string(plural(newer, "run state"), " written by a newer version of Runtests"))
+    @warn "Runtests: $(relpath_or_path(dir)) holds $(join(what, " and ")); this version does not read them, " *
+        "so the durations and failures they recorded are not used"
+    return nothing
+end
+
+"""
+    old_format_runstates(root) -> Vector{String}
+
+The run states in the project's own directory of a format older than any this
+version reads, which no later version reads either. Empty for a directory that
+`RUNTESTS_RUNSTATE_DIR` names, which can hold other projects' files.
+"""
+function old_format_runstates(root::AbstractString)
+    isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", "")) || return String[]
+    return filter(runstate_files(root)) do f
+        v = runstate_version(f)
+        v !== nothing && v < first(RS_READABLE)
+    end
 end
 
 # `project_runs`, with `base` among them, when there is one, wherever its file is:
@@ -1042,119 +1218,222 @@ end
 since_base(runs, base::Union{Nothing, RunStateRecord}) =
     base === nothing ? runs : filter(((_, rs),) -> rs.start_unix >= base.start_unix, runs)
 
-# Item `i`'s verdict in a run: `true` when it did not pass, `false` when it passed or
-# was skipped, and `nothing` when the run got none — it stopped before the item ran,
-# or while it ran.
+# Item `i`'s verdict in a run: `true` when it did not pass, `false` when it passed,
+# and `nothing` when the run got none: it skipped the item, or stopped before the
+# item ran or while it ran. A skip says the item did not run here, not that it works.
 function verdict(rs::RunStateRecord, i::Integer)
     state = i <= length(rs.statuses) ? rs.statuses[i].state : UNSEEN
-    (state === UNSEEN || state === CANCELLED) && return nothing
-    return !(state === PASSED || state === SKIPPED)
+    (state === UNSEEN || state === CANCELLED || state === SKIPPED) && return nothing
+    return state !== PASSED
 end
 
-# Whether a run was of the whole suite, and so lists every item the suite had: one
-# missing from it had been renamed or deleted, and is no longer failing.
-whole_suite(rs::RunStateRecord) = !rs.dry_run && get(rs.meta, "selection", nothing) == ""
+"""
+    ItemFacts
+
+What the kept run states say about one item. The run order, `runtestsf`, `debug` and
+pruning all read these, so they cannot disagree about an item.
+"""
+struct ItemFacts
+    verdict::Int8          # the latest: -1 for none, 0 passed, 1 failing
+    state::ItemState       # the state that verdict was
+    verdict_at::Float64    # when the run of the latest verdict started
+    verdict_end::Float32   # when the item ended in that run, in seconds from its start
+    seed::UInt64           # the seed the item's numbers came from in that run
+    seconds::Float64       # the newest duration; 0 for none
+    hash::UInt32           # the source hash in the newest run that ran it; 0 for unknown
+    selected_at::Float64   # when the newest run that is over and selected it started
+    unreached::Bool        # whether that run stopped before the item ended
+end
+const NO_FACTS = ItemFacts(Int8(-1), UNSEEN, 0.0, 0.0f0, UInt64(0), 0.0, UInt32(0), 0.0, false)
+
+is_failing(f::ItemFacts) = f.verdict == 1
 
 """
-    removable_runs(runs, candidates) -> Vector{String}
+    item_facts(runs; base = nothing) -> Dict{String, ItemFacts}
 
-Of `candidates`, files among `runs` (every run state of the project, oldest first),
-those that can be deleted without changing which items are failing (see
-[`failing_items`](@ref)). A run state stays while it holds an item's last verdict and
-the verdict the item would fall back to without it reads differently: its last
-failure, or a pass that keeps an older failure from counting again. A run of the
-whole suite gives every item it did not find a verdict of its own, not failing.
-Taken oldest first, so a run state is judged by what is left once the older ones
-have gone.
+Every item's facts from `runs`, oldest first as `project_runs` gives them. Durations
+and source hashes come from every run but dry runs and those that ended before their
+first item, a run another process is still in the middle of included: what it has
+finished is finished. Verdicts and stops come from the runs that are over, and with
+`base`, the run state a replay names, from it and the runs that started after it.
 """
-function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates)
-    known = Set{String}(it.name for (_, rs) in runs for it in rs.items)
-    verdicts = [Dict{String, Bool}() for _ in runs]   # per run: item => failing
-    holders = Dict{String, Vector{Int}}()             # per item: the runs left with a verdict, oldest first
-    for (k, (_, rs)) in enumerate(runs)
-        # Nothing it holds is a verdict yet.
-        is_live(rs) && continue
-        for (i, it) in enumerate(rs.items)
-            v = verdict(rs, i)
-            v === nothing || (verdicts[k][it.name] = v)
-        end
-        if whole_suite(rs)
-            found = Set(it.name for it in rs.items)
-            for name in known
-                name in found || (verdicts[k][name] = false)
+function item_facts(runs::Vector{Pair{String, RunStateRecord}}; base::Union{Nothing, RunStateRecord} = nothing)
+    facts = Dict{String, ItemFacts}()
+    for (_, rs) in runs
+        (rs.dry_run || rs.aborted) && continue
+        counts = !is_live(rs) && (base === nothing || rs.start_unix >= base.start_unix)
+        # Paired by index: a damaged file can hold fewer statuses than items.
+        for i in 1:min(length(rs.items), length(rs.statuses))
+            it, st = rs.items[i], rs.statuses[i]
+            f = get(facts, it.name, NO_FACTS)
+            v, state, at, ended, seed = f.verdict, f.state, f.verdict_at, f.verdict_end, f.seed
+            seconds, hash, selected_at, unreached = f.seconds, f.hash, f.selected_at, f.unreached
+            timed(st.state) && st.elapsed > 0 && (seconds = Float64(st.elapsed))
+            (st.state === UNSEEN || st.state === RUNNING || st.state === CANCELLED) || (hash = it.hash)
+            if counts
+                found = verdict(rs, i)
+                if found !== nothing
+                    v, state, at, ended, seed = Int8(found), st.state, rs.start_unix, st.start_off + st.elapsed, it.seed
+                end
+                selected_at = rs.start_unix
+                unreached = rs.cancelled && (st.state === UNSEEN || st.state === CANCELLED)
             end
-        end
-        for name in keys(verdicts[k])
-            push!(get!(Vector{Int}, holders, name), k)
+            facts[it.name] = ItemFacts(v, state, at, ended, seed, seconds, hash, selected_at, unreached)
         end
     end
-    index = Dict(f => k for (k, (f, _)) in enumerate(runs))
+    return facts
+end
+
+"""
+    removable_runs(runs, candidates; names = nothing) -> Vector{String}
+
+Of `candidates`, files among `runs` (every run state of the project, oldest first),
+those whose deletion changes no item's facts (see [`item_facts`](@ref)): its latest
+verdict and when it was recorded, the seed of a failure, its newest duration and
+source hash, and whether the newest run to select it stopped before it. With
+`names`, the suite's items, only theirs count: an item the suite no longer has holds
+back no run state beyond the newest ones pruning keeps anyway. Taken oldest first, so
+a run state is judged by what is left once the older ones have gone. Each item's
+newest verdict stays, which is also what a replay's base is read against: the
+verdicts after the base, newest first.
+"""
+function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates; names = nothing)
+    kept = copy(runs)
+    now = kept_facts(item_facts(kept), names)
     out = String[]
     for f in candidates
-        k = index[f]
-        keeps = any(verdicts[k]) do (name, failing)
-            h = holders[name]
-            last(h) == k || return false                  # a newer run has the item's verdict
-            (length(h) >= 2 && verdicts[h[end - 1]][name]) != failing
-        end
-        keeps && continue
+        k = findfirst(((g, _),) -> g == f, kept)
+        k === nothing && continue
+        without = deleteat!(copy(kept), k)
+        kept_facts(item_facts(without), names) == now || continue
         push!(out, f)
-        for name in keys(verdicts[k])
-            filter!(!=(k), holders[name])
-        end
+        kept = without
     end
     return out
 end
 
-"""
-    sweep_runstate_dirs(base = runstate_root())
+# The facts a deletion has to leave as they are, by item: a pass's seed, and the time
+# of a verdict that does not exist, say nothing.
+kept_facts(facts::Dict{String, ItemFacts}, names) = Dict(
+    n => (f.verdict, f.verdict == -1 ? 0.0 : f.verdict_at, is_failing(f) ? f.seed : UInt64(0), f.seconds, f.hash, f.unreached)
+    for (n, f) in facts if names === nothing || n in names
+)
 
-Clear the default location of projects that are gone: in each directory whose
-recorded project path no longer exists, delete this machine's run states, and then
-the directory once nothing else is left in it. A run state recorded elsewhere, one
-that cannot be read, and a directory without a recorded project stay: nothing shows
-they are this machine's to delete. So does a project that is out of reach rather
-than gone: one whose parent directory is missing or empty, as a drive that is not
-mounted leaves it.
+# What a file manager leaves in a folder it shows, which says nothing of the folder:
+# `.DS_Store` and the like on macOS, `Thumbs.db` and `desktop.ini` on Windows.
+is_folder_metadata(name::AbstractString) = startswith(name, '.') || name in ("Thumbs.db", "desktop.ini")
+
+# How long the run states of a checkout that is gone stay, from the newest of them.
+const SWEEP_GRACE_S = 30 * 24 * 3600.0
+
 """
-function sweep_runstate_dirs(base::AbstractString = runstate_root())
-    here = run_host()
-    dirs = try
-        readdir(base; join = true)
-    catch e
-        e isa Base.IOError || rethrow()
-        return nothing
-    end
-    for dir in dirs
-        mark = joinpath(dir, PROJECT_MARK)
-        try
-            isfile(mark) || continue
-            project = String(strip(read(mark, String)))
-            ispath(project) && continue
-            parent = dirname(project)
-            (isdir(parent) && !isempty(readdir(parent))) || continue
-            for f in filter!(endswith(".runstate"), readdir(dir; join = true))
-                rs = read_run_state(f)
-                rs !== nothing && get(rs.meta, "host", "") == here && !is_live(rs) && rm(f; force = true)
-            end
-            readdir(dir) == [PROJECT_MARK] && rm(dir; recursive = true, force = true)
-        catch
-            # A directory another process is writing or deleting is left for next time.
-        end
-    end
-    return nothing
+    GoneCheckout
+
+A directory of the default location whose checkout is gone, as the sweep finds it:
+the path the checkout was at, the run states of this machine's it deletes there,
+and whether the directory goes as well, with nothing left in it but what a file
+manager put there.
+"""
+struct GoneCheckout
+    dir::String
+    project::String
+    runstates::Vector{String}
+    whole::Bool
 end
 
 """
-    recent_runs(root, n) -> Vector{Pair{String, RunStateRecord}}
+    sweep_runstate_dirs(base = runstate_root(); temp = tempdir(), fix = true, ntasks) -> Vector{GoneCheckout}
 
-The newest `n` runs, oldest first, each with its file: this project's, readable,
-and not dry runs, which ran nothing. The files of other projects in a shared
-directory are passed over rather than counted.
+Clear the default location of checkouts that are gone, as `chores` does: in each
+directory whose recorded project path has not existed for `SWEEP_GRACE_S`, by the
+newest of its run states, or at once for a project that was in `temp`, the system's
+temporary files, delete this machine's run states and their logs, and those of a
+format older than any this version reads, and then the directory once nothing else
+is left in it. With `fix = false` it deletes nothing and says what it would. A run
+state recorded elsewhere, one that cannot be read otherwise, and a directory without
+a recorded project stay: nothing shows they are this machine's to delete. So does a
+project that is out of reach rather than gone: one whose parent directory is missing
+or empty, as a drive that is not mounted leaves it.
+
+The directories are read by `ntasks` tasks: a test suite that makes packages in the
+temporary files leaves hundreds of them, and on a file system that answers slowly,
+one directory holds up one task rather than the sweep.
 """
-function recent_runs(root::AbstractString, n::Int)
-    runs = filter!(((_, rs),) -> !rs.dry_run && !is_live(rs), project_runs(root))
-    return runs[max(1, end - n + 1):end]
+function sweep_runstate_dirs(
+        base::AbstractString = runstate_root(); temp::AbstractString = tempdir(), fix::Bool = true,
+        ntasks::Int = default_scan_tasks()
+    )
+    dirs = try
+        filter!(isdir, readdir(base; join = true))
+    catch e
+        e isa Base.IOError || rethrow()
+        return GoneCheckout[]
+    end
+    ch = Channel{String}(length(dirs))
+    foreach(d -> put!(ch, d), dirs)
+    close(ch)
+    parents = ParentCheck(ReentrantLock(), Dict{String, Bool}())
+    found = [GoneCheckout[] for _ in 1:clamp(ntasks, 1, max(1, length(dirs)))]
+    @sync for out in found
+        Threads.@spawn for dir in ch
+            gone = gone_checkout(dir, temp, parents)
+            gone === nothing && continue
+            fix && sweep!(gone)
+            push!(out, gone)
+        end
+    end
+    return sort!(reduce(vcat, found; init = GoneCheckout[]); by = g -> g.dir)
+end
+
+# Whether the folder a gone checkout was in is there with something in it, as an
+# unmounted drive's is not: asked once a folder, since the checkouts of a test suite's
+# packages share one, the temporary files, which can list thousands of entries.
+struct ParentCheck
+    lock::ReentrantLock
+    seen::Dict{String, Bool}
+end
+reachable!(c::ParentCheck, parent::String) =
+    @lock c.lock get!(() -> isdir(parent) && !isempty(readdir(parent)), c.seen, parent)
+
+# What the sweep deletes in `dir`, or `nothing` when its checkout is there, out of
+# reach, gone for less than the grace period, or the directory cannot be read: one
+# another process is writing or deleting is left for next time.
+function gone_checkout(dir::AbstractString, temp::AbstractString, parents::ParentCheck)
+    try
+        mark = joinpath(dir, PROJECT_MARK)
+        isfile(mark) || return nothing
+        project = String(strip(read(mark, String)))
+        ispath(project) && return nothing
+        # The temporary files are always there, and a checkout in them does not come
+        # back; one elsewhere can, after its grace period, from a drive mounted again.
+        in_temp = startswith(project, joinpath(temp, ""))
+        in_temp || reachable!(parents, dirname(project)) || return nothing
+        entries = readdir(dir)
+        files = [joinpath(dir, f) for f in entries if endswith(f, ".runstate")]
+        in_temp || time() - maximum(mtime, files; init = 0.0) >= SWEEP_GRACE_S || return nothing
+        deleted = filter(files) do f
+            rs = read_run_state(f)
+            rs === nothing ? something(runstate_version(f), typemax(UInt32)) < first(RS_READABLE) :
+                recorded_here(rs) && !is_live(rs)
+        end
+        going = Set(basename(f) for f in deleted)
+        union!(going, (basename(logs_dir(f)) for f in deleted))
+        whole = all(f -> f == PROJECT_MARK || is_folder_metadata(f) || f in going, entries)
+        return GoneCheckout(String(dir), project, deleted, whole)
+    catch e
+        is_interrupt(e) && rethrow()
+        return nothing
+    end
+end
+
+function sweep!(gone::GoneCheckout)
+    foreach(remove_runstate, gone.runstates)
+    try
+        gone.whole && rm(gone.dir; recursive = true, force = true)
+    catch e
+        is_interrupt(e) && rethrow()
+    end
+    return nothing
 end
 
 """
@@ -1162,94 +1441,62 @@ end
 
 The items that are failing as the recorded runs leave them, sorted: for each item,
 the last run in which it ran to a verdict decides, so running a few of one run's
-failures again does not forget the rest. A verdict other than passed or skipped —
-failed, errored, timed out, cut short by a dead worker, left running when the run
-itself died — is failing. A run that stopped before reaching an item, or while
-running it, says nothing about it, and the verdict before stands, as does a run
-another process is still in the middle of (`is_live`). An item that a
-newer run of the whole suite did not find was renamed or deleted, and is not
-failing whatever older runs say. With `names`, only those items, and the reading
-stops once each has its verdict. With `base`, the run state a replay names, the
-verdicts are its own and those of the runs that started after it.
+failures again does not forget the rest. A verdict other than passed (failed,
+errored, timed out, cut short by a dead worker, left running when the run itself
+died) is failing. A skip is no verdict, and neither is a run that stopped before the
+item ran or while it ran, nor a run another process is still in the middle of
+(`is_live`): the verdict before stands. With `names`, only those items, which is how
+a caller leaves out the items its suite no longer has. With `base`, the run state a
+replay names, the verdicts are its own and those of the runs that started after it.
 """
 function failing_items(
         root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing,
         base::Union{Nothing, RunStateRecord} = nothing
     )
-    decided = Set{String}()
-    failing = String[]
-    alive = nothing   # the items every newer run of the whole suite found
-    # Newest first, as far back as it takes: pruning keeps every run state an
-    # item's failure rests on, however many runs ago.
-    for (_, rs) in Iterators.reverse(since_base(runs_with(root, base), base))
-        (rs.dry_run || is_live(rs)) && continue
-        for (i, it) in enumerate(rs.items)
-            (it.name in decided || (names !== nothing && !(it.name in names))) && continue
-            v = verdict(rs, i)
-            v === nothing && continue
-            push!(decided, it.name)
-            v && (alive === nothing || it.name in alive) && push!(failing, it.name)
-        end
-        if whole_suite(rs)
-            found = Set(it.name for it in rs.items)
-            alive = alive === nothing ? found : intersect!(alive, found)
-            names === nothing || union!(decided, setdiff(names, alive))
-        end
-        names !== nothing && length(decided) == length(names) && break
-    end
-    return sort!(failing)
+    return sort!(collect(keys(failing_facts(root; names, base))))
+end
+
+# The facts of the items `failing_items` names, by name.
+function failing_facts(
+        root::AbstractString; names::Union{Nothing, AbstractSet{String}} = nothing,
+        base::Union{Nothing, RunStateRecord} = nothing
+    )
+    facts = item_facts(runs_with(root, base); base)
+    return Dict(n => f for (n, f) in facts if is_failing(f) && (names === nothing || n in names))
 end
 
 """
     history(root; nruns = HISTORY_RUNS, base = nothing) -> History
 
-Per-item durations from every run state kept, each item's newest that ran to an
-end (see [`timed`](@ref)), so that runs of a few items leave the others' standing, and a
-run stopped part way through, or another process's still going, leaves those it
-finished. Last-run failures, when the newest run started, and what a fresh worker
-cost, from the most recent `nruns` that are over (see [`is_live`](@ref)). With `base`,
-the run state a replay names, those come from it and the runs after it only; the
-durations still come from every run. Only items that actually ran contribute; a
-name that has never been seen simply has no estimate and is scheduled as if it
-were new.
+What planning takes from the kept run states, out of every item's facts (see
+[`item_facts`](@ref)): newest durations and source hashes; the failing items, and
+those the newest run to select them stopped before, each with how many runs ago
+that was; every item a run state records; and what a fresh worker cost, from the
+most recent `nruns` runs that are over (see [`is_live`](@ref)). With `base`, the run
+state a replay names, verdicts, stops and costs come from it and the runs after it
+only; durations still come from every run.
 """
 function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{Nothing, RunStateRecord} = nothing)
-    everything = filter!(((_, rs),) -> !rs.dry_run, runs_with(root, base))
-    runs = last.(everything)
-    isempty(runs) && return History()
-    seconds = Dict{String, Float64}()
-    # Oldest first, so a newer duration overwrites an older one.
-    for rs in runs
-        for (i, it) in enumerate(rs.items)
-            i <= length(rs.statuses) || break
-            st = rs.statuses[i]
-            timed(st.state) && st.elapsed > 0 && (seconds[it.name] = Float64(st.elapsed))
-        end
-    end
+    runs = runs_with(root, base)
+    facts = item_facts(runs; base)
+    isempty(facts) && return History()
+    over = [rs for (_, rs) in since_base(runs, base) if !rs.dry_run && !rs.aborted && !is_live(rs)]
+    starts = sort!([rs.start_unix for rs in over])
+    # How many runs that are over started after one that started at `t`.
+    ago(t) = length(starts) - searchsortedlast(starts, t)
     failed = Dict{String, Int}()
-    since = 0.0
-    # Failures and the newest run's start from runs that are over, finished or died:
-    # another process's run part way through has no verdicts yet.
-    counted = last.(since_base(filter(((_, rs),) -> !is_live(rs), everything), base))
-    recent = counted[max(1, end - nruns + 1):end]
-    for (k, rs) in enumerate(recent)
-        ago = length(recent) - k
-        since = rs.start_unix
-        for (i, it) in enumerate(rs.items)
-            i <= length(rs.statuses) || break
-            st = rs.statuses[i]
-            if st.state === UNSEEN
-                # A cancelled run stopped before reaching these: the next run takes
-                # them early, as it does what failed, so it picks up where that one
-                # stopped.
-                ago == 0 && rs.cancelled && (failed[it.name] = 0)
-                continue
-            end
-            # Runs are read oldest first, so a newer failure overwrites an older one.
-            is_non_pass(st.state) && (failed[it.name] = ago)
+    cancelled = Set{String}()
+    for (name, f) in facts
+        is_failing(f) && (failed[name] = ago(f.verdict_at))
+        if f.unreached && ago(f.selected_at) <= get(failed, name, typemax(Int))
+            failed[name] = ago(f.selected_at)
+            push!(cancelled, name)
         end
     end
-    return History(seconds, failed, since, recorded_cold_cost(recent))
+    seconds = Dict(n => f.seconds for (n, f) in facts if f.seconds > 0)
+    hashes = Dict(n => f.hash for (n, f) in facts if f.hash != 0)
+    recent = sort(over; by = rs -> rs.start_unix)[max(1, end - nruns + 1):end]
+    return History(seconds, failed, recorded_cold_cost(recent), cancelled, hashes, Set(keys(facts)))
 end
 
 """

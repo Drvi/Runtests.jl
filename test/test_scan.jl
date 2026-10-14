@@ -18,6 +18,39 @@ function scan_source(src::AbstractString; filter=Filter(), setups=Dict{Symbol,St
     return result, path
 end
 @testset "scan" begin
+    @testset "an item's hash follows its text, not its place in the file" begin
+        item(name, body) = "@testitem \"$name\" begin\n    $body\nend\n"
+        hashes(src) = Dict(it.name => it.hash for it in first(scan_source(src)))
+        base = hashes(item("a", "@test 1 == 1") * "\n" * item("b", "@test 2 == 2"))
+        @test all(!=(0), values(base)) && base["a"] != base["b"]
+        # Moved below lines added above it, or below the other item: the same text.
+        @test hashes("\n\n# a comment\n" * item("a", "@test 1 == 1") * "\n" * item("b", "@test 2 == 2")) == base
+        @test hashes(item("b", "@test 2 == 2") * "\n" * item("a", "@test 1 == 1")) == base
+        # Blank lines after it, and Windows line endings, are layout.
+        @test hashes(item("a", "@test 1 == 1") * "\n\n\n" * item("b", "@test 2 == 2") * "\n\n") == base
+        @test hashes(replace(item("a", "@test 1 == 1") * "\n" * item("b", "@test 2 == 2"), "\n" => "\r\n")) == base
+        # An edit is the edited item's alone.
+        edited = hashes(item("a", "@test 1 == 2") * "\n" * item("b", "@test 2 == 2"))
+        @test edited["a"] != base["a"] && edited["b"] == base["b"]
+    end
+
+    @testset "an entry's type from the listing is the one a stat gives" begin
+        # The walk takes it from Base's internal listing where Julia has one, and
+        # stats each entry where it does not: both say the same of the same tree.
+        root = mktempdir()
+        mkpath(joinpath(root, "sub", "deeper"))
+        write(joinpath(root, "a_test.jl"), "")
+        write(joinpath(root, "sub", "b.jl"), "")
+        # A link counts as a file, as `walkdir` takes it. Windows makes links only
+        # with privileges a CI runner may not have.
+        linked = !Sys.iswindows()
+        linked && symlink(joinpath(root, "sub"), joinpath(root, "link_to_dir"))
+        P = Runtests.Private
+        listed(entries) = sort!([(P.entry_name(e), P.entry_isdir(e)) for e in entries])
+        @test listed(P.dir_listing(root)) == listed(P.stat_listing(root)) ==
+              [("a_test.jl", false); linked ? [("link_to_dir", false)] : Tuple{String, Bool}[]; ("sub", true)]
+    end
+
     @testset "file naming" begin
         @test is_test_file("a_test.jl")
         @test is_test_file("a_tests.jl")

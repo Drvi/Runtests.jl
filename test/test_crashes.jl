@@ -33,7 +33,7 @@ end
             @test states["kills its worker"] === ERRORED
             @test occursin("died while running \"kills its worker\": exited with code 7", out)
             @test occursin("the worker running this item died: exited with code 7", out)
-            rs = read_run_state(only(readdir(dir; join=true)))
+            rs = read_run_state(only(filter(endswith(".runstate"), readdir(dir; join=true))))
             down = only(e for e in rs.events if e.kind === :worker_down)
             @test down.ended_by in (:connection_lost, :process_exit)
             @test (down.exitcode, down.signal) == (7, 0)
@@ -239,16 +239,18 @@ const REPO_ROOT = dirname(@__DIR__)
 # there is no teardown to watch.
 
 """
-    interrupted_run(; items, julia_args, monitor, delay, repl) -> NamedTuple
+    interrupted_run(; items, julia_args, monitor, delay, repl, cut) -> NamedTuple
 
 Run `items` items that each sleep for ten minutes, on as many workers, in a
 coordinator of its own started with `julia_args`, and send it SIGINT `delay` seconds
 after every item is running. With `repl`, the coordinator raises the interrupt as a
-REPL does; without, it exits on it, as a script and `Pkg.test` do. Returns whether
+REPL does; without, it exits on it, as a script and `Pkg.test` do. With `cut`, each
+item first cuts its worker's connection to the coordinator and goes on sleeping, so
+the interrupt finds every slot waiting for a worker it has lost. Returns whether
 the items got running, how long the coordinator took to end, what it printed and
 said on stderr, and the pids of the workers it started.
 """
-function interrupted_run(; items = 4, julia_args = String[], monitor = false, delay, repl = true)
+function interrupted_run(; items = 4, julia_args = String[], monitor = false, delay, repl = true, cut = false)
     tmp = mktempdir()
     ready = joinpath(tmp, "ready")
     ignored = joinpath(tmp, "sigint_ignored")
@@ -272,6 +274,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
         [\"\"\"
         @testitem "slow \$i" begin
             touch(joinpath($(repr(dirname(ready))), string("ready", \$i)))
+            $(cut ? "for fd in 3:1023; ccall(:shutdown, Cint, (Cint, Cint), fd, 2); end" : "")
             sleep(600)
             @test true
         end
@@ -395,6 +398,23 @@ Sys.iswindows() ||
         @test !occursin("could not relay", r.printed * r.out)
         @test !occursin("resource monitor stopped", r.printed * r.out)
         VERSION >= v"1.13" && @test occursin(CAUGHT_INTERRUPT, r.out)
+    end
+end
+
+Sys.iswindows() ||
+@testset "an interrupt while a slot waits for its lost worker counts the item as cancelled" begin
+    # A worker whose connection is gone is given a few seconds to exit before it is
+    # signalled, and its slot waits for it with the item still in hand. Stopped then,
+    # the run records the item as cancelled, as it does one in flight, and the slot
+    # neither records it again nor reports its worker as lost after the run has
+    # said how it ended.
+    for repl in (true, false)
+        r = interrupted_run(; items = 1, delay = 1.0, repl, cut = true)
+        @test r.got_running
+        @test occursin("interrupted after 0 of 1 test item", r.printed)
+        @test occursin("1 cancelled", r.printed)
+        @test !occursin("did not run", r.printed)
+        @test !occursin("LOST", r.printed)
     end
 end
 

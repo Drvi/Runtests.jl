@@ -13,7 +13,7 @@ end
 
 # The `n`th run state recorded for `pkg` in `dir`, each item `outcomes` names with its
 # state and duration: a run of the whole suite, or of only those items.
-function record_run(dir, pkg, n, outcomes; whole = false)
+function record_run(dir, pkg, n, outcomes; whole = false, cancelled = false)
     p, _ = prepare((pkg,); name = whole ? nothing : Set(keys(outcomes)), announce = false)
     path = joinpath(dir, string(1_000_000 + n, "-1.runstate"))
     rsf = init_run_state(path, p)
@@ -22,7 +22,7 @@ function record_run(dir, pkg, n, outcomes; whole = false)
         state, elapsed = outcomes[p.items.name[i]]
         write_status!(rsf, i, state, 1, 1; elapsed)
     end
-    finish_run_state!(rsf)
+    finish_run_state!(rsf; cancelled)
     return path
 end
 
@@ -46,12 +46,25 @@ end
                     @test read(joinpath(dirname(path), "project"), String) == abspath(pkg)
                 end
                 # Among one gone project's run states, one recorded on another machine.
-                here = gethostname()
+                here = Runtests.Private.machine_name()
                 elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
                 write(paths[foreign], replace(read(paths[foreign], String), here => elsewhere))
                 rm(gone; recursive = true)
                 rm(foreign; recursive = true)
-                Runtests.Private.sweep_runstate_dirs()
+                # These packages are in the temporary files, which the sweep takes for
+                # gone for good: elsewhere they are checkouts that can come back.
+                sweep(; temp = mktempdir()) = Runtests.Private.sweep_runstate_dirs(; temp)
+                # Gone a moment ago: a checkout moved by hand can come back.
+                sweep()
+                @test isfile(paths[gone])
+                # Gone for longer than the grace period.
+                for pkg in (gone, foreign)
+                    f = Base.Filesystem.open(paths[pkg], Base.Filesystem.JL_O_WRONLY)
+                    then = time() - Runtests.Private.SWEEP_GRACE_S - 60
+                    Base.Filesystem.futime(f, then, then)
+                    close(f)
+                end
+                sweep()
                 @test isfile(paths[kept])
                 @test !ispath(dirname(paths[gone]))
                 @test isfile(paths[foreign])        # not this machine's to delete
@@ -61,7 +74,7 @@ end
                     away = mkpath(joinpath(dirname(dirname(paths[kept])), "Unmounted-" * string(hash(recorded); base = 16)))
                     write(joinpath(away, "project"), recorded)
                     cp(paths[kept], joinpath(away, basename(paths[kept])))
-                    Runtests.Private.sweep_runstate_dirs()
+                    sweep()
                     @test isfile(joinpath(away, basename(paths[kept])))
                 end
 
@@ -76,6 +89,82 @@ end
             end
         finally
             filter!(!=(depot), DEPOT_PATH)
+        end
+    end
+
+    @testset "only chores sweeps: what it would delete, then all of it, read by several tasks" begin
+        depot = mktempdir()
+        pushfirst!(DEPOT_PATH, depot)
+        try
+            withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
+                one_item = "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n"
+                function gone_runstate()
+                    pkg = make_pkg("Ephemeral", one_item)
+                    path = new_runstate_path(pkg)
+                    finish_run_state!(init_run_state(path, a_plan(pkg)))
+                    rm(pkg; recursive = true)
+                    return path
+                end
+                # Checkouts in the temporary files, gone for good: no grace for them.
+                gone = [gone_runstate() for _ in 1:12]
+                # What a file manager leaves behind is no reason to keep a directory.
+                write(joinpath(dirname(gone[1]), ".DS_Store"), "")
+                # A run of another project reads its own directory and leaves these be.
+                kept = make_pkg("Kept", one_item)
+                capture_run(() -> run_states(kept; workers = 0, logs = :issues, monitor = false))
+                @test all(isfile, gone)
+                # A dry run of chores says what it would delete, and deletes nothing.
+                _, out = capture_run(() -> Runtests.chores(kept; dry_run = true))
+                @test occursin("checkouts that are gone: 12 directories", out) && occursin("12 run states to delete", out)
+                @test all(isfile, gone)
+                # Several tasks read the directories, each once.
+                found = Runtests.Private.sweep_runstate_dirs(; fix = false, ntasks = 4)
+                @test sort([only(g.runstates) for g in found]) == sort(gone) && all(g -> g.whole, found)
+                _, out = capture_run(() -> Runtests.chores(kept))
+                @test occursin("12 run states deleted", out)
+                @test !any(f -> ispath(dirname(f)), gone) && isdir(runstate_dir(kept))
+            end
+        finally
+            filter!(!=(depot), DEPOT_PATH)
+        end
+    end
+
+    @testset "this machine's name is one it keeps, and what it recorded by hostname is its own" begin
+        name = Runtests.Private.machine_name()
+        @test !isempty(name) && name == Runtests.Private.machine_name()
+        Sys.isapple() && @test name == strip(read(`scutil --get LocalHostName`, String))
+        pkg = make_pkg("Machine", "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n")
+        withenv("RUNTESTS_HOST" => nothing) do
+            with_runstate_dir() do dir
+                rs = read_run_state(record_run(dir, pkg, 1, Dict("one" => (PASSED, 1.0))))
+                @test rs.meta["host"] == name && Runtests.Private.recorded_here(rs)
+                rs.meta["host"] = gethostname()     # as an earlier version recorded it
+                @test Runtests.Private.recorded_here(rs)
+                rs.meta["host"] = "another-machine"
+                @test !Runtests.Private.recorded_here(rs)
+            end
+        end
+    end
+
+    @testset "on CI, run states of other machines without RUNTESTS_HOST are said once" begin
+        pkg = make_pkg("CIHost", "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n")
+        with_runstate_dir() do dir
+            # A run state a cache brought back from a job that was another machine.
+            path = record_run(dir, pkg, 1, Dict("one" => (PASSED, 1.0)))
+            name = Runtests.Private.machine_name()
+            write(path, replace(read(path, String), name => "x"^ncodeunits(name)))
+            withenv("CI" => "true", "RUNTESTS_HOST" => nothing) do
+                @test_logs (:warn, r"`RUNTESTS_HOST` is not set") prune_runstates(pkg)
+                @test_logs prune_runstates(pkg)
+            end
+        end
+        with_runstate_dir() do dir
+            path = record_run(dir, pkg, 1, Dict("one" => (PASSED, 1.0)))
+            name = Runtests.Private.machine_name()
+            write(path, replace(read(path, String), name => "x"^ncodeunits(name)))
+            withenv("CI" => "true", "RUNTESTS_HOST" => "ci-linux") do
+                @test_logs prune_runstates(pkg)
+            end
         end
     end
 
@@ -105,6 +194,54 @@ end
         @test haskey(rs.profiles, :default)
         # A profile without `init` or `test_end` reads back without them.
         @test rs.profiles[:default].init == Expr(:block) && rs.profiles[:default].test_end == Expr(:block)
+    end
+
+    @testset "a run state keeps each item's source hash and seed" begin
+        p = a_plan()
+        path = joinpath(mktempdir(), "run.runstate")
+        finish_run_state!(init_run_state(path, p))
+        rs = read_run_state(path)
+        @test rs.version == Runtests.Private.RS_VERSION
+        @test all(!=(0), p.items.hash) && [it.hash for it in rs.items] == p.items.hash
+        @test all(==(p.cfg.seed), p.items.seed) && [it.seed for it in rs.items] == p.items.seed
+    end
+
+    @testset "a run state of format 7 is read, each item with its run's seed" begin
+        rs = read_run_state(joinpath(@__DIR__, "runstates", "format7.runstate"))
+        @test rs !== nothing && rs.version == 7 && rs.complete
+        @test [it.name for it in rs.items] == ["passes", "fails", "never ran"]
+        @test [st.state for st in rs.statuses] == [PASSED, FAILED, UNSEEN]
+        @test rs.statuses[1].elapsed == 1.5f0 && rs.statuses[2].elapsed == 2.5f0
+        # Format 7 recorded no source hash, and one seed for the whole run.
+        @test all(it -> it.hash == 0 && it.seed == 0x0123456789abcdef, rs.items)
+        @test count(e -> e.kind === :attempt, rs.events) == 2
+    end
+
+    @testset "run states of another format are said once, and chores deletes the older" begin
+        depot = mktempdir()
+        pushfirst!(DEPOT_PATH, depot)
+        try
+            withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
+                pkg = make_pkg("OtherFormats", "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n")
+                current = new_runstate_path(pkg)
+                rsf = init_run_state(current, a_plan(pkg))
+                write_status!(rsf, 1, PASSED, 1, 1; elapsed = 1.0)
+                finish_run_state!(rsf)
+                header(version) = [reinterpret(UInt8, [Runtests.Private.RS_MAGIC, UInt32(version)]); zeros(UInt8, 88)]
+                older = joinpath(runstate_dir(pkg), "0000000000000001-1.runstate")
+                newer = joinpath(runstate_dir(pkg), "0000000000000002-1.runstate")
+                write(older, header(6)); write(newer, header(99))
+                project_runs = Runtests.Private.project_runs
+                @test_logs (:warn, r"1 run state of an older format.* and 1 run state written by a newer version") project_runs(pkg)
+                @test_logs project_runs(pkg)   # once a session
+                @test only(project_runs(pkg)).first == current
+                capture_run(() -> Runtests.chores(pkg))
+                # The older is no version's that reads this one; the newer is left to its own.
+                @test !isfile(older) && isfile(newer) && isfile(current)
+            end
+        finally
+            filter!(!=(depot), DEPOT_PATH)
+        end
     end
 
     @testset "the manifest is stored compressed, and a damaged copy costs only the manifest" begin
@@ -290,7 +427,7 @@ end
             pkg = fixture("Basic.jl")
             p, target = prepare((pkg,); workers=1, logs=:issues)
             run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
             h = history(pkg)
             @test length(h.seconds) == 6
             @test all(>(0), values(h.seconds))
@@ -326,6 +463,20 @@ end
             # A timeout is how long the item took at the least, and counts.
             record_run(dir, pkg, 3, Dict("slow" => (TIMEDOUT, 600.0)); whole = true)
             @test history(pkg).seconds["slow"] == 600.0
+        end
+    end
+
+    @testset "what a cancelled run did not finish is told apart from what failed" begin
+        # Both go early in the next run; only a failure is said to be one.
+        pkg = make_pkg("CutShort", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("a", "b", "c", "d"))))
+        with_runstate_dir() do dir
+            record_run(dir, pkg, 1, Dict("b" => (FAILED, 1.0), "c" => (FAILED, 1.0)); whole = true)
+            # Cancelled while `a` ran, after `d` failed and before `b` and `c` started.
+            record_run(dir, pkg, 2, Dict("a" => (Runtests.Private.CANCELLED, 0.5), "d" => (FAILED, 1.0));
+                       whole = true, cancelled = true)
+            h = history(pkg)
+            @test h.failed == Dict("a" => 0, "b" => 0, "c" => 0, "d" => 0)
+            @test h.cancelled == Set(["a", "b", "c"])
         end
     end
 
@@ -375,7 +526,9 @@ end
             @test occursin("matching 1 failing item", out)
             @test occursin("ran 1 test item", out)
             @test failing(pkg) == String[]
-            @test_throws Runtests.NoTestsError Runtests.runtestsf(pkg)
+            # Nothing failing is where the work ends, not a mistake: said, not thrown.
+            nothing_left, out = capture_run(() -> Runtests.runtestsf(pkg))
+            @test nothing_left === nothing && occursin("no test item is failing", out)
         end
     end
 
@@ -454,29 +607,227 @@ end
         end
     end
 
-    @testset "an item the suite no longer has is not failing, and holds no run state back" begin
+    @testset "an item the suite no longer has stays on record, and holds no run state back" begin
         items(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
         pkg = make_pkg("Renamed", "test/t_test.jl" => items("x", "y"))
         failing = Runtests.Private.failing_items
         with_runstate_dir() do dir
             failed = record_run(dir, pkg, 1, Dict("x" => (FAILED, 1.0), "y" => (PASSED, 1.0)); whole = true)
             @test failing(pkg) == ["x"]
-            # `x` renamed to `z`. A run of some of the items does not say what the
-            # suite has, so `x` stays failing.
+            # `x` renamed to `z`, or on a branch that this one does not have: its
+            # failure stays on record, for a checkout that has `x` again, and the
+            # suite's own names leave it out.
             write(joinpath(pkg, "test", "t_test.jl"), items("y", "z"))
             record_run(dir, pkg, 2, Dict("y" => (PASSED, 1.0)))
+            third = record_run(dir, pkg, 3, Dict("y" => (PASSED, 1.0), "z" => (PASSED, 1.0)); whole = true)
             @test failing(pkg) == ["x"]
-            # A run of the whole suite does: `x` is gone.
-            record_run(dir, pkg, 3, Dict("y" => (PASSED, 1.0), "z" => (PASSED, 1.0)); whole = true)
-            @test failing(pkg) == String[]
-            @test failing(pkg; names = Set(["x", "y"])) == String[]
-            # Nor is the run state `x` failed in kept for it.
+            @test failing(pkg; names = Set(["y", "z"])) == String[]
+            # Nor is the run state `x` failed in kept for it; the newest that ran `z`
+            # is, for its duration.
             for k in 1:20
                 record_run(dir, pkg, 3 + k, Dict("y" => (PASSED, 1.0)))
             end
-            prune_runstates(pkg)
-            @test !(failed in runstate_files(pkg))
-            @test length(runstate_files(pkg)) == 20
+            prune_runstates(pkg; names = Set(["y", "z"]))
+            left = runstate_files(pkg)
+            @test !(failed in left) && third in left
+            @test length(left) == 21
+        end
+    end
+
+    @testset "what the runs recorded about an item survives ordinary iteration" begin
+        items(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
+        failing = Runtests.Private.failing_items
+        keep = Runtests.Private.KEEP_RUNS
+
+        @testset "pruning keeps every item's newest duration" begin
+            pkg = make_pkg("Durations", "test/t_test.jl" => items("quick", "slow"))
+            with_runstate_dir() do dir
+                full = record_run(dir, pkg, 1, Dict("quick" => (PASSED, 1.0), "slow" => (PASSED, 300.0)); whole = true)
+                for k in 1:(keep + 3)
+                    record_run(dir, pkg, 1 + k, Dict("quick" => (PASSED, 1.0)))
+                end
+                prune_runstates(pkg; names = Set(["quick", "slow"]))
+                @test full in runstate_files(pkg)
+                @test length(runstate_files(pkg)) == keep + 1
+                @test history(pkg).seconds["slow"] == 300.0
+            end
+        end
+
+        @testset "progress against a replay's base survives pruning" begin
+            pkg = make_pkg("Baseline", "test/t_test.jl" => items("x", "y"))
+            ci = mktempdir()
+            base = read_run_state(record_run(ci, pkg, 1, Dict("x" => (FAILED, 1.0), "y" => (PASSED, 1.0)); whole = true))
+            with_runstate_dir() do dir
+                @test failing(pkg; base) == ["x"]
+                record_run(dir, pkg, 2, Dict("x" => (PASSED, 1.0)))
+                @test failing(pkg; base) == String[]
+                for k in 1:(keep + 3)
+                    record_run(dir, pkg, 2 + k, Dict("y" => (PASSED, 1.0)))
+                end
+                prune_runstates(pkg; names = Set(["x", "y"]))
+                @test failing(pkg; base) == String[]
+            end
+        end
+
+        @testset "a failing item leads however many runs of others follow, and a fixed one does not" begin
+            pkg = make_pkg("Urgency", "test/t_test.jl" => items("a", "b", "c"))
+            with_runstate_dir() do dir
+                record_run(dir, pkg, 1, Dict("a" => (PASSED, 1.0), "b" => (FAILED, 1.0), "c" => (FAILED, 1.0)); whole = true)
+                record_run(dir, pkg, 2, Dict("c" => (PASSED, 1.0)))
+                for k in 1:(Runtests.Private.HISTORY_RUNS + 2)
+                    record_run(dir, pkg, 2 + k, Dict("a" => (PASSED, 1.0)))
+                end
+                @test history(pkg).failed == Dict("b" => Runtests.Private.HISTORY_RUNS + 3)
+                p, _ = prepare((pkg,); announce = false)
+                why(n) = p.units.why[p.items.unit[findfirst(==(n), p.items.name)]]
+                @test why("b") === Runtests.Private.RECENT
+                @test why("c") === Runtests.Private.IN_FILE_ORDER
+            end
+        end
+
+        @testset "a skip leaves a failure standing" begin
+            pkg = make_pkg("SkipKeeps", "test/t_test.jl" => items("a"))
+            with_runstate_dir() do dir
+                record_run(dir, pkg, 1, Dict("a" => (FAILED, 1.0)))
+                record_run(dir, pkg, 2, Dict("a" => (SKIPPED, 0.1)))
+                @test failing(pkg) == ["a"]
+                record_run(dir, pkg, 3, Dict("a" => (PASSED, 1.0)))
+                @test failing(pkg) == String[]
+            end
+        end
+
+        @testset "an edit stays marked until the item runs, and a fresh checkout marks nothing" begin
+            pkg = make_pkg("Edits", "test/a_test.jl" => items("a"), "test/b_test.jl" => items("b"))
+            whys(dir) = (p = first(prepare((dir,); announce = false));
+                         Dict(p.items.name[i] => Runtests.Private.why_text(p, p.items.unit[i]) for i in eachindex(p.items.name)))
+            with_runstate_dir() do _
+                capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+                @test whys(pkg) == Dict("a" => "", "b" => "")
+                edited = "@testitem \"%s\" begin\n    @test 1 == 1\nend\n"
+                write(joinpath(pkg, "test", "a_test.jl"), replace(edited, "%s" => "a"))
+                write(joinpath(pkg, "test", "b_test.jl"), replace(edited, "%s" => "b"))
+                capture_run(() -> run_states(joinpath(pkg, "test", "a_test.jl"); workers = 0, logs = :issues, monitor = false))
+                @test whys(pkg) == Dict("a" => "", "b" => "edited since its last run")
+                # Every file of a copy is new to the file system, and nothing in it is.
+                copied = cp(pkg, joinpath(mktempdir(), "Edits"))
+                @test whys(copied) == Dict("a" => "", "b" => "edited since its last run")
+                # A new item is said to be one.
+                write(joinpath(copied, "test", "a_test.jl"), replace(edited, "%s" => "a") * items("c"))
+                @test whys(copied)["c"] == "new"
+            end
+        end
+    end
+
+    @testset "a run keeps its items' logs beside its run state, for as long as the run state" begin
+        pkg = make_pkg("Logs", "test/t_test.jl" => """
+            @testitem "talks" begin
+                println("hello from talks")
+                @test true
+            end
+            @testitem "quiet" begin
+                @test true
+            end
+            @testitem "fails" begin
+                println("about to fail")
+                @test 1 == 2
+            end
+            """)
+        with_runstate_dir() do dir
+            (_, run, p), out = capture_run(() -> run_states(pkg; workers = 1, logs = :issues, monitor = false))
+            # `run_states` reports nothing; the closing block is the report's.
+            path = only(runstate_files(pkg))
+            logs = Runtests.Private.logs_dir(path)
+            @test run.logdir == logs && isdir(logs)
+            at(n) = findfirst(==(n), p.items.name)
+            log(n) = joinpath(logs, "item_$(at(n))_1.log")
+            @test occursin("hello from talks", read(log("talks"), String))
+            @test !isfile(log("quiet"))   # it printed nothing, so nothing is kept
+            @test occursin("about to fail", read(log("fails"), String))
+            report = joinpath(logs, "item_$(at("fails"))_1.failure.txt")
+            @test occursin("1 == 2", read(report, String))
+            # Whoever is handed the run state is told where they are.
+            @test occursin(report, sprint(show, MIME("text/plain"), read_run_state(path)))
+            _, closing = capture_run(() -> Runtests.Private.print_conclusion(run))
+            @test occursin("logs: $logs", closing)
+            # A prune that keeps the run state keeps them; one that deletes it, deletes them.
+            for k in 1:3
+                record_run(dir, pkg, k, Dict(n => (PASSED, 1.0) for n in ("talks", "quiet", "fails")))
+            end
+            prune_runstates(pkg; names = Set(p.items.name))
+            @test isfile(path) && isdir(logs)
+            for k in 4:(Runtests.Private.KEEP_RUNS + 1)
+                record_run(dir, pkg, k, Dict(n => (PASSED, 1.0) for n in ("talks", "quiet", "fails")))
+            end
+            prune_runstates(pkg; names = Set(p.items.name))
+            @test !isfile(path) && !isdir(logs)
+        end
+    end
+
+    @testset "RUNTESTS_ARTIFACT_DIR receives each run's own run state and logs, and no history" begin
+        pkg = make_pkg("Exported", "test/t_test.jl" => """
+            @testitem "fails" begin
+                println("evidence")
+                @test false
+            end
+            @testitem "passes" begin
+                @test true
+            end
+            """)
+        artifacts = mktempdir()
+        logs_dir = Runtests.Private.logs_dir
+        with_runstate_dir() do dir
+            # The history a CI cache would hold, which the artifact leaves out.
+            for k in 1:3
+                record_run(dir, pkg, k, Dict("passes" => (PASSED, 1.0)))
+            end
+            exported_run() = withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
+                first(capture_run(() -> run_states(pkg; workers = 1, logs = :issues, monitor = false)))
+            end
+            _, run, p = exported_run()
+            path = (@atomic run.runstate).path
+            @test sort(readdir(artifacts)) == sort([basename(path), basename(logs_dir(path))])
+            @test read(joinpath(artifacts, basename(path))) == read(path)
+            at = findfirst(==("fails"), p.items.name)
+            @test occursin("evidence", read(joinpath(artifacts, basename(logs_dir(path)), "item_$(at)_1.log"), String))
+            _, closing = capture_run(() -> Runtests.Private.print_conclusion(run))
+            @test occursin("copied to: $artifacts", closing)
+            # And what to type to run the failure again, here or from the copy.
+            @test occursin("run the failing items again: Runtests.runtestsf()", closing)
+            @test occursin("Runtests.runtestsf(replay = $(repr(basename(path))))", closing)
+            @test occursin("its failing items with Runtests.runtestsf(replay = ", sprint(show, MIME("text/plain"), read_run_state(path)))
+            # A second run, a sub-package's say, puts its own beside it.
+            exported_run()
+            @test count(endswith(".runstate"), readdir(artifacts)) == 2
+        end
+    end
+
+    @testset "runtestsf reruns each failure with the seed it failed with" begin
+        mktempdir() do tmp
+            draws = joinpath(tmp, "draws")
+            pkg = make_pkg("SameSeed", "test/t_test.jl" => """
+                @testitem "draws" begin
+                    open(io -> println(io, rand(UInt64)), $(repr(draws)), "a")
+                    @test false
+                end
+                """)
+            # Outside the enclosing testset, where a failing run throws rather than
+            # adding its failures to this one's.
+            quietly(f) = capture_run(() -> try Runtests.Private.without_enclosing_testset(f) catch end)
+            drawn() = readlines(draws)
+            with_runstate_dir() do _
+                quietly(() -> Runtests.runtests(pkg; workers = 0, logs = :issues, monitor = false))
+                for _ in 1:2
+                    quietly(() -> Runtests.runtestsf(pkg; workers = 0, logs = :issues, monitor = false))
+                end
+                @test length(drawn()) == 3 && length(unique(drawn())) == 1
+                # Run again from its run state, a rerun draws what it drew.
+                rerun = last(runstate_files(pkg))
+                quietly(() -> Runtests.runtests(pkg; replay = rerun, workers = 0, logs = :issues, monitor = false))
+                @test length(unique(drawn())) == 1
+                # A seed given is every item's.
+                quietly(() -> Runtests.runtestsf(pkg; seed = 1, workers = 0, logs = :issues, monitor = false))
+                @test length(unique(drawn())) == 2
+            end
         end
     end
 
@@ -552,16 +903,13 @@ end
             @test occursin("ran 1 test item", out)
             # `b` is still on record, but not what the suite has, so nothing is left to run.
             @test failing(pkg) == ["b"]
-            err = try
-                Runtests.runtestsf(pkg; workers = 0)
-            catch e
-                e
-            end
-            @test err isa Runtests.NoTestsError
-            @test occursin("no test item is failing", sprint(showerror, err))
-            # A run of the whole suite takes `b` off the record.
+            nothing_left, out = capture_run(() -> Runtests.runtestsf(pkg; workers = 0))
+            @test nothing_left === nothing && occursin("no test item is failing", out)
+            # A run of the whole suite leaves `b` on record, for a checkout that has it,
+            # and outside what this suite runs.
             capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
-            @test failing(pkg) == String[]
+            @test failing(pkg) == ["b"]
+            @test failing(pkg; names = Set(["a", "b2"])) == String[]
         end
     end
 
@@ -571,13 +919,16 @@ end
             a = make_pkg("SharedA", "test/t_test.jl" => item(true))
             b = make_pkg("SharedB", "test/t_test.jl" => item(false))
             capture_run(() -> run_states(a; workers=0, logs=:issues, monitor=false))
-            capture_run(() -> run_states(b; workers=0, logs=:issues, monitor=false))   # the newer, failing
-            @test length(runstate_files(a)) == 2          # both in the one directory
+            capture_run(() -> run_states(b; workers=0, logs=:issues, monitor=false))   # failing
+            capture_run(() -> run_states(a; workers=0, logs=:issues, monitor=false))   # the newest
+            @test length(runstate_files(a)) == 3          # all in the one directory
             @test isempty(history(a; nruns=1).failed)
             @test history(b; nruns=1).failed == Dict("shared name" => 0)
-            # Pruning one project's runs leaves the other's alone.
+            # Pruning one project's runs leaves the other's alone: `a`'s older run goes,
+            # and `b`'s, older than `a`'s newest, stays.
             prune_runstates(a, 0)
-            @test isempty(history(a).seconds)
+            @test length(runstate_files(a)) == 2
+            @test isempty(history(a).failed) && haskey(history(a).seconds, "shared name")
             @test history(b; nruns=1).failed == Dict("shared name" => 0)
         end
     end
@@ -605,7 +956,7 @@ end
             end
             # A CI artifact downloaded among them, older than any: the same file, but
             # recorded on another machine. Rewritten byte for byte, so it stays valid.
-            here = gethostname()
+            here = Runtests.Private.machine_name()
             elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
             artifact = joinpath(dir, "999999-1.runstate")
             write(artifact, replace(read(joinpath(dir, "1000001-1.runstate"), String), here => elsewhere))
@@ -627,7 +978,7 @@ end
             # own: one that sorts after every name a run here gets.
             capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
             recorded = only(runstate_files(pkg))
-            here = gethostname()
+            here = Runtests.Private.machine_name()
             elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
             ci = joinpath(dir, "run.runstate")
             write(ci, replace(read(recorded, String), here => elsewhere))
@@ -853,6 +1204,76 @@ end
         @test_throws Runtests.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.runstate"))
     end
 
+    @testset "a replay keeps the recorded [order] and reads the recorded profiles' environments" begin
+        dir = make_pkg("RecordedOrder",
+            "test/a_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n@testitem \"b\" begin\n    @test true\nend\n",
+            "test/qa/Project.toml" => "",
+            "test/qa/q_test.jl" => "@testitem \"q\" begin\n    @test true\nend\n",
+            "test/TestItems.toml" => "[order]\nfirst = [\"b\"]\n\n[profiles.qa]\nenvironment = \"qa\"\n")
+        with_runstate_dir() do _
+            p, _ = prepare((dir,); announce = false)
+            path = joinpath(mktempdir(), "run.runstate")
+            rsf = init_run_state(path, p)
+            write_status!(rsf, findfirst(==("q"), p.items.name), FAILED, 1, 1; elapsed = 1.0)
+            finish_run_state!(rsf)
+            # The checkout drops the order and the profile since.
+            write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"a\"]\n")
+            (replayed, _), _ = capture_run(() -> prepare((dir,); replay = path))
+            @test replayed.cfg.order_first == ["b"]
+            # `runtestsf` reads the suite as the replay does, the recorded environment's
+            # items with it, and finds the failure there.
+            _, out = capture_run(() -> Runtests.runtestsf(dir; replay = path, dry_run = true))
+            @test occursin("1 test item", out) && occursin("\"q\"", out)
+        end
+    end
+
+    @testset "a replay's workers compile with the Julia flags the run state recorded" begin
+        # Recorded by a process whose bounds checking is the opposite of this one's,
+        # by an item that holds its workers to it.
+        repo = dirname(@__DIR__)
+        pkg = make_pkg("Flagged", "test/t_test.jl" => """
+            @testitem "bounds" begin
+                @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
+            end
+            """)
+        with_runstate_dir() do dir
+            script = "using Runtests; Runtests.runtests($(repr(pkg)); workers = 1, monitor = false)"
+            cmd = addenv(`$(Base.julia_cmd()) $(OTHER_BOUNDS.arg) --project=$repo --startup-file=no -e $script`,
+                         "JULIA_LOAD_PATH" => join([repo, joinpath(repo, "test"), ""], Runtests.Private.PATHSEP),
+                         "RUNTESTS_RUNSTATE_DIR" => dir)
+            @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+            recorded = only(runstate_files(pkg))
+            @test OTHER_BOUNDS.arg in split(read_run_state(recorded).meta["julia_flags"])
+            (states, run, p), out = capture_run(() -> run_states(pkg; replay = recorded, workers = 1, logs = :issues, monitor = false))
+            @test states["bounds"] === PASSED
+            @test p.cfg.julia_flags == split(read_run_state(recorded).meta["julia_flags"])
+            @test occursin("the workers compile with the Julia flags the run state recorded", out)
+            # The replay records what its workers ran with, so a replay of it does too.
+            @test read_run_state((@atomic run.runstate).path).meta["julia_flags"] == read_run_state(recorded).meta["julia_flags"]
+        end
+    end
+
+    @testset "a replay's threads keyword reaches the profiles that take the run's threads" begin
+        dir = make_pkg(
+            "ReplayedThreads",
+            "test/a_test.jl" => """
+            @testitem "own" sandbox=:own begin\n @test true\nend
+            @testitem "inherits" sandbox=:inherits begin\n @test true\nend
+            """,
+            "test/TestItems.toml" => "[profiles.own]\nthreads = \"3\"\n[profiles.inherits]\nenv = { X = \"1\" }\n"
+        )
+        items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
+        p = plan(items, read_config(joinpath(dir, "test"); threads = "2,1"); root=dir)
+        path = joinpath(mktempdir(), "run.runstate")
+        finish_run_state!(init_run_state(path, p))
+        threads_of(; kwargs...) = let ((q, _), _) = capture_run(() -> prepare((dir,); replay = path, kwargs...))
+            Dict(x.name => x.threads for x in q.profiles)
+        end
+        @test threads_of() == Dict(:default => "2,1", :own => "3", :inherits => "2,1")
+        # A profile that set its own keeps it, as it would in a run without a replay.
+        @test threads_of(threads = "4") == Dict(:default => "4", :own => "3", :inherits => "4")
+    end
+
     @testset "a run records where it ran, how it was asked for, and what each worker did" begin
         with_runstate_dir() do dir
             pkg = make_pkg("Recorded", "test/r_test.jl" => """
@@ -867,7 +1288,7 @@ end
             end
             """)
             run_states(pkg; workers=1, logs=:issues, monitor=false, seed=0x1234)
-            rs = read_run_state(only(readdir(dir; join=true)))
+            rs = read_run_state(only(runstate_files(pkg)))
             @test rs.meta["seed"] == "0x0000000000001234"
             @test (rs.meta["workers"], rs.meta["machine"], rs.meta["julia"]) == ("1", Sys.MACHINE, string(VERSION))
             @test occursin("[[deps.", Runtests.Private.recorded_manifest(rs))
@@ -902,7 +1323,7 @@ end
                 end
                 """)
                 run_states(pkg; workers=1, retries=1, logs=:issues, monitor=false)
-                recorded = only(readdir(dir; join=true))
+                recorded = only(filter(endswith(".runstate"), readdir(dir; join=true)))
                 # An item added since is not part of the run that was recorded.
                 write(joinpath(pkg, "test", "later_test.jl"), "@testitem \"added later\" begin\n @test true\nend\n")
                 (p, _), out = capture_run(() -> prepare((pkg,); replay=recorded))

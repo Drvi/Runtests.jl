@@ -38,6 +38,10 @@ struct RawItem
     chain::Symbol          # NO_CHAIN when the item stands alone
     profile::Symbol        # DEFAULT_PROFILE, or a name from TestItems.toml
     exclusive::Bool        # sandbox=true: alone in a process, torn down after
+    # CRC32c of the item's source text, from its first line to the line before the
+    # next statement: what a later run compares to tell an edited item from one that
+    # only moved. 0 when there is no file to read it from, as for a pasted item.
+    hash::UInt32
 end
 
 # A problem in a test file, located. Scanning collects all of them before failing,
@@ -208,14 +212,20 @@ Filter(; name = nothing, tags = nothing, paths = String[], line = 0, group = not
            name isa FailingItems ? "failing item" : "named item")
 
 """
-    FailingItems(names)
+    FailingItems(names, seeds)
 
 The names [`runtestsf`](@ref) hands a run as its `name`: a set of exact names, which
-the run says are the failing items.
+the run says are the failing items, each with the seed it failed with in `seeds`.
 """
 struct FailingItems
     names::Set{String}
+    seeds::Dict{String, UInt64}
 end
+FailingItems(names) = FailingItems(Set{String}(names), Dict{String, UInt64}())
+
+# What a run of `FailingItems` throws when none of them is an item the suite has, for
+# `runtestsf` to say there is nothing failing.
+struct NothingFailing <: Exception end
 
 _asname(n::Union{Nothing, Regex}) = n
 _asname(f::FailingItems) = f.names

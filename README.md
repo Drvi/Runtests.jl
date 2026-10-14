@@ -101,8 +101,12 @@ when it does not. `group="all"` is always the whole suite.
 
 `runtestsf()` remembers each item's latest verdict across runs. Rerunning one
 failure does not forget other failures, and renamed or deleted items are left
-out. Every other selection narrows the failing items, `name` included, so nothing
-that is not failing runs. To reproduce a recorded run's settings and seed, use
+out. A skip is not a verdict, so a skipped item that failed before stays failing.
+Every other selection narrows the failing items, `name` included, so nothing that
+is not failing runs. Each failing item runs with the seed it failed with, so a
+failure that depends on its random numbers comes back until it is fixed. Give
+`seed` to choose another. When nothing is failing, `runtestsf()` says so and returns
+`nothing`. To reproduce a recorded run's settings and seed, use
 [`replay`](#run-state).
 
 A normal run returns a `RunTestSet`; a dry run returns `nothing`. Outside an
@@ -114,7 +118,7 @@ Problems discovered before execution also throw:
 | Error | Cause |
 |:------|:------|
 | `Runtests.ScanFailure` | Invalid test files, duplicate names, or missing or stale template expansions. |
-| `Runtests.NoTestsError` | No test files, no matching items, or no recorded failures for `runtestsf()`. |
+| `Runtests.NoTestsError` | No test files, or no matching items. |
 | `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, another config file or an environment variable: an invalid setting, profile or group, an undeclared group in `RUNTESTS_GROUP`, or a profile's environment that does not resolve. |
 | `ArgumentError` | A mistake in the call: a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a tag no item carries, an undeclared group, or a path outside `test/`, in another package, or at a line the file does not have. |
 
@@ -322,11 +326,11 @@ Runtests.chores()              # apply automatic fixes and report remaining prob
 - Converts setups to packages and adds newly imported dependencies.
 - Expands templates and deletes generated files whose templates were removed.
 - Checks test items and `test/TestItems.toml`, reporting problems that need manual
-  changes, including manually edited expansions.
-- Removes this machine's obsolete run states, respecting the
-  [retention rules](#run-state). Among retained states, it removes only those with
-  no information about any current item, such as empty dry runs. Records from
-  other machines are preserved.
+  changes, including manually edited expansions. A package without test files, such
+  as a fixture package in another package's `test/`, has nothing to check.
+- Deletes the run states that a run's own pruning deletes, by the same
+  [retention rules](#storage-and-retention), with their logs, and those of a format
+  this version does not read. Records from other machines are preserved.
 
 After applying automatic fixes, it returns `true` or throws
 `Runtests.ChoresError` if manual work remains. This lets you check the suite before
@@ -452,7 +456,7 @@ block each say how many test files it holds.
 
 | Keyword | Default | Meaning |
 |:--------|:--------|:--------|
-| `workers` | `"auto"` | Worker count. Auto uses CPU count, threads per worker, and an assumed 4 GiB per worker, capped at 8. |
+| `workers` | `"auto"` | Worker count. Auto uses CPU count, threads per worker, and an assumed 4 GiB per worker, capped at 8. A worker with `threads = "auto"` takes every CPU. |
 | `threads` | `"2,1"` | Each worker's Julia `--threads` value. |
 | `timeout` | `1800` | Seconds allowed per item attempt. |
 | `init_timeout`, `test_end_timeout` | `timeout` | Separate limits for profile hooks. |
@@ -468,15 +472,21 @@ block each say how many test files it holds.
 | `full_names` | `false` | Print long names in full instead of [unique prefixes](#the-plan). |
 | `testset_name` | `"Runtests"` | Summary testset name; useful for several runs inside one `@testset`. |
 | `coverage` | `false` | Write merged line coverage to `lcov.info`; see [Coverage](#coverage). |
-| `seed` | random | Seed combined with each item's name. `0` chooses a random seed; the run prints the chosen value. |
+| `seed` | random | Seed combined with each item's name. Without one, the run chooses a random seed and prints it. |
 | `dry_run` | `false` | Print the plan without executing tests. |
 | `replay` | `nothing` | Path to a recorded [run state](#run-state). |
 | `config` | `test/TestItems.toml` | Config file to read; an explicit path is relative to the current directory. |
 | `group` | `RUNTESTS_GROUP`, else `default`, when nothing else selects | A [group](#groups) to run; `"all"` for the whole suite. |
 
 An interactive run with at most one worker defaults to `logs=:eager`. All options
-above except `dry_run`, `replay`, `config`, and `group` can also go under `[run]`; use TOML
-strings for symbols, such as `logs = "issues"`. Explicit keywords override the file.
+above except `dry_run`, `replay`, `config`, and `group` can also go under `[run]`. Use
+TOML strings for symbols, such as `logs = "issues"`. Explicit keywords override the file.
+
+Each of those settings can also come from a variable named `RUNTESTS_` and the
+setting in capitals, such as `RUNTESTS_WORKERS=4`, `RUNTESTS_RETRIES=1` or
+`RUNTESTS_SEED=0x1234`. CI sets a job's settings this way without an edit to the
+project. A keyword wins over the variable, and the variable wins over the file. The
+run's header names each variable that set something.
 
 Timeouts must be positive and at most 2,147,483,647 seconds; fractional values
 round up to whole seconds. Invalid settings are rejected before execution.
@@ -550,12 +560,16 @@ timings and resource usage depend on the suite and machine.
 The table lists the items in the order the run is expected to start them, each
 with the worker expected to run it. The prediction plays out the run's own
 dispatch with the durations earlier runs recorded, so it is as good as they are.
+When earlier runs recorded durations, the `est` column gives each item's newest
+one. It is blank for an item that has none yet.
 
 A run hands out, in this order:
 
 1. the items `[order] first` names;
 2. sandboxed items, while every process is still fresh;
-3. items that failed recently, or whose file changed since the last run;
+3. items whose latest result is a failure, however long ago; items that the newest
+   run to select them stopped before; and items edited since they last ran, or new.
+   The long ones among them go first;
 4. items long enough to set the length of the run: at least 3 s, and over a quarter
    of a worker's share of the work;
 5. everything else, in file order, each worker walking its own stretch of files so
@@ -597,6 +611,9 @@ run goes; otherwise it is printed every `monitor_interval` seconds, every 10 fin
 items but no sooner than 5 seconds after the previous one, when the run moves from
 setup to testing, and when the machine's memory crosses 90%.
 
+The header names the Julia flags of the workers that a plain `julia` does not have,
+such as `--check-bounds=yes -O1`, and the variables that set run settings.
+
 An item that did not pass gets its results and captured output right after its
 `DONE` line:
 
@@ -620,6 +637,11 @@ The run ends with what it cost, stage by stage, followed by `Test`'s usual summa
 <b>│ </b>cpu · 9% of 18 threads for this run's processes, 14% for the whole machine (averages over the run)
 <b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276123456-96211.runstate
 </pre>
+
+When items printed anything, the block also names the directory of their logs (see
+[Run state](#run-state)). When items failed, it says how to run them again:
+`Runtests.runtestsf()`, or `Runtests.runtestsf(replay = "<file>")` where the run
+state was copied for CI.
 
 The memory figures cover every process the run owns: the coordinator, the workers,
 and whatever they spawn, such as `Pkg` precompiling or a process a test starts.
@@ -687,7 +709,7 @@ steps into one test item, here in this process:
 ```julia
 julia> using Debugger
 
-julia> Runtests.debug()                 # the last run's most recent failure
+julia> Runtests.debug()                 # the most recent failure
 
 julia> Runtests.debug("adds numbers")   # seed = … to draw the random numbers a run drew
 
@@ -701,9 +723,10 @@ path is read as `runtests` reads one, relative to the current directory: a
 `file.jl:line`, or a file or directory that holds one item. What picks no item, or
 several, is an error that lists what it found.
 
-Without a name it steps into the failure the last run recorded most recently, with
-that run's seed, and names the run's other failures; if the last run passed, there
-is nothing to step into and it says so. The item gets what a run gives it: its
+Without a name it steps into the most recent failure among the items that are
+failing, with the seed it failed with, and names the other failing items. When
+nothing is failing, there is nothing to step into, and it says so. A failing item
+named in the call runs with the seed it failed with too. The item gets what a run gives it: its
 module and imports, the test environment and setups, and its profile's `env`,
 `init` and `test_end`. Its body is a function the debugger enters at the first
 call, in the test file. What cannot be part of a function (`using`, `struct`,
@@ -734,7 +757,11 @@ one with `TestEnv`, so dependencies your package declares only for testing
 (`[extras]`/`[targets]`, or `test/Project.toml`) are importable from a test item.
 Whatever environment you had active is restored when the run ends.
 
-Generated environments are cached for the session, so calling `runtests()` again
+If your package lists `test` in its `[workspace]`, Runtests activates
+`test/Project.toml` and instantiates it, as `Pkg.test` does. The test project then
+shares the manifest of the package, so TestEnv does not build a separate environment.
+
+Environments are cached for the session, so calling `runtests()` again
 at the REPL does not re-resolve and re-precompile. The cache notices when you
 change `Project.toml` or a manifest, and rebuilds.
 
@@ -744,8 +771,10 @@ instead, stacked over this one.
 ## Run state
 
 Every run writes a binary record as it progresses and prints its path at the end.
-Even an interrupted run leaves a record of completed items. Use a record from a
-local run or a downloaded CI artifact to inspect or replay it:
+Even an interrupted run leaves a record of completed items. Beside the record, a
+directory with the same name ending in `.logs` keeps what each item printed and the
+failure report of each item that did not pass. Use a record from a local run or a
+downloaded CI artifact to inspect or replay it:
 
 ```julia
 Runtests.read_run_state("run.runstate")
@@ -753,9 +782,12 @@ Runtests.runtests(replay="run.runstate")
 Runtests.runtestsf(replay="run.runstate")
 ```
 
-`runtests(replay=...)` uses the recorded items, settings, profiles, and seed.
-Explicit keywords override recorded settings. Replay reports package versions
+`runtests(replay=...)` uses the recorded items, settings, profiles, `[order]`, and
+seeds. It gives the workers the Julia flags of the recorded run when this process
+has others. Explicit keywords override recorded settings. Replay reports package versions
 that differ from the recorded environment; it does not restore those versions.
+It also names each recorded item that the suite no longer has, because a renamed
+or deleted item cannot run again.
 `runtestsf(replay=...)` selects failures using that run's verdicts and those of
 runs started after it. Earlier runs contribute durations only.
 
@@ -767,6 +799,12 @@ runs started after it. Earlier runs contribute durations only.
 - The commit, Julia version and build, machine, settings, the selection and the
   group that made it, profiles and the environment each names, preferences, and
   random seed. A replay finds a profile's environment in the checkout it runs in.
+- Each item's seed, and a hash of its source, which tells an edited item from one
+  that only moved.
+- The Julia flags that change compiled code, such as `--check-bounds` and `-O`.
+- In the `.logs` directory beside the record: what each item printed, the failure
+  report of each attempt that did not pass, and why a run ended before its first
+  item.
 - `JULIA_*`, `RUNTESTS_*`, and CI job environment variables, excluding names that
   look like credentials.
 - The test environment's `Project.toml` and `Manifest.toml`.
@@ -784,20 +822,33 @@ Runs are ordered by their recorded start time, regardless of filename or when a
 record was downloaded. Each item's latest completed verdict determines whether
 it is failing, and its latest recorded duration informs scheduling.
 
-Runtests keeps this machine's newest 20 records, plus any older record containing
-a failing item's latest verdict. A full run retires failures for items that have
-been renamed or deleted; with a `default` group, that is a run with `group="all"`. Records for a deleted project are also removed, unless
-its parent directory is missing or empty, as with an unmounted drive.
+Runtests keeps this machine's newest 20 records. It keeps an older record while
+its deletion would change what the records say about an item the suite has: its
+latest verdict and when it was recorded, the seed of a failure, its newest duration
+and source hash, or whether the newest run that selected it stopped before it. An
+item the suite no longer has stays on record, for a branch that still has it, and
+keeps no record beyond the newest 20. A record's logs are deleted with it, and only
+with it. Records of a deleted project are removed 30 days after its newest run,
+unless its parent directory is missing or empty, as with an unmounted drive. A
+project in the system's temporary files has no such wait. A run looks for deleted
+projects at most once a day.
 
-The machine identity is its hostname, overridden by `RUNTESTS_HOST`. Records from
-other machines are never changed or deleted. Replay performs no pruning and
-never deletes the supplied record.
+The machine identity is `RUNTESTS_HOST` when it is set. Otherwise it is the name
+macOS gives the machine, which stays the same when the hostname follows the
+network, and the hostname elsewhere. Records from other machines are never changed
+or deleted. Replay performs no pruning and never deletes the supplied record.
+
+Each version of Runtests reads the record format of the version before it. A run
+warns once about records of a format it does not read, and `Runtests.chores()`
+deletes those of older formats.
 
 ### Keeping history on CI
 
-Cache run states between jobs to preserve scheduling history, and upload them
-as artifacts after failures. For a GitHub Actions matrix with `os`, `version`, and
-a [`group`](#groups) per job:
+Cache run states between jobs to preserve scheduling history, and upload each
+job's own records and logs as an artifact. `RUNTESTS_ARTIFACT_DIR` names a
+directory into which each run copies its record and its logs when it ends, also
+after a failure or an interrupt. For a GitHub Actions matrix with `os`, `version`,
+and a [`group`](#groups) per job:
 
 ```yaml
 - uses: actions/cache/restore@v4
@@ -810,22 +861,31 @@ a [`group`](#groups) per job:
     RUNTESTS_GROUP: ${{ matrix.group }}
     RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
     RUNTESTS_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
+    RUNTESTS_ARTIFACT_DIR: ${{ runner.temp }}/runtests-artifact
 - uses: actions/cache/save@v4
   if: always()
   with:
-    path: ${{ runner.temp }}/runtests
+    path: |
+      ${{ runner.temp }}/runtests
+      !${{ runner.temp }}/runtests/**/*.logs
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
   with:
-    name: runtests-run-state-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}
-    path: ${{ runner.temp }}/runtests
+    name: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}
+    path: ${{ runner.temp }}/runtests-artifact
 ```
+
+The cache leaves the logs out, because the next job plans from the records alone.
+The artifact holds this job's records and logs and none of the history. On your
+machine, run the failures of a downloaded record with
+`Runtests.runtestsf(replay = "<file>")`.
 
 Use a unique cache key per run and `restore-keys` to retrieve the previous cache.
 Save it even when tests fail, so the next run sees those failures. A stable
 `RUNTESTS_HOST` makes restored records eligible for normal retention instead of
-accumulating under a new hostname each run.
+accumulating under a new hostname each run. On CI without it, a run warns when its
+directory holds other machines' records.
 
 Every dimension of the matrix belongs in the key: two jobs of one workflow run
 with the same key race to save it, and the cache keeps only one of them. A
@@ -843,7 +903,8 @@ when the run finishes or is declared dead. Active records are never pruned.
 
 A run is considered dead if its record has not been updated for 90 seconds, or
 its local process is known to have exited. It then counts as cancelled, with any
-item that was running counted as failing. Machines sharing records over a network
+item that was running counted as failing. A run whose setup fails finishes its
+record as one that ended before its first item, so no other run waits for it. Machines sharing records over a network
 must agree on time to within a minute, and each `RUNTESTS_HOST` must identify only
 one machine at a time.
 
@@ -854,7 +915,8 @@ per-item results, and a **Run Failed Tests** command. Its README covers local
 installation and settings.
 
 `Runtests.serve(path)` lets an editor drive a package's suite: it lists the test items
-with where they are and what they declare, runs the ones asked for, reports each
+with where they are and what they declare, runs the ones asked for (or a `group`, or
+a `replay` of a record), reports each
 item's start and outcome as it happens — failures with their file and line — and
 cancels a run on request. It speaks one JSON object per line: commands on stdin,
 events on stdout, and everything written for people on stderr.

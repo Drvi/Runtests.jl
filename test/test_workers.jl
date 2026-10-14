@@ -2,6 +2,7 @@
 using RuntestsWorkers: RuntestsWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
                     WorkerTerminatedException, RemoteException
 using RuntestsWorkers: ItemSpec, ItemResult, PASSED, ERRORED
+using Random: Random
 using Sockets
 
 # A connected socket pair standing in for coordinator and worker.
@@ -93,6 +94,27 @@ end
         @test_throws ErrorException RuntestsWorkers.with_timeout(() -> sleep(3), 0.2)
         err = try; RuntestsWorkers.with_timeout(() -> error("inner"), 5); catch e; e; end
         @test err isa CapturedException && occursin("inner", sprint(showerror, err))
+    end
+
+    @testset "a skip expression draws from the item's seed, and leaves the caller's numbers alone" begin
+        # It runs where the item does, just before it: its draws repeat with the seed,
+        # as the body's do, and the process's own sequence goes on as if it had not.
+        skip = quote
+            ENV["RUNTESTS_SKIP_DRAW"] = string(rand(UInt64))
+            false
+        end
+        spec = probe_spec(:(@test true); skip)
+        withenv("RUNTESTS_SKIP_DRAW" => nothing) do
+            Random.seed!(42)
+            expected = rand(UInt64)
+            Random.seed!(42)
+            draws = map(1:2) do _
+                @test RuntestsWorkers.run_item(spec).state === PASSED
+                ENV["RUNTESTS_SKIP_DRAW"]
+            end
+            @test draws[1] == draws[2]
+            @test rand(UInt64) == expected
+        end
     end
 
     @testset "a worker evaluates, runs items, reports errors as text, and stops" begin

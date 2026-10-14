@@ -11,11 +11,12 @@ using Runtests.Private.Platform: process_rss, child_pids, process_tree, machine_
 
 # `n` MiB of old garbage: it lived through collections, so only a full one frees it,
 # and a run allocates too little to set one off. Made here rather than in the test
-# body, whose frame could keep it reachable.
+# body, whose frame could keep it reachable. The weak reference says whether it is
+# still there.
 @noinline function leave_old_garbage(n)
     kept = [fill(UInt8(1), 2^20) for _ in 1:n]
     GC.gc(false); GC.gc(false)
-    return length(kept)
+    return WeakRef(kept)
 end
 
 @testset "platform bindings" begin
@@ -191,7 +192,7 @@ end
         p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true,
                             monitor_interval=1)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         @test run.monitor !== nothing
         st = run.monitor.stats
         @test st.machine_total > 0
@@ -232,7 +233,7 @@ end
     @testset "no stage claims more than the run as a whole" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
         # The run-wide peak is still the largest of the stages, and each stage's
         # largest single process is within its own total.
@@ -269,7 +270,7 @@ end
     @testset "the status line says what is happening" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         line = status_line(run.monitor)
         @test startswith(line, Runtests.Private.MARK_INFO * " w0" * Runtests.Private.FIELD)
         @test occursin("INFO", line)
@@ -321,7 +322,7 @@ end
     @testset "the status line names the item that has been running longest" begin
         p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
         @test length(run.slots) == 2
         named(i) = " · " * sprint(io -> Runtests.Private.print_clipped(io, p.items.name[i], Runtests.Private.RUNNING_WIDTH))
@@ -348,7 +349,7 @@ end
     @testset "a printed line and the status line are one update" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
         out = String(take!(copy(status_update!(m, "a line of output"))))
         # Erase, the line, then the status line again — assembled whole, because
@@ -413,7 +414,7 @@ end
     @testset "monitor=false runs without one" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         @test run.monitor === nothing
         @test all(==(Runtests.Private.PASSED), run.statuses.state)
         @test stop_monitor!(nothing) === nothing     # stopping a monitor there isn't is fine
@@ -422,7 +423,7 @@ end
     @testset "a report fires on a clock, on a phase change, and near OOM" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
 
         # Upward through a mark is worth saying; sitting above it is not, and
@@ -450,7 +451,7 @@ end
         # only on what the readings say and for how long they have said it.
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = Monitor(run)
         limit = p.cfg.memory_threshold
         function reading(pressure)
@@ -465,8 +466,11 @@ end
         @test !Runtests.Private.is_paused(run.queues)
         reading(min(1.0, limit + 0.02))
         release = round(Int, 100 * (limit - Runtests.Private.GUARD_HYSTERESIS))
+        collections = Base.gc_num().pause
         @test_logs (:warn, Regex("holding off on new test items until it is below $release%")) Runtests.Private.guard!(m)
         @test Runtests.Private.is_paused(run.queues)
+        # Collecting costs less than waiting, so the hold starts with it.
+        @test Base.gc_num().pause > collections
         # Dipping under the threshold is not enough to let go: a machine hovering on
         # it would take and release the hold at every sample.
         reading(limit - Runtests.Private.GUARD_HYSTERESIS / 2)
@@ -489,6 +493,32 @@ end
         _, out = capture_run(() -> Runtests.Private.guard!(m))
         @test !Runtests.Private.is_paused(run.queues)
         @test occursin("memory is down to $(round(Int, 50 * limit))%; no longer holding off on new test items", out)
+    end
+
+    @testset "a worker held back for memory collects its garbage first" begin
+        # Between units it is idle, and what its items left behind is what the hold
+        # waits to see go; a worker left alone may not collect it for a long time.
+        p, _ = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=false, announce=false)
+        q = Runtests.Private.Queues(p)
+        file = joinpath(mktempdir(), "collections")
+        w = RuntestsWorkers.Worker(; threads = "1", redirect_io = IOBuffer())
+        try
+            # How many collections the worker has made, written where this process can read it.
+            function collections()
+                RuntestsWorkers.remote_fetch(w, :(write($file, string(Base.gc_num().pause))))
+                return parse(Int, read(file, String))
+            end
+            before = collections()
+            slot = Runtests.Private.Slot(Runtests.Private.SlotIdx(1), p.profiles[1], w, 0.0, 0,
+                                         Runtests.Private.ItemIdx(0), Int8(0), "", String[], false)
+            Runtests.Private.set_paused!(q, true)
+            released = @async (sleep(1); Runtests.Private.set_paused!(q, false))
+            Runtests.Private.wait_while_paused(q, slot)
+            wait(released)
+            @test collections() > before
+        finally
+            close(w)
+        end
     end
 
     @testset "the memory guard restarts a worker between items, and stops no item" begin
@@ -526,10 +556,16 @@ end
     @testset "a run with workers frees what the session left behind while they start" begin
         pkg = make_pkg("SessionGarbage", "test/t_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
         capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))   # compiled, environment cached
-        leave_old_garbage(256)
-        before = Base.gc_live_bytes()
-        capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))
-        @test Base.gc_live_bytes() < before - 128 * 2^20
+        garbage = leave_old_garbage(256)
+        # Asked by whether the garbage is gone, not by the bytes left: a process on a
+        # machine short of memory collects in full on its own, before the run as much
+        # as during it, and the count of live bytes says more about that than the run.
+        if garbage.value === nothing
+            @test_skip "the process collected the garbage itself, before the run"
+        else
+            capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))
+            @test garbage.value === nothing
+        end
     end
 
     @testset "a run with no workers does not talk about workers" begin
@@ -577,7 +613,7 @@ end
     @testset "a dead worker's memory is its own" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
         r = @atomic m.reading
         @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
@@ -610,7 +646,7 @@ end
     @testset "a sample counts against the stage it was taken in" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
         st = m.stats
         for ps in st.phases
@@ -653,7 +689,7 @@ end
     @testset "the summary reports each stage the run went through" begin
         p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
         summary = sprint(io -> print_memory_summary(io, run.monitor))
 
@@ -703,7 +739,7 @@ end
         ))
         p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
         @test phase_stats(st, PHASE_TEST).starts == 4
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak <= 2   # the run and one worker
@@ -714,7 +750,7 @@ end
         # would be the worker count again, under another name.
         p2, target2 = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run2 = execute(p2, target2)
-        rm(run2.logdir; force=true, recursive=true)
+        rm(run2.scratch; force=true, recursive=true)
         @test phase_stats(run2.monitor.stats, PHASE_TEST).starts == 1
         @test !occursin("worker start", sprint(io -> print_memory_summary(io, run2.monitor)))
     end
@@ -722,7 +758,7 @@ end
     @testset "a run with no workers reports stages without process counts" begin
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         # A sample of its own: a short run on a busy machine can finish between
         # two of the monitor's, and what is under test here is the shape of the
         # line, not whether one happened to land.
@@ -763,7 +799,7 @@ end
         """)
         p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
         # The process doing the compiling is in the tree and counted there, in
         # the setup stage that spawned it: some sample of that stage has it, though
@@ -778,7 +814,7 @@ end
     @testset "the memory summary reports totals, not what was running" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
         @test occursin("tree max", summary)
@@ -792,7 +828,7 @@ end
         withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
             run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
             @test !isempty(Runtests.Private.runstate_files(p.root))
             @test Runtests.Private.read_run_state(last(Runtests.Private.runstate_files(p.root))) !== nothing
         end
@@ -803,7 +839,7 @@ end
     @testset "withdrawing the line is restored even when the body throws" begin
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=true)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         m = run.monitor
         @test Runtests.Private.with_status_line_off(m) do
             m.quiet
@@ -826,7 +862,7 @@ end
         # behind.
         p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         plain(s) = replace(s, r"\e\[[0-9;?]*[a-zA-Z]" => "")
         drawn(cols) = withenv("COLUMNS" => string(cols)) do
             with(Runtests.Private.TTY_OVERRIDE => true) do
@@ -900,7 +936,7 @@ end
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false,
                             memory_threshold=0.001)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         _, out = capture_run() do
             with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
@@ -929,7 +965,7 @@ end
         # continues the pinned line.
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         _, out = capture_run() do
             with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
@@ -958,7 +994,7 @@ end
         # a pipe; `TTY_OVERRIDE` is how it is reached without arranging one.
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         _, out = capture_run() do
             with(Runtests.Private.TTY_OVERRIDE => true) do
                 # Not started: the sampling task would draw on its own clock, and

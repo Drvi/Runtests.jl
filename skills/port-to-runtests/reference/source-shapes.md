@@ -180,6 +180,28 @@ A `@testsetup` ran once in each worker. A setup module is precompiled, so its
 top-level code runs once per machine, at precompilation: SKILL.md, step 4, item 3 applies. Test
 files hold only `@testitem`s, so move every `@testsetup` out of them.
 
+`scripts/port_retestitems.jl` makes the changes in this table that are the same in
+every suite: the setups, `setup = [...]`, a quoted `skip`, `default_imports` and `_id`.
+A setup moves from the directory of its old file to `testsetups/`, so the script also
+rewrites each `@__DIR__` in it to name the old directory.
+
+What a `runtests.jl` does around the call is the person's to port:
+
+- A filter that selects by tag from an environment variable, such as
+  `TEST_SLICE=juliac`, becomes `[groups]` in `test/TestItems.toml`, one group per
+  value. The new `runtests.jl` passes the variable's value as `group`. Keep the
+  variable's own check if it has one: its error message names the variable, where an
+  unknown group names the `group` keyword.
+- A hack that dispatches slow items first, such as one through ReTestItems'
+  `failures_first`, becomes `first = [...]` under `[order]`, listing those items.
+  Runtests also puts long items first once it has their durations from a run.
+- Code that runs once before the items, such as cleaning a scratch directory or
+  setting an environment variable the workers inherit, stays in `runtests.jl`
+  before the call.
+- A `Pkg.test` of another package in the same repository, after the call, stays too.
+  That package's suite is ported on its own, in its own test directory: one
+  `Runtests.runtests` call runs one package.
+
 ## TestItemRunner
 
 | TestItemRunner | Runtests |

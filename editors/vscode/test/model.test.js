@@ -4,6 +4,12 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const model = require('../src/model');
 
+test('what a run did not select of what was queued is told apart from what it does not know', () => {
+    const started = { items: ['fast'], unknown: ['gone'] };
+    assert.deepEqual(model.unselected(['fast', 'slow', 'gone'], started), ['slow']);
+    assert.deepEqual(model.unselected(['fast'], { items: ['fast'] }), []);
+});
+
 test('items group into files, in order, with paths relative to the test directory', () => {
     const items = [
         { name: 'b2', file: '/p/test/sub/b_test.jl', line: 9 },
@@ -13,6 +19,20 @@ test('items group into files, in order, with paths relative to the test director
     const files = model.groupByFile(items, '/p/test');
     assert.deepEqual(files.map(f => f.relpath), ['a_test.jl', 'sub/b_test.jl']);
     assert.deepEqual(files[1].items.map(it => it.name), ['b1', 'b2']);
+});
+
+test('a name declared twice is in the tree once, where the listing has it first', () => {
+    // Names are the tree's ids, and VS Code throws on a repeated one; the listing's
+    // errors say where the other declaration is.
+    const items = [
+        { name: 'same', file: '/p/test/a_test.jl', line: 1 },
+        { name: 'same', file: '/p/test/a_test.jl', line: 4 },
+        { name: 'other', file: '/p/test/b_test.jl', line: 1 },
+        { name: 'other', file: '/p/test/a_test.jl', line: 9 },
+    ];
+    const files = model.groupByFile(items, '/p/test');
+    assert.deepEqual(files.map(f => [f.relpath, f.items.map(it => `${it.name}:${it.line}`)]),
+        [['a_test.jl', ['same:1']], ['b_test.jl', ['other:1']]]);
 });
 
 test('a selection is the items under what is included, less what is excluded', () => {

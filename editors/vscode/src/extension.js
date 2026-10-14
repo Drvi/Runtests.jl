@@ -190,7 +190,7 @@ class Suite {
     show(listing) {
         const container = this.container();
         const files = model.groupByFile(listing.items, listing.testdir);
-        const all = listing.items.map(it => it.name);
+        const all = files.flatMap(f => f.items.map(it => it.name));
         this.byName.clear();
         this.under.clear();
         const nodes = [];
@@ -282,6 +282,12 @@ class Suite {
                         const t = this.byName.get(n);
                         if (t) run.errored(t, new vscode.TestMessage('not in the suite any more'));
                         unknownSeen = true;
+                    }
+                    // Queued, but not what the run selected: outside its default group.
+                    for (const n of model.unselected(targets.map(t => t.label), ev)) {
+                        const t = this.byName.get(n);
+                        if (t) run.skipped(t);
+                        settled.add(n);
                     }
                 } else if (ev.event === 'item_started') {
                     if (item) run.started(item);

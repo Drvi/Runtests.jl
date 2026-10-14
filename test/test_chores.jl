@@ -1,5 +1,5 @@
 using Runtests.Private: prepare, init_run_state, finish_run_state!, read_run_state, runstate_files,
-                    write_status!, stale_runstates, KEEP_RUNS, PASSED, FAILED, nitems
+                    write_status!, prunable_runstates, KEEP_RUNS, PASSED, FAILED, nitems
 
 declared(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
 
@@ -85,43 +85,42 @@ end)
         withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
             recorded = recorded_runs(runs, dir, KEEP_RUNS + 4)
             # The two oldest: one recorded on another machine, one that cannot be read.
-            here = gethostname()
+            here = Runtests.Private.machine_name()
             elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
             write(recorded[1], replace(read(recorded[1], String), here => elsewhere))
             @test read_run_state(recorded[1]).meta["host"] == elsewhere
             write(recorded[2], "not a run state")
             # This machine's newest twenty stay, however old the others are.
-            @test stale_runstates(dir, Set(["one"])) == recorded[3:4]
-            @test stale_runstates(dir) == recorded[3:4]
+            @test prunable_runstates(dir; names = Set(["one"])) == recorded[3:4]
+            @test prunable_runstates(dir) == recorded[3:4]
         end
     end
 
-    @testset "among the newest, only a run state with nothing about the suite's items goes" begin
+    @testset "chores deletes what a run's pruning deletes, and nothing among the newest" begin
         dir = make_pkg("Useless", "test/a_test.jl" => declared("one"))
         file = joinpath(dir, "test", "a_test.jl")
         runs = mktempdir()
         withenv("RUNTESTS_RUNSTATE_DIR" => runs) do
-            useful = recorded_runs(runs, dir, 3)
-            # Of items the suite has since lost.
+            # Of an item the suite has since lost, and one stopped before any item ran.
             write(file, declared("gone"))
-            renamed = recorded_runs(runs, dir, 2; after = 3)
+            renamed = recorded_runs(runs, dir, 2)
             write(file, declared("one"))
-            # A dry run, and a run stopped before any item finished: nothing in either.
             p, _ = prepare((dir,); announce = false)
-            dry = joinpath(runs, "1000006-1.runstate")
-            finish_run_state!(init_run_state(dry, p; dry_run = true))
-            stopped = joinpath(runs, "1000007-1.runstate")
+            stopped = joinpath(runs, "1000003-1.runstate")
             finish_run_state!(init_run_state(stopped, p); cancelled = true)
-            # And one that ran `one`, however little else: it stays.
-            partial = recorded_runs(runs, dir, 1; after = 7)
-            @test stale_runstates(dir, Set(["one"])) == [renamed; dry; stopped]
-            # With the suite unread nothing says what it has: fewer than twenty, all stay.
-            @test isempty(stale_runstates(dir))
-
+            useful = recorded_runs(runs, dir, 3; after = 3)
+            # Among the newest twenty they stay, whatever they hold: another branch
+            # may have `gone`.
+            @test isempty(prunable_runstates(dir; names = Set(["one"])))
             done, out = chores_out(dir)
-            @test done === true
-            @test occursin("4 of this machine's deleted", out)
-            @test runstate_files(dir) == [useful; partial]
+            @test done === true && occursin("none to delete", out)
+            # Beyond them, the same ones go as a run's own pruning deletes.
+            newer = recorded_runs(runs, dir, KEEP_RUNS; after = 6)
+            pruned = prunable_runstates(dir; names = Set(["one"]))
+            @test pruned == [renamed; stopped; useful]
+            done, out = chores_out(dir)
+            @test done === true && occursin("$(length(pruned)) of this machine's deleted", out)
+            @test runstate_files(dir) == newer
         end
     end
 
@@ -132,10 +131,51 @@ end)
             # The oldest run failed `two`; every run since ran only `one`.
             first_ = only(recorded_runs(runs, dir, 1; failed = ["two"]))
             since = recorded_runs(runs, dir, KEEP_RUNS + 2; after = 1, ran = ["one"])
-            stale = stale_runstates(dir, Set(["one", "two"]))
+            stale = prunable_runstates(dir; names = Set(["one", "two"]))
             @test !(first_ in stale) && stale == since[1:2]
             @test Runtests.Private.failing_items(dir) == ["two"]
         end
+    end
+
+    @testset "a package without test files, a fixture in another's test/ say, has nothing to do" begin
+        outer = make_pkg("Outer", "test/a_test.jl" => declared("one"))
+        fixture = mkpath(joinpath(outer, "test", "fixtures", "Inner"))
+        write(joinpath(fixture, "Project.toml"), "name = \"Inner\"\nuuid = \"$(next_uuid())\"\nversion = \"0.1.0\"\n")
+        mkpath(joinpath(fixture, "src"))
+        write(joinpath(fixture, "src", "Inner.jl"), "module Inner\nend\n")
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            # Asked of the fixture, which is a package of its own and has no tests.
+            ok, out = chores_out(fixture; dry_run = true)
+            @test ok === true
+            @test occursin("test items: none, no test files under test", out) && occursin("nothing to do", out)
+            done, _ = chores_out(fixture)
+            @test done === true
+            # Asked of the package around it, the fixture is no test file of its own.
+            ok, out = chores_out(outer; dry_run = true)
+            @test ok === true && occursin("test items: 1 in 1 file, all valid", out)
+            # A run of the fixture has nothing to run, and says so.
+            @test_throws Runtests.NoTestsError Runtests.runtests(fixture; dry_run = true)
+        end
+    end
+
+    @testset "a fixture package in test/ is no stray, however many threads read the suite" begin
+        # The checks of the suite run in tasks, which move between threads. A walk
+        # that `walkdir` led went into a fixture's `src/` while it was taking the
+        # fixture out of the walk, and took its source for a misnamed test file.
+        repo = dirname(@__DIR__)
+        pkg = make_pkg("WithFixture", "test/a_test.jl" => declared("one"))
+        fixture = mkpath(joinpath(pkg, "test", "fixtures", "Inner", "src"))
+        write(joinpath(dirname(fixture), "Project.toml"), "name = \"Inner\"\nuuid = \"$(next_uuid())\"\nversion = \"0.1.0\"\n")
+        write(joinpath(fixture, "Inner.jl"), "module Inner\nend\n")
+        script = """
+            using Runtests
+            fails = count(_ -> !redirect_stdout(() -> Runtests.chores(ARGS[1]; dry_run = true), devnull), 1:10)
+            print(Threads.nthreads(), " threads, ", fails, " failed")
+            """
+        cmd = addenv(`$(Base.julia_cmd()) --threads=4 --project=$repo --startup-file=no -e $script $pkg`,
+                     "JULIA_LOAD_PATH" => join([repo, joinpath(repo, "test"), ""], Runtests.Private.PATHSEP),
+                     "RUNTESTS_RUNSTATE_DIR" => mktempdir())
+        @test read(cmd, String) == "4 threads, 0 failed"
     end
 
     @testset "what a run would refuse to start on is left to a person" begin

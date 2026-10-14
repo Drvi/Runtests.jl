@@ -142,6 +142,14 @@ is_function_definition(ex::Expr) =
 is_call_signature(s) =
     s isa Expr && (s.head === :call || (s.head in (:where, :(::)) && is_call_signature(s.args[1])))
 
+# The run settings variables set, but for coverage, which says so on its own line.
+function print_env_settings(io::IO, cfg)
+    vars = [v for v in cfg.env_settings if first(v) != "RUNTESTS_COVERAGE"]
+    isempty(vars) && return nothing
+    println(io, "set by the environment: ", join((string(n, "=", v) for (n, v) in vars), " · "))
+    return nothing
+end
+
 # Whether the run counts coverage and what decided it, when something did.
 function print_coverage_setting(io::IO, cfg)
     isempty(cfg.coverage_source) && return nothing
@@ -180,7 +188,7 @@ that cannot be written is said in the closing block, and the run's verdict stand
 """
 function collect_coverage(run)
     root = run.plan.root
-    dir = coverage_dir(run.logdir)
+    dir = coverage_dir(run.scratch)
     out = joinpath(root, "lcov.info")
     written = Set{Int32}()
     for f in (isdir(dir) ? readdir(dir) : String[])

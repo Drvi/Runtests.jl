@@ -8,6 +8,10 @@ module PortScript
 include(joinpath(dirname(@__DIR__), "skills", "port-to-runtests", "scripts", "port_testsets.jl"))
 end
 
+module PortRTI
+include(joinpath(dirname(@__DIR__), "skills", "port-to-runtests", "scripts", "port_retestitems.jl"))
+end
+
 # A package whose tests may use Test and Random, as test dependencies.
 function port_pkg(name, files...)
     pkg = make_pkg(name, files...)
@@ -415,5 +419,105 @@ end
             "test/gamma.jl" => "module GammaTests\nusing Test\nx = 1\n@test x == 1\n@test x + 1 == 2\nend\n")
         port!(pkg)
         @test sort!(collect(keys(ported_items(pkg)))) == ["alpha", "beta", "gamma"]
+    end
+end
+
+# What `port_retestitems.jl` printed, porting `pkg`'s test directory in place.
+function port_rti!(pkg)
+    return mktemp() do path, io
+        redirect_stdout(() -> PortRTI.main([joinpath(pkg, "test")]), io)
+        close(io)
+        read(path, String)
+    end
+end
+
+@testset "port_retestitems.jl" begin
+    @testset "setups move out, setup= becomes using, skip is unquoted, and the suite runs" begin
+        pkg = port_pkg("PortRTI",
+            "test/runtests.jl" => "using ReTestItems, PortRTI\nruntests(PortRTI; nworkers = 2, testitem_timeout = 60)\n",
+            "test/shared_testsetup.jl" => """
+                # Shared numbers.
+                @testsetup module Numbers
+                export TWO
+                const TWO = 2
+                end # module Numbers
+                """,
+            "test/data/table.txt" => "21\n",
+            "test/a_tests.jl" => """
+                # Reads the data beside the tests.
+                @testsetup module Data
+                export ANSWER
+                const ANSWER = 2 * parse(Int, readline(joinpath(@__DIR__, "data", "table.txt")))
+                end # module Data
+
+                @testitem "uses both" setup=[Numbers, Data] tags=[:fast] begin
+                    @test ANSWER == 21 * TWO
+                end
+
+                @testitem "skipped by a quoted condition" skip=:(1 + 1 == 2) default_imports=false begin
+                    @test false
+                end
+
+                @testitem "kept" skip=(1 + 1 == 3) _id="x1" begin
+                    @test true
+                end
+                """,
+            "test/b.jl" => "@testitem \"in a misnamed file\" setup=[Numbers] begin\nend\n")
+        out = port_rti!(pkg)
+        test = joinpath(pkg, "test")
+        @test occursin("shared_testsetup.jl: @testsetup Numbers -> testsetups/Numbers.jl", out)
+        @test occursin("deleted shared_testsetup.jl: nothing is left in it", out)
+        @test occursin("a_tests.jl: @testsetup Data -> testsetups/Data.jl", out)
+        @test occursin("moved b.jl -> b_tests.jl", out)
+        @test occursin("runtests.jl calls ReTestItems", out) && occursin("(nworkers, testitem_timeout)", out)
+        @test occursin("testsetups/Data.jl: `@__DIR__` named test/", out)
+        # A setup carries the comments above it and after its `end`, and leaves none behind.
+        @test read(joinpath(test, "testsetups", "Numbers.jl"), String) ==
+            "# Shared numbers.\nmodule Numbers\nexport TWO\nconst TWO = 2\nend # module Numbers\n"
+        a = read(joinpath(test, "a_tests.jl"), String)
+        @test !occursin("@testsetup", a) && !occursin("# module Data", a) && !occursin("beside the tests", a)
+        # The blank line that followed the setup goes with it, rather than opening the file.
+        @test startswith(a, "@testitem \"uses both\"")
+        @test occursin("@testitem \"uses both\" tags=[:fast] begin\n    using Numbers, Data\n    @test ANSWER", a)
+        @test occursin("@testitem \"skipped by a quoted condition\" skip=(1 + 1 == 2) begin", a)
+        @test occursin("@testitem \"kept\" skip=(1 + 1 == 3) begin", a)
+        @test read(joinpath(test, "b_tests.jl"), String) ==
+            "@testitem \"in a misnamed file\" begin\n    using Numbers\nend\n"
+        # Written over its new place, `@__DIR__` still names the directory the data is in.
+        @test occursin("joinpath(normpath(joinpath(@__DIR__, \"..\")), \"data\", \"table.txt\")",
+                       read(joinpath(test, "testsetups", "Data.jl"), String))
+        # runtests.jl is the person's: the notes said what to do with it.
+        write(joinpath(test, "runtests.jl"), "using Runtests\nRuntests.runtests()\n")
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            states, _, _ = run_states(pkg; workers = 1, logs = :issues, monitor = false)
+            @test states["uses both"] === PASSED
+            @test states["kept"] === PASSED
+            @test states["in a misnamed file"] === PASSED
+            @test states["skipped by a quoted condition"] === Runtests.Private.SKIPPED
+        end
+    end
+
+    @testset "what it cannot port is listed for a person" begin
+        pkg = port_pkg("PortRTINotes",
+            "test/runtests.jl" => "using Runtests\nRuntests.runtests()\n",
+            "test/c_tests.jl" => """
+                const LIMIT = 3
+                @testsetup module Here
+                const FILE = @__FILE__
+                end
+                @testitem "unknown keyword" frobnicate=true begin
+                    @test true
+                end
+                @testitem "quoted symbol" skip=:yes begin
+                    @test true
+                end
+                """)
+        out = port_rti!(pkg)
+        @test occursin("c_tests.jl:1 holds code that is not an item", out)
+        @test occursin("testsetups/Here.jl uses `@__FILE__`", out)
+        @test occursin("@testitem \"unknown keyword\": Runtests has no `frobnicate`", out)
+        @test occursin("`skip = :yes` quotes something other than an expression in parentheses", out)
+        # A runtests.jl already ported needs nothing.
+        @test !occursin("calls ReTestItems", out)
     end
 end

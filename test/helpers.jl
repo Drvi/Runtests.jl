@@ -35,6 +35,14 @@ function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractS
     return dir
 end
 
+# A `--check-bounds` setting other than this process's, for a profile whose julia
+# flags must differ from the ones the workers inherit. The suite does not always
+# run with the default: `Pkg.test` on Julia 1.12 passes `--check-bounds=yes`, and
+# later versions pass on the caller's setting. `value` is what
+# `Base.JLOptions().check_bounds` reads under it.
+const OTHER_BOUNDS = Base.JLOptions().check_bounds == 1 ?
+    (arg = "--check-bounds=no", value = 2) : (arg = "--check-bounds=yes", value = 1)
+
 # `Runtests.activate(pkg)` for the length of `f`, leaving the session as it found it:
 # activating changes the active project and LOAD_PATH, and a test that leaked
 # either would take the rest of the file with it.
@@ -59,7 +67,7 @@ function run_states(pkg; kwargs...)
             states = Dict(p.items.name[i] => run.statuses.state[i] for i in 1:nitems(p))
             return states, run, p
         finally
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
         end
     end
 end

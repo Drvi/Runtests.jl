@@ -30,9 +30,9 @@ function makePackage() {
 let dir, server;
 const log = [];
 
-before(async () => {
-    dir = makePackage();
-    server = new RuntestsServer({
+// A server of the package the tests made, each with run states of its own.
+function serve() {
+    return new RuntestsServer({
         julia, juliaArgs: [], environment: REPO, root: dir, onLog: line => log.push(line),
         env: {
             ...process.env,
@@ -41,6 +41,11 @@ before(async () => {
             RUNTESTS_RUNSTATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'runtests-runs-')),
         },
     });
+}
+
+before(async () => {
+    dir = makePackage();
+    server = serve();
     const hello = await server.start();
     assert.equal(hello.protocol, PROTOCOL);
     assert.equal(hello.root, dir);   // as given: the paths VS Code has
@@ -96,6 +101,21 @@ test('a cancel stops a run at once', { timeout: 240_000 }, async () => {
     assert.equal(end.event, 'run_finished');
     assert.equal(end.state, 'cancelled');
     assert.ok(Date.now() - cancelledAt < 30_000, 'the run stopped well before its items would have');
+});
+
+test('a cancel while the server starts stops the run it waits for', { timeout: 240_000 }, async () => {
+    const starting = serve();
+    try {
+        const events = [];
+        const run = starting.run(['passes'], { workers: 1 }, ev => events.push(ev.event));
+        starting.cancel();
+        const end = await run;
+        assert.equal(end.event, 'run_finished');
+        assert.equal(end.state, 'cancelled');
+        assert.ok(!events.includes('item_started'));
+    } finally {
+        await starting.stop();
+    }
 });
 
 test('a julia that cannot be started is said, and tried again next time', async () => {

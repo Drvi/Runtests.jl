@@ -77,6 +77,8 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 "012" => "`.`, `e` or the end of the number", "{} x" => "the end of the text",
                 "\"a\tb\"" => "a character other than a raw control character", "\"\\q\"" => "after `\\`",
                 "tru" => "a value", "" => "a value", "{1: 2}" => "a key in double quotes",
+                # Four bytes that are not all hex digits, a character of several among them.
+                "\"\\uää\"" => "four hexadecimal digits", "\"\\u 12a\"" => "four hexadecimal digits",
             )
             err = try
                 read_json(bad); nothing
@@ -209,7 +211,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 # A run of another item leaves the failure as it was.
                 send(s, (; id = 9, command = "list"))
                 @test next_event(s)["failed"] == ["fails"]
-                @test !isdir(done["logdir"])        # the earlier run's logs went with it
+                @test isdir(done["logdir"])         # the earlier run's logs stay with its run state
 
                 close_session(s)
                 @test last(collect(s.events))["event"] == "bye"
@@ -271,6 +273,28 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             errors = next_event(s)["errors"]
             @test length(errors) == 1 && occursin("gone.toml does not exist", only(errors)["message"])
             @test only(errors)["file"] == joinpath(dirname(config), "gone.toml")
+            close_session(s)
+        end
+    end
+
+    @testset "a run selects by group and replays a run state, as runtests does" begin
+        dir = make_pkg("ServedGroups",
+            "test/a_test.jl" => string(item("fast"), item("slow"; opts = "tags=[:slow]")),
+            "test/TestItems.toml" => "[groups]\ndefault = \"!slow\"\n")
+        with_runstate_dir() do _
+            s = open_session(dir)
+            next_event(s)
+            started(seen) = only(e for e in seen if e["event"] == "run_started")
+            # Asked for no names: the default group, which `run_started` says.
+            send(s, (; id = 1, command = "run"))
+            seen = events_until(e -> e["event"] == "run_finished", s)
+            @test started(seen)["items"] == ["fast"]
+            recorded = last(seen)["runstate"]
+            send(s, (; id = 2, command = "run", options = (; group = "all")))
+            @test sort(started(events_until(e -> e["event"] == "run_finished", s))["items"]) == ["fast", "slow"]
+            # The run state of the first, run again: its items, not the whole suite.
+            send(s, (; id = 3, command = "run", options = (; replay = recorded)))
+            @test started(events_until(e -> e["event"] == "run_finished", s))["items"] == ["fast"]
             close_session(s)
         end
     end

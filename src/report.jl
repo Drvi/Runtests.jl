@@ -29,6 +29,7 @@ function plan_block(p::Plan, order)
                 " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
         print_profiles(io, p)
         print_unclaimed(io, p)
+        print_env_settings(io, p.cfg)
         print_coverage_setting(io, p.cfg)
         estimated = any(>(0), p.units.est_s)
         if !single_process(p)
@@ -52,8 +53,13 @@ function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UIn
     rev = project_revision(p.root)
     isempty(rev) || print(io, " · rev ", first(rev, 10))
     seed === nothing || print(io, " · seed ", seed_text(seed))
+    own = count(n -> haskey(p.cfg.item_seeds, n), p.items.name)
+    own == 0 || print(io, " · ", plural(own, "item"), " with ", own == 1 ? "its" : "their", " own seed")
     p.cfg.workers == 0 ? print(io, " · in this process") :
         print(io, " · ", plural(nworkers, "worker"), " · threads ", p.profiles[1].threads)
+    # What a plain `julia` would not do, for whoever compares this run with another.
+    flags = nondefault_flags(run_code_flags(p.cfg))
+    isempty(flags) || print(io, " · ", join(flags, " "))
     return nothing
 end
 
@@ -156,11 +162,12 @@ function why_text(p::Plan, u::UnitIdx)
                                   chain === NO_CHAIN ? "" : string(" (chain: `", chain, "`)"))
     why === RECENT || return ""
     ago, f = p.units.failed_ago[u], p.units.failed_item[u]
+    how = p.units.cancelled[u] ? "cancelled" : "failed"
     failed = ago < 0 ? "" : string(f == first(span) ? "" : string(name(f), " "),
-                                   ago == 0 ? "failed in the last run" : string("failed ", ago + 1, " runs ago"))
+                                   ago == 0 ? "$how in the last run" : string(how, " ", ago + 1, " runs ago"))
     c = p.units.changed_item[u]
-    changed = c == 0 ? "" : chain === NO_CHAIN ? "file changed since last" :
-        string(p.relfiles[p.items.fileidx[c]], " changed since last")
+    what = p.units.changed_new[u] ? "new" : "edited since its last run"
+    changed = c == 0 ? "" : c == first(span) ? what : string(name(c), " ", what)
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
@@ -288,6 +295,7 @@ function print_plan_table(io::IO, p::Plan, order)
     shown, column = item_names(p, name_width(it.name))
     names = [shown[i] for i in rows]
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
+    ests = [it.est_s[i] > 0 ? est_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     # A chain's reason is its first item's: the unit is placed, not each member.
     whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i]) : "" for i in rows]
@@ -297,6 +305,7 @@ function print_plan_table(io::IO, p::Plan, order)
     solo || push!(columns, ("worker", workers))
     push!(columns, ("test item", names))
     push!(columns, ("at", locations))
+    any(!isempty, ests) && push!(columns, ("est", ests))
     any(!isempty, tags) && push!(columns, ("tags", tags))
     any(!isempty, whys) && push!(columns, ("why here", whys))
     any(!isempty, details) && push!(columns, ("details", details))
@@ -314,9 +323,9 @@ function print_plan_table(io::IO, p::Plan, order)
         last_ = something(findlast(!isempty, cells), 1)
         for c in 1:last_
             c == 1 || print(io, FIELD)
-            # The number and the worker are right-aligned, the rest left, and the
-            # last column is not padded.
-            text = columns[c][1] in ("#", "worker") ? lpad(cells[c], widths[c]) :
+            # The number, the worker and the estimate are right-aligned, the rest
+            # left, and the last column is not padded.
+            text = columns[c][1] in ("#", "worker", "est") ? lpad(cells[c], widths[c]) :
                 c == last_ ? cells[c] : rpad(cells[c], widths[c])
             r == 0 ? print_bold(io, text) : print(io, text)
         end
@@ -623,6 +632,7 @@ function print_run_header(run)
         print_startup(io, p.startup)
         print_profiles(io, p)
         print_unclaimed(io, p)
+        print_env_settings(io, p.cfg)
         print_coverage_setting(io, p.cfg)
     end
     print_label_block(run, head, body)
@@ -723,6 +733,28 @@ function print_conclusion(run, ended::Symbol = :finished)
             print(io, "run state: ")
             printstyled(io, run.runstate.path; color = :light_black)
             println(io)
+            # Whatever the run printed of its items, and more: what the passing ones
+            # printed, which only `logs = :batched` shows.
+            if run.logdir != run.scratch && isdir(run.logdir)
+                print(io, "logs: ")
+                printstyled(io, run.logdir; color = :light_black)
+                println(io)
+            end
+            if !isempty(run.exported)
+                print(io, "copied to: ")
+                printstyled(io, run.exported; color = :light_black)
+                println(io)
+            end
+            # What to type next, for whoever reads this in a CI log as much as here.
+            if any(s -> is_non_pass(s) && s !== CANCELLED && s !== RUNNING, run.statuses.state)
+                print(io, "run the failing items again: ")
+                printstyled(io, "Runtests.runtestsf()"; bold = true)
+                if !isempty(run.exported)
+                    print(io, ", or where the copy is: ")
+                    printstyled(io, "Runtests.runtestsf(replay = ", repr(basename(run.runstate.path)), ")"; bold = true)
+                end
+                println(io)
+            end
         end
     end
     print_label_block(run, head, body)
@@ -1032,6 +1064,10 @@ on_worker(run, i::ItemIdx) =
 
 item_logpath(run, i::ItemIdx) =
     item_log_path(run.logprefix, i, max(run.statuses.attempt[i], 1))
+
+# The failure report of an attempt, beside its log.
+failure_path(prefix::String, index::Integer, attempt::Integer) =
+    string(chopsuffix(item_log_path(prefix, index, attempt), ".log"), ".failure.txt")
 
 """
     item_log_path(prefix, index, attempt) -> String

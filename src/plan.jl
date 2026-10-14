@@ -20,7 +20,12 @@ struct Items
     timeout_s::Vector{Int32}
     retries::Vector{Int32}
     failfast::Vector{Int8}
+    est_s::Vector{Float64}   # the newest duration a run recorded; 0 for none
     unit::Vector{UnitIdx}
+    hash::Vector{UInt32}     # see `RawItem`
+    # The seed each item draws its numbers from, mixed with its name: the run's, or
+    # for an item `runtestsf` runs again, the one it failed with.
+    seed::Vector{UInt64}
 end
 
 Base.length(it::Items) = length(it.name)
@@ -36,7 +41,7 @@ handed out: what the dry run says about why an item runs where it does.
 @enum Why::UInt8 begin
     PINNED_FIRST    # `[order] first`
     SANDBOXED       # needs a process of its own
-    RECENT          # failed in a recorded run, or its file changed since the newest one
+    RECENT          # failing, a stopped run did not finish it, or it changed or is new since its last run
     LONG            # long enough to decide how long the run takes
     IN_FILE_ORDER   # everything else
     PINNED_LAST     # `[order] last`
@@ -58,7 +63,9 @@ struct Units
     why::Vector{Why}            # where `order_pool!` put it, and so why
     failed_ago::Vector{Int32}   # runs since a member last did not pass, -1 for none recorded
     failed_item::Vector{ItemIdx}    # that member, 0 for none
-    changed_item::Vector{ItemIdx}   # a member whose file was written since the newest recorded run, 0 for none
+    cancelled::Vector{Bool}         # whether that was a cancel rather than a verdict
+    changed_item::Vector{ItemIdx}   # a member edited since its last run, or never run, 0 for none
+    changed_new::Vector{Bool}       # whether that member has never run
 end
 
 Base.length(u::Units) = length(u.span)
@@ -147,17 +154,24 @@ itemlocation(p::Plan, i::Integer) = p.locations[i]
 
 What earlier runs measured, keyed by item name: how long each item took and how
 many runs ago it last did not pass (0 for the newest run); when the newest run
-started (0 without one); and what a fresh worker cost. Empty on a first run:
-nothing has an estimate, and the body is cut by count.
+started (0 without one); what a fresh worker cost; and which of those not passing
+a cancel decided, not a verdict. Empty on a first run: nothing has an estimate,
+and the body is cut by count.
 """
 struct History
     seconds::Dict{String, Float64}
+    # The failing items, and those the newest run to select them stopped before: how
+    # many runs ago that was, 0 for the newest.
     failed::Dict{String, Int}
-    since::Float64
     cold::ColdCost
+    # Of `failed`, the items whose newest entry is a stop's rather than a verdict's.
+    cancelled::Set{String}
+    hashes::Dict{String, UInt32}   # each item's source hash in the newest run that ran it
+    known::Set{String}             # every item a kept run state records
 end
-History(seconds, failed, since) = History(seconds, failed, since, ColdCost())
-History() = History(Dict{String, Float64}(), Dict{String, Int}(), 0.0)
+History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::ColdCost = ColdCost(),
+        cancelled = Set{String}(), hashes = Dict{String, UInt32}(), known = Set{String}()) =
+    History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known))
 
 """
     plan(raw, cfg; history, root, strict_order, selection, suite_names, unclaimed) -> Plan
@@ -181,11 +195,11 @@ function plan(
     units = build_units(raw, profile_idx, history)
     pools = [findall(d -> d.profile == k, units) for k in sort!(unique(d.profile for d in units))]
     slots = count_slots(pools, units, cfg)
-    changed = changed_files(units, history.since)
     for (k, pool) in enumerate(pools)
-        order_pool!(pool, units, slots[k], cfg, history, changed)
+        order_pool!(pool, units, slots[k], cfg, history)
     end
-    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold, unclaimed)
+    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold,
+                       history.seconds, unclaimed)
 end
 
 # The file the settings came from, as a message names it.
@@ -270,7 +284,7 @@ end
 
 function profile_table(cfg::RunConfig)
     names = sort!(collect(keys(cfg.profiles)); by = n -> (n !== DEFAULT_PROFILE, string(n)))
-    profiles = Profile[cfg.profiles[n] for n in names]
+    profiles = Profile[run_profile(cfg.profiles[n], cfg.threads) for n in names]
     idx = Dict{Symbol, ProfileIdx}(n => ProfileIdx(i) for (i, n) in enumerate(names))
     return profiles, idx
 end
@@ -286,14 +300,16 @@ mutable struct UnitDraft
     why::Why
     failed_ago::Int32
     failed_at::Int    # which of `items` failed most recently, 0 for none
-    changed_at::Int   # which of `items` has a file written since the newest run, 0 for none
+    cancelled::Bool   # whether that was a cancel rather than a verdict
+    changed_at::Int   # which of `items` was edited since its last run, or never ran, 0 for none
+    changed_new::Bool # whether that one never ran
 end
 
 function build_units(raw::Vector{RawItem}, profile_idx, history::History)
     draft(its, exclusive, chain) = UnitDraft(
         its, profile_idx[its[1].profile], exclusive, chain,
         sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
-        IN_FILE_ORDER, Int32(-1), 0, 0
+        IN_FILE_ORDER, Int32(-1), 0, false, 0, false
     )
     chains = Dict{Symbol, Vector{RawItem}}()
     units = UnitDraft[]
@@ -353,12 +369,11 @@ function count_slots(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, cfg::
     return n
 end
 
-# Files written since the newest recorded run started: what is being worked on,
-# and so the likeliest to have something to say.
-function changed_files(units::Vector{UnitDraft}, since::Float64)
-    since > 0 || return Set{String}()
-    return Set(f for f in unique(it.file for d in units for it in d.items) if mtime(f) > since)
-end
+# Whether an item is what is being worked on: its source differs from the newest run
+# that ran it, or no kept run state records it although others record the suite. An
+# item recorded without a source hash, by an older format, is not taken for edited.
+edited(it::RawItem, h::History) = (r = get(h.hashes, it.name, UInt32(0)); r != 0 && it.hash != 0 && r != it.hash)
+never_ran(it::RawItem, h::History) = !isempty(h.known) && !(it.name in h.known)
 
 const HEAD_CLASSES = Int(PINNED_FIRST):Int(LONG)
 const TAIL_CLASS = Int(PINNED_LAST)
@@ -368,7 +383,7 @@ const TAIL_CLASS = Int(PINNED_LAST)
 const LONG_FLOOR_S = 3.0
 
 """
-    order_pool!(pool, units, nslots, cfg, history, changed)
+    order_pool!(pool, units, nslots, cfg, history)
 
 Sort a pool's units into the order they are handed out, by class and then within
 it:
@@ -376,10 +391,12 @@ it:
 0. `[order] first`, in the order listed;
 1. sandboxed units, in file order: each needs a fresh process, and at the start
    every process is fresh, so running them first discards no compiled code;
-2. units that failed recently, or whose file changed since the last run: the
-   answer most likely to matter, as early as it can be had. A failure in the
-   newest run and a changed file come first, then older failures, the more recent
-   first; file order within each;
+2. units with a member that is failing, however long ago it failed, that the newest
+   run to select it stopped before, or that was edited since its last run or never
+   ran: the answer most likely to matter, as early as it can be had. An edited or
+   new member and a failure in the newest run come first, then older failures, the
+   more recent first; within each, the units class 3 would take, longest first,
+   then file order;
 3. units long enough to decide how long the run takes — more than a quarter of
    one slot's share of the pool's work, and at least `LONG_FLOOR_S` — longest first;
 4. everything else, in file order, where neighbours share compiled code;
@@ -389,7 +406,7 @@ Classes 0–3 are the pool's head, 4 its body and 5 its tail. A chain goes where
 its most urgent member would. The class is recorded as a [`Why`](@ref), whose
 values are these numbers.
 """
-function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, cfg, history::History, changed)
+function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, cfg, history::History)
     pin = Dict{String, Int}()
     for (i, n) in enumerate(cfg.order_first)
         pin[n] = i - length(cfg.order_first) - 1
@@ -408,13 +425,15 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, c
         ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
         d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
         d.failed_at = ago == typemax(Int) ? 0 : k
-        d.changed_at = something(findfirst(it -> it.file in changed, d.items), 0)
+        d.cancelled = d.failed_at > 0 && d.items[k].name in history.cancelled
+        d.changed_at = something(findfirst(it -> edited(it, history) || never_ran(it, history), d.items), 0)
+        d.changed_new = d.changed_at > 0 && never_ran(d.items[d.changed_at], history)
         urgency = d.changed_at > 0 ? 0 : ago
+        long = d.est_s >= LONG_FLOOR_S && d.est_s > share / 4
         d.why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : d.exclusive ? SANDBOXED :
-            urgency < typemax(Int) ? RECENT :
-            d.est_s >= LONG_FLOOR_S && d.est_s > share / 4 ? LONG : IN_FILE_ORDER
+            urgency < typemax(Int) ? RECENT : long ? LONG : IN_FILE_ORDER
         d.key = (
-            Int(d.why), d.why === RECENT ? urgency : p, d.why === LONG ? -d.est_s : 0.0, at...,
+            Int(d.why), d.why === RECENT ? urgency : p, long && d.why in (RECENT, LONG) ? -d.est_s : 0.0, at...,
         )
     end
     return sort!(pool; by = u -> units[u].key)
@@ -450,7 +469,8 @@ end
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
         profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString,
-        suite_names::Vector{String}, cold::ColdCost, unclaimed::Vector{Pair{String, Int}} = Pair{String, Int}[]
+        suite_names::Vector{String}, cold::ColdCost, seconds::Dict{String, Float64},
+        unclaimed::Vector{Pair{String, Int}} = Pair{String, Int}[]
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -459,11 +479,12 @@ function materialize(
     tags = Symbol[]; tag_span = UnitRange{Int32}[]
     setups = Symbol[]; setup_span = UnitRange{Int32}[]
     code = Expr[]; skip = Any[]; timeout = Int32[]; retries = Int32[]
-    failfast = Int8[]; item_unit = UnitIdx[]
+    failfast = Int8[]; est = Float64[]; item_unit = UnitIdx[]
+    item_hash = UInt32[]; item_seed_ = UInt64[]
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
     uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
-    uwhy = Why[]; uago = Int32[]; ufailed = ItemIdx[]; uchanged = ItemIdx[]
+    uwhy = Why[]; uago = Int32[]; ufailed = ItemIdx[]; ucancelled = Bool[]; uchanged = ItemIdx[]; unew = Bool[]
     all_setups = Symbol[]
     ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
     for (k, pool) in enumerate(pools)
@@ -482,15 +503,18 @@ function materialize(
                 append!(all_setups, it.setups)
                 push!(code, it.code); push!(skip, it.skip)
                 push!(timeout, it.timeout_s); push!(retries, it.retries)
-                push!(failfast, it.failfast)
+                push!(failfast, it.failfast); push!(est, get(seconds, it.name, 0.0))
                 push!(item_unit, UnitIdx(length(uspan) + 1))
+                push!(item_hash, it.hash); push!(item_seed_, get(cfg.item_seeds, it.name, cfg.seed))
             end
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
             push!(uchain, d.chain); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
             push!(uwhy, d.why); push!(uago, d.failed_ago)
             push!(ufailed, d.failed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.failed_at - 1))
+            push!(ucancelled, d.cancelled)
             push!(uchanged, d.changed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.changed_at - 1))
+            push!(unew, d.changed_new)
         end
         nhead = count(u -> units[u].key[1] in HEAD_CLASSES, pool)
         ntail = count(u -> units[u].key[1] == TAIL_CLASS, pool)
@@ -506,11 +530,11 @@ function materialize(
 
     items = Items(
         name, fileidx, line, tags, tag_span, setups, setup_span,
-        code, skip, timeout, retries, failfast, item_unit
+        code, skip, timeout, retries, failfast, est, item_unit, item_hash, item_seed_
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, uchanged), files, relfiles,
+        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
         profiles, ps, slot_pool, slot_units, pending, cold, sort!(unique!(all_setups)), cfg,
         String(root), Startup(), String(selection), suite_names, unclaimed

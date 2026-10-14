@@ -390,4 +390,29 @@ end
             @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
         end
     end
+
+    @testset "a profile's init and test_end are held to their limits" begin
+        # As in a run: a hook past `init_timeout` or `test_end_timeout` stops the item
+        # instead of holding the session for as long as it takes.
+        dir = make_pkg("PastedHooks", "test/TestItems.toml" => """
+            [run]
+            init_timeout = 2
+            test_end_timeout = 2
+
+            [profiles.slow_init]
+            init = "sleep(60)"
+
+            [profiles.slow_end]
+            test_end = "sleep(60)"
+            """)
+        with_activated(dir) do _
+            for profile in (:slow_init, :slow_end)
+                ex = :(@testitem $("pasted $profile") sandbox=$(QuoteNode(profile)) begin
+                    @test true
+                end)
+                took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
+                @test took < 40
+            end
+        end
+    end
 end

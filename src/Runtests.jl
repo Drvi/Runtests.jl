@@ -104,13 +104,15 @@ Output: `logs` (`:issues`, `:batched`, `:eager`), `verbose`,
 also `RUNTESTS_COVERAGE`, which a keyword overrides and which overrides the file).
 
 State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
-downloaded from CI, say) and runs it again: the same items, settings, profiles
-and seed, with any keyword given here winning, and a warning naming each package
-whose version differs from the one recorded.
+downloaded from CI, say) and runs it again: the same items, settings, profiles,
+`[order]` and seeds, on workers given the Julia flags it recorded, with any keyword
+given here winning, and a warning naming each package whose version differs from
+the one recorded and each recorded item the suite no longer has.
 
 The execution and output settings can also be set under `[run]` in
-`test/TestItems.toml`, which also declares profiles, groups and forced ordering; a
-keyword wins. `config` names another file to read in its place, relative to the
+`test/TestItems.toml`, which also declares profiles, groups and forced ordering, and
+by a variable `RUNTESTS_<SETTING>` (`RUNTESTS_WORKERS`, say), which the run's header
+names: a keyword wins over the variable, and the variable over the file. `config` names another file to read in its place, relative to the
 current directory, which has to exist; nothing but this keyword makes a run read
 one. A mistake in the call, such as a misspelled keyword or a value out of range, is
 an `ArgumentError`; one in a file or an environment variable is a `ConfigError`.
@@ -127,7 +129,7 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
         try
             return RunTestSet(report(run))
         finally
-            rm(run.logdir; force = true, recursive = true)
+            rm(run.scratch; force = true, recursive = true)
         end
     end
 end
@@ -135,31 +137,48 @@ end
 # Everything up to starting a process, so a plan can be inspected, printed or run.
 # `announce` prints what is being read and what was found, as it happens.
 # `expansions = false` leaves the expansions of templates unchecked, for `chores`,
-# which says itself where they stand.
+# which says itself where they stand. `allow_unknown_names` runs the named items the
+# suite has and leaves the rest out, for an editor, whose tree can be behind the files.
 function prepare(args; name = nothing, tags = nothing, group = nothing, replay = nothing, announce::Bool = true,
-                 expansions::Bool = true, kwargs...)
+                 expansions::Bool = true, allow_unknown_names::Bool = false, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
+    named = name !== nothing   # by the caller, not by a replay
+    # A seed the caller gives is every item's; otherwise a failure runs again with the
+    # seed it failed with, and a replayed item with the one it was recorded with.
+    seeded = haskey(kwargs, :seed)
+    item_seeds = Dict{String, UInt64}()
     rs = replay === nothing ? nothing : read_replay(String(replay), target)
+    if rs !== nothing && !seeded
+        run_seed = tryparse(UInt64, get(rs.meta, "seed", ""))
+        for it in rs.items
+            it.seed == run_seed || (item_seeds[it.name] = it.seed)
+        end
+    end
+    !seeded && name isa FailingItems && merge!(item_seeds, name.seeds)
+    recorded = nothing         # the items a replay runs again, when the call selects none itself
     if rs !== nothing
         # The items and settings it recorded, under whatever the call says itself.
         selected = name !== nothing || tags !== nothing || group !== nothing || !isempty(target.paths) || target.line != 0
-        selected || (name = Set(it.name for it in rs.items))
+        selected || (name = recorded = Set(it.name for it in rs.items))
         kwargs = merge(recorded_settings(rs), kwargs)
     end
     # Read before the test files: which directories the profiles' environments are
     # decides which files are read, and the group what is selected from them.
     config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
     claimed = claimed_environments(config_path, toml)
+    rs === nothing || (claimed = replayed_claims(claimed, rs, target.root))
     selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
     filter = Filter(; name, tags, paths = target.paths, line = target.line,
                     group = select_group(read_groups(config_path, toml), config_path, group, selected))
     setups = setup_modules(target.testdir)
     # Printed directly: there is no printer yet, and nothing else writes this early.
+    # How many of the failing items on record the suite has is known once it is read.
     announce && println(
         stdout, label_prefix(), "reading test files under ",
         relpath_or_path(target.testdir, target.root),
-        is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
+        name isa FailingItems ? " for the items failing on record" :
+            is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
     t_files = time()
     walked = walk_test_dir(target.testdir; claimed)
@@ -188,7 +207,28 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
     items = scan(files, filter, setups; strays, templates, expansions, suite_names, claimed)
+    # The failing items on record may all be of items the suite no longer has, which
+    # is nothing failing rather than a selection that matched nothing.
+    if name isa FailingItems
+        in_suite = Set(suite_names)
+        present = Set(n for n in name.names if n in in_suite)
+        isempty(present) && throw(NothingFailing())
+        # What the run says it selected: the failing items the suite has.
+        filter = Filter(present, filter.tags, filter.paths, filter.line, filter.group, filter.names_are)
+    end
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target) * name_hint(filter.name, suite_names)))
+    # One unknown name beside known ones would be left out without a word. A failing
+    # item the suite no longer has is left out on purpose.
+    if named && !allow_unknown_names && !(name isa FailingItems)
+        hint = name_hint(filter.name, suite_names)
+        isempty(hint) || throw(NoTestsError("not every name given is a test item" * hint))
+    end
+    if recorded !== nothing
+        gone = sort!(collect(setdiff(recorded, suite_names)))
+        isempty(gone) || @warn "Runtests: the run state recorded $(plural(length(gone), "test item")) the suite " *
+            "no longer has, renamed or deleted since, which cannot run again: " *
+            join(repr.(first(gone, 20)), ", ") * (length(gone) > 20 ? ", …" : "")
+    end
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
         plural(length(unique(i -> i.file, items)), "file"),
@@ -200,6 +240,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
     rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
+    merge!(cfg.item_seeds, item_seeds)
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
         strict_order = is_full_run(filter, target),
@@ -258,6 +299,19 @@ function recorded_settings(rs::RunStateRecord)
     return NamedTuple(out)
 end
 
+# The directories of the profiles' environments, with the recorded profiles in place
+# of this checkout's: a directory a recorded profile ran in is that profile's, and
+# its tests are read, whatever this checkout's TestItems.toml says of it now.
+function replayed_claims(claimed::Dict{String, Symbol}, rs::RunStateRecord, root::AbstractString)
+    out = Dict(dir => name for (dir, name) in claimed if !haskey(rs.profiles, name))
+    for (name, prof) in rs.profiles
+        isempty(prof.environment) && continue
+        env = isabspath(prof.environment) ? prof.environment : joinpath(root, prof.environment)
+        out[rstrip_path(normpath(env))] = name
+    end
+    return out
+end
+
 # The recorded profiles in place of this checkout's, each preferences file written
 # back out from what was recorded, each environment found in this checkout, under
 # `root`, where the recording's was in its own, and the recorded manifest kept for
@@ -274,9 +328,23 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
         ))
         profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, env)
     end
+    # The code its workers compiled, which this process's flags need not match: the
+    # recorded flags go first, before each profile's own, as the recorded workers had
+    # them from their coordinator.
+    # The order the recording handed its items out in, whatever this checkout's says.
+    order_first = String.(split(get(rs.meta, "order_first", ""), '\n'; keepempty = false))
+    order_last = String.(split(get(rs.meta, "order_last", ""), '\n'; keepempty = false))
+    recorded = split(get(rs.meta, "julia_flags", ""))
+    julia_flags = isempty(recorded) || recorded == code_flags() ? String[] : String.(recorded)
+    if !isempty(julia_flags)
+        for (name, prof) in profiles
+            profiles[name] = Profile(prof.name, [julia_flags; prof.julia_args], prof.threads, prof.env, prof.init,
+                                     prof.test_end, prof.preferences, prof.environment)
+        end
+    end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; profiles, replayed_manifest = recorded_manifest(rs),
-                                        replayed_from = rs.path))...)
+    return RunConfig(; merge(fields, (; profiles, julia_flags, order_first, order_last,
+                                        replayed_manifest = recorded_manifest(rs), replayed_from = rs.path))...)
 end
 
 """
@@ -292,17 +360,25 @@ are that run's and those of the runs that started after it. See
 
 Every other selection narrows the failing items: `name` keeps those it matches, as
 paths, a `file.jl:line`, `tags` and `group` do, so nothing that is not failing runs.
+Each item runs with the seed it failed with, so it draws the random numbers it
+failed with, unless `seed` is given.
+
+When no item is failing, it says so and returns `nothing`: running the failures
+until there are none is what it is for. A `name` that none of the failing items
+matches is an error.
 """
 function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
     target = resolve_target(args)
     base = replay === nothing ? nothing : read_replay(String(replay), target; announce = false)
-    names = Set(failing_items(target.root; names = suite_item_names(target; config = get(kwargs, :config, nothing)), base))
-    isempty(names) && throw(
-        NoTestsError(
-            "no test item is failing in the recorded runs" *
-                (isempty(runstate_files(target.root)) ? " (no run state found for this project)" : "")
-        )
-    )
+    # Every item failing on record. The run reads the suite once, and leaves out of
+    # these the items it no longer has; reading it here as well doubled the time
+    # before the first item.
+    facts = failing_facts(target.root; base)
+    names = Set(keys(facts))
+    nothing_failing() = (println(stdout, label_prefix(), "no test item is failing in the recorded runs",
+                                 isempty(runstate_files(target.root)) ? " (no run state found for this project)" : "");
+                         nothing)
+    isempty(names) && return nothing_failing()
     if name !== nothing
         want = Filter(; name).name
         kept = Set(n for n in names if matches_name(want, n))
@@ -312,7 +388,12 @@ function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
         )))
         names = kept
     end
-    return runtests(args...; name = FailingItems(names), replay, kwargs...)
+    try
+        return runtests(args...; name = FailingItems(names, Dict(n => facts[n].seed for n in names)), replay, kwargs...)
+    catch e
+        e isa NothingFailing || rethrow()
+        return nothing_failing()
+    end
 end
 
 # Every item's name in the suite, read as a run reads it, the environments profiles
@@ -352,8 +433,13 @@ function resolve_target(args)
         ln == 0 || (line = ln; line_arg = String(a))
         push!(paths, abspath(path))
     end
-    for path in paths
-        ispath(path) || throw(ArgumentError("no such file or directory: $path"))
+    for (a, path) in zip(args, paths)
+        # A name given where a path goes is the likeliest slip: `debug` takes either.
+        named = !occursin(r"[/\\]|\.jl", a)
+        ispath(path) || throw(ArgumentError(string(
+            "no such file or directory: ", path,
+            named ? string("; to run the test item called ", repr(a), ", give `name = ", repr(a), "`") : ""
+        )))
     end
     t = target_from_dir(isdir(first(paths)) ? first(paths) : dirname(first(paths)))
     # Naming the project or its test directory means "everything": beside other

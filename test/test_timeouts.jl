@@ -130,6 +130,20 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         end
     end
 
+    @testset "what a test_end expression checks counts when it passes too" begin
+        for workers in (0, 1)
+            dir = make_pkg(
+                "EndPasses",
+                "test/t_test.jl" => """@testitem "checked twice" begin\n    @test true\nend\n""",
+                "test/TestItems.toml" => "[profiles.default]\ntest_end = \"@test 1 == 1\"\n"
+            )
+            states, run, _ = run_states(dir; workers, logs=:issues, monitor=false)
+            @test states["checked twice"] === PASSED
+            tc = Test.get_test_counts(run.statuses.testsets[1])
+            @test tc.passes + tc.cumulative_passes == 2
+        end
+    end
+
     @testset "an item that passes is not asked to run test_end twice" begin
         dir = make_pkg(
             "EndCounts",

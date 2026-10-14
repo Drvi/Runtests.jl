@@ -26,6 +26,7 @@ class RuntestsServer extends EventEmitter {
         this.nextId = 1;
         this.pending = new Map();   // id -> the handler of that command's events
         this.hello = null;
+        this.waiting = null;        // a run not sent yet, until the server is ready: { cancelled }
     }
 
     get running() { return this.proc !== null; }
@@ -112,7 +113,13 @@ class RuntestsServer extends EventEmitter {
      * an `error` when the run could not start, or `exit` when the server died.
      */
     async run(names, options, onEvent) {
-        await this.start();
+        const waiting = { cancelled: false };
+        this.waiting = waiting;
+        try {
+            await this.start();
+        } finally {
+            if (this.waiting === waiting) this.waiting = null;
+        }
         const id = this.nextId++;
         return new Promise(resolve => {
             let started = false;
@@ -128,11 +135,16 @@ class RuntestsServer extends EventEmitter {
             const command = { id, command: 'run', options: options ?? {} };
             if (names !== null) command.names = names;
             this.send(command);
+            // The server reads commands in order, so it cancels this run as it would
+            // one already going, and says what did not run.
+            if (waiting.cancelled) this.send({ command: 'cancel' });
         });
     }
 
+    /** Cancel the run in progress, or the one waiting for the server to be ready. */
     cancel() {
-        if (this.proc) this.send({ command: 'cancel' });
+        if (this.waiting) this.waiting.cancelled = true;
+        else if (this.proc) this.send({ command: 'cancel' });
     }
 
     /** Ask the server to stop, and kill it when it has not within `timeoutMs`. */

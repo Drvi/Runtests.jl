@@ -195,6 +195,8 @@ end
 
 function run_sandboxed(item::RawItem, target)
     prof = interactive_profile(item, target)
+    # The limits a run holds the profile's own code to; without a project, a run's defaults.
+    limits = target === nothing ? RunConfig(; workers = 0) : read_config(target.testdir)
     timeout = item.timeout_s == USE_RUN_DEFAULT ? nothing : Int(item.timeout_s)
     attempts = item.retries == USE_RUN_DEFAULT ? 1 : Int(item.retries) + 1
     result = nothing
@@ -206,8 +208,10 @@ function run_sandboxed(item::RawItem, target)
     for attempt in 1:attempts
         w = sandbox_worker(prof, target, relay)
         try
-            isempty(prof.init.args) ||
-                fetch(RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
+            isempty(prof.init.args) || fetch_within(
+                RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)), limits.init_timeout_s,
+                TimeoutException(limits.init_timeout_s, "the `init` expression of profile `$(prof.name)`", "", "init_timeout")
+            )
             spec = interactive_spec(item, target, attempt, seed)
             fut = RuntestsWorkers.remote_run(w, spec)
             result = (
@@ -216,7 +220,11 @@ function run_sandboxed(item::RawItem, target)
             )::ItemResult
             # What the profile's `test_end` records counts, as it does in a run.
             if !isempty(prof.test_end.args) && result.state !== SKIPPED
-                result = merge_test_end(result, fetch(RuntestsWorkers.remote_end(w, spec, prof.test_end))::ItemResult)
+                endres = fetch_within(
+                    RuntestsWorkers.remote_end(w, spec, prof.test_end), limits.test_end_timeout_s,
+                    TimeoutException(limits.test_end_timeout_s, "the `test_end` expression of profile `$(prof.name)`", "", "test_end_timeout")
+                )::ItemResult
+                result = merge_test_end(result, endres)
             end
             (!is_non_pass(result.state) || attempt == attempts) && break
         catch e
@@ -248,7 +256,7 @@ function interactive_profile(item::RawItem, target)
                 relpath_or_path(joinpath(target.testdir, "TestItems.toml"), target.root)
         )
     )
-    return cfg.profiles[item.profile]
+    return run_profile(cfg.profiles[item.profile], cfg.threads)
 end
 
 function print_interactive_result(result::ItemResult)

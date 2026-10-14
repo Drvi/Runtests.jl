@@ -65,7 +65,7 @@ end
     write(joinpath(dir, "test", "testsetups", setup * ".jl"),
           "module $setup\n" * join(["f$i(x) = x + $i" for i in 1:200], "\n") * "\nend\n")
     write(joinpath(dir, "test", "TestItems.toml"),
-          "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+          "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
 
     # A setup module is loaded from a file rather than as a registered package, so
     # its cache is a flat `<name>*.ji` beside the package directories, not inside
@@ -92,8 +92,8 @@ end
     end
 
     @testset "a profile with other julia flags undoes the stage's work" begin
-        # `--check-bounds=yes` changes code generation, so a worker under it will
-        # not accept a cache compiled without it. A setup module has no UUID, so
+        # `--check-bounds` changes code generation, so a worker under another setting
+        # will not accept a cache compiled under this one. A setup module has no UUID, so
         # Julia keys its cache by name alone with no room for the flags — the
         # worker recompiles into the same file and the next run under the ordinary
         # flags finds it stale.
@@ -101,7 +101,7 @@ end
         @testitem "checked" sandbox=:bounds begin
             using $setup
             @test $setup.f1(1) == 2
-            @test Base.JLOptions().check_bounds == 1
+            @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
         end
         """)
         @test length(caches()) == 1
@@ -135,8 +135,8 @@ end
 
     @testset "the flags come from a process started the same way" begin
         @test Runtests.Private.cache_flags_for(``) == Base.CacheFlags()
-        @test Runtests.Private.cache_flags_for(`--check-bounds=yes`).check_bounds == 1
-        @test Runtests.Private.cache_flags_for(`--check-bounds=yes`) != Base.CacheFlags()
+        @test Runtests.Private.cache_flags_for(`$(OTHER_BOUNDS.arg)`).check_bounds == OTHER_BOUNDS.value
+        @test Runtests.Private.cache_flags_for(`$(OTHER_BOUNDS.arg)`) != Base.CacheFlags()
     end
 
     @testset "only profiles that change the cache flags are precompiled" begin
@@ -150,7 +150,7 @@ end
                 @test true
             end
             @testitem "checked" sandbox=:bounds begin
-                @test Base.JLOptions().check_bounds == 1
+                @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
             end
             @testitem "hushed" sandbox=:quiet begin
                 @test true
@@ -158,7 +158,7 @@ end
             """,
             "test/TestItems.toml" => """
             [profiles.bounds]
-            julia_args = ["--check-bounds=yes"]
+            julia_args = ["$(OTHER_BOUNDS.arg)"]
 
             [profiles.quiet]
             julia_args = ["--banner=no"]

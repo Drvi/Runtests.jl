@@ -511,7 +511,10 @@ function should_skip(spec::ItemSpec)
     spec.skip isa Bool && return spec.skip
     mod = Module(Symbol("skip_", spec.name))
     foreach(ex -> Core.eval(mod, ex), item_prelude(spec))
-    skip = Core.eval(mod, softscope_all!(Expr(:block, deepcopy(spec.skip))))
+    # From the item's seed, as its body draws, which then starts from the seed again.
+    skip = with_seed(spec.seed) do
+        Core.eval(mod, softscope_all!(Expr(:block, deepcopy(spec.skip))))
+    end
     # Shown in the latest world: the expression may have defined how its value prints.
     skip isa Bool || error("test item $(repr(spec.name)): `skip` must evaluate to a Bool, " *
                            "got $(Base.invokelatest(repr, skip))")
@@ -602,18 +605,30 @@ end
 # stdout/stderr redirection is process-wide, which is fine because a worker runs
 # one item at a time. An empty path means eager logs: leave the streams alone and
 # let the coordinator relay them as they appear.
+#
+# C's stdio buffers what C code prints, and empties a buffer bound for a pipe only
+# when it fills or the process exits. Emptied before the item and again before its
+# capture ends, what the item printed from C goes where its other output goes.
 function capture_output(f, logpath::AbstractString)
-    isempty(logpath) && return f()
+    Libc.flush_cstdio()
+    isempty(logpath) && return try f() finally Libc.flush_cstdio() end
     # Read before redirecting: this is the coordinator's setting, passed down as
     # the worker's `--color` flag. The captured file is not a terminal, so the
     # logger has to be told, or every captured log record comes out grey.
     color = get(stdout, :color, false)::Bool
+    # Made by the coordinator; made again should something have removed it since,
+    # which costs the record of the output and not the item.
+    mkpath(dirname(logpath))
     open(logpath, "a") do io
         line_buffered!(io)
         redirect_stdout(io) do
             redirect_stderr(io) do
                 with_logger(ConsoleLogger(IOContext(io, :color => color))) do
-                    f()
+                    try
+                        f()
+                    finally
+                        Libc.flush_cstdio()
+                    end
                 end
             end
         end

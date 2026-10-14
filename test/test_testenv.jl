@@ -1,4 +1,5 @@
 using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED, nitems
+using TOML: TOML
 
 @testset "test environment" begin
     @testset "a test-only dependency is loadable" begin
@@ -8,7 +9,7 @@ using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Ta
         for workers in (0, 1)
             p, target = prepare((pkg,); workers, logs=:issues, monitor=false)
             run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
             @test all(==(PASSED), run.statuses.state)
             # One item imports the test-only dependency itself; the other reaches it
             # through a setup module, which resolves its own imports against the
@@ -27,13 +28,13 @@ using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Ta
         _, cold = capture_run() do
             p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
             run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
         end
         @test occursin("resolving the test environment", cold)
         _, warm = capture_run() do
             p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
             run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
+            rm(run.scratch; force=true, recursive=true)
         end
         @test !occursin("resolving the test environment", warm)
     end
@@ -66,6 +67,22 @@ using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Ta
         @test after != before
     end
 
+    @testset "the cache follows the manifest Julia reads" begin
+        # Julia reads `Manifest-v1.x.toml` before `Manifest.toml`: writing one makes it
+        # the manifest the environment is built from, and changing it changes that.
+        pkg = make_pkg("VersionedManifest", "test/a_test.jl" => """@testitem "x" begin\n @test true\nend\n""")
+        target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
+        before = test_env(target)
+        @test test_env(target) == before
+        versioned = joinpath(pkg, "Manifest-v$(VERSION.major).$(VERSION.minor).toml")
+        write(versioned, "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n")
+        created = test_env(target)
+        @test created != before
+        sleep(0.01)
+        touch(versioned)
+        @test test_env(target) != created
+    end
+
     @testset "a JULIA_PROJECT in the caller's environment does not reach the items" begin
         # A worker inherits this process's environment. If the variable came
         # through, every item would resolve against the caller's project instead of
@@ -85,7 +102,7 @@ using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Ta
         before = Base.active_project()
         p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         @test Base.active_project() == before
     end
 
@@ -109,5 +126,26 @@ using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Ta
         finally
             Base.set_active_project(original)
         end
+    end
+
+    @testset "a test project in the package's workspace is used as it is" begin
+        # As under `Pkg.test`: it shares the package's manifest, so there is no
+        # sandbox to build.
+        item = """@testitem "loads" begin\n    using InWorkspace, Random\n    @test true\nend\n"""
+        pkg = make_pkg("InWorkspace", "test/a_test.jl" => item)
+        uuid = TOML.parsefile(joinpath(pkg, "Project.toml"))["uuid"]
+        open(io -> write(io, "\n[workspace]\nprojects = [\"test\"]\n"), joinpath(pkg, "Project.toml"), "a")
+        write(joinpath(pkg, "test", "Project.toml"),
+              "[deps]\nInWorkspace = \"$uuid\"\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n")
+        target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
+        @test samefile(test_env(target), joinpath(pkg, "test", "Project.toml"))
+        states, _, _ = run_states(pkg; workers=1, logs=:issues, monitor=false)
+        @test all(==(PASSED), values(states))
+
+        # Outside a workspace, a test project has a manifest of its own, which need
+        # not match the package's: that one is sandboxed, as `Pkg.test` does.
+        pkg = make_pkg("OwnTestProject", "test/Project.toml" => "[deps]\n")
+        target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
+        @test !samefile(test_env(target), joinpath(pkg, "test", "Project.toml"))
     end
 end

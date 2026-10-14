@@ -183,10 +183,18 @@ function json_string(s::String, i::Int)
     end
 end
 
+# Byte by byte: four bytes need not end on a character boundary, and `tryparse`
+# would take spaces around the digits.
 function json_hex4(s::String, i::Int)
     i + 3 <= ncodeunits(s) || json_error(s, i, "four hexadecimal digits")
-    u = tryparse(UInt32, SubString(s, i, i + 3); base = 16)
-    u === nothing && json_error(s, i, "four hexadecimal digits")
+    u = UInt32(0)
+    for k in i:(i + 3)
+        c = codeunit(s, k)
+        d = UInt8('0') <= c <= UInt8('9') ? c - UInt8('0') :
+            UInt8('a') <= c <= UInt8('f') ? c - UInt8('a') + 0x0a :
+            UInt8('A') <= c <= UInt8('F') ? c - UInt8('A') + 0x0a : json_error(s, k, "four hexadecimal digits")
+        u = u << 4 | d
+    end
     return u, i + 4
 end
 

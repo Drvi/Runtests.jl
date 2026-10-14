@@ -124,7 +124,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
     @testset "history drives ordering" begin
         h = History(Dict("uses setup" => 100.0, "add works" => 0.1, "mul works" => 0.1),
-                    Dict("mul works" => 0), 0.0)
+                    Dict("mul works" => 0))
         p = make_plan(; history=h, workers=2)
         # the failure from last time is dispatched before the rest of its pool's work
         order = dispatch_order(p)
@@ -143,18 +143,25 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                        "test/b_test.jl" => items("b1", "b2"), "test/c_test.jl" => items("c1", "c2"))
         # a3 failed in the last run and b2 two runs ago; c2 takes more than a quarter
         # of a slot's share of the work.
-        h = History(Dict("c2" => 60.0, "a1" => 1.0), Dict("b2" => 2, "a3" => 0), 0.0)
+        h = History(Dict("c2" => 60.0, "a1" => 1.0), Dict("b2" => 2, "a3" => 0))
         p = plan_dir(dir; history=h)
         @test length(only(p.pools).head) == 3
         @test dispatch_order(p) == ["a3", "b2", "c2", "a1", "a2", "b1", "c1"]
-        # A file written since the last run leads, in file order.
-        since = maximum(mtime, readdir(joinpath(dir, "test"); join=true))
-        sleep(0.05)
-        touch(joinpath(dir, "test", "b_test.jl"))
-        @test dispatch_order(plan_dir(dir; history=History(Dict{String,Float64}(), Dict{String,Int}(), since)))[1:2] ==
-              ["b1", "b2"]
+        # Among those as recent, a long one goes first, as long units do.
+        h = History(Dict("c2" => 60.0, "a1" => 1.0), Dict("b2" => 2, "a3" => 0, "c2" => 0))
+        @test dispatch_order(plan_dir(dir; history=h)) == ["c2", "a3", "b2", "a1", "a2", "b1", "c1"]
+        # An item edited since its last run leads, and so does one that never ran; an
+        # item that moved, or whose neighbour changed, has not changed.
+        ran = plan_dir(dir)
+        recorded = History(; hashes = Dict(ran.items.name[i] => ran.items.hash[i] for i in eachindex(ran.items.name)),
+                           known = Set(ran.items.name))
+        write(joinpath(dir, "test", "b_test.jl"), items("b1") * "@testitem \"b2\" begin\n    @test 1 == 1\nend\n")
+        @test dispatch_order(plan_dir(dir; history = recorded))[1] == "b2"
+        write(joinpath(dir, "test", "b_test.jl"), "\n# moved down\n" * items("b1", "b2", "b3"))
+        moved = plan_dir(dir; history = recorded)
+        @test dispatch_order(moved)[1] == "b3" && length(only(moved.pools).head) == 1
         # Over a quarter of a slot's share, but a matter of seconds: not long.
-        p = plan_dir(dir; history=History(Dict("a1" => 2.0), Dict{String,Int}(), 0.0))
+        p = plan_dir(dir; history=History(Dict("a1" => 2.0), Dict{String,Int}()))
         @test isempty(only(p.pools).head)
         @test p.units.why[p.items.unit[findfirst(==("a1"), p.items.name)]] === Runtests.Private.IN_FILE_ORDER
         # A sandboxed unit goes before any of them: its process is fresh anyway.
@@ -250,7 +257,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"1\"\n",
         )
         second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
-        known = History(second, Dict{String, Int}(), 0.0)
+        known = History(second, Dict{String, Int}())
         Q, claim!, cold_cost, ColdCost = Runtests.Private.Queues, Runtests.Private.claim!, Runtests.Private.cold_cost,
             Runtests.Private.ColdCost
         profile_of(p, c) = p.profiles[p.units.profile[c.unit]].name
@@ -327,7 +334,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
         # What a fresh worker costs: measured in its pool once the run has seen it
         # there, across the run's pools before that, and from earlier runs before either.
-        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(2.0, 0.5)))
+        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(); cold = ColdCost(2.0, 0.5)))
         q = Q(p)
         tiny = pool_named(p, :tiny)
         @test cold_cost(q, default) == 2.5
@@ -350,11 +357,11 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         on_tiny(p) = [p.items.name[i] for (_, w, i) in Runtests.Private.run_order(p).items if w == tiny_slot(p)]
         @test first(on_tiny(p)) == "p1"
         @test length(on_tiny(p)) > 1 && all(startswith("a"), on_tiny(p)[2:end])
-        costly = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(20.0, 0.0)))
+        costly = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(); cold = ColdCost(20.0, 0.0)))
         @test on_tiny(costly) == ["p1"]
         # A slot that moves is charged the fresh worker before its first unit there:
         # `p1`'s second, then a second and a half.
-        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(1.0, 0.5)))
+        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(); cold = ColdCost(1.0, 0.5)))
         starts = [t for (t, w, i) in Runtests.Private.run_order(p).items if w == tiny_slot(p)]
         @test starts[1:2] ≈ [0.0, 2.5]
     end
@@ -371,15 +378,15 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         unit(p, name) = p.items.unit[findfirst(==(name), p.items.name)]
         # Each link takes two seconds, under the floor below which nothing is long;
         # together they take six, and so go before a single item of four.
-        p = plan_dir(dir; history = History(seconds(4.0), Dict{String, Int}(), 0.0))
+        p = plan_dir(dir; history = History(seconds(4.0), Dict{String, Int}()))
         @test p.units.est_s[unit(p, "c1")] == 6.0
         @test p.units.why[unit(p, "c1")] === Runtests.Private.LONG
         @test dispatch_order(p)[1:4] == ["c1", "c2", "c3", "solo"]
         # ...and after a single item of ten.
-        p = plan_dir(dir; history = History(seconds(10.0), Dict{String, Int}(), 0.0))
+        p = plan_dir(dir; history = History(seconds(10.0), Dict{String, Int}()))
         @test dispatch_order(p)[1:4] == ["solo", "c1", "c2", "c3"]
         # A link that failed last time takes the whole chain ahead of it.
-        p = plan_dir(dir; history = History(seconds(10.0), Dict("c3" => 0), 0.0))
+        p = plan_dir(dir; history = History(seconds(10.0), Dict("c3" => 0)))
         @test p.units.why[unit(p, "c1")] === Runtests.Private.RECENT
         @test dispatch_order(p)[1:4] == ["c1", "c2", "c3", "solo"]
     end
@@ -673,15 +680,24 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # From the recorded runs: one item failed in the newest, one three runs back,
         # and one took far longer than the rest.
         h = History(Dict("uses setup" => 100.0, "add works" => 0.1, "mul works" => 0.1),
-                    Dict("add works" => 0, "mul works" => 2), 0.0)
+                    Dict("add works" => 0, "mul works" => 2))
         w = whys(make_plan(; history = h))
         @test w["slow thing"] == "[order] first"
         @test w["add works"] == "failed in the last run"
         @test w["mul works"] == "failed 3 runs ago"
         @test w["uses setup"] == "long: est 1m40.0s"
-        # A file written since the newest run started: its items come early too.
-        w = whys(make_plan(; history = History(Dict{String, Float64}(), Dict{String, Int}(), 1.0)))
-        @test w["add works"] == "file changed since last"
+        # What a cancelled run did not finish goes early too, and is not called a failure.
+        h = History(Dict{String, Float64}(), Dict("add works" => 0, "mul works" => 2);
+                    cancelled = Set(["add works", "mul works"]))
+        w = whys(make_plan(; history = h))
+        @test w["add works"] == "cancelled in the last run"
+        @test w["mul works"] == "cancelled 3 runs ago"
+        # An item edited since its last run, and one no run recorded, come early too.
+        all_names = Set(make_plan().items.name)
+        w = whys(make_plan(; history = History(; hashes = Dict("add works" => UInt32(1)),
+                                               known = setdiff(all_names, ["mul works"]))))
+        @test w["add works"] == "edited since its last run"
+        @test w["mul works"] == "new"
 
         dir = make_pkg("Placed",
             "test/p_test.jl" => """
@@ -703,6 +719,25 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test w["in file order"] == ""
     end
 
+    @testset "the dry run shows each item's expected time, when one is recorded" begin
+        lines(p) = split(sprint(print_plan, p), '\n')
+        header(p) = only(filter(l -> occursin("test item", l) && occursin(" at ", l), lines(p)))
+        @test !occursin(r"\best\b", header(make_plan()))
+        h = History(Dict("uses setup" => 100.0, "add works" => 0.25, "chain one" => 2.0), Dict{String, Int}())
+        p = make_plan(; workers = 2, history = h)
+        row(name) = collect(only(filter(l -> occursin(repr(name), l) && occursin("_test.jl:", l), lines(p))))
+        # Right-aligned, ending under the title's last letter; a member of a chain has
+        # its own, and an item nothing was recorded for has none.
+        hdr = header(p)
+        stop = length(hdr[1:prevind(hdr, findfirst("est ·", hdr).start)]) + 3
+        cell(name) = strip(String(row(name)[(stop - length("1m40.0s") + 1):stop]))
+        @test cell("uses setup") == "1m40.0s"
+        @test cell("add works") == "0.25s" && row("add works")[stop] == 's'
+        @test cell("chain one") == "2.0s"
+        @test cell("chain two") == ""
+        @test cell("mul works") == ""
+    end
+
     @testset "a chain's reason is its own, naming the member it is owed to" begin
         # A chain split across two files, a single item, and filler for the share.
         dir = make_pkg(
@@ -721,27 +756,24 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                                             Runtests.Private.why_text(p, p.items.unit[i]) : "")
                         for i in 1:nitems(p))
         end
-        w = why_column(History(seconds, Dict("c3" => 0), 0.0))
+        w = why_column(History(seconds, Dict("c3" => 0)))
         @test w["c1"] == "\"c3\" failed in the last run"
         @test w["c2"] == "" && w["c3"] == ""
-        @test why_column(History(seconds, Dict("c3" => 1), 0.0))["c1"] == "\"c3\" failed 2 runs ago"
+        @test why_column(History(seconds, Dict("c3" => 1)))["c1"] == "\"c3\" failed 2 runs ago"
         # The first member itself: nothing to name.
-        @test why_column(History(seconds, Dict("c1" => 0), 0.0))["c1"] == "failed in the last run"
+        @test why_column(History(seconds, Dict("c1" => 0)))["c1"] == "failed in the last run"
         # Long by the chain's total, though each member is short.
-        w = why_column(History(merge(seconds, Dict("solo" => 4.0)), Dict{String, Int}(), 0.0))
+        w = why_column(History(merge(seconds, Dict("solo" => 4.0)), Dict{String, Int}()))
         @test w["c1"] == "long: est 6.0s (chain: `c`)"
         @test w["solo"] == "long: est 4.0s"
-        # Written since the newest run: the file, which need not be the first member's.
-        since = maximum(mtime, readdir(joinpath(dir, "test"); join = true))
-        sleep(0.05)
-        touch(joinpath(dir, "test", "d_test.jl"))
-        @test why_column(History(seconds, Dict{String, Int}(), since))["c1"] ==
-              "$(joinpath("test", "d_test.jl")) changed since last"
+        # Edited since its last run: the member, which need not be the first.
+        edited = History(seconds, Dict{String, Int}(); hashes = Dict("c3" => UInt32(1)), known = Set(keys(seconds)))
+        @test why_column(edited)["c1"] == "\"c3\" edited since its last run"
         # Pinned by the member `[order]` names.
         write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"c2\"]\n")
-        @test why_column(History(seconds, Dict{String, Int}(), 0.0))["c1"] == "[order] first names \"c2\""
+        @test why_column(History(seconds, Dict{String, Int}()))["c1"] == "[order] first names \"c2\""
         write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"c1\"]\n")
-        @test why_column(History(seconds, Dict{String, Int}(), 0.0))["c1"] == "[order] first"
+        @test why_column(History(seconds, Dict{String, Int}()))["c1"] == "[order] first"
     end
 
     @testset "[order] last naming any member of a chain sends the chain last" begin

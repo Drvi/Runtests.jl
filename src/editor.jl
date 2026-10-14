@@ -147,11 +147,13 @@ end
 
 ### The server ##############################################################
 
-# What a run command may set, beyond which items: the `runtests` keywords that
-# change how it runs rather than what, or where its output goes.
+# What a run command may set besides its names: the `runtests` keywords that change
+# how it runs, or where its output goes, and `group` and `replay`, which select as
+# they do for `runtests`.
 const RUN_OPTIONS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries, :failfast,
     :item_failfast, :logs, :verbose, :memory_threshold, :full_stacktraces, :coverage, :seed,
+    :group, :replay,
 )
 
 mutable struct Session
@@ -160,7 +162,9 @@ mutable struct Session
     const stream::EventStream
     task::Union{Nothing, Task}   # the run in flight, or the last one
     cancelled::Bool              # a cancel that arrived before the run's task started
-    logdir::String               # the last run's item logs, kept until the next run
+    # The last run's own temporary directory, kept until the next run: its items' logs
+    # when it had no run state to keep them by.
+    scratch::String
 end
 
 """
@@ -215,7 +219,7 @@ function stop_serving!(s::Session)
         catch
         end
     end
-    isempty(s.logdir) || rm(s.logdir; force = true, recursive = true)
+    isempty(s.scratch) || rm(s.scratch; force = true, recursive = true)
     emit(s.stream, "bye")
     return nothing
 end
@@ -295,13 +299,14 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
         push!(kwargs, key => value)
     end
     # The last run's logs were an editor's to read until now.
-    isempty(s.logdir) || rm(s.logdir; force = true, recursive = true)
-    s.logdir = ""
+    isempty(s.scratch) || rm(s.scratch; force = true, recursive = true)
+    s.scratch = ""
     claim_process!() || (emit_error(s.stream, BUSY; id); return nothing)
     # From here the process is the run's, released by its task when it ends.
     started = false
     try
         p, target = prepare((s.root,); name = names === nothing ? nothing : Set{String}(names), announce = false,
+                            allow_unknown_names = true,
                             s.config, kwargs...)
         unknown = names === nothing ? String[] : sort!(setdiff(Set{String}(names), Set(p.suite_names)) |> collect)
         emit(s.stream, "run_started"; id, items = p.items.name, workers = single_process(p) ? 0 : nslots(p),
@@ -333,7 +338,7 @@ function run_for_editor(s::Session, id, p::Plan, target)
         @atomic RuntestsWorkers.INTERRUPT_TARGET.task = nothing
         release_process!()
     end
-    run === nothing || (s.logdir = run.logdir)
+    run === nothing || (s.scratch = run.scratch)
     emit_run_finished(s.stream, id, run, ended)
     s.stream.run, s.stream.run_id = nothing, nothing
     return nothing

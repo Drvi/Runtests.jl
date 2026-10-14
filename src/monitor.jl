@@ -996,6 +996,9 @@ function guard!(m::Monitor)
         @warn "Runtests: memory is at $(round(Int, 100 * pressure))% of the machine; holding off on new " *
             "test items until it is below $(round(Int, 100 * release))%, for " *
             "$(round(Int, MAX_BACKPRESSURE_SECONDS))s at most"
+        # Collecting costs less than waiting. A worker running an item collects when
+        # the item is done and it waits (`wait_while_paused`).
+        collect_idle_garbage!(run)
         return nothing
     end
     over = now - m.over_since
@@ -1006,16 +1009,17 @@ function guard!(m::Monitor)
     elseif over > GUARD_BACKPRESSURE_SECONDS && now - m.last_gc > GUARD_GC_SECONDS
         m.last_gc = now
         m.stats.guard_actions += 1
-        GC.gc(true)
-        for slot in run.slots
-            w = @atomic slot.worker
-            (w === nothing || (@atomic slot.current) != 0) && continue   # do not disturb a running item
-            try
-                RuntestsWorkers.remote_eval(w, :(GC.gc(true)))
-            catch e
-                is_interrupt(e) && rethrow()
-            end
-        end
+        collect_idle_garbage!(run)
+    end
+    return nothing
+end
+
+# This process, and each worker not running an item: a request to one that is would
+# wait behind the item and hold up its `test_end`.
+function collect_idle_garbage!(run)
+    GC.gc(true)
+    for slot in run.slots
+        (@atomic slot.current) == 0 && collect_garbage(@atomic slot.worker)
     end
     return nothing
 end

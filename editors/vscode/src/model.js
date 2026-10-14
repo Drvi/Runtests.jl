@@ -7,13 +7,18 @@ const path = require('node:path');
 
 /**
  * The items of a listing grouped by file, each file with its path relative to the
- * test directory, files and items in the order they appear.
+ * test directory, files and items in the order they appear. A name declared twice
+ * is kept where the listing has it first: names are the tree's ids, and the
+ * listing's errors say where the other declaration is.
  * @param {Array<{name: string, file: string, line: number}>} items
  * @param {string} testdir
  */
 function groupByFile(items, testdir) {
     const files = new Map();
+    const seen = new Set();
     for (const it of items) {
+        if (seen.has(it.name)) continue;
+        seen.add(it.name);
         let f = files.get(it.file);
         if (!f) {
             f = { file: it.file, relpath: path.relative(testdir, it.file), items: [] };
@@ -87,4 +92,18 @@ const crlf = text => text.replace(/\r?\n/g, '\r\n');
 // output channel shows the escape codes as they are, so it gets the text without.
 const plain = text => text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
-module.exports = { groupByFile, selectedNames, outcome, crlf, plain };
+/**
+ * The names an editor queued for a run that the run did not select: a run asked for
+ * no names in particular selects the items of the suite's default group, which can
+ * be fewer than the tree shows. Names the suite does not have are left out; the run
+ * says those are unknown.
+ * @param {string[]} queued  the names queued
+ * @param {{items?: string[], unknown?: string[]}} started  the run's `run_started` event
+ */
+function unselected(queued, started) {
+    const selected = new Set(started.items ?? []);
+    const unknown = new Set(started.unknown ?? []);
+    return queued.filter(n => !selected.has(n) && !unknown.has(n));
+}
+
+module.exports = { groupByFile, selectedNames, outcome, crlf, plain, unselected };

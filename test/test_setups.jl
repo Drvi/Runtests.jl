@@ -54,7 +54,7 @@ using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, 
         # built before its worker starts rather than inside its first item.
         dir = make_pkg("ProfiledSetup")
         setup = string("Flagged", string(hash(dir); base=16))
-        write(joinpath(dir, "test", "TestItems.toml"), "[profiles.checked]\njulia_args = [\"--check-bounds=yes\"]\n")
+        write(joinpath(dir, "test", "TestItems.toml"), "[profiles.checked]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
         # Each item asks, before it loads the setup, whether its own process has a
         # cache to load: `false` would mean the worker compiles it itself. (Loading a
         # cache touches its file, so the file's time cannot say who wrote it.)
@@ -279,6 +279,10 @@ end
                 "name = \"Stale\"\n\n[deps]\nRandom = \"00000000-0000-0000-0000-000000000001\"\n",
             "test/testsetups/Renamed/src/Renamed.jl" => "module Renamed\nend\n",
             "test/testsetups/Renamed/Project.toml" => "name = \"Other\"\n",
+            "test/testsetups/BadUuid/src/BadUuid.jl" => "module BadUuid\nend\n",
+            "test/testsetups/BadUuid/Project.toml" => "name = \"BadUuid\"\nuuid = \"not-a-uuid\"\n",
+            "test/testsetups/BadDep/src/BadDep.jl" => "module BadDep\nusing Random\nend\n",
+            "test/testsetups/BadDep/Project.toml" => "name = \"BadDep\"\n\n[deps]\nRandom = \"not-a-uuid\"\n",
         )
         setups = joinpath(dir, "test", "testsetups")
         listing() = sort([relpath(joinpath(d, f), setups) for (d, _, fs) in walkdir(setups) for f in fs])
@@ -300,7 +304,14 @@ end
         @test occursin("$(at(joinpath("Stale", "Project.toml"))): lists `Random` as 00000000-0000-0000-0000-000000000001; " *
                        "it is $(stdlib_uuid("Random"))", msg)
         @test occursin("$(at(joinpath("Renamed", "Project.toml"))): names the package `Other`, not `Renamed`", msg)
+        @test occursin("$(at(joinpath("BadUuid", "Project.toml"))): `uuid = \"not-a-uuid\"` is not a UUID", msg)
+        @test occursin("$(at(joinpath("BadDep", "Project.toml"))): lists `Random` as \"not-a-uuid\", which is not a UUID", msg)
         @test !occursin("Fine", msg)
+        @test listing() == before
+        # A dry run of `chores` says the same, and returns rather than throws.
+        dry, out = with_runstate_dir(_ -> capture_run(() -> Runtests.chores(dir; dry_run = true)))
+        @test dry === false
+        @test occursin("is not a UUID", out)
         @test listing() == before
     end
 

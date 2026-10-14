@@ -74,7 +74,9 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
         get(toml, "name", name) == name ||
             push!(problems, "$(shown(project)): names the package `$(toml["name"])`, not `$name`")
         tomls[name] = toml
-        uuids[name] = haskey(toml, "uuid") ? Base.UUID(toml["uuid"]) : random_uuid()
+        uuid = haskey(toml, "uuid") ? tryparse(Base.UUID, string(toml["uuid"])) : random_uuid()
+        uuid === nothing && push!(problems, "$(shown(project)): `uuid = $(repr(toml["uuid"]))` is not a UUID")
+        uuids[name] = something(uuid, random_uuid())
     end
     available = test_env_packages(target)
     # What a moved setup's `@__DIR__` becomes `pkgdir` of; `nothing` for a project
@@ -116,8 +118,10 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
         toml = tomls[name]
         have = get(Dict{String, Any}, toml, "deps")
         for (n, u) in deps
-            haskey(have, n) && Base.UUID(have[n])::Base.UUID != u &&
-                push!(problems, "$(shown(project)): lists `$n` as $(have[n]); it is $u")
+            haskey(have, n) || continue
+            listed = tryparse(Base.UUID, string(have[n]))
+            listed === nothing ? push!(problems, "$(shown(project)): lists `$n` as $(repr(have[n])), which is not a UUID") :
+                listed != u && push!(problems, "$(shown(project)): lists `$n` as $(have[n]); it is $u")
         end
         rewritten, imported = 0, false
         if source != entry

@@ -226,7 +226,7 @@ end
     @testset "a failing item's stacktrace stops at the test's own frames" begin
         p, target = prepare((FAULTY,); workers=1, logs=:issues, monitor=false, name="errors")
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         trimmed = sprint(show, first(Runtests.Private.collect_failures(run.statuses.testsets[1])))
         @test occursin("faults_test.jl", trimmed)        # the item's own frame is kept
         @test !occursin("runitem.jl", trimmed)           # the framework's are not
@@ -235,7 +235,7 @@ end
         p2, target2 = prepare((FAULTY,); workers=1, logs=:issues, monitor=false, name="errors",
                               full_stacktraces=true)
         run2 = execute(p2, target2)
-        rm(run2.logdir; force=true, recursive=true)
+        rm(run2.scratch; force=true, recursive=true)
         full = sprint(show, first(Runtests.Private.collect_failures(run2.statuses.testsets[1])))
         @test occursin("runitem.jl", full)               # kept when asked for
         @test length(split(full, '\n')) > length(split(trimmed, '\n'))
@@ -425,29 +425,52 @@ end
         end
     end
 
+    @testset "what an item prints from C is in its log, not after it as the worker's" begin
+        # C's stdio keeps a buffer of its own, which a pipe empties only when it fills
+        # or the process exits: left there, the line came out after the item ended.
+        dir = make_pkg("PrintsFromC", "test/c_test.jl" => """
+            @testitem "prints from C" begin
+                ccall(:puts, Cint, (Cstring,), "printed from C")
+                @test false
+            end
+            """)
+        # Captured on a worker and in this process, and relayed as it comes.
+        for (workers, logs) in ((1, :issues), (0, :issues), (1, :eager))
+            (states, _, _), out = capture_run(() -> run_states(dir; workers, logs, monitor=false))
+            @test states["prints from C"] === FAILED
+            printed = findfirst("printed from C", out)
+            @test printed !== nothing
+            @test !occursin("⚫ w1 · printed from C", out)
+            # Relayed as it comes, it is between the item's RUN and DONE lines.
+            if logs === :eager && printed !== nothing
+                @test findfirst("· RUN ", out).start < printed.start < findfirst("· DONE ", out).start
+            end
+        end
+    end
+
     @testset "workers=0 still gives a sandboxed item its process" begin
         # `workers=0` is a promise about the pool, not about never starting a
-        # process. An item that asked for `--check-bounds=yes` is testing
+        # process. An item that asked for its own `--check-bounds` is testing
         # something that depends on it, so running it here and reporting a pass
         # would report a pass for a test that never ran the way it was written.
         dir = make_pkg(
             "Sandboxed",
             "test/a_test.jl" => """
             @testitem "bounded" sandbox=:bounds begin
-                @test Base.JLOptions().check_bounds == 1          # what it asked for
-                @test Main.FROM_PROFILE_INIT == 7                 # and its profile's init
+                @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)  # what it asked for
+                @test Main.FROM_PROFILE_INIT == 7                             # and its profile's init
                 @test getpid() != parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             @testitem "alone" sandbox=true begin
                 @test getpid() != parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             @testitem "ordinary" begin
-                @test Base.JLOptions().check_bounds == 0
+                @test Base.JLOptions().check_bounds == $(Base.JLOptions().check_bounds)
                 @test getpid() == parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             """,
             "test/TestItems.toml" =>
-                "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n" *
+                "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n" *
                 "init = \"const FROM_PROFILE_INIT = 7\"\n",
         )
         before = live_worker_processes()
@@ -471,7 +494,7 @@ end
         @test count(l -> occursin("· UP ", l), lifecycle) == 2
         @test count(l -> occursin("· EXIT", l), lifecycle) == 2
         @test all(l -> occursin("1 item ", l), filter(l -> occursin("· EXIT", l), lifecycle))
-        @test any(l -> occursin("--check-bounds=yes", l), lifecycle)
+        @test any(l -> occursin(OTHER_BOUNDS.arg, l), lifecycle)
 
         # ...and the processes it started are gone again.
         sleep(0.5)
@@ -500,14 +523,14 @@ end
         mkpath(joinpath(dir, "src")); write(joinpath(dir, "src", "Flagged.jl"), "module Flagged end\n")
         write(joinpath(dir, "test", "a_test.jl"), """
         @testitem "default flags" begin
-            @test Base.JLOptions().check_bounds == 0
+            @test Base.JLOptions().check_bounds == $(Base.JLOptions().check_bounds)
         end
         @testitem "checked flags" sandbox=:bounds begin
-            @test Base.JLOptions().check_bounds == 1
+            @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
         end
         """)
         write(joinpath(dir, "test", "TestItems.toml"),
-              "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+              "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
         states, _, _ = run_states(dir; workers=2, logs=:issues)
         @test states["default flags"] === PASSED
         @test states["checked flags"] === PASSED
@@ -534,7 +557,7 @@ end
             end
         end
         run = execute(p, target)
-        rm(run.logdir; force=true, recursive=true)
+        rm(run.scratch; force=true, recursive=true)
         wait(watcher)
         @test peak[] <= 2
     end

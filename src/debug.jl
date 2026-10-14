@@ -8,10 +8,11 @@ exact name; a `Regex` that matches the name of that item and no other; or a path
 [`runtests`](@ref) takes one, relative to the current directory: `file.jl:line` for
 the item that line is inside, or a test file or directory that holds that item and
 no other. What picks no item, or several, is an error that says what it found.
-Without `item` it is the last recorded run's most recent failure, the item among
-those that failed, errored or timed out that finished last, with that run's seed, so
-it draws the random numbers it failed with. When no run of the project is recorded,
-or the last one had no failures, there is nothing to step into, and it says so.
+Without `item` it is the most recent failure among the items that are failing (see
+[`runtestsf`](@ref)): of those that failed, errored or timed out, the one whose
+failure was recorded last, with the seed it failed with, so it draws the random
+numbers it failed with. When no run of the project is recorded, or no item is
+failing, there is nothing to step into, and it says so.
 
 The item runs here, in this process, as a run would run it: its module and imports,
 the test environment, or the environment its profile names, and the setups, and
@@ -45,7 +46,7 @@ function debugger_entry()
 end
 
 # `enter(body)` calls the item's body, a function of no arguments, under a debugger.
-# Without a name, the item is the last run's most recent failure.
+# Without a name, the item is the most recent failure of the items that are failing.
 function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Nothing, Integer})
     target = interactive_target()
     target === nothing &&
@@ -54,10 +55,15 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
     item = find_item(target, failure === nothing ? name : failure.name)
     # The profile a run would give the item, `[profiles.default]` included.
     prof = interactive_profile(item, target)
-    # A failure is stepped into with the seed of the run it happened in.
-    runs = failure === nothing ? nothing : failure.seed
-    run_seed = UInt64(something(seed, runs, rand(RandomDevice(), UInt64)))
-    print_debug_header(item, prof, run_seed, failure, seed === nothing && runs !== nothing)
+    # A failing item is stepped into with the seed it failed with, named or not.
+    failed_with = if failure !== nothing
+        failure.seed
+    else
+        f = get(failing_facts(target.root; names = Set([item.name])), item.name, nothing)
+        f === nothing ? nothing : f.seed
+    end
+    run_seed = UInt64(something(seed, failed_with, rand(RandomDevice(), UInt64)))
+    print_debug_header(item, prof, run_seed, failure, seed === nothing && failed_with !== nothing)
     return with_interactive_env(target, prof) do
         withenv(prof.env...) do
             isempty(prof.init.args) || Core.eval(Main, Expr(:block, prof.init.args...))
@@ -86,31 +92,30 @@ const STEPPABLE = (FAILED, ERRORED, TIMEDOUT)
 """
     last_failure(target) -> (; name, others, seed)
 
-The project's last recorded run, and of the items in it that failed, errored or
-timed out, the one that finished last; `others` are the rest, most recent first.
-`seed` is the run's, or `nothing` if it did not record one. Throws when no run is
-recorded or the last one had no failures.
+Of the suite's items that are failing (see [`failing_items`](@ref)) because they
+failed, errored or timed out, the one whose failure was recorded last: in the
+newest run that has one, the item that finished last. `others` are the rest, most
+recent first, and `seed` is the one the item failed with. Throws when no run is
+recorded or no item is failing.
 """
 function last_failure(target)
-    runs = recent_runs(target.root, 1)
-    isempty(runs) && throw(
+    runs = project_runs(target.root)
+    any(((_, rs),) -> !rs.dry_run && !rs.aborted && !is_live(rs), runs) || throw(
         NoTestsError(
             "no run of this project is recorded, so there is no failure to step into; " *
                 "run its tests first, or name an item: `Runtests.debug(\"name\")`"
         )
     )
-    rs = last(only(runs))
-    # Paired by `zip`: a damaged file can hold fewer items than statuses.
-    failed = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if st.state in STEPPABLE]
+    suite = suite_item_names(target)
+    failed = [(n, f) for (n, f) in item_facts(runs) if is_failing(f) && f.state in STEPPABLE && n in suite]
     isempty(failed) && throw(
         NoTestsError(
-            "the last recorded run of this project had no failures to step into; " *
-                "name an item instead: `Runtests.debug(\"name\")`"
+            "no test item of this project is failing in the recorded runs, so there is no failure to " *
+                "step into; name an item instead: `Runtests.debug(\"name\")`"
         )
     )
-    sort!(failed; by = ((_, st),) -> st.start_off + st.elapsed, rev = true)
-    names = [it.name for (it, _) in failed]
-    return (; name = first(names), others = names[2:end], seed = tryparse(UInt64, get(rs.meta, "seed", "")))
+    sort!(failed; by = ((_, f),) -> (f.verdict_at, f.verdict_end), rev = true)
+    return (; name = first(failed)[1], others = [n for (n, _) in failed[2:end]], seed = first(failed)[2].seed)
 end
 
 # The one item `what` picks from the whole suite, read the way a run reads it: an
@@ -172,15 +177,15 @@ end
 function print_debug_header(item::RawItem, prof::Profile, seed::UInt64, failure, runs_seed::Bool)
     head = string(
         "debugging ", repr(item.name), " in this process",
-        failure === nothing ? "" : " · the last run's most recent failure",
-        runs_seed ? " · the run's seed " : " · seed ", seed_text(seed)
+        failure === nothing ? "" : " · the most recent failure",
+        runs_seed ? " · the seed it failed with " : " · seed ", seed_text(seed)
     )
     body = String[]
     if failure !== nothing && !isempty(failure.others)
         shown = first(failure.others, 5)
         push!(
             body, string(
-                "the run's other failures: ", join(repr.(shown), ", "),
+                "the other failing items: ", join(repr.(shown), ", "),
                 length(failure.others) > length(shown) ? string(" and ", length(failure.others) - length(shown), " more") : ""
             )
         )

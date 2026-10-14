@@ -344,12 +344,16 @@ end
             close(connect(Sockets.localhost, port))
             other = connect(Sockets.localhost, port)
             write(other, "x"^RuntestsWorkers.COOKIE_BYTES)
+            # Closed, never answered, before the coordinator connects: of two
+            # connections waiting at once, libuv on Windows hands `accept` the newer
+            # first, and the older would never be accepted at all.
+            closed = Threads.@spawn eof(other)
+            @test timedwait(() -> istaskdone(closed), 60) === :ok && fetch(closed)
             coordinator = connect(Sockets.localhost, port)
             write(coordinator, cookie)
             sock = fetch(accepted)
             write(sock, "served\n")
             @test readline(coordinator) == "served"
-            @test eof(other)   # closed, never answered
             close(sock); close(other); close(coordinator)
         finally
             close(server)

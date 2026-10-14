@@ -646,10 +646,10 @@ Something Runtests says that runs to more than one line, drawn in a bracket so t
 reads as one block among the workers' output. With nothing under its first line it
 is printed as the plain line it is.
 """
-function print_label_block(run, head::AbstractString, body::AbstractString)
-    isempty(strip(body)) && return say(run, head)
-    return printline(run, bracket(body, "[TEST]", head, "", :default))
-end
+print_label_block(run, head::AbstractString, body::AbstractString) = printline(run, label_block(head, body))
+
+label_block(head::AbstractString, body::AbstractString) =
+    isempty(strip(body)) ? string(label_prefix(), head) : bracket(body, "[TEST]", head, "", :default)
 
 """
     printline(run, text)
@@ -668,6 +668,42 @@ function printline(run, text::AbstractString)
         else
             write(stdout, status_update!(m, text))
             flush(stdout)
+        end
+    end
+    return nothing
+end
+
+"""
+    write_now(io, text)
+
+Write `text` to `io` before returning, without the event loop. A write to a pipe or a
+terminal otherwise waits for libuv to complete it, and an exit hook can run where
+nothing ever will: Julia 1.12 exits on Ctrl-C from wherever its first thread was.
+What a full pipe still refuses after two seconds is dropped, since an exit that
+hangs is worse than one that says less. On Unix; elsewhere, and for a stream libuv
+does not drive, an ordinary write.
+"""
+function write_now(io::IO, text::AbstractString)
+    if !(Sys.isunix() && io isa Base.LibuvStream)
+        print(io, text)
+        flush(io)
+        return nothing
+    end
+    fd = Base._fd(io)
+    s = String(text)
+    deadline = time() + 2.0
+    GC.@preserve s begin
+        at, left = pointer(s), sizeof(s)
+        while left > 0
+            n = ccall(:write, Cssize_t, (RawFD, Ptr{UInt8}, Csize_t), fd, at, left)
+            if n >= 0
+                at += n
+                left -= n
+            elseif Libc.errno() in (Libc.EAGAIN, Libc.EINTR) && time() < deadline
+                Libc.systemsleep(0.001)
+            else
+                break
+            end
         end
     end
     return nothing
@@ -709,7 +745,10 @@ so the last thing on screen says how the run went rather than which items
 happened to finish last. `ended` is `:interrupted` or `:stalled` for a run that was
 stopped, which then says how far it got.
 """
-function print_conclusion(run, ended::Symbol = :finished)
+print_conclusion(run, ended::Symbol = :finished) = printline(run, conclusion_text(run, ended))
+
+# The text of `print_conclusion`.
+function conclusion_text(run, ended::Symbol = :finished)
     p = run.plan
     st = run.statuses
     elapsed = fmt_seconds(time() - run.t0)
@@ -757,8 +796,7 @@ function print_conclusion(run, ended::Symbol = :finished)
             end
         end
     end
-    print_label_block(run, head, body)
-    return nothing
+    return label_block(head, body)
 end
 
 # Everything that is not a plain pass, in the order a reader cares about.

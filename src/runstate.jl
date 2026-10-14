@@ -448,6 +448,8 @@ function beat(rsf::RunStateFile, timer::Timer)
     while true
         try
             wait(timer)
+            # Closed with its timer left running: the exit hook's way of ending a run.
+            isopen(rsf.io) || break
             update!(io -> write(io, RS_MAGIC), rsf, 0)
         catch e
             e isa EOFError && break   # closed: the run is over
@@ -525,18 +527,18 @@ write_memory!(rsf::Union{Nothing, RunStateFile}, m) = update!(rsf, rsf === nothi
     write(io, Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak))
 end
 
-# `exiting`, from the exit hook, which waits on no task: there the beat is stopped and
-# not waited for, and one that comes after the file is closed writes nothing. Waited
-# for otherwise, so that nothing is written once this returns. `aborted` for a run that
-# ended before its first item.
+# `exiting`, from the exit hook, which waits neither on a task nor on the event loop:
+# there the beat's timer is left running, since closing a timer waits for the event
+# loop to close it, and the beat ends at its next tick, finding the file closed.
+# Stopped and waited for otherwise, so that nothing is written once this returns.
+# `aborted` for a run that ended before its first item.
 function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false, exiting::Bool = false,
                            aborted::Bool = false)
     rsf === nothing && return nothing
     beating = rsf.heartbeat[]
     if beating !== nothing
         rsf.heartbeat[] = nothing
-        close(first(beating))
-        exiting || wait(last(beating))
+        exiting || (close(first(beating)); wait(last(beating)))
     end
     flags = RS_FLAG_COMPLETE | (cancelled ? RS_FLAG_CANCELLED : UInt32(0)) | (aborted ? RS_FLAG_ABORTED : UInt32(0))
     update!(io -> write(io, flags), rsf, header_offset(:flags))

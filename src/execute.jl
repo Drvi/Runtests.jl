@@ -1762,6 +1762,12 @@ delivers an interrupt to whichever task its first thread is running, which betwe
 items is a finished one that cannot catch it, so no `finally` runs; a test item
 calling `exit` ends the same way. Best effort: the printer is taken with `trylock`,
 so a line of output cannot hang the exit.
+
+Nothing here waits on the event loop. A script exiting on Ctrl-C under Julia 1.12 runs
+its exit hooks from wherever its first thread was, and a wait there can last forever.
+So the workers are signalled and their connections left to the exit, the run state's
+beat is left to its timer, and the closing block is written straight to the
+descriptor (see [`write_now`](@ref)).
 """
 function report_unfinished_run()
     run = LIVE_RUN[]
@@ -1776,7 +1782,7 @@ function report_unfinished_run()
             w = slot.worker
             w === nothing && continue
             @atomic slot.worker = nothing
-            RuntestsWorkers.kill!(w)
+            RuntestsWorkers.kill!(w; exiting = true)
         end
         # Told to stop, not waited for: `stop_monitor!` takes the printer and waits
         # for the monitor's task, and a task frozen by the exit holding either
@@ -1789,8 +1795,10 @@ function report_unfinished_run()
         export_run!(run)
         if trylock(run.printer)
             try
-                clear_status_line(run.monitor)
-                print_conclusion(run, :interrupted)
+                # In one write, the status line erased by it.
+                m = run.monitor
+                text = conclusion_text(run, :interrupted)
+                write_now(stdout, string(m !== nothing && m.tty ? "\r\e[2K" : "", text, endswith(text, "\n") ? "" : "\n"))
             finally
                 unlock(run.printer)
             end

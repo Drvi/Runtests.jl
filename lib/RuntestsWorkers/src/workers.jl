@@ -284,8 +284,23 @@ function signal!(pid::Integer, proc::Base.Process, sig::Integer)
     return nothing
 end
 
-wait_exit(proc::Base.Process, seconds::Real) =
-    timedwait(() -> process_exited(proc), seconds; pollint=0.02) === :ok
+# Whether `proc` exits within `seconds`, woken by its exit or by one timer at the end
+# rather than by polling. A timer that fires every few milliseconds is what Julia 1.12,
+# exiting on Ctrl-C from wherever its first thread was, can catch in the middle of its
+# callback, holding a lock that every later callback of that timer then waits on
+# forever, so that the exit hangs.
+function wait_exit(proc::Base.Process, seconds::Real)
+    process_exited(proc) && return true
+    done = Base.Event()
+    timer = Timer(_ -> notify(done), seconds)
+    Threads.@spawn (wait(proc); notify(done))
+    try
+        wait(done)
+    finally
+        close(timer)
+    end
+    return process_exited(proc)
+end
 
 """
     end_group!(w::Worker)
@@ -537,17 +552,22 @@ function watch_and_terminate!(w::Worker, ev::Threads.Event)
 end
 
 """
-    kill!(w)
+    kill!(w; exiting = false)
 
 Stop the worker now, without the grace `terminate!` allows: an interrupt is someone
 asking for their terminal back, and across a pool the graceful windows add up to
 most of a minute. Safe on a worker already being torn down, which is the common
 case.
+
+`exiting`, from an exit hook: the worker is marked as stopped by the interrupt and
+signalled, and nothing else, since everything else can wait. Julia 1.12 runs the
+exit hooks on Ctrl-C from wherever its first thread was, where a wait on a lock or
+on the event loop, as closing the connection is, can last forever.
 """
-function kill!(w::Worker)
+function kill!(w::Worker; exiting::Bool = false)
     (; success) = @atomicreplace w.terminated false => true
     success && (@atomic w.ended_by = :interrupt)
-    @lock w.lock begin
+    exiting || @lock w.lock begin
         for (_, fut) in w.futures
             close(fut.value, WorkerTerminatedException(w))
         end
@@ -560,6 +580,7 @@ function kill!(w::Worker)
         # Already gone, or never ours to signal. Either way there is nothing left
         # to stop, and an interrupt is not the moment to complain about it.
     end
+    exiting && return nothing
     # What `terminate!` would do on its way out, which it skips for a worker
     # already marked terminated.
     untrack!(w.process)

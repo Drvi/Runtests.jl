@@ -68,12 +68,17 @@
             write($(repr(pidfile)), string(getpid(p)))
             @testset "leaves a process running" begin\n    @test true\nend
             """
+        # Named by pid: Windows reports a Julia process's command line as its
+        # executable alone.
+        named(note, pidfile) = occursin(Regex(string("pid ", read(pidfile, String), "\\b")), note)
         try
             r = run_snippet(leave_running(10, joinpath(dir, "short")))
             @test r.ok
             if Sys.iswindows()
                 @test occursin("its output was held for", r.note)
-                @test occursin("sleep(10)", r.note)
+                @test named(r.note, joinpath(dir, "short"))
+                # What the file itself said it left running, once its tests were done.
+                @test occursin("processes running after the tests: ", r.note)
             else
                 @test isempty(r.note)
             end
@@ -81,7 +86,7 @@
             if Sys.iswindows()
                 @test !r.ok
                 @test occursin("its output still held 3s after it exited", r.status)
-                @test occursin("sleep(600)", r.note)
+                @test named(r.note, joinpath(dir, "long"))
             else
                 @test r.ok
             end

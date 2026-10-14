@@ -198,19 +198,24 @@ function collect_log(log::AbstractString, pid::Int32; release::Real = LOG_RELEAS
             true
         end
         seconds = time() - t0
-        held || return output, held_note(holders, seconds, true), true
+        held || return output, held_note(pid, holders, seconds, true, output), true
         holders === nothing && (holders = leftover_processes(pid))
-        seconds < release || return output, held_note(holders, seconds, false), false
+        seconds < release || return output, held_note(pid, holders, seconds, false, output), false
         sleep(0.5)
     end
 end
 
-held_note(::Nothing, _, _) = ""
-held_note(holders::Vector{String}, seconds, released) = string(
-    "its output was held ", released ? "for " : "still after ", round(seconds; digits = 1), "s after it exited; ",
-    isempty(holders) ? "no process it started was running then" : "these processes it started were running then:",
-    join(("\n    " * h for h in holders))
+held_note(_, ::Nothing, _, _, _) = ""
+held_note(pid, holders::Vector{String}, seconds, released, output) = string(
+    "its output was held ", released ? "for " : "still after ", round(seconds; digits = 1), "s after it (pid ", pid,
+    ") exited; ", isempty(holders) ? "no process it started was running then" : "these processes it started were running then:",
+    join(("\n    " * h for h in holders)), join(("\n  " * l for l in said_running(output)))
 )
+
+# The lines in which the child said what it had left running (`print_running` in
+# runtests.jl).
+said_running(output::AbstractString) =
+    [l for l in eachsplit(output, '\n') if startswith(l, "[tests] ") && occursin(" processes running ", l)]
 
 # The processes descended from `pid`, which has exited, a line each, with the command
 # that started each where Windows says it. Windows keeps the pid of a process's

@@ -327,11 +327,48 @@ end
         cmd = `$(Base.julia_cmd()) --startup-file=no -e $(RuntestsWorkers.worker_startup_code(1))`
         proc = open(worker_child_env(cmd), "r+")
         println(proc, "x"^RuntestsWorkers.COOKIE_BYTES)
-        close(proc.in)
+        # Its stdin open, as a coordinator keeps it: closed, it says the coordinator is gone.
         t = @elapsed wait(proc)
+        close(proc.in)
         @test proc.exitcode == 1
         @test t < 30
         @test occursin("no coordinator connected", read(proc, String))
+    end
+
+    @testset "a worker whose coordinator is killed goes, and what its item started with it" begin
+        # Killed outright, the coordinator runs no teardown, and the worker is in an item
+        # that sleeps for ten minutes and reads nothing from the coordinator meanwhile.
+        dir = mktempdir()
+        pidfile = joinpath(dir, "pids")
+        script = joinpath(dir, "coordinator.jl")
+        write(script, """
+            using RuntestsWorkers
+            w = RuntestsWorkers.Worker(; threads = "1", redirect_io = devnull)
+            RuntestsWorkers.remote_eval(w, :(begin
+                child = run(Sys.iswindows() ? Cmd([Base.julia_cmd().exec..., "--startup-file=no", "-e", "sleep(600)"]) :
+                            `sleep 600`; wait = false)
+                write($(repr(pidfile)), string(getpid(), " ", getpid(child)))
+                sleep(600)
+            end))
+            sleep(600)
+            """)
+        coordinator = run(worker_child_env(`$(Base.julia_cmd()) --startup-file=no $script`); wait = false)
+        pids = Int32[]
+        try
+            timedwait(() -> isfile(pidfile) && length(split(read(pidfile, String))) == 2, 300)
+            isfile(pidfile) && append!(pids, parse.(Int32, split(read(pidfile, String))))
+            @test length(pids) == 2
+            kill(coordinator, Base.SIGKILL)
+            wait(coordinator)
+            # By the job that holds them on Windows; elsewhere, by the worker's watch on
+            # the coordinator.
+            gone = timedwait(() -> !any(alive, pids), 30) === :ok
+            @test gone
+            gone || foreach(p -> ccall(:uv_kill, Cint, (Cint, Cint), p, Base.SIGKILL), pids)
+        finally
+            process_running(coordinator) && kill(coordinator, Base.SIGKILL)
+            rm(dir; force = true, recursive = true)
+        end
     end
 
     @testset "a worker waits out connections that are not its coordinator's" begin

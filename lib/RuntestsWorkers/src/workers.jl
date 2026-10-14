@@ -541,6 +541,7 @@ function watch_and_terminate!(w::Worker, ev::Threads.Event)
     end
     terminate!(w, w.closing ? :close : :process_exit)
     end_group!(w)
+    close_input(w.process)
     w.on_exit === nothing && return nothing
     try
         w.on_exit(w)
@@ -681,10 +682,11 @@ function Worker(;
     cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
     local sock, w
     try
-        # The cookie is the only thing the worker ever reads from its stdin.
+        # The cookie is the only thing the worker ever reads from its stdin. The pipe
+        # stays open while the worker runs: its end-of-file is how the worker learns
+        # that this process is gone (see `watch_coordinator`).
         try
             println(proc, cookie)
-            close(proc.in)
         catch e
             e isa Base.IOError || rethrow()   # the process is already gone; `read_port` reports that
         end
@@ -716,10 +718,22 @@ function Worker(;
         end
         untrack!(proc)
         @isdefined(sock) && close(sock)
-        # The job is the worker's to end once it exists; until then, it is here.
-        @isdefined(w) ? (terminate!(w, :start_failed); end_group!(w)) : end_job!(job)
+        # The job and the worker's stdin are the worker's to end once it exists; until
+        # then, they are here.
+        @isdefined(w) ? (terminate!(w, :start_failed); end_group!(w)) : (end_job!(job); close_input(proc))
         rethrow()
     end
+end
+
+# The worker's stdin, closed once the worker has ended. A watch still in its group
+# then ends what is left of the group (see `watch_coordinator`).
+function close_input(proc::Base.Process)
+    try
+        close(proc.in)
+    catch e
+        is_interrupt(e) && rethrow()
+    end
+    return nothing
 end
 
 # The worker announces the port it listens on; anything it prints before that is
@@ -901,6 +915,37 @@ end
 ### Worker side ############################################################
 
 """
+    watch_coordinator(pipe)
+
+End the worker's process group once the coordinator is gone. `pipe` is the worker's
+stdin, which the coordinator holds open for as long as either of them runs, so it
+reads end-of-file once the coordinator has exited, however it exited. A coordinator
+killed outright runs no teardown, and a worker in an item that never returns would
+run on, and what the item started with it. The watch is a shell of its own in the
+worker's group: it acts whatever the worker is doing, and while it waits the group
+has a member, so its id cannot pass to another group before the kill. It is no child
+of the worker's, the shell that starts it having exited, so the processes counted as
+the worker's and what its items started do not include it.
+
+Unix only: on Windows the job object that holds the worker does this (see
+[`worker_job`](@ref)). Without a shell, the worker says so and runs without the watch.
+"""
+function watch_coordinator(pipe::IO)
+    Sys.iswindows() && return nothing
+    # `detach` made the worker the leader of a group of its own. The pipe is read
+    # through descriptor 3: a shell without job control gives what it runs in the
+    # background `/dev/null` for its stdin.
+    script = string("exec 3<&0; (while read -r _ <&3; do :; done; kill -s KILL -- -", getpid(), ") &")
+    try
+        run(pipeline(`/bin/sh -c $script`; stdin = pipe, stdout = devnull, stderr = devnull); wait = false)
+    catch e
+        println(stdout, "Runtests worker: cannot watch for the coordinator's exit, so this worker outlives ",
+                "a coordinator killed outright: ", sprint(showerror, e))
+    end
+    return nothing
+end
+
+"""
     startworker(connect_timeout)
 
 The worker process's entry point. `connect_timeout` is how long to wait for the
@@ -908,6 +953,7 @@ coordinator before giving up.
 """
 function startworker(connect_timeout::Real)
     cookie = readline(stdin)
+    watch_coordinator(stdin)
     redirect_stdin(devnull)
     close(stdin)
     redirect_stderr(stdout)   # one ordered stream for the coordinator to relay

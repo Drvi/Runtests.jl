@@ -415,10 +415,13 @@ end
         rs = read_run_state(last(sort!(files)))
         @test rs !== nothing
         # Killed that way, the coordinator never stopped its worker, which is asleep
-        # in "hangs" and would outlive this test by ten minutes.
-        rs === nothing || foreach(rs.events) do e
-            e.kind === :worker_up && ccall(:uv_kill, Cint, (Cint, Cint), e.pid, Base.SIGKILL)
-        end
+        # in "hangs" for ten minutes: it goes by itself, through the job that holds it
+        # on Windows and its watch on the coordinator elsewhere.
+        workers = rs === nothing ? Int32[] : Int32[e.pid for e in rs.events if e.kind === :worker_up]
+        @test !isempty(workers)
+        gone = timedwait(() -> all(p -> ccall(:uv_kill, Cint, (Cint, Cint), p, 0) != 0, workers), 30) === :ok
+        @test gone
+        gone || foreach(p -> ccall(:uv_kill, Cint, (Cint, Cint), p, Base.SIGKILL), workers)
         @test !rs.complete                              # the run never finished
         @test any(s -> s.state === PASSED, rs.statuses) # but what did finish is recorded
         @test any(s -> s.state === RUNNING, rs.statuses) # and what was in flight says so

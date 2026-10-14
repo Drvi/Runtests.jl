@@ -72,6 +72,7 @@ const PRECOMPILE_SIGNATURES = (
     (read_message, (IOBuffer,)),
     (read_message, (IOBuffer, FrameReader)),
     (terminate!, (Worker, Symbol)),
+    (watch_coordinator, (Base.PipeEndpoint,)),
 )
 
 # The workload does not *run* a test item: that evaluates code into `Main`, and a

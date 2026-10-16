@@ -50,11 +50,13 @@ const HEADER_BYTES = sizeof(UInt64) + sizeof(UInt8) + sizeof(UInt32)
 const COOKIE_BYTES = 32
 
 # A healthy worker exits within milliseconds of the connection closing. On SIGTERM
-# Julia prints every thread's backtrace, a hung worker's most useful last words, so
-# SIGTERM gets a moment before SIGKILL. A process that survives SIGKILL is stuck in
-# the kernel.
+# Julia prints every thread's backtrace, a hung worker's most useful last words, and
+# runs its exit hooks, which write its coverage tracefile, so SIGTERM gets time before
+# SIGKILL. A process that exits waits none of it, and the exit is slow: Julia 1.11
+# takes 0.6s on an idle Linux machine, and up to 5s with four busy processes per CPU.
+# A process that survives SIGKILL is stuck in the kernel.
 const GRACEFUL_EXIT_SECONDS = 3
-const TERM_GRACE_SECONDS    = 2
+const TERM_GRACE_SECONDS    = 10
 const KILL_WAIT_SECONDS     = 10
 
 ### Framing ################################################################

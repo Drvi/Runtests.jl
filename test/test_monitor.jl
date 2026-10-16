@@ -356,7 +356,10 @@ end
         # three separate writes are what makes a busy run flicker.
         @test startswith(out, "\r\e[2K" * "a line of output" * "\n")
         @test occursin("\r\e[2K" * Runtests.Private.MARK_INFO, out)
-        @test endswith(out, status_line(m))
+        # The status line gives the time to the second, which can tick between the
+        # update and the line it is compared with here.
+        untimed(s) = replace(s, r"\d\d:\d\d:\d\d" => "hh:mm:ss")
+        @test endswith(untimed(out), untimed(status_line(m)))
         # A line that already ends in a newline does not get a second one.
         out2 = String(take!(copy(status_update!(m, "ends in a newline\n"))))
         @test occursin("ends in a newline\n\r\e[2K" * Runtests.Private.MARK_INFO, out2)

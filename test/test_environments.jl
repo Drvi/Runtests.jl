@@ -7,7 +7,7 @@ using Runtests.Private: prepare, nitems, read_config, claimed_environments, conf
     ScanFailure, NoTestsError, environment_project, write_environment, replayed_config, read_run_state,
     runstate_files, failing_items, suite_item_names, resolve_target, list_items, Profile, PASSED, FAILED,
     init_run_state, finish_run_state!
-using RuntestsWorkers: state_of
+using Runtests.RuntestsWorkers: state_of
 using Runtests.Private: TOML
 
 """
@@ -61,7 +61,7 @@ const QA_ITEMS = """
     @test EnvRunTools.marker() === :tools
     # The package under test, and the sibling it takes by `[sources]`.
     @test EnvRun.double(1) == 4
-    @test Main.RuntestsWorkers.current_testitem().profile === :qa
+    @test Main.Runtests.current_testitem().profile === :qa
 end
 
 @testitem "qa fails" begin
@@ -421,7 +421,7 @@ end
                 @test EnvRun.double(1) == 4
                 # The environment's packages are its profile's alone.
                 @test Base.find_package("EnvRunTools") === nothing
-                @test Main.RuntestsWorkers.current_testitem().profile === :default
+                @test Main.Runtests.current_testitem().profile === :default
             end
             """,
             "test/opts_in_tests.jl" => """
@@ -435,7 +435,7 @@ end
             @testitem "qa nested" begin
                 using EnvRunTools
                 @test EnvRunTools.marker() === :tools
-                @test Main.RuntestsWorkers.current_testitem().profile === :qa
+                @test Main.Runtests.current_testitem().profile === :qa
             end
             """,
             "test/qa/LocalPreferences.toml" => "[EnvRunTools]\nmode = \"env\"\n",
@@ -517,7 +517,7 @@ end
                     include_string(Main, """
                     @testitem "pasted in qa" begin
                         using EnvRunTools
-                        @test Main.RuntestsWorkers.current_testitem().profile === :qa
+                        @test Main.Runtests.current_testitem().profile === :qa
                     end
                     """, joinpath(qa, "pasted_tests.jl"))
                 end

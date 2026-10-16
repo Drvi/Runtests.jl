@@ -5,7 +5,7 @@
 
 using Runtests.Private: activate, deactivate, is_activated, ScanFailure, ConfigError,
             collect_failures, PASSED, FAILED, SKIPPED, ERRORED
-using RuntestsWorkers: state_of
+using Runtests.RuntestsWorkers: state_of
 using Logging: Logging
 
 const DEPS = fixture("TestDeps.jl")
@@ -353,7 +353,7 @@ end
                 ts, _ = capture_run() do
                     # The fixture's workers load RuntestsWorkers, not Runtests.
                     @testitem "paste attempts" retries=1 sandbox=true begin
-                        attempt = Main.RuntestsWorkers.current_testitem().attempt
+                        attempt = Main.Runtests.current_testitem().attempt
                         open(io -> println(io, attempt, " ", rand(UInt64)), ENV["RUNTESTS_ATTEMPTS"], "a")
                         @test attempt == 2
                     end

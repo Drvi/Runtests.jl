@@ -5,7 +5,7 @@
 # workload that covers less and less. The build asserts, and this checks the same
 # thing from a session that loaded the package out of a cache built earlier.
 
-using RuntestsWorkers: precompile_or_throw
+using Runtests.RuntestsWorkers: precompile_or_throw
 using Runtests.Private: PASSED
 
 @testset "precompile coverage" begin

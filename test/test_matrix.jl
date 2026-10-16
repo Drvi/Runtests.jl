@@ -8,7 +8,7 @@
 # the first time somebody adds a line above it.
 
 using Runtests.Private: PASSED, FAILED, ERRORED, SKIPPED
-using RuntestsWorkers: RuntestsWorkers
+using Runtests: RuntestsWorkers
 
 """
     marked(source) -> (source, marks)

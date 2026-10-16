@@ -1,7 +1,7 @@
 # The worker protocol: the framing on its own, then real worker processes.
-using RuntestsWorkers: RuntestsWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
+using Runtests.RuntestsWorkers: RuntestsWorkers, Worker, remote_eval, remote_fetch, remote_run, terminate!,
                     WorkerTerminatedException, RemoteException
-using RuntestsWorkers: ItemSpec, ItemResult, PASSED, ERRORED
+using Runtests.RuntestsWorkers: ItemSpec, ItemResult, PASSED, ERRORED
 using Random: Random
 using Sockets
 
@@ -342,7 +342,7 @@ end
         pidfile = joinpath(dir, "pids")
         script = joinpath(dir, "coordinator.jl")
         write(script, """
-            using RuntestsWorkers
+            using Runtests: RuntestsWorkers
             w = RuntestsWorkers.Worker(; threads = "1", redirect_io = devnull)
             RuntestsWorkers.remote_eval(w, :(begin
                 child = run(Sys.iswindows() ? Cmd([Base.julia_cmd().exec..., "--startup-file=no", "-e", "sleep(600)"]) :

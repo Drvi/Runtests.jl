@@ -44,12 +44,11 @@ The package's own project cannot load a test-only dependency, so make a separate
 environment outside the repository. If Runtests is in the General registry, add it
 there with `Pkg.add("Runtests")`; to find out, run
 `julia -e 'using Pkg; Pkg.activate(; temp = true); Pkg.add("Runtests")'`. If it isn't,
-add it by URL, together with its worker package from the same repository:
+add it by URL:
 
 ```sh
 RT=$(mktemp -d)/runner
-julia --project=$RT -e 'using Pkg; u = "https://github.com/Drvi/Runtests.jl"
-    Pkg.add([PackageSpec(url = u, subdir = "lib/RuntestsWorkers"), PackageSpec(url = u)])'
+julia --project=$RT -e 'using Pkg; Pkg.add(url = "https://github.com/Drvi/Runtests.jl")'
 ```
 
 With the package directory as the working directory,
@@ -116,30 +115,26 @@ Check: you have the baseline totals and the list of checks that did not pass.
 
 Add it next to the package's other test dependencies: `[extras]` and `[targets]` in
 `Project.toml`, or `test/Project.toml` if the package has one. While Runtests is not
-registered, both packages come by URL. Leaving `RuntestsWorkers` out fails resolution
-with "RuntestsWorkers has no known versions":
+registered, it comes by URL:
 
 ```toml
 [extras]            # [deps] in test/Project.toml
 Runtests = "632efd68-cd41-4e05-bd25-b86dc2150078"
-RuntestsWorkers = "acf69a68-059a-4663-b032-8b5ead8afe67"
 
 [sources]
 Runtests = {url = "https://github.com/Drvi/Runtests.jl"}
-RuntestsWorkers = {url = "https://github.com/Drvi/Runtests.jl", subdir = "lib/RuntestsWorkers"}
 
 [targets]           # Project.toml only
-test = ["Test", "Runtests", "RuntestsWorkers"]   # the existing entries, plus these two
+test = ["Test", "Runtests"]   # the existing entries, plus this one
 ```
 
 If the tests run Aqua's `test_all` or `test_deps_compat`, also add
-`Runtests = "0.1"` and `RuntestsWorkers = "0.1"` under `[compat]`. Aqua asks every
-test dependency for a compat bound.
+`Runtests = "0.1"` under `[compat]`. Aqua asks every test dependency for a compat
+bound.
 
 For a trial against a local checkout of Runtests, a path works:
-`Runtests = {path = "../../Runtests"}`, relative to the project file. The Runtests
-project brings RuntestsWorkers by its own `[sources]`. But a path names that local
-checkout only. CI, and every script that checks the package out somewhere else, such
+`Runtests = {path = "../../Runtests"}`, relative to the project file. But a path names
+that local checkout only. CI, and every script that checks the package out somewhere else, such
 as a git worktree in a temporary directory, need the URL form. Tell the user which one
 the port uses.
 

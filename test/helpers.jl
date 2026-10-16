@@ -2,7 +2,7 @@
 # package, running it, and reading back what happened and what was printed.
 
 using Runtests.Private: prepare, execute, exclusively, report, nitems
-using RuntestsWorkers: RuntestsWorkers
+using Runtests: RuntestsWorkers
 
 # Fixture packages are written to a tempdir rather than checked in when their
 # content is the thing under test: a profile, a broken layout, an item that has to

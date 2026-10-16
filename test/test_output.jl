@@ -3,7 +3,7 @@
 # relaying output at once, and check that no two writers ever landed on the same
 # line.
 
-using RuntestsWorkers: RuntestsWorkers
+using Runtests: RuntestsWorkers
 
 @testset "run output" begin
     work = mktempdir()

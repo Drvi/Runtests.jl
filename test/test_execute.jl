@@ -39,15 +39,17 @@ end
         end
     end
 
-    @testset "an item on a worker has `Test` without the worker loading Runtests" begin
-        # Whatever a worker loads beyond RuntestsWorkers is paid for by the first item
-        # it runs, and Runtests brings `Pkg` and `TestEnv` with it.
+    @testset "an item on a worker has `Test`, and the worker has loaded neither `Pkg` nor `TestEnv`" begin
+        # A worker loads Runtests, which loads `Pkg` and `TestEnv` only to build an
+        # environment, which a worker never does: `Pkg` alone would nearly double the
+        # time a worker takes to start.
         pkg = make_pkg("Lean", "test/l_test.jl" => """
         @testitem "lean" begin
             @test Test isa Module
             loaded(uuid, name) = Base.root_module_exists(Base.PkgId(Base.UUID(uuid), name))
-            @test !loaded("632efd68-cd41-4e05-bd25-b86dc2150078", "Runtests")
+            @test loaded("632efd68-cd41-4e05-bd25-b86dc2150078", "Runtests")
             @test !loaded("44cfe95a-1eb2-52ea-b672-e2afdf69b78f", "Pkg")
+            @test !loaded("1e6cf692-eddd-4d53-88a5-2d735e33781b", "TestEnv")
         end
         """)
         states, _, _ = run_states(pkg; workers=1, logs=:issues)

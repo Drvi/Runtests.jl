@@ -7,7 +7,7 @@
 
 module Platform
 
-using RuntestsWorkers: is_interrupt, OncePerProcess
+using ...RuntestsWorkers: is_interrupt, OncePerProcess
 
 export process_rss, child_pids, machine_memory, available_fraction, cpu_load, cpu_count,
     cpu_ticks, process_cpu_seconds, platform_selfcheck!, ensure_checked!, PER_PROCESS_OK,

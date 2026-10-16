@@ -623,18 +623,20 @@ function Base.wait(w::Worker)
     return nothing
 end
 
-# A worker loads this package by UUID rather than by name. `using RuntestsWorkers` at
-# the top level of the worker's `Main` needs the package in the active project's
-# `[deps]`, and in a user's test environment it is only a dependency of Runtests;
-# `Base.require` on the `PkgId` finds it through the manifest either way.
-const PKGID = Base.PkgId(@__MODULE__)
+# A worker loads Runtests, of which this is a part, by UUID rather than by name.
+# `using Runtests` at the top level of the worker's `Main` needs the package in the
+# active project's `[deps]`, which a profile's environment need not have;
+# `Base.require` on the `PkgId` finds it through the load path either way.
+const PKGID = Base.PkgId(Base.moduleroot(@__MODULE__))
 
 # What separates the entries of a path list in an environment variable.
 const PATHSEP = Sys.iswindows() ? ";" : ":"
 
+# Bound as a constant in `Main`, which a later `using Runtests` there, in an `init`
+# expression say, takes for the same module; a plain global it would refuse.
 worker_startup_code(connect_timeout::Real) = string(
-    "RuntestsWorkers = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"RuntestsWorkers\")); ",
-    "RuntestsWorkers.startworker(", connect_timeout, ")")
+    "const Runtests = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"", PKGID.name, "\")); ",
+    "Runtests.", nameof(@__MODULE__), ".startworker(", connect_timeout, ")")
 
 """
     Worker(; julia_args, threads, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit)

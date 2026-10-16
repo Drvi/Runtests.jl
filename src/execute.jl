@@ -561,6 +561,14 @@ function test_env_for(target, announce = nothing)
     return env
 end
 
+# `f(Pkg, TestEnv)`, loading them the first time any call needs them rather than with
+# this package: a worker process loads this package too, and Pkg alone would double
+# the time a worker takes to start. Loaded during the call, their functions are newer
+# than its caller, so `f` runs in the latest world.
+const PKG_ID = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
+const TESTENV_ID = Base.PkgId(Base.UUID("1e6cf692-eddd-4d53-88a5-2d735e33781b"), "TestEnv")
+with_pkg(f) = Base.invokelatest(f, Base.require(PKG_ID), Base.require(TESTENV_ID))
+
 # Test environments, kept for the session and keyed by project file: building one
 # costs a resolve, seconds at the REPL. It costs no compilation: caches are keyed by
 # package versions and flags, not by environment, so a new environment with the same
@@ -589,11 +597,15 @@ function test_env(target, announce = nothing)
                 if in_package_workspace(testproj, proj)
                     # It shares the package's manifest, so `Pkg.test` runs it as it
                     # is, without a sandbox.
-                    Pkg.activate(testproj; io = devnull)
-                    Pkg.instantiate(; allow_autoprecomp = false)
+                    with_pkg() do Pkg, _
+                        Pkg.activate(testproj; io = devnull)
+                        Pkg.instantiate(; allow_autoprecomp = false)
+                    end
                 else
-                    Pkg.activate(proj; io = devnull)
-                    TestEnv.activate()
+                    with_pkg() do Pkg, TestEnv
+                        Pkg.activate(proj; io = devnull)
+                        TestEnv.activate()
+                    end
                 end
             end
             # What activating made active: a project, or it would have thrown.
@@ -979,9 +991,11 @@ function resolve_environment(dir::AbstractString, prof::Profile)
     original = Base.active_project()
     try
         withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-            Pkg.activate(dir; io = devnull)
-            Pkg.resolve(; io = devnull)
-            Pkg.instantiate(; io = devnull)
+            with_pkg() do Pkg, _
+                Pkg.activate(dir; io = devnull)
+                Pkg.resolve(; io = devnull)
+                Pkg.instantiate(; io = devnull)
+            end
         end
     catch e
         is_interrupt(e) && rethrow()

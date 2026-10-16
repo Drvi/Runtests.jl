@@ -1,11 +1,11 @@
-# Checks of the package's own code rather than of what it does: Aqua for how the two
-# packages are put together, JET for errors and dynamic dispatch in the code a run
+# Checks of the package's own code rather than of what it does: Aqua for how the
+# package is put together, JET for errors and dynamic dispatch in the code a run
 # depends on, and AllocCheck for the functions that exist to allocate nothing.
 
 using Aqua: Aqua
 using JET: JET
 using AllocCheck: check_allocs
-using RuntestsWorkers: RuntestsWorkers
+using Runtests: RuntestsWorkers
 using Sockets: TCPSocket
 
 const P = Runtests.Private
@@ -16,8 +16,9 @@ const OURS = (P, W)
 
 @testset "static checks" begin
     @testset "Aqua: packaging" begin
-        Aqua.test_all(Runtests)
-        Aqua.test_all(RuntestsWorkers)
+        # Pkg and TestEnv are loaded when an environment is built, not with the package
+        # (see `with_pkg`), which Aqua would otherwise call stale.
+        Aqua.test_all(Runtests; stale_deps = (ignore = [:Pkg, :TestEnv],))
     end
 
     # From each public entry point, and the worker's, through everything it calls.

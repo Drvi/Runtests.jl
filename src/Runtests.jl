@@ -14,6 +14,8 @@ contain `@testitem` declarations and nothing else. Shared setup code goes in
 """
 module Runtests
 
+include("RuntestsWorkers/RuntestsWorkers.jl")
+
 """
     Runtests.Private
 
@@ -24,16 +26,13 @@ module Private
 
 using Base.ScopedValues: ScopedValue, with
 using Logging: Logging, with_logger, current_logger
-using Pkg: Pkg
 using Random: Random, RandomDevice
 using Test
 using Test: Test
-using TestEnv: TestEnv
 using TOML: TOML
 
-# The worker side is a package of its own, so a worker loads the protocol and the
-# item runner and nothing else.
-using RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
+# The worker side: the protocol and the item runner, which a worker process calls.
+using ..RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_test_run, run_item,
     with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK,

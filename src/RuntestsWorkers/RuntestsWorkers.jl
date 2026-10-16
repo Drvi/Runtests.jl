@@ -2,8 +2,9 @@
     RuntestsWorkers
 
 The part of Runtests that runs inside a worker process: the protocol between the
-coordinator and a worker, the types that cross it, and `run_item`. A worker loads
-this package alone, never the scanner, the planner, the monitor or `Pkg`.
+coordinator and a worker, the types that cross it, and `run_item`. A worker loads all
+of Runtests, which takes it little longer than this part alone, because Runtests
+loads `Pkg` only when it builds an environment, which a worker never does.
 
 Test code reaches this package through Runtests: `Runtests.current_testitem()`,
 `Runtests.in_testitem()` and `Runtests.in_test_run()` are defined here.

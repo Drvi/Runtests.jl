@@ -1082,6 +1082,7 @@ function precompile_phase(run::Run, p::Plan, target)
     # The environment first: a setup module compiled before it would make its
     # worker build the dependencies itself, one at a time.
     others = precompile_env(run, p)
+    precompile_self(run, others)
     precompile_setups(run, p, target, others)
     return nothing
 end
@@ -1248,6 +1249,30 @@ function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, B
                         (isempty(detail) ? "" : string("\n", detail))
                 )
             )
+        end
+    end
+    return nothing
+end
+
+# Runtests itself, for each set of flags in `others` it has no cache for. A worker
+# loads it, and under flags with no cache compiles it before it can connect, which can
+# take longer than a worker is given: 44s on a fast machine. Where the test environment
+# lists Runtests, `precompile_env` has done this already. Work brought forward, as
+# there: a failure is said, and the workers compile it for themselves.
+function precompile_self(run::Run, others::Vector{Pair{Cmd, Base.CacheFlags}})
+    pkg = RuntestsWorkers.PKGID
+    stale = filter(config -> !has_fresh_cache(pkg, last(config)), others)
+    path = Base.locate_package(pkg)
+    (isempty(stale) || path === nothing) && return nothing
+    say(run, "precompiling Runtests for workers started with ", join(("`$(join(first(c).exec, " "))`" for c in stale), ", "))
+    for (args, flags) in stale
+        out = IOBuffer()
+        try
+            Base.compilecache(pkg, path, out, out; flags = args, cacheflags = flags)
+        catch e
+            is_interrupt(e) && rethrow()
+            @warn "Runtests: could not precompile Runtests under `$(join(args.exec, " "))`; its \
+                   workers will compile it themselves" exception = e
         end
     end
     return nothing

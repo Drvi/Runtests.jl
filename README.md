@@ -12,7 +12,7 @@ and long items get priority; other items run in file order to reuse compiled
 code. Each run records its results, settings, profiles, and random seed for
 [inspection and replay](#run-state).
 
-**Requires Julia 1.12 or later.** Runtests is a vibe-coded package: its code was
+**Requires Julia 1.11 or later.** Runtests is a vibe-coded package: its code was
 written with an AI coding assistant.
 
 - [Quick start](#quick-start) · [Running tests](#running-tests)

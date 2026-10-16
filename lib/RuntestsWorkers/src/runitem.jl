@@ -539,7 +539,8 @@ function with_testset_printing(f, enabled::Bool)
 end
 
 # How Test tracks the active testset is internal: a task-local stack before 1.13,
-# scoped values from 1.13. The shape is detected rather than the version.
+# scoped values from 1.13. The shape is detected rather than the version, when the
+# method is defined, so that the code each version runs names only what it has.
 """
     without_enclosing_testset(f)
 
@@ -548,23 +549,24 @@ enclosing one whenever the depth is not zero, and an item's results belong to th
 run's report, not to whatever `@testset` the caller of `runtests` is inside.
 """
 function without_enclosing_testset(f)
-    if isdefined(Test, :TESTSET_DEPTH) && Test.TESTSET_DEPTH isa ScopedValue
+    @static if isdefined(Test, :TESTSET_DEPTH) && Test.TESTSET_DEPTH isa ScopedValue
         return with(f, Test.TESTSET_DEPTH => 0, Test.CURRENT_TESTSET => Test.FallbackTestSet())
-    end
-    # Before the scoped-value rewrite the stack lived in task-local storage.
-    tls = task_local_storage()
-    key = :__BASETESTNEXT__
-    prev = get(tls, key, nothing)
-    tls[key] = Test.AbstractTestSet[]
-    try
-        return f()
-    finally
-        prev === nothing ? delete!(tls, key) : (tls[key] = prev)
+    else
+        # Before the scoped-value rewrite the stack lived in task-local storage.
+        tls = task_local_storage()
+        key = :__BASETESTNEXT__
+        prev = get(tls, key, nothing)
+        tls[key] = Test.AbstractTestSet[]
+        try
+            return f()
+        finally
+            prev === nothing ? delete!(tls, key) : (tls[key] = prev)
+        end
     end
 end
 
 function with_testset(f, ts::Test.AbstractTestSet)
-    if isdefined(Test, :CURRENT_TESTSET) && Test.CURRENT_TESTSET isa ScopedValue
+    @static if isdefined(Test, :CURRENT_TESTSET) && Test.CURRENT_TESTSET isa ScopedValue
         return with(f, Test.CURRENT_TESTSET => ts,
                        Test.TESTSET_DEPTH => Test.get_testset_depth() + 1)
     elseif isdefined(Test, :push_testset)
@@ -574,9 +576,10 @@ function with_testset(f, ts::Test.AbstractTestSet)
         finally
             Test.pop_testset()
         end
+    else
+        error("Runtests cannot tell how this Julia's Test stdlib tracks the active testset; " *
+              "this build of Test is not supported")
     end
-    error("Runtests cannot tell how this Julia's Test stdlib tracks the active testset; " *
-          "this build of Test is not supported")
 end
 
 # The item's random numbers start from its seed, and the task's own stream is put

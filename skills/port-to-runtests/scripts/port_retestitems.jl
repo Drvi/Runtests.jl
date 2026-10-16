@@ -21,9 +21,12 @@
 # in every worker: read each one (SKILL.md, step 4, item 3).
 
 const JS = Base.JuliaSyntax
+# Where a node is in the text it was parsed from. Julia 1.11's JuliaSyntax has no
+# `byte_range`.
+byte_range(n) = JS.first_byte(n):JS.last_byte(n)
 
 kids(n) = something(JS.children(n), JS.SyntaxNode[])
-text_of(src, n) = String(codeunits(src)[JS.byte_range(n)])
+text_of(src, n) = String(codeunits(src)[byte_range(n)])
 # The macro's name with its `@` or without: JuliaSyntax's text of it has the `@` from
 # Julia 1.13 and not before.
 is_macro(n, name) = JS.kind(n) == JS.K"macrocall" && !isempty(kids(n)) &&
@@ -62,7 +65,7 @@ function port_file!(path, testdir, setupdir, notes, moves)
     edits = Tuple{UnitRange{Int}, String}[]   # byte ranges and what replaces them
     nitems = 0
     for node in kids(tree)
-        r = JS.byte_range(node)
+        r = byte_range(node)
         if is_macro(node, "@testsetup")
             mod = kids(node)[2]
             name = JS.sourcetext(kids(mod)[1])   # (module name body)
@@ -121,7 +124,7 @@ function item_edits!(edits, notes, src, rel, call)
     name = text_of(src, kids(call)[2])
     used = String[]
     for (key, kw) in keywords(call)
-        r = JS.byte_range(kw)
+        r = byte_range(kw)
         # The keyword and the blank before it.
         from = something(findprev(!isspace, src, prevind(src, first(r))), 0) + 1
         if key == "setup"
@@ -135,7 +138,7 @@ function item_edits!(edits, notes, src, rel, call)
                 # The parentheses stay: `skip = (a == b)` reads as one value.
                 unq = startswith(inner, ":(") && endswith(inner, ")") ? inner[2:end] :
                     (push!(notes, "$rel: @testitem $name: `skip = $inner` quotes something other than an expression in parentheses; write it as an expression that gives a Bool"); continue)
-                push!(edits, (JS.byte_range(v), unq))
+                push!(edits, (byte_range(v), unq))
             end
         elseif key in ("default_imports", "_id")
             push!(edits, (from:last(r), ""))
@@ -148,10 +151,10 @@ function item_edits!(edits, notes, src, rel, call)
     stmts = kids(block)
     if isempty(stmts)
         # `begin end` with nothing in it: the `using` is all there is.
-        r = JS.byte_range(block)
+        r = byte_range(block)
         push!(edits, (r, "begin\n    using $(join(used, ", "))\nend"))
     else
-        at = first(JS.byte_range(stmts[1]))
+        at = first(byte_range(stmts[1]))
         pad = indent_at(src, at)
         push!(edits, (at:at - 1, "using $(join(used, ", "))\n$pad"))
     end

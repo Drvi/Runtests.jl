@@ -138,7 +138,9 @@ using TOML: TOML
         write(joinpath(pkg, "test", "Project.toml"),
               "[deps]\nInWorkspace = \"$uuid\"\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n")
         target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
-        @test samefile(test_env(target), joinpath(pkg, "test", "Project.toml"))
+        # Workspaces came with Julia 1.12. Before, the test project is sandboxed as any
+        # other is, and the items run the same.
+        @test samefile(test_env(target), joinpath(pkg, "test", "Project.toml")) == (VERSION >= v"1.12")
         states, _, _ = run_states(pkg; workers=1, logs=:issues, monitor=false)
         @test all(==(PASSED), values(states))
 

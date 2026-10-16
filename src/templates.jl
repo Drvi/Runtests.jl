@@ -126,6 +126,10 @@ byte_slice(text::String, r::UnitRange{Int}) = String(codeunits(text)[r])
 # A node's children, none for a leaf.
 children_of(node) = something(JuliaSyntax.children(node), JuliaSyntax.SyntaxNode[])
 
+# Where `node` is in the text it was parsed from. Julia 1.11's JuliaSyntax has no
+# `byte_range`.
+byte_range(node) = JuliaSyntax.first_byte(node):JuliaSyntax.last_byte(node)
+
 declaration_nodes(tree) = [c for c in children_of(tree) if Expander.is_testtemplate(Expr(c))]
 
 """
@@ -174,7 +178,7 @@ function render_instance(text::String, node, name::String, values::Dict{Symbol, 
     end
     interpolation_ranges!(at, text, body, values, nothing)
     sort!(at; by = first ∘ first)
-    ranges = (JuliaSyntax.byte_range(kids[2]), JuliaSyntax.byte_range(loop), JuliaSyntax.byte_range(body))
+    ranges = (byte_range(kids[2]), byte_range(loop), byte_range(body))
     want = instance_code(Expr(node), values, computed)
     for parenthesize in (false, true)
         instance = splice_instance(text, name, ranges..., at, parenthesize)
@@ -209,7 +213,7 @@ end
 # code that replaces it (see `interpolated_code`); none from inside a quoted
 # expression, where every `$` is the quote's.
 function interpolation_ranges!(out, text::String, node, values, computed)
-    r = JuliaSyntax.byte_range(node)
+    r = byte_range(node)
     isempty(r) && return out
     c = codeunits(text)[first(r)]
     if c == UInt8('$') || c == UInt8(':') || c == UInt8('q')

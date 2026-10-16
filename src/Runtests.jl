@@ -36,7 +36,8 @@ using TOML: TOML
 using RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_test_run, run_item,
-    with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK
+    with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK,
+    OncePerProcess
 
 include("types.jl")
 include("json.jl")

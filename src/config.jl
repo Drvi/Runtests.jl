@@ -449,7 +449,7 @@ function read_groups(path, toml)
         what = "group `$name` of [groups] in $(relpath_or_path(path))"
         name == ALL_GROUP && throw(ConfigError("$what: `$ALL_GROUP` is the whole suite, and is not declared"))
         # Told apart by case alone, `All` and `all` would select different items.
-        reserved = lowercase(name)
+        reserved = lowercase(name::String)   # a TOML key
         reserved in (ALL_GROUP, DEFAULT_GROUP) && name != DEFAULT_GROUP && throw(ConfigError(string(
             what, ": `", reserved, "` is reserved, and this differs from it only in case; ",
             reserved == ALL_GROUP ? "`all` is the whole suite, and is not declared" :

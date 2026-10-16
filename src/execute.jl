@@ -634,8 +634,12 @@ mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
 # loader uses to find a workspace member's manifest.
 function in_package_workspace(testproj, proj)
     isfile(testproj) || return false
-    base = Base.base_project(testproj)
-    return base !== nothing && samefile(base, proj)
+    @static if isdefined(Base, :base_project)
+        base = Base.base_project(testproj)
+        return base !== nothing && samefile(base, proj)
+    else
+        return false   # workspaces came with Julia 1.12
+    end
 end
 
 # `Pkg.test` runs `test/runtests.jl` in an environment it built for the purpose.
@@ -1215,7 +1219,10 @@ function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, B
         # and throws an exception saying only that it failed; both go in the error.
         out = IOBuffer()
         try
-            Base.compilecache(pkg, out, out; flags = args, cacheflags = flags)
+            # Given the source path: Julia 1.11's form without it takes no `cacheflags`.
+            path = Base.locate_package(pkg)
+            path === nothing && throw(ArgumentError("$pkg not found during precompilation"))
+            Base.compilecache(pkg, path, out, out; flags = args, cacheflags = flags)
         catch e
             is_interrupt(e) && rethrow()
             detail = strip(String(take!(out)))

@@ -921,8 +921,10 @@ Test.get_test_counts(ts::RunTestSet) = Test.get_test_counts(ts.testset)
 Test.get_alignment(ts::RunTestSet, depth::Int) = Test.get_alignment(ts.testset, depth)
 Test.format_duration(ts::RunTestSet) = Test.format_duration(ts.testset)
 Test.filter_errors(ts::RunTestSet) = Test.filter_errors(ts.testset)
-Test.get_rng(ts::RunTestSet) = Test.get_rng(ts.testset)
-Test.set_rng!(ts::RunTestSet, rng::Random.AbstractRNG) = Test.set_rng!(ts.testset, rng)
+@static if isdefined(Test, :get_rng)   # from Julia 1.12
+    Test.get_rng(ts::RunTestSet) = Test.get_rng(ts.testset)
+    Test.set_rng!(ts::RunTestSet, rng::Random.AbstractRNG) = Test.set_rng!(ts.testset, rng)
+end
 Test.print_test_results(ts::RunTestSet, depth_pad = 0) = Test.print_test_results(ts.testset, depth_pad)
 @static if isdefined(Test, :anynonpass)
     Test.anynonpass(ts::RunTestSet) = Test.anynonpass(ts.testset)

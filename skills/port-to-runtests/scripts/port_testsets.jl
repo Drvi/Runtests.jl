@@ -33,6 +33,9 @@
 # unqualified) or about paths relative to a file it moved (`@__DIR__`).
 using TOML
 const JS = Base.JuliaSyntax
+# Where a node is in the text it was parsed from. Julia 1.11's JuliaSyntax has no
+# `byte_range`.
+byte_range(n) = JS.first_byte(n):JS.last_byte(n)
 
 # The file's top-level forms as exact source spans, comments included, from the
 # lossless tree: SyntaxNode ranges leave out a trailing `end` in some forms. Forms
@@ -79,7 +82,7 @@ function testset_parts(src::String)
     end
     last_ = args[end]
     if JS.kind(last_) == JS.K"block" && !isempty(name)
-        r = JS.byte_range(last_)
+        r = byte_range(last_)
         block = bytes(src, r)
         startswith(block, "begin") && endswith(block, "end") || return (name, nothing)
         return (name, bytes(block, 6:(ncodeunits(block) - 3)))
@@ -126,12 +129,12 @@ function loop_testsets(src::String)
     found = Tuple{Vector{String}, String}[]
     function visit(loop, headers)
         iter, body = JS.children(loop)
-        header = bytes(src, first(JS.byte_range(loop)):last(JS.byte_range(iter)))
+        header = bytes(src, first(byte_range(loop)):last(byte_range(iter)))
         vars = loop_vars(header)
         headers = [filter(h -> !issubset(loop_vars(h), vars), headers); header]
-        before = last(JS.byte_range(iter))
+        before = last(byte_range(iter))
         for c in JS.children(body)
-            r = JS.byte_range(c)
+            r = byte_range(c)
             text = bytes(src, (before + 1):last(r))
             if JS.kind(c) == JS.K"for"
                 visit(c, headers) || return false
@@ -324,7 +327,7 @@ function lift_imports(body)
 end
 
 is_module(src) = startswith(src, "module ") || startswith(src, "baremodule ")
-module_body(src) = (node = JS.parsestmt(JS.SyntaxNode, src); bytes(src, JS.byte_range(JS.children(node)[end])))
+module_body(src) = (node = JS.parsestmt(JS.SyntaxNode, src); bytes(src, byte_range(JS.children(node)[end])))
 
 # Whether a testset's body holds nothing but testsets and imports. One that also
 # defines something stays whole: taken apart, its locals would be globals of the
@@ -937,7 +940,7 @@ function bind!(s::Suite, @nospecialize(ex), dir)
 end
 
 kids(n) = something(JS.children(n), JS.SyntaxNode[])
-node_text(src, n) = bytes(src, JS.byte_range(n))
+node_text(src, n) = bytes(src, byte_range(n))
 # A block's statements, without a `begin` and `end` around them.
 function statements(t)
     s = strip(t)

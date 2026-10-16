@@ -41,6 +41,33 @@ else
     shielded(f) = f()
 end
 
+# `OncePerProcess{T}(f)`: a callable that runs `f` at most once per process and returns
+# its value. Base's from Julia 1.12, and on 1.11 this one; Runtests imports it from
+# here. A value worked out while precompiling is not kept, because the process that
+# loads the cache is another.
+@static if isdefined(Base, :OncePerProcess)
+    const OncePerProcess = Base.OncePerProcess
+else
+    mutable struct OncePerProcess{T, F}
+        @atomic value::Union{Nothing, Some{T}}
+        const f::F
+        const lock::ReentrantLock
+        OncePerProcess{T, F}(f::F) where {T, F} = new{T, F}(nothing, f, ReentrantLock())
+    end
+    OncePerProcess{T}(f::F) where {T, F} = OncePerProcess{T, F}(f)
+    function (once::OncePerProcess{T})() where {T}
+        v = @atomic :acquire once.value
+        v === nothing || return something(v)
+        @lock once.lock begin
+            v = @atomic :monotonic once.value
+            v === nothing || return something(v)
+            r = once.f()::T
+            ccall(:jl_generating_output, Cint, ()) == 0 && @atomic :release once.value = Some(r)
+            return r
+        end
+    end
+end
+
 include("runitem.jl")
 include("workers.jl")
 

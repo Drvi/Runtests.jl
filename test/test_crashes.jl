@@ -390,7 +390,9 @@ Sys.iswindows() ||
     # with no monitor a worker's output relay or message reader. Sent a second
     # after the items start, before the stall watchdog first looks.
     for monitor in (true, false)
-        r = interrupted_run(; items = 2, julia_args = ["--threads=1,0"], monitor, delay = 1.0)
+        # No interactive thread: Julia 1.11 has none unless asked, and refuses a count of
+        # zero; from 1.12 there is one unless the count says zero.
+        r = interrupted_run(; items = 2, julia_args = [VERSION >= v"1.12" ? "--threads=1,0" : "--threads=1"], monitor, delay = 1.0)
         @test r.got_running
         @test r.elapsed < 30
         @test all_gone(r.started)

@@ -1235,9 +1235,10 @@ function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, B
         out = IOBuffer()
         try
             # Given the source path: Julia 1.11's form without it takes no `cacheflags`.
+            # Without this process's modules, as in `precompile_self`.
             path = Base.locate_package(pkg)
             path === nothing && throw(ArgumentError("$pkg not found during precompilation"))
-            Base.compilecache(pkg, path, out, out; flags = args, cacheflags = flags)
+            Base.compilecache(pkg, path, out, out, false; flags = args, cacheflags = flags)
         catch e
             is_interrupt(e) && rethrow()
             detail = strip(String(take!(out)))
@@ -1268,24 +1269,32 @@ function precompile_self(run::Run, others::Vector{Pair{Cmd, Base.CacheFlags}})
     for (args, flags) in stale
         out = IOBuffer()
         try
-            Base.compilecache(pkg, path, out, out; flags = args, cacheflags = flags)
+            # Without this process's modules (`false`): the child would be held to the
+            # builds of them loaded here, which are compiled under other flags and so
+            # cannot be loaded there. That failure is returned, not thrown.
+            r = Base.compilecache(pkg, path, out, out, false; flags = args, cacheflags = flags)
+            r isa Exception && throw(r)
         catch e
             is_interrupt(e) && rethrow()
+            detail = strip(String(take!(out)))
             @warn "Runtests: could not precompile Runtests under `$(join(args.exec, " "))`; its \
-                   workers will compile it themselves" exception = e
+                   workers will compile it themselves$(isempty(detail) ? "" : "\n" * detail)" exception = e
         end
     end
     return nothing
 end
 
-# Whether `pkg` has a cache that a process with cache flags `flags` can load. 1.12's
-# `isprecompiled` takes the flags; from 1.13 it asks for this process's only, and
-# the function behind it takes them.
+# Whether a new process with cache flags `flags` finds a cache of `pkg` it can load.
+# Asked as of a fresh session (`ignore_loaded`), as a worker is one: otherwise the
+# answer is about the builds this process has loaded, which for other flags is no.
+# 1.12's `isprecompiled` takes the flags; from 1.13 it asks for this process's only,
+# and the function behind it takes them.
 @static if hasmethod(Base.isprecompiled, Tuple{Base.PkgId}, (:flags,))
-    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) = Base.isprecompiled(pkg; flags)
+    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) =
+        Base.isprecompiled(pkg; flags, ignore_loaded = true)
 else
     has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) =
-        Base.compilecache_freshest_path(pkg; flags, verify_checksums = false) !== nothing
+        Base.compilecache_freshest_path(pkg; flags, ignore_loaded = true, verify_checksums = false) !== nothing
 end
 
 ### Workers ################################################################

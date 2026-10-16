@@ -176,6 +176,29 @@ end
         @test occursin("1 profile", line)
     end
 
+    @testset "Runtests is compiled for a profile's flags once, before its workers start" begin
+        # A worker loads Runtests before it connects, and compiling it there can take
+        # longer than a worker is given to connect.
+        dir = make_pkg(
+            "SelfPrecompile",
+            "test/t_test.jl" => """
+            @testitem "checked" sandbox=:bounds begin
+                @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
+            end
+            """,
+            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n"
+        )
+        outs = map(1:2) do _
+            _, out = capture_run() do
+                states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
+                @test all(==(PASSED), values(states))
+            end
+            out
+        end
+        @test !occursin("could not precompile Runtests", outs[1])
+        @test !occursin("precompiling Runtests", outs[2])
+    end
+
     @testset "a run with no profile flags says nothing about it" begin
         dir = make_pkg("NoProfilePrecompile", "test/t_test.jl" => """
         @testitem "plain" begin

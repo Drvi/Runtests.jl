@@ -21,12 +21,3 @@ jobs:
           # With a deploy key, the tag push starts CI, and a commit that changes a
           # workflow file can be tagged; GITHUB_TOKEN can do neither.
           ssh: ${{ secrets.DOCUMENTER_KEY }}
-      - name: Tag RuntestsWorkers
-        # Each package is tagged whatever became of the other.
-        if: ${{ !cancelled() }}
-        uses: JuliaRegistries/TagBot@d8d3e8f45a4cd9839f1d6d8798ca246431564418 # v1.25.12
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ssh: ${{ secrets.DOCUMENTER_KEY }}
-          # Its tags are `RuntestsWorkers-v<version>`, beside Runtests' `v<version>`.
-          subdir: lib/RuntestsWorkers

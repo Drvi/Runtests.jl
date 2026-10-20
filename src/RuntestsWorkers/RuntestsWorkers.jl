@@ -123,8 +123,11 @@ const PRECOMPILE_SIGNATURES = (
         softscope_all!(Expr(:block, :(x = 1)))
         io = IOBuffer()
         write(io, encode_message(UInt64(1), KIND_RUN, spec))
+        # A result's way back, which a worker's first item makes within its timeout.
+        write(io, encode_message(UInt64(2), KIND_RESULT, result))
         seekstart(io)
         try
+            read_message(io)
             read_message(io)
         catch
         end

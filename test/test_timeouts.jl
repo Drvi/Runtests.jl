@@ -42,11 +42,13 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
     end
 
     @testset "an init expression is not charged to the item" begin
-        # The item's own limit is shorter than the profile spends starting up.
+        # The item's own limit is shorter than the profile spends starting up, and
+        # long enough for a fresh worker's first item on a loaded CI runner, which
+        # can spend seconds compiling.
         dir = make_pkg(
             "SlowInit",
-            "test/t_test.jl" => """@testitem "quick" timeout=2 begin\n    @test true\nend\n""",
-            "test/TestItems.toml" => "[profiles.default]\ninit = \"sleep(4)\"\n"
+            "test/t_test.jl" => """@testitem "quick" timeout=5 begin\n    @test true\nend\n""",
+            "test/TestItems.toml" => "[profiles.default]\ninit = \"sleep(7)\"\n"
         )
         states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["quick"] === PASSED
@@ -94,8 +96,8 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
     @testset "a test_end expression is not charged to the item" begin
         dir = make_pkg(
             "SlowEnd",
-            "test/t_test.jl" => """@testitem "quick" timeout=3 begin\n    @test true\nend\n""",
-            "test/TestItems.toml" => "[profiles.default]\ntest_end = \"sleep(5)\"\n"
+            "test/t_test.jl" => """@testitem "quick" timeout=5 begin\n    @test true\nend\n""",
+            "test/TestItems.toml" => "[profiles.default]\ntest_end = \"sleep(7)\"\n"
         )
         states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["quick"] === PASSED

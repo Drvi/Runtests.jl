@@ -98,7 +98,7 @@ end
 # most 1032-fold, so a length claiming more is garbled, and is refused before it
 # sizes an allocation.
 function zlib_uncompress(data::Vector{UInt8}, len::Integer)
-    len <= 1032 * length(data) || error("$(length(data)) compressed bytes cannot inflate to $len")
+    len <= 1032 * Int64(length(data)) || error("$(length(data)) compressed bytes cannot inflate to $len")
     out = Vector{UInt8}(undef, len)
     n = Ref{Culong}(len)
     rc = ccall((:uncompress, libz), Cint, (Ptr{UInt8}, Ref{Culong}, Ptr{UInt8}, Culong),
@@ -815,9 +815,10 @@ function read_strings(io::IOBuffer, bytes::Vector{UInt8})
     n = bounded(read(io, UInt32), total)
     out = sizehint!(String[], n)
     for _ in 1:n
-        len = Int(read(io, UInt32))
+        len = read(io, UInt32)
         at = position(io)
-        at + len > total && break
+        # Against what is left: in a 32-bit `Int`, `at + len` wraps past the check.
+        len > total - at && break
         push!(out, GC.@preserve bytes unsafe_string(pointer(bytes, at + 1), len))
         skip(io, len)
     end
@@ -895,7 +896,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
     println(io, "  started ", started, took, rs.cancelled ? ", cancelled" : "", rs.aborted ? ", ended before its first item" : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
-        m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int, m("memory_bytes")), 0)), " · host ", m("host"))
+        m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
     flags = nondefault_flags(split(m("julia_flags")))

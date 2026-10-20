@@ -40,7 +40,9 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
     repo = repository_root(root)
     # The package's own path from the repository's root, empty at the root.
     prefix = repo === nothing ? String[] : filter!(!=("."), splitpath(relpath(abspath(root), repo)))
-    counts = Dict{String, Dict{Int, Int}}()
+    # Line => times run, which several workers add to: an `Int64`, as a 32-bit `Int`
+    # passes 2^31 and turns negative, and a negative count reads as a line not run.
+    counts = Dict{String, Dict{Int, Int64}}()
     for f in readdir(tracedir; join = true)
         endswith(f, ".info") || continue
         file = nothing
@@ -50,9 +52,9 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
             elseif startswith(line, "DA:") && file !== nothing
                 fields = split(line[4:end], ',')
                 length(fields) >= 2 || continue
-                l, n = tryparse(Int, fields[1]), tryparse(Int, fields[2])
+                l, n = tryparse(Int, fields[1]), tryparse(Int64, fields[2])
                 (l === nothing || n === nothing) && continue
-                lines = get!(Dict{Int, Int}, counts, file)
+                lines = get!(Dict{Int, Int64}, counts, file)
                 lines[l] = get(lines, l, 0) + n
             elseif line == "end_of_record"
                 file = nothing
@@ -64,7 +66,7 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
         for (d, _, names) in walkdir(joinpath(root, dir)), name in names
             endswith(name, ".jl") || continue
             path = joinpath(d, name)
-            lines = get!(Dict{Int, Int}, counts, join([prefix; splitpath(relpath(path, root))], '/'))
+            lines = get!(Dict{Int, Int64}, counts, join([prefix; splitpath(relpath(path, root))], '/'))
             for l in function_body_lines(path)
                 haskey(lines, l) || (lines[l] = 0)
             end

@@ -334,6 +334,10 @@ mutable struct Run
     coverage::Union{Nothing, CoverageSummary}
     # An editor's, when it asked for the run: each item's start and end go there.
     const events::Union{Nothing, EventStream}
+    # The caller's `on_item`, or nothing: none was given, one call threw, or the
+    # process is exiting. Called under `on_item_lock`, so calls never overlap.
+    @atomic on_item::Any
+    const on_item_lock::ReentrantLock
 end
 
 # One at a time in a process: a run, `chores` and a pasted item set the root paths
@@ -359,14 +363,15 @@ function exclusively(f)
 end
 
 """
-    execute(plan, target) -> Run
+    execute(plan, target; on_item = nothing) -> Run
 
 Run the plan to completion and return the run, whose `statuses` hold what
 happened to every item. Printing and the pass/fail verdict are `report`'s job,
 so a caller that wants to inspect the outcome does not have to catch anything.
-The caller holds the process (`exclusively`).
+The caller holds the process (`exclusively`). `on_item` is called with an
+[`ItemEvent`](@ref) as each attempt starts and ends.
 """
-function execute(p::Plan, target)
+function execute(p::Plan, target; on_item = nothing)
     cfg = p.cfg
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
@@ -377,7 +382,7 @@ function execute(p::Plan, target)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch,
         joinpath(scratch, "item_"), "", column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
-        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[]
+        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[], on_item, ReentrantLock()
     )
     run.events === nothing || (run.events.run = run)
     cfg.coverage && mkpath(coverage_dir(scratch))
@@ -1469,7 +1474,8 @@ function stall_limit(p::Plan)
     item = maximum(t -> t == USE_RUN_DEFAULT ? cfg.timeout_s : Int(t), p.items.timeout_s; init = cfg.timeout_s)
     init = any(prof -> !isempty(prof.init.args), p.profiles) ? cfg.init_timeout_s : 0
     test_end = any(prof -> !isempty(prof.test_end.args), p.profiles) ? cfg.test_end_timeout_s : 0
-    return Float64(item + init + test_end + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S)
+    # Summed as floats: three limits of up to 2^31 - 1 seconds each overflow a 32-bit `Int`.
+    return Float64(item) + init + test_end + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S
 end
 
 """
@@ -1843,6 +1849,9 @@ function report_unfinished_run()
         # for the monitor's task, and a task frozen by the exit holding either
         # would hang it.
         run.monitor === nothing || (@atomic run.monitor.stop = true)
+        # Not called from here: `on_item` is the caller's code, which may wait on the
+        # event loop, or on its lock held by a task the exit froze.
+        @atomic run.on_item = nothing
         # Nothing unwound, so the slots never recorded what they were holding.
         # They are frozen where they were, and each still names its item.
         foreach(slot -> record_stopped_item!(run, slot), run.slots)
@@ -2026,11 +2035,13 @@ end
 # truth and usually the answer. An outcome the run decides is timed from here.
 function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer)
     st = run.statuses
-    st.start[i] = Float32(time() - run.t0)
+    now = time()
+    st.start[i] = Float32(now - run.t0)
     st.pid[i] = Int32(pid)
     pid == 0 || @lock run.lock push!(run.item_pids, Int32(pid))
     pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
     run.events === nothing || event_item_started(run, i, attempt, slot, pid)
+    tell_on_item(run, i, :started, RUNNING, attempt, slot, now, 0.0, RuntestsWorkers.PerfStats(), false)
     return nothing
 end
 
@@ -2290,7 +2301,8 @@ function record!(
     st.slot[i] = slot
     # An outcome the item reported took what the item measured; one the run decided
     # took as long as the item held its worker.
-    st.elapsed[i] = synthetic ? max(0.0, ended - run.t0 - st.start[i]) : stats.elapsed_ns / 1.0e9
+    elapsed = synthetic ? max(0.0, ended - run.t0 - st.start[i]) : stats.elapsed_ns / 1.0e9
+    st.elapsed[i] = elapsed
     st.compile[i] = stats.compile_ns / 1.0e9
     st.testsets[i] = testset
     # What the run prints of a failure, kept beside the item's output for whoever
@@ -2307,6 +2319,84 @@ function record!(
     @atomic run.last_finish = time()
     report_item!(run, i, state, count_done!(run, i), note)
     run.events === nothing || event_item_finished(run, i, state, attempt, slot, note)
+    tell_on_item(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
+    return nothing
+end
+
+"""
+    ItemEvent
+
+What a function given as `runtests(on_item = f)` is called with, in this process:
+once as an attempt at a test item starts, `kind = :started`, and once as it ends,
+`kind = :finished`. A retry is another attempt, with a call of each.
+
+It says which item it is (`name`, `file`, `line`, `attempt`), where it ran (`worker`,
+numbered as the run's lines number them, `w1`, and `pid`, its process), when it
+started or ended (`time`, as `time()` gives it), and how it went (`state`: `:running`
+as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped`,
+`:broken_chain` or `:cancelled`). `pid` is 0 when no process ran the attempt: the run
+could not start a worker for it, or it is an item of a chain whose worker died before
+it ran, which has `worker` 0 as well.
+
+As it ends, it says what the attempt cost: `elapsed`, `cpu` (user and system time),
+`compile`, `recompile` (of `compile`) and `gc` in seconds, `allocated` in bytes,
+`allocations`, how many there were, and `maxrss`, the largest its process has been
+resident so far, in bytes. Every figure
+but `elapsed` is the whole process's, which runs one item at a time: its worker's,
+or with `workers = 0` this process's. `measured` says the item measured them itself.
+It is `false` as an attempt starts, and as it ends when the run decided the outcome,
+as for a timeout, a lost worker, a chain cut short or a stopped run: the figures are
+then 0, and `elapsed` is how long the attempt held its worker.
+"""
+struct ItemEvent
+    kind::Symbol
+    name::String
+    file::String
+    line::Int
+    attempt::Int
+    worker::Int
+    pid::Int
+    time::Float64
+    state::Symbol
+    measured::Bool
+    elapsed::Float64
+    cpu::Float64
+    compile::Float64
+    recompile::Float64
+    gc::Float64
+    # As wide as the worker's counters, which pass 2^31 on 32-bit platforms too: an
+    # item's allocations add up, and a 32-bit process can hold over 2 GiB.
+    allocated::Int64
+    allocations::Int64
+    maxrss::Int64
+end
+
+# The caller's `on_item` with one attempt's event, which is built only when there is
+# a function to call. A call that throws is reported and is the last: the function
+# is the caller's code, and a run goes on whatever its observer does.
+function tell_on_item(
+        run::Run, i::ItemIdx, kind::Symbol, state::ItemState, attempt::Int8, slot::Integer, at::Float64,
+        elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool
+    )
+    (@atomic run.on_item) === nothing && return nothing
+    p = run.plan
+    event = ItemEvent(
+        kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, run.statuses.pid[i],
+        at, Symbol(state_name(state)), measured, elapsed, stats.cpu_ns / 1.0e9, stats.compile_ns / 1.0e9,
+        stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss
+    )
+    @lock run.on_item_lock begin
+        # Read again: a call another task made while this one waited may have failed.
+        f = @atomic run.on_item
+        f === nothing && return nothing
+        try
+            f(event)
+        catch e
+            is_interrupt(e) && rethrow()
+            @atomic run.on_item = nothing
+            @error "Runtests: `on_item` threw for $(repr(event.name)), and is not called again in this run; the tests carry on" exception = (e, catch_backtrace())
+        end
+    end
     return nothing
 end
 

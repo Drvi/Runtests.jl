@@ -147,7 +147,7 @@ end)
             # Asked of the fixture, which is a package of its own and has no tests.
             ok, out = chores_out(fixture; dry_run = true)
             @test ok === true
-            @test occursin("test items: none, no test files under test", out) && occursin("nothing to do", out)
+            @test occursin("test items: none, no test files under $(joinpath("test", ""))\n", out) && occursin("nothing to do", out)
             done, _ = chores_out(fixture)
             @test done === true
             # Asked of the package around it, the fixture is no test file of its own.

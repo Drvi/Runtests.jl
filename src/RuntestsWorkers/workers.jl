@@ -368,34 +368,43 @@ and their processes with it. Assigned straight after the worker is spawned, befo
 it has run anything that could start a process. Anything that fails leaves the
 worker outside a job, as it would be without one.
 """
-function worker_job(pid::Integer)
-    (Sys.iswindows() && pid > 0) || return C_NULL
-    job = ccall((:CreateJobObjectW, "kernel32"), Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{UInt16}), C_NULL, C_NULL)
-    job == C_NULL && return C_NULL
-    limits = Ref(JobExtendedLimits(
-        JobBasicLimits(0, 0, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0, 0, 0, 0, 0, 0),
-        ntuple(_ -> UInt64(0), 6), 0, 0, 0, 0
-    ))
-    ok = ccall((:SetInformationJobObject, "kernel32"), Cint, (Ptr{Cvoid}, Cint, Ptr{JobExtendedLimits}, UInt32),
-               job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, limits, sizeof(JobExtendedLimits)) != 0
-    if ok
-        h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid}, (UInt32, Cint, UInt32),
-                  PROCESS_SET_QUOTA_AND_TERMINATE, 0, pid)
-        ok = h != C_NULL && ccall((:AssignProcessToJobObject, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), job, h) != 0
-        h == C_NULL || ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), h)
-    end
-    ok && return job
-    ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), job)
-    return C_NULL
-end
+function worker_job end
 
-# End every process the job holds, and close it. The caller owns `job` and passes
-# it here once.
-function end_job!(job::Ptr{Cvoid})
-    job == C_NULL && return nothing
-    ccall((:TerminateJobObject, "kernel32"), Cint, (Ptr{Cvoid}, UInt32), job, 1)
-    ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), job)
-    return nothing
+# The Windows API is `stdcall`, which only 32-bit Windows tells apart from C's, and
+# which LLVM refuses to compile for other processors: the calls exist on Windows only.
+@static if Sys.iswindows()
+    function worker_job(pid::Integer)
+        pid > 0 || return C_NULL
+        job = ccall((:CreateJobObjectW, "kernel32"), stdcall, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{UInt16}), C_NULL, C_NULL)
+        job == C_NULL && return C_NULL
+        limits = Ref(JobExtendedLimits(
+            JobBasicLimits(0, 0, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0, 0, 0, 0, 0, 0),
+            ntuple(_ -> UInt64(0), 6), 0, 0, 0, 0
+        ))
+        ok = ccall((:SetInformationJobObject, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, Cint, Ptr{JobExtendedLimits}, UInt32),
+                   job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, limits, sizeof(JobExtendedLimits)) != 0
+        if ok
+            h = ccall((:OpenProcess, "kernel32"), stdcall, Ptr{Cvoid}, (UInt32, Cint, UInt32),
+                      PROCESS_SET_QUOTA_AND_TERMINATE, 0, pid)
+            ok = h != C_NULL && ccall((:AssignProcessToJobObject, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, Ptr{Cvoid}), job, h) != 0
+            h == C_NULL || ccall((:CloseHandle, "kernel32"), stdcall, Cint, (Ptr{Cvoid},), h)
+        end
+        ok && return job
+        ccall((:CloseHandle, "kernel32"), stdcall, Cint, (Ptr{Cvoid},), job)
+        return C_NULL
+    end
+
+    # End every process the job holds, and close it. The caller owns `job` and passes
+    # it here once.
+    function end_job!(job::Ptr{Cvoid})
+        job == C_NULL && return nothing
+        ccall((:TerminateJobObject, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, UInt32), job, 1)
+        ccall((:CloseHandle, "kernel32"), stdcall, Cint, (Ptr{Cvoid},), job)
+        return nothing
+    end
+else
+    worker_job(::Integer) = C_NULL
+    end_job!(::Ptr{Cvoid}) = nothing
 end
 
 ### Interrupts #############################################################

@@ -98,7 +98,7 @@ function check_suite!(io::IO, target)
     # has nothing to run and says so.
     walked = walk_test_dir(target.testdir; claimed = claimed_environments(config_toml(target.testdir, nothing)...))
     if all(isempty, (walked.tests, walked.strays, walked.templates, walked.unclaimed))
-        println(io, "test items: none, no test files under ", relpath_or_path(target.testdir, target.root))
+        println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir, target.root), ""))
         return 0, Set{String}()
     end
     try

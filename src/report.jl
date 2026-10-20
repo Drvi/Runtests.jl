@@ -588,14 +588,15 @@ function parse_record(line::AbstractString)
     stop = ncodeunits(line)
     lo = ncodeunits(RECORD_MARK) + 1
     word = :other
-    n, k = (0, 0, 0, 0, 0, 0), -1   # k: the numbers read, after the word
+    # `Int64` rather than `Int`: in 32 bits, nanoseconds pass 2^31 in 2.1 seconds.
+    n, k = ntuple(_ -> Int64(0), Val(6)), -1   # k: the numbers read, after the word
     while true
         sp = something(findnext(' ', line, lo), stop + 1)
         field = SubString(line, lo, prevind(line, sp))
         if k < 0
             word = field == "RUN" ? :run : field == "DONE" ? :done : :other
         else
-            v = tryparse(Int, field)
+            v = tryparse(Int64, field)
             (v === nothing || k == length(n)) && return nothing
             n = Base.setindex(n, v, k + 1)
         end

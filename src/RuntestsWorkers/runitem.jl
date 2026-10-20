@@ -23,9 +23,11 @@ is_non_pass(s::ItemState) = !(s === PASSED || s === SKIPPED || s === UNSEEN)
 
 Base.@kwdef struct PerfStats
     elapsed_ns   :: UInt64 = 0
+    cpu_ns       :: UInt64 = 0   # user and system time of the whole process, every thread
     compile_ns   :: UInt64 = 0
     recompile_ns :: UInt64 = 0
     bytes        :: Int64  = 0
+    allocs       :: Int64  = 0
     gc_ns        :: Int64  = 0
     maxrss       :: UInt64 = 0   # the worker process's largest resident size so far, when the item ended
 end
@@ -105,23 +107,72 @@ is process-level: it is visible to every task and inherited by subprocesses.
 """
 in_test_run() = haskey(ENV, "RUNTESTS_RUN_ID")
 
+"""
+    cpu_time_ns() -> UInt64
+
+The user and system time this process has used, over all its threads, in
+nanoseconds. On Windows from `GetProcessTimes`: libuv's `uv_getrusage` goes through
+a calendar time there and drops whole days, so its reading wraps every 24 hours of
+CPU time.
+"""
+function cpu_time_ns end
+
+@static if Sys.iswindows()
+    function cpu_time_ns()
+        # FILETIMEs, in units of 100 ns.
+        created, exited, kernel, user = Ref{UInt64}(0), Ref{UInt64}(0), Ref{UInt64}(0), Ref{UInt64}(0)
+        process = ccall((:GetCurrentProcess, "kernel32"), stdcall, Ptr{Cvoid}, ())
+        ok = ccall((:GetProcessTimes, "kernel32"), stdcall, Cint,
+                   (Ptr{Cvoid}, Ref{UInt64}, Ref{UInt64}, Ref{UInt64}, Ref{UInt64}), process, created, exited, kernel, user)
+        Base.windowserror(:GetProcessTimes, ok == 0)
+        return (kernel[] + user[]) * UInt64(100)
+    end
+else
+    # libuv's `uv_timeval_t` as Julia's libuv declares it (`include/julia/uv.h`): an
+    # `int64_t` of seconds and an `int32_t` of microseconds, not upstream libuv's two
+    # `long`s. A field declared wider reads the padding after it, which libuv never
+    # writes, and on 32-bit platforms makes the struct smaller than the one libuv fills.
+    struct UvTimeval
+        sec  :: Int64
+        usec :: Int32
+    end
+
+    # libuv's `uv_rusage_t`: user and system time, then fourteen counters.
+    struct UvRusage
+        utime    :: UvTimeval
+        stime    :: UvTimeval
+        counters :: NTuple{14, UInt64}
+    end
+
+    function cpu_time_ns()
+        r = Ref{UvRusage}()
+        Base.uv_error("getrusage", ccall(:uv_getrusage, Cint, (Ref{UvRusage},), r))
+        u, s = r[].utime, r[].stime
+        return UInt64(u.sec + s.sec) * UInt64(1_000_000_000) + UInt64(u.usec + s.usec) * UInt64(1_000)
+    end
+end
+
 # `f()`, with what it cost put in `stats` even when it throws: an item that errors
 # took time too, and that time is what the next run schedules it by. Compilation
 # is kept apart because on a compilation-heavy suite it is what explains the run.
+# Every figure but the time is the whole process's, which runs one item at a time.
 function timed!(f, stats::Base.RefValue{PerfStats})
     gc0 = Base.gc_num()
     t0 = Base.time_ns()
+    cpu0 = cpu_time_ns()
     Base.cumulative_compile_timing(true)
     c0 = Base.cumulative_compile_time_ns()
     try
         return f()
     finally
         elapsed = Base.time_ns() - t0
+        cpu = cpu_time_ns() - cpu0
         Base.cumulative_compile_timing(false)
         c = Base.cumulative_compile_time_ns() .- c0
         diff = Base.GC_Diff(Base.gc_num(), gc0)
-        stats[] = PerfStats(; elapsed_ns = elapsed, compile_ns = first(c), recompile_ns = last(c),
-                            bytes = diff.allocd, gc_ns = diff.total_time, maxrss = Sys.maxrss())
+        stats[] = PerfStats(; elapsed_ns = elapsed, cpu_ns = cpu, compile_ns = first(c), recompile_ns = last(c),
+                            bytes = diff.allocd, allocs = Base.gc_alloc_count(diff), gc_ns = diff.total_time,
+                            maxrss = Sys.maxrss())
     end
 end
 

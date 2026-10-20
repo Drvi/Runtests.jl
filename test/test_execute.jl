@@ -563,4 +563,116 @@ end
         wait(watcher)
         @test peak[] <= 2
     end
+
+    @testset "on_item" begin
+        # Through `runtests`, outside any testset: the failures are the fixture's.
+        function heard(on_item, pkg; kwargs...)
+            return capture_run() do
+                try
+                    Runtests.Private.without_enclosing_testset() do
+                        Runtests.runtests(pkg; logs = :issues, monitor = false, on_item, kwargs...)
+                    end
+                catch e
+                    e isa Test.TestSetException || rethrow()
+                end
+            end
+        end
+
+        @testset "is called as each attempt starts and as it ends, with what the item measured" begin
+            events = Runtests.ItemEvent[]
+            with_marker_dir() do _
+                heard(ev -> push!(events, ev), FAULTY; workers = 1,
+                      name = r"^(passes|passes on the second try|chain start kills the worker|chain rest must not run)$")
+            end
+            kinds = Dict{Tuple{String, Int}, Vector{Symbol}}()
+            for ev in events
+                push!(get!(kinds, (ev.name, ev.attempt), Symbol[]), ev.kind)
+            end
+            @test length(kinds) == 5   # the retried item twice
+            @test all(==([:started, :finished]), values(kinds))
+            @test all(ev -> ev.state === :running && !ev.measured && ev.elapsed == 0, filter(ev -> ev.kind === :started, events))
+            ended = Dict((ev.name, ev.attempt) => ev for ev in events if ev.kind === :finished)
+            @test ended[("passes on the second try", 1)].state === :failed
+            @test ended[("passes on the second try", 2)].state === :passed
+            passed = ended[("passes", 1)]
+            @test passed.state === :passed && passed.measured
+            @test passed.file == joinpath(FAULTY, "test", "faults_test.jl") && passed.line == 1
+            @test passed.worker == 1 && passed.pid > 0
+            @test passed.elapsed > 0 && passed.compile >= passed.recompile >= 0 && passed.maxrss > 0
+            # An outcome the run decided has nothing the item measured.
+            died = ended[("chain start kills the worker", 1)]
+            @test died.state === :errored && !died.measured && died.pid > 0
+            rest = ended[("chain rest must not run", 1)]
+            @test rest.state === :broken_chain && !rest.measured && rest.worker == 0 && rest.pid == 0
+            for ev in (died, rest)
+                @test ev.cpu == ev.compile == ev.recompile == ev.gc == 0 && ev.allocated == ev.allocations == ev.maxrss == 0
+            end
+        end
+
+        @testset "hears what an attempt cost, on a worker and in this process" begin
+            pkg = make_pkg("Costs", "test/costs_test.jl" => """
+                @testitem "works" begin
+                    function spin(n)
+                        s = 0.0
+                        for i in 1:n
+                            s += sqrt(i)
+                        end
+                        return s
+                    end
+                    @test spin(2 * 10^8) > 0
+                    @test length(zeros(10^7)) == 10^7
+                    @test length([Ref(i) for i in 1:10^5]) == 10^5
+                    GC.gc()
+                end
+                @testitem "waits" begin
+                    sleep(0.5)
+                    @test true
+                end
+                """)
+            for workers in (0, 1)
+                events = Runtests.ItemEvent[]
+                heard(ev -> ev.kind === :finished && push!(events, ev), pkg; workers)
+                works, waits = (only(filter(ev -> ev.name == n, events)) for n in ("works", "waits"))
+                @test all(ev -> ev.state === :passed && ev.measured && ev.maxrss > 0, events)
+                @test works.cpu > 0.05 && works.compile > 0 && works.gc > 0
+                @test works.allocated >= 8 * 10^7 && works.allocations >= 10^5
+                # CPU time, not the time that passed.
+                @test waits.elapsed >= 0.5 && waits.cpu < waits.elapsed / 2
+                workers == 0 && @test all(ev -> ev.pid == getpid(), events)
+            end
+        end
+
+        @testset "calls come one at a time" begin
+            inside, overlapped, calls = Ref(false), Ref(false), Ref(0)
+            heard(BASICPKG; workers = 2) do _
+                inside[] && (overlapped[] = true)
+                inside[] = true
+                calls[] += 1
+                sleep(0.1)   # yields: another slot's call would run meanwhile
+                inside[] = false
+            end
+            @test calls[] == 2 * 6
+            @test !overlapped[]
+        end
+
+        @testset "a call that throws is reported, and the run goes on without it" begin
+            calls = Ref(0)
+            _, out = heard(_ -> (calls[] += 1; error("the observer broke")), BASICPKG; workers = 1)
+            @test calls[] == 1
+            @test count("`on_item` threw", out) == 1
+            @test occursin("the observer broke", out)
+            @test occursin("all passed", out)
+        end
+
+        @testset "a value that cannot take an ItemEvent is refused before anything runs" begin
+            for bad in (1, (x::Int) -> x)
+                e = try
+                    Runtests.runtests(BASICPKG; on_item = bad)
+                catch e
+                    e
+                end
+                @test e isa ArgumentError && occursin("`on_item` must be a function that takes a `Runtests.ItemEvent`", e.msg)
+            end
+        end
+    end
 end

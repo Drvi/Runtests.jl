@@ -348,7 +348,7 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
                         "`n` in the body names a loop variable, which nothing binds in the item: write `\$n` where its value goes, `\"\$(\$n)\"` in a string",
                         "the body interpolates only a loop variable, as `\$x`, since a `\$(...)` there may be a macro's",
                         "no skip list today",
-                        "`\$(Ref(n))` would be written `Base.RefValue{Int64}(1)`, which does not give its value back",
+                        "`\$(Ref(n))` would be written `$(repr(Ref(1)))`, which does not give its value back",
                         "ran no iteration, so it declares no test item",
                         "ParseError"]
                 @test occursin(msg, out)

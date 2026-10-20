@@ -110,26 +110,19 @@ end
 
 ### Windows ################################################################
 
-# PROCESS_MEMORY_COUNTERS: cb, PageFaultCount (UInt32 each), then SIZE_T fields;
-# WorkingSetSize is the second SIZE_T.
-function rss_windows(pid::Integer)
-    handle = ccall(:OpenProcess, Ptr{Cvoid}, (UInt32, Cint, UInt32), 0x1000, 0, UInt32(pid))
-    handle == C_NULL && return Int64(-1)
-    try
-        buf = zeros(UInt8, 80)
-        reinterpret(UInt32, @view buf[1:4])[1] = UInt32(length(buf))
-        ok = ccall(
-            :K32GetProcessMemoryInfo, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32),
-            handle, buf, UInt32(length(buf))
-        )
-        ok == 0 && return Int64(-1)
-        return Int64(only(reinterpret(UInt64, @view buf[17:24])))
-    catch e
-        is_interrupt(e) && rethrow()
-        return Int64(-1)
-    finally
-        ccall(:CloseHandle, Cint, (Ptr{Cvoid},), handle)
-    end
+# PROCESS_MEMORY_COUNTERS, as `GetProcessMemoryInfo` fills it: two `DWORD`s, then
+# `SIZE_T`s, which are as wide as a pointer.
+struct ProcessMemoryCounters
+    cb::UInt32
+    page_fault_count::UInt32
+    peak_working_set::Csize_t
+    working_set::Csize_t
+    quota_peak_paged_pool::Csize_t
+    quota_paged_pool::Csize_t
+    quota_peak_nonpaged_pool::Csize_t
+    quota_nonpaged_pool::Csize_t
+    pagefile::Csize_t
+    peak_pagefile::Csize_t
 end
 
 # PROCESSENTRY32W, as `Process32FirstW` and `Process32NextW` fill it: 568 bytes on
@@ -150,33 +143,67 @@ end
 const TH32CS_SNAPPROCESS = UInt32(0x2)
 const INVALID_HANDLE_VALUE = reinterpret(Ptr{Cvoid}, typemax(UInt))
 
-# Every process on the machine, `pid => parent pid`, from one toolhelp snapshot.
-# Windows keeps no list of a process's children, only each process's parent.
-function process_parents_windows()
-    out = Pair{Int32, Int32}[]
-    snap = ccall((:CreateToolhelp32Snapshot, "kernel32"), Ptr{Cvoid}, (UInt32, UInt32), TH32CS_SNAPPROCESS, 0)
-    snap == INVALID_HANDLE_VALUE && return out
-    try
-        entry = Ref(ProcessEntry32W(sizeof(ProcessEntry32W), 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0x0000, 260)))
-        ok = ccall((:Process32FirstW, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
-        while ok != 0
-            push!(out, Int32(entry[].pid) => Int32(entry[].parent_pid))
-            ok = ccall((:Process32NextW, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
-        end
-    catch e
-        is_interrupt(e) && rethrow()
-    finally
-        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), snap)
-    end
-    return out
-end
-
 # The children of each pid, as a function, from a list of `pid => parent`. A pid
 # Windows has reused since a parent exited can name a process that was never the
 # parent's child; a snapshot cannot tell them apart.
 children_in(parents) = pid -> Int32[c for (c, p) in parents if p == pid && c != pid]
 
-children_windows(pid::Integer) = children_in(process_parents_windows())(pid)
+# The Windows API is `stdcall`, which only 32-bit Windows tells apart from C's, and
+# which LLVM refuses to compile for other processors: the calls exist on Windows only.
+@static if Sys.iswindows()
+    function rss_windows(pid::Integer)
+        handle = ccall(:OpenProcess, stdcall, Ptr{Cvoid}, (UInt32, Cint, UInt32), 0x1000, 0, UInt32(pid))
+        handle == C_NULL && return Int64(-1)
+        try
+            n = UInt32(sizeof(ProcessMemoryCounters))
+            counters = Ref(ProcessMemoryCounters(n, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            ok = ccall(
+                :K32GetProcessMemoryInfo, stdcall, Cint, (Ptr{Cvoid}, Ref{ProcessMemoryCounters}, UInt32),
+                handle, counters, n
+            )
+            ok == 0 && return Int64(-1)
+            return Int64(counters[].working_set)
+        catch e
+            is_interrupt(e) && rethrow()
+            return Int64(-1)
+        finally
+            ccall(:CloseHandle, stdcall, Cint, (Ptr{Cvoid},), handle)
+        end
+    end
+
+    # Every process on the machine, `pid => parent pid`, from one toolhelp snapshot.
+    # Windows keeps no list of a process's children, only each process's parent.
+    function process_parents_windows()
+        out = Pair{Int32, Int32}[]
+        snap = ccall((:CreateToolhelp32Snapshot, "kernel32"), stdcall, Ptr{Cvoid}, (UInt32, UInt32), TH32CS_SNAPPROCESS, 0)
+        snap == INVALID_HANDLE_VALUE && return out
+        try
+            entry = Ref(ProcessEntry32W(sizeof(ProcessEntry32W), 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0x0000, 260)))
+            ok = ccall((:Process32FirstW, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
+            while ok != 0
+                push!(out, Int32(entry[].pid) => Int32(entry[].parent_pid))
+                ok = ccall((:Process32NextW, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
+            end
+        catch e
+            is_interrupt(e) && rethrow()
+        finally
+            ccall((:CloseHandle, "kernel32"), stdcall, Cint, (Ptr{Cvoid},), snap)
+        end
+        return out
+    end
+
+    children_windows(pid::Integer) = children_in(process_parents_windows())(pid)
+
+    function available_fraction_windows()
+        buf = zeros(UInt8, 64)
+        reinterpret(UInt32, @view buf[1:4])[1] = UInt32(length(buf))
+        ok = ccall(:GlobalMemoryStatusEx, stdcall, Cint, (Ptr{UInt8},), buf)
+        ok == 0 && return -1.0
+        load = only(reinterpret(UInt32, @view buf[5:8]))
+        load > 100 && return -1.0
+        return (100 - Float64(load)) / 100
+    end
+end
 
 # The children of each process, as one function for a whole walk: on Windows every
 # listing is a snapshot of every process, so a walk takes one and reads it.
@@ -298,16 +325,6 @@ function cgroup_available()
     end
 end
 
-function available_fraction_windows()
-    buf = zeros(UInt8, 64)
-    reinterpret(UInt32, @view buf[1:4])[1] = UInt32(length(buf))
-    ok = ccall(:GlobalMemoryStatusEx, Cint, (Ptr{UInt8},), buf)
-    ok == 0 && return -1.0
-    load = only(reinterpret(UInt32, @view buf[5:8]))
-    load > 100 && return -1.0
-    return (100 - Float64(load)) / 100
-end
-
 """
     available_fraction() -> Float64
 
@@ -380,6 +397,13 @@ const RUSAGE_SELF = Cint(0)
 const RUSAGE_CHILDREN = Cint(-1)
 const RUSAGE_BYTES = 256   # `struct rusage` is 144 on the 64-bit platforms; room to spare
 
+# `struct timeval` as `getrusage` fills it: seconds in a `long`, and microseconds in
+# a `long` too but for macOS's `int32_t`. On 32-bit Linux it is 8 bytes, not 16.
+struct Timeval
+    sec::Clong
+    usec::(Sys.isapple() ? Int32 : Clong)
+end
+
 """
     process_cpu_seconds() -> Float64
 
@@ -393,11 +417,9 @@ function process_cpu_seconds()
     buf = zeros(UInt8, RUSAGE_BYTES)
     for who in (RUSAGE_SELF, RUSAGE_CHILDREN)
         ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), who, buf) == 0 || return -1.0
-        # `ru_utime` then `ru_stime`, each a 16-byte `struct timeval`: seconds as an
-        # Int64, then microseconds. Those are an Int32 on macOS and an Int64 on
-        # Linux, below a million either way, so the low four bytes hold them.
-        for at in (0, 16)
-            total += reinterpret(Int64, buf[at .+ (1:8)])[1] + reinterpret(Int32, buf[at .+ (9:12)])[1] / 1e6
+        # `ru_utime` then `ru_stime`, where `struct rusage` starts.
+        for t in GC.@preserve buf unsafe_load(Ptr{NTuple{2, Timeval}}(pointer(buf)))
+            total += t.sec + t.usec / 1e6
         end
     end
     return total

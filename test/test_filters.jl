@@ -282,7 +282,7 @@ filtered(paths...; kwargs...) =
         _, out = capture_run() do
             prepare((dir,); name="step two")
         end
-        @test occursin("matching name = \"step two\"", out)
+        @test occursin("reading test files under $(joinpath("test", "")) matching name = \"step two\"", out)
         @test occursin("found 1 test item", out)
         _, plain = capture_run() do
             prepare((dir,); tags=:fast)

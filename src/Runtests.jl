@@ -109,6 +109,13 @@ downloaded from CI, say) and runs it again: the same items, settings, profiles,
 given here winning, and a warning naming each package whose version differs from
 the one recorded and each recorded item the suite no longer has.
 
+Each item: `on_item`, a function this process calls with an [`ItemEvent`](@ref) as
+each attempt at an item starts, and again as it ends with what the attempt cost: its
+time, CPU time, compilation, garbage collection, allocations and the memory of its
+process. The calls come one at a time from the run's own tasks, which wait for each,
+so a slow function slows the run. A call that throws is reported, the function is not
+called again, and the tests carry on.
+
 The execution and output settings can also be set under `[run]` in
 `test/TestItems.toml`, which also declares profiles, groups and forced ordering, and
 by a variable `RUNTESTS_<SETTING>` (`RUNTESTS_WORKERS`, say), which the run's header
@@ -117,7 +124,10 @@ current directory, which has to exist; nothing but this keyword makes a run read
 one. A mistake in the call, such as a misspelled keyword or a value out of range, is
 an `ArgumentError`; one in a file or an environment variable is a `ConfigError`.
 """
-function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, kwargs...)
+function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, on_item = nothing, kwargs...)
+    on_item === nothing || hasmethod(on_item, Tuple{ItemEvent}) || throw(ArgumentError(
+        "`on_item` must be a function that takes a `Runtests.ItemEvent`, got $(repr(on_item))"
+    ))
     return exclusively() do
         # A dry run says what it found in its own block, with the plan.
         p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
@@ -125,7 +135,7 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
             print_plan(stdout, p)
             return nothing
         end
-        run = execute(p, target)
+        run = execute(p, target; on_item)
         try
             return RunTestSet(report(run))
         finally
@@ -176,7 +186,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     # How many of the failing items on record the suite has is known once it is read.
     announce && println(
         stdout, label_prefix(), "reading test files under ",
-        relpath_or_path(target.testdir, target.root),
+        joinpath(relpath_or_path(target.testdir, target.root), ""),
         name isa FailingItems ? " for the items failing on record" :
             is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
@@ -199,7 +209,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
         isempty(errors) || throw(ScanFailure(errors))
         throw(
             NoTestsError(
-                "no test files found under $(relpath_or_path(target.testdir)); test files are " *
+                "no test files found under $(joinpath(relpath_or_path(target.testdir), "")); test files are " *
                     "named `*_test.jl` or `*_tests.jl` and live under `test/`"
             )
         )
@@ -684,7 +694,7 @@ end # module Private
 using Test
 using .Private: @testitem, @testtemplate, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
-    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 
 export @testitem, @testtemplate, runtests, runtestsf, chores
 
@@ -698,6 +708,6 @@ end
 
 public current_testitem, in_testitem, in_test_run,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
-    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 
 end # module Runtests

@@ -117,6 +117,29 @@ end
         end
     end
 
+    Sys.iswindows() || @testset "the CPU reading declares libuv's fields as wide as libuv writes them" begin
+        # libuv writes each field and leaves the padding as it was. Filled with ones
+        # first, a field declared wider than libuv's reads ones where its value ends.
+        buf = fill(0xff, sizeof(RuntestsWorkers.UvRusage))
+        r = GC.@preserve buf begin
+            @test ccall(:uv_getrusage, Cint, (Ptr{UInt8},), buf) == 0
+            unsafe_load(Ptr{RuntestsWorkers.UvRusage}(pointer(buf)))
+        end
+        @test all(t -> 0 <= t.sec < 10^7 && 0 <= t.usec < 10^6, (r.utime, r.stime))
+        a = RuntestsWorkers.cpu_time_ns()
+        @test 0 < a <= RuntestsWorkers.cpu_time_ns()
+    end
+
+    @testset "a DONE record reads back whole, its numbers past 2^31 included" begin
+        # A 32-bit `Int` holds 2.1 seconds of nanoseconds and 2 GiB.
+        spec = probe_spec(:(@test true))
+        stats = RuntestsWorkers.PerfStats(; elapsed_ns = 3_000_000_000, compile_ns = 2_500_000_000, maxrss = 5_000_000_000)
+        line = RuntestsWorkers.record_done(spec, ItemResult(spec.index, PASSED, Test.DefaultTestSet("probe"), stats))
+        rec = Runtests.Private.parse_record(line)
+        @test rec !== nothing && rec.how.state === PASSED
+        @test rec !== nothing && (rec.how.elapsed_ns, rec.how.compile_ns, rec.how.maxrss) == (3_000_000_000, 2_500_000_000, 5_000_000_000)
+    end
+
     @testset "a worker evaluates, runs items, reports errors as text, and stops" begin
         out = IOBuffer()
         w = Worker(; threads="1", redirect_io=out)

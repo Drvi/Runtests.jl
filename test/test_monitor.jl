@@ -112,8 +112,12 @@ end
         # The C layout rules for these fields are the same on every 64-bit
         # platform, so a field moved or resized fails here, and not only where
         # Windows would read the wrong bytes.
+        offset(T, f) = fieldoffset(T, findfirst(==(f), fieldnames(T)))
+        # Two `DWORD`s, then pointer-sized `SIZE_T`s: the same rule on every platform.
+        M = Runtests.Private.Platform.ProcessMemoryCounters
+        @test sizeof(M) == (Sys.WORD_SIZE == 64 ? 72 : 40)
+        @test offset(M, :working_set) == (Sys.WORD_SIZE == 64 ? 16 : 12)
         if Sys.WORD_SIZE == 64
-            offset(T, f) = fieldoffset(T, findfirst(==(f), fieldnames(T)))
             E = Runtests.Private.Platform.ProcessEntry32W
             @test sizeof(E) == 568
             @test offset(E, :pid) == 8

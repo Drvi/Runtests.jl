@@ -96,7 +96,7 @@ const RUN_KEYS = (
 )
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
-const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config)
+const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_item)
 
 # A keyword `runtests` does not take, with the nearest it does: a misspelled one would
 # otherwise be the one setting a run quietly goes without.
@@ -576,8 +576,8 @@ run_code_flags(cfg::RunConfig) = isempty(cfg.julia_flags) ? code_flags() : cfg.j
 nondefault_flags(flags) = String[f for f in flags if !(f in DEFAULT_CODE_FLAGS)]
 
 # A guess, not a measurement: too many workers is an OOM kill, and each extra one
-# compiles the same code again.
-const ASSUMED_WORKER_RSS = 4 * 2^30
+# compiles the same code again. An `Int64`: 4 GiB is 0 in a 32-bit `Int`.
+const ASSUMED_WORKER_RSS = Int64(4) * 2^30
 
 function auto_workers(threads::String, nunits::Int)
     # The CPUs this process may use: fewer than the machine's under a container

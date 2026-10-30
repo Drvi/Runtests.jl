@@ -335,6 +335,11 @@ end
         @test read_run_state(joinpath(mktempdir(), "not_a_file")) === nothing
         write(garbled, "not a run state at all")
         @test read_run_state(garbled) === nothing
+        # What the seeded garbling above hits depends on the machine's own text in the
+        # file. One case it found: flags that are no longer valid UTF-8.
+        rs = read_run_state(path)
+        rs.meta["julia_flags"] = "--check-bounds=yes \xf0\x80\x80\x84 -O3"
+        @test occursin("-O3", sprint(show, MIME"text/plain"(), rs))
     end
 
     @testset "a file with fewer items than statuses shows, and says what failed" begin

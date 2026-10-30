@@ -340,7 +340,7 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
     # The order the recording handed its items out in, whatever this checkout's says.
     order_first = String.(split(get(rs.meta, "order_first", ""), '\n'; keepempty = false))
     order_last = String.(split(get(rs.meta, "order_last", ""), '\n'; keepempty = false))
-    recorded = split(get(rs.meta, "julia_flags", ""))
+    recorded = split(get(rs.meta, "julia_flags", ""), ' '; keepempty = false)
     julia_flags = isempty(recorded) || recorded == code_flags() ? String[] : String.(recorded)
     if !isempty(julia_flags)
         for (name, prof) in profiles

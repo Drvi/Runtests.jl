@@ -900,7 +900,9 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
-    flags = nondefault_flags(split(m("julia_flags")))
+    # Split at the spaces they were joined with: a damaged file's text need not be valid
+    # UTF-8, and `split` at whitespace asks each character what it is.
+    flags = nondefault_flags(split(m("julia_flags"), ' '; keepempty = false))
     println(io, "  seed ", m("seed"), " · workers ", m("workers"), " · threads ", m("threads"), " · timeout ", m("timeout"),
         "s · retries ", m("retries"), isempty(flags) ? "" : string(" · ", join(flags, " ")),
         isempty(m("selection")) ? "" : string(" · selected ", m("selection")))

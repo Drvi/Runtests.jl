@@ -1,0 +1,115 @@
+name: CI ergonomics
+
+# What a project's CI gets from Runtests, checked end to end. The first job runs a fake
+# suite, test/testfixtures/FakeCI.jl, whose items fail in every way the README describes,
+# with the README's recipe for CI: `julia-runtest`, the run-state cache, and
+# `RUNTESTS_ARTIFACT_DIR` uploaded as an artifact. The second job downloads what the
+# first left, as a person would, and checks it: the run state, the logs, each failed
+# attempt's evidence, the cache, and the failing items run again from the download.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  FAKECI: test/testfixtures/FakeCI.jl
+
+jobs:
+  fake-run:
+    name: fake run - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Restore the run states of earlier runs
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/runtests
+          key: fakeci-runstates-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fakeci-runstates-${{ matrix.os }}-
+      - name: Run the fake suite, whose tests fail on purpose
+        id: suite
+        uses: julia-actions/julia-runtest@v1
+        # Its failure is checked by the next step, and what it left by the verify job.
+        continue-on-error: true
+        with:
+          project: ${{ env.FAKECI }}
+          coverage: false
+        env:
+          RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
+          RUNTESTS_HOST: ci-${{ matrix.os }}
+          RUNTESTS_ARTIFACT_DIR: ${{ runner.temp }}/runtests-artifact
+      - name: Check that the suite failed
+        if: steps.suite.outcome != 'failure'
+        shell: bash
+        run: |
+          echo "::error::the fake suite's tests ended with '${{ steps.suite.outcome }}'; they fail on purpose, so this has to be 'failure'"
+          exit 1
+      - name: Save the run states for the next run, without their logs
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/runtests
+            !${{ runner.temp }}/runtests/**/*.logs
+          key: fakeci-runstates-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload this run's run state, logs and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fakeci-${{ matrix.os }}
+          path: ${{ runner.temp }}/runtests-artifact
+          if-no-files-found: error
+
+  verify:
+    name: verify - ${{ matrix.os }}
+    needs: fake-run
+    # What a failed fake run left is checked too: it says what went wrong.
+    if: always()
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Download what the fake run uploaded
+        uses: actions/download-artifact@v4
+        with:
+          name: fakeci-${{ matrix.os }}
+          path: ${{ runner.temp }}/downloaded
+      - name: Restore the run states the fake run saved
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/runtests
+          key: fakeci-runstates-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+      - name: Instantiate the fake suite's test environment
+        run: julia --color=yes --project=${{ env.FAKECI }}/test -e "using Pkg; Pkg.instantiate()"
+      - name: Check what the fake run left
+        run: julia --color=yes --project=${{ env.FAKECI }}/test .github/scripts/verify_fake_run.jl
+        env:
+          FAKECI_ARTIFACT: ${{ runner.temp }}/downloaded
+          FAKECI_RUNSTATES: ${{ runner.temp }}/runtests

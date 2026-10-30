@@ -79,6 +79,7 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
                 println(stdout)
             end
             say(item, target, 1, outcome(result))
+            print_evidence(finish_here!(spec, result))
             return result.testset
         end
     end
@@ -121,7 +122,7 @@ end
 # The one item `what` picks from the whole suite, read the way a run reads it: an
 # exact name first, then a `Regex` matched against the names, or a path.
 function find_item(target, what::Union{String, Regex})
-    claimed = claimed_environments(config_toml(target.testdir, nothing)...)
+    claimed = suite_claims(target)
     files, strays, templates = walk_test_dir(target.testdir; claimed)
     items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, claimed)
     if what isa String

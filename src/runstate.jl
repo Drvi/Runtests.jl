@@ -260,7 +260,7 @@ seed_text(seed::UInt64) = string("0x", string(seed; base = 16, pad = 16))
 const REPLAYED_SETTINGS = (
     :workers => s -> parse(Int, s), :threads => identity,
     :timeout => s -> parse(Int, s), :init_timeout => s -> parse(Int, s),
-    :test_end_timeout => s -> parse(Int, s), :retries => s -> parse(Int, s),
+    :test_end_timeout => s -> parse(Int, s), :artifacts_timeout => s -> parse(Int, s), :retries => s -> parse(Int, s),
     :failfast => s -> parse(Bool, s), :item_failfast => s -> parse(Bool, s),
     :logs => Symbol, :memory_threshold => s -> parse(Float64, s),
     :seed => s -> parse(UInt64, s),
@@ -268,7 +268,8 @@ const REPLAYED_SETTINGS = (
 
 run_setting(cfg::RunConfig, key::Symbol) =
     key === :timeout ? cfg.timeout_s : key === :init_timeout ? cfg.init_timeout_s :
-    key === :test_end_timeout ? cfg.test_end_timeout_s : getfield(cfg, key)
+    key === :test_end_timeout ? cfg.test_end_timeout_s : key === :artifacts_timeout ? cfg.artifacts_timeout_s :
+    getfield(cfg, key)
 
 # Variables a run's behaviour can depend on, and the ones that find the CI job it
 # ran in. Anything that looks like a credential stays out: the file is meant to be
@@ -918,7 +919,8 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
         println(io, "    ", rpad(repr(it.name), 30), " ", rpad(string(st.state), 12), " attempt ", st.attempt,
             " · worker ", st.slot, " (pid ", st.pid, ") · ", fmt_seconds(st.elapsed), " · ", it.file, ":", it.line)
         i = findfirst(x -> x === it, rs.items)
-        kept = filter(isfile, [failure_path(prefix, i, max(st.attempt, 1)), item_log_path(prefix, i, max(st.attempt, 1))])
+        kept = filter(ispath, [failure_path(prefix, i, max(st.attempt, 1)), item_log_path(prefix, i, max(st.attempt, 1)),
+                               artifacts_path(prefix, i, max(st.attempt, 1))])
         isempty(kept) || println(io, "      ", join(kept, " · "))
     end
     downs = filter(e -> e.kind === :worker_down && e.ended_by !== :close, rs.events)

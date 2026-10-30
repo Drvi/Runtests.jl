@@ -4,6 +4,9 @@
 const TEST_FILE_SUFFIXES = ("_test.jl", "_tests.jl")
 const TESTSETUPS_DIR = "testsetups"
 const TESTTEMPLATES_DIR = "testtemplates"
+# Input to the suite's tests, which the suite itself never reads: packages, broken
+# projects and sources, reference files. Only the one at the top of `test/`.
+const TESTFIXTURES_DIR = "testfixtures"
 
 is_test_file(path::AbstractString) = any(s -> endswith(path, s), TEST_FILE_SUFFIXES)
 
@@ -15,36 +18,35 @@ Every test file under `testdir`, sorted. See [`walk_test_dir`](@ref).
 discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 
 """
-    walk_test_dir(testdir; claimed) -> (; tests, strays, templates, unclaimed)
+    walk_test_dir(testdir; claimed) -> (; tests, strays, templates)
 
 Every test file under `testdir`; an error for every other Julia file there, each
 saying where such a file belongs; and every test template, a `*_tests_template.jl`
 in `testtemplates/` (see [`expansion_errors`](@ref)). Each is sorted by path.
-Hidden files and directories and `testsetups/` are skipped. So is a directory with
-an environment of its own, a `Project.toml` or a `JuliaProject.toml`, unless a
-profile names it as its `environment` (`claimed`, from [`claimed_environments`](@ref)):
-then its files are read as any others are, and its items run under that profile.
-One that no profile names and that holds test files is in `unclaimed`, with how many:
-its tests do not run, and the run says so. The strays are reported, not skipped: a
-file of tests not named `*_test.jl` would otherwise never run, and the run would pass
-without it, and a template anywhere but `testtemplates/` would never be expanded.
+Hidden files and directories, `testsetups/`, and `testfixtures/` at the top of
+`testdir` are skipped. A directory with an environment of its own, a `Project.toml`
+or a `JuliaProject.toml`, is read when a profile names it as its `environment`
+(`claimed`, from [`claimed_environments`](@ref)), and its items run under that
+profile; any other is an error among the strays, whether or not it holds tests. The
+strays are reported, not skipped: a file of tests not named `*_test.jl` would
+otherwise never run, and the run would pass without it, a template anywhere but
+`testtemplates/` would never be expanded, and the tests of an environment nothing
+names would never run.
 """
 function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = Dict{String, Symbol}())
     tests, strays, templates = String[], ScanError[], String[]
-    unclaimed = Pair{String, Int}[]
-    isdir(testdir) || return (; tests, strays, templates, unclaimed)
+    isdir(testdir) || return (; tests, strays, templates)
     templates_dir = joinpath(testdir, TESTTEMPLATES_DIR)
-    projects = String[]
-    # A directory with a project of its own is not read, unless a profile claims it:
-    # told from the listing the walk reads anyway, and counted after the walk.
+    # Told from the listing the walk reads anyway.
     function enter(dir, entries)
         dir == testdir && return true
-        any(e -> !entry_isdir(e) && entry_name(e) in PROJECT_NAMES, entries) || return true
-        haskey(claimed, dir) && return true
-        push!(projects, dir)
+        i = findfirst(e -> !entry_isdir(e) && entry_name(e) in PROJECT_NAMES, entries)
+        (i === nothing || haskey(claimed, dir)) && return true
+        push!(strays, unclaimed_error(joinpath(dir, entry_name(entries[i])), testdir))
         return false
     end
-    descend(dir, d) = !(startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && d == TESTTEMPLATES_DIR))
+    descend(dir, d) = !(startswith(d, '.') || d == TESTSETUPS_DIR ||
+                        (dir == testdir && (d == TESTTEMPLATES_DIR || d == TESTFIXTURES_DIR)))
     walk_dirs(testdir; enter, descend) do dir, n
         startswith(n, '.') && return
         if is_test_file(n)
@@ -66,21 +68,19 @@ function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = 
             push!(strays, misplaced_template_error(path))
         end
     end
-    for path in projects
-        n = count_test_files(path)
-        n > 0 && push!(unclaimed, path => n)
-    end
-    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates),
-            unclaimed = sort!(unclaimed; by = first))
+    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates))
 end
 
-# The test files under `dir`, hidden ones aside, for saying how many a run leaves out.
-function count_test_files(dir::AbstractString)
-    n = Ref(0)
-    walk_dirs(dir; descend = (_, d) -> !startswith(d, '.')) do _, f
-        !startswith(f, '.') && is_test_file(f) && (n[] += 1)
-    end
-    return n[]
+# An environment under `test/` that no profile names: one error for the directory,
+# at its project file, which is what either fix changes.
+function unclaimed_error(projectfile::AbstractString, testdir::AbstractString)
+    dir = dirname(projectfile)
+    return ScanError(
+        projectfile, 0,
+        "$(relpath_or_path(dir)) has an environment of its own, which no profile names. To run its tests, " *
+            "declare a profile with `environment = $(repr(relpath_or_path(dir, testdir)))` in test/TestItems.toml; " *
+            "if it is input for the tests, move it under `test/$TESTFIXTURES_DIR/`, which the suite does not read."
+    )
 end
 
 """
@@ -147,8 +147,8 @@ stray_error(path::AbstractString) = ScanError(
     path, 0,
     "not a test file. Test files are named `*_test.jl` or `*_tests.jl`, and test templates live in " *
         "`test/$TESTTEMPLATES_DIR/`; shared code goes in `test/$TESTSETUPS_DIR/` as a module that test " *
-        "items load with `using`; a directory with its own Project.toml or JuliaProject.toml is read only " *
-        "when a profile names it as its `environment`. Rename it, move it there, or remove it."
+        "items load with `using`; input for the tests, such as fixture source, goes in `test/$TESTFIXTURES_DIR/`, " *
+        "which the suite does not read. Rename it, move it there, or remove it."
 )
 
 misplaced_template_error(path::AbstractString) = ScanError(

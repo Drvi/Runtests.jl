@@ -1,7 +1,8 @@
 # Profiles that name an environment. A directory under `test/` with a Project.toml of
 # its own is read only when a profile names it as its `environment`; its items then
 # run under that profile, in a copy of that environment with the package under test
-# added by path, and a directory no profile names is reported as tests not run.
+# added by path, and a directory no profile names is an error. See test_fixtures.jl
+# for `test/testfixtures/`, which holds the projects the suite does not read.
 
 using Runtests.Private: prepare, nitems, read_config, claimed_environments, config_toml, ConfigError,
     ScanFailure, NoTestsError, environment_project, write_environment, replayed_config, read_run_state,
@@ -116,16 +117,16 @@ end
             @test occursin("is the `environment` of both [profiles.a] and [profiles.b]", msg)
             # Reading the test files checks the same, before the rest of the settings.
             write(joinpath(dir, "test", "TestItems.toml"), "[profiles.a]\nenvironment = \"qa\"\n[profiles.b]\nenvironment = \"qa\"\n")
-            @test_throws ConfigError claimed_environments(config_toml(joinpath(dir, "test"), nothing)...)
+            @test_throws ConfigError claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...)
             @test_throws ConfigError plan_of(dir)
         end
 
         @testset "the directories profiles name, and nothing else, are claimed" begin
             write(joinpath(dir, "test", "TestItems.toml"),
                   "[profiles.qa]\nenvironment = \"qa\"\n[profiles.fast]\nthreads = \"1\"\n")
-            @test claimed_environments(config_toml(joinpath(dir, "test"), nothing)...) == Dict(qa => :qa)
+            @test claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...) == Dict(qa => :qa)
             rm(joinpath(dir, "test", "TestItems.toml"))
-            @test isempty(claimed_environments(config_toml(joinpath(dir, "test"), nothing)...))
+            @test isempty(claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...))
         end
 
         @testset "a config file elsewhere names an environment relative to itself" begin
@@ -214,7 +215,7 @@ end
             msg = message_of(() -> plan_of(bad))
             @test occursin(joinpath("qa", "helpers.jl"), msg)
             @test occursin("not a test file", msg)
-            @test occursin("is read only when a profile names it as its `environment`", msg)
+            @test occursin("goes in `test/testfixtures/`", msg)
         end
 
         @testset "a path into an environment's directory is a path of the package's tests" begin
@@ -237,15 +238,15 @@ end
             write(joinpath(paths, "test", "TestItems.toml"),
                   "[profiles.qa]\nenvironment = \"qa\"\n[profiles.fx]\nenvironment = \"fixture\"\n")
             @test root("fixture", "test", "f_tests.jl") == paths
+            # A path into one no profile names stops the run as the whole suite does,
+            # and says how to fix it; so does the directory itself.
+            for path in (joinpath(paths, "test", "vendor", "v_tests.jl"), joinpath(paths, "test", "vendor"))
+                msg = message_of(() -> plan_of(path))
+                @test occursin("$(joinpath("test", "vendor")) has an environment of its own, which no profile names", msg)
+                @test occursin("`environment = \"vendor\"`", msg)
+            end
+            open(io -> println(io, "[profiles.vendor]\nenvironment = \"vendor\""), joinpath(paths, "test", "TestItems.toml"), "a")
             @test profiles_of(plan_of(joinpath(paths, "test", "fixture")))["fixture"] == (:fx, false)
-            # A path into one no profile names selects nothing, and says why.
-            msg = message_of(() -> plan_of(joinpath(paths, "test", "vendor", "v_tests.jl")))
-            @test occursin("$(joinpath("test", "vendor", "v_tests.jl")) is in $(joinpath("test", "vendor")), which " *
-                           "has an environment of its own; a profile with `environment = \"vendor\"` runs the tests there", msg)
-            # Given the directory itself, it says so of the directory.
-            msg = message_of(() -> plan_of(joinpath(paths, "test", "vendor")))
-            @test occursin("$(joinpath("test", "vendor")) has an environment of its own; a profile with `environment = \"vendor\"`", msg)
-            @test !occursin(" is in ", msg)
         end
 
         @testset "item names are one namespace across environments" begin
@@ -263,53 +264,60 @@ end
             "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test false\nend\n",
             "test/qa/sub/more_tests.jl" => "@testitem \"qa more\" begin\n    @test false\nend\n",
             "test/qa/notes.jl" => "# not a test file, and not this suite's to judge\n",
-            # No test files: nothing is being left out.
+            # No test files, and an error all the same.
             "test/vendor/Project.toml" => "[deps]\n",
             "test/vendor/vendored.jl" => "x = 1\n",
         )
-        note = "not run: 2 test files in $(joinpath("test", "qa")), which has an environment of its own; " *
-            "a profile with `environment = \"qa\"` runs them"
+        # The error of each, at its project file.
+        unclaimed(rel) = "$(joinpath("test", rel)) has an environment of its own, which no profile names"
 
-        @testset "are not read, and are counted" begin
-            p = plan_of(dir)
-            @test p.items.name == ["main"]
-            @test p.unclaimed == [joinpath(dir, "test", "qa") => 2]
+        @testset "are an error, with tests or without, that says both ways to fix it" begin
+            msg = message_of(() -> plan_of(dir))
+            @test occursin(unclaimed("qa"), msg)
+            @test occursin(unclaimed("vendor"), msg)
+            @test occursin("declare a profile with `environment = \"qa\"` in test/TestItems.toml", msg)
+            @test occursin("move it under `test/testfixtures/`", msg)
+            # Neither is read: the stray in `qa` is not this suite's to judge yet.
+            @test !occursin("notes.jl", msg)
+            @test !occursin("vendored.jl", msg)
         end
 
-        @testset "the dry run, the header and the conclusion say what was left out" begin
-            _, dry = capture_run(() -> Runtests.runtests(dir; dry_run = true))
-            @test occursin(note, dry)
-            @test !occursin("vendor", dry)
-            _, out = capture_run(() -> Runtests.runtests(dir; workers = 0, monitor = false))
-            @test count(note, out) == 2
-        end
-
-        @testset "chores says so too" begin
+        @testset "the dry run and chores say the same" begin
+            err = try
+                capture_run(() -> Runtests.runtests(dir; dry_run = true))
+                nothing
+            catch e
+                e
+            end
+            @test err isa ScanFailure
+            @test occursin(unclaimed("qa"), sprint(showerror, err))
             _, out = capture_run(() -> Runtests.chores(dir; dry_run = true))
-            @test occursin(note, out)
+            @test occursin(unclaimed("qa"), out)
+            @test occursin(unclaimed("vendor"), out)
         end
 
-        @testset "naming it runs it, and a project inside it that nothing names is left out" begin
+        @testset "naming it runs it, and a project inside it that nothing names is an error" begin
+            rm(joinpath(dir, "test", "vendor"); recursive = true)
             write(joinpath(dir, "test", "TestItems.toml"), "[profiles.qa]\nenvironment = \"qa\"\n")
             inner = joinpath(dir, "test", "qa", "inner")
             mkpath(inner)
-            write(joinpath(inner, "Project.toml"), "[deps]\n")
-            write(joinpath(inner, "inner_tests.jl"), "@testitem \"inner\" begin\nend\n")
+            write(joinpath(inner, "JuliaProject.toml"), "[deps]\n")
             # Read now, it is held to what any directory under `test/` is held to.
-            @test occursin(joinpath("qa", "notes.jl"), message_of(() -> plan_of(dir)))
+            msg = message_of(() -> plan_of(dir))
+            @test occursin(joinpath("qa", "notes.jl"), msg)
+            @test occursin(unclaimed(joinpath("qa", "inner")), msg)
+            @test occursin("`environment = $(repr(joinpath("qa", "inner")))`", msg)
+            @test occursin(joinpath("qa", "inner", "JuliaProject.toml"), msg)
             rm(joinpath(dir, "test", "qa", "notes.jl"))
-            p = plan_of(dir)
-            @test sort(p.items.name) == ["main", "qa", "qa more"]
-            @test p.unclaimed == [inner => 1]
-            _, dry = capture_run(() -> Runtests.runtests(dir; dry_run = true))
-            @test occursin("a profile with `environment = $(repr(joinpath("qa", "inner")))` runs them", dry)
+            rm(inner; recursive = true)
+            @test sort(plan_of(dir).items.name) == ["main", "qa", "qa more"]
             rm(joinpath(dir, "test", "TestItems.toml"))
         end
 
         @testset "a suite whose only tests are in one is told why there is nothing to run" begin
             only_there = make_pkg("EnvOnlyThere", "test/qa/Project.toml" => "[deps]\n",
                                   "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n")
-            @test_throws NoTestsError plan_of(only_there)
+            @test occursin(unclaimed("qa"), message_of(() -> plan_of(only_there)))
         end
 
         @testset "a replay reads the ones its recorded profiles ran in" begin

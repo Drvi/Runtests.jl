@@ -1,0 +1,2 @@
+using Runtests
+Runtests.runtests()

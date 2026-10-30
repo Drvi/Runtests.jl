@@ -28,7 +28,6 @@ function plan_block(p::Plan, order)
         println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
                 " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
         print_profiles(io, p)
-        print_unclaimed(io, p)
         print_env_settings(io, p.cfg)
         print_coverage_setting(io, p.cfg)
         estimated = any(>(0), p.units.est_s)
@@ -74,18 +73,6 @@ function print_profiles(io::IO, p::Plan)
         isempty(prof.init.args) || push!(parts, "init expression")
         isempty(prof.test_end.args) || push!(parts, "test end expression")
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
-    end
-    return nothing
-end
-
-# The tests the run leaves out because they are in an environment no profile names:
-# said at its start and at its end, since a run that passes without them reads as a
-# run of them.
-function print_unclaimed(io::IO, p::Plan)
-    for (dir, n) in p.unclaimed
-        println(io, "not run: ", plural(n, "test file"), " in ", relpath_or_path(dir, p.root),
-                ", which has an environment of its own; a profile with `environment = ",
-                repr(relpath_or_path(dir, joinpath(p.root, "test"))), "` runs them")
     end
     return nothing
 end
@@ -632,7 +619,6 @@ function print_run_header(run)
         println(io, "env: ", something(Base.active_project(), "none"))
         print_startup(io, p.startup)
         print_profiles(io, p)
-        print_unclaimed(io, p)
         print_env_settings(io, p.cfg)
         print_coverage_setting(io, p.cfg)
     end
@@ -768,7 +754,6 @@ function conclusion_text(run, ended::Symbol = :finished)
         monitor, coverage = run.monitor, run.coverage
         monitor === nothing || print_memory_summary(io, monitor; indent = "")
         coverage === nothing || print_coverage(io, coverage, p.root)
-        print_unclaimed(io, p)
         if run.runstate !== nothing
             print(io, "run state: ")
             printstyled(io, run.runstate.path; color = :light_black)
@@ -785,6 +770,9 @@ function conclusion_text(run, ended::Symbol = :finished)
                 printstyled(io, run.exported; color = :light_black)
                 println(io)
             end
+        end
+        print_evidence_kept(io, run)
+        if run.runstate !== nothing
             # What to type next, for whoever reads this in a CI log as much as here.
             if any(s -> is_non_pass(s) && s !== CANCELLED && s !== RUNNING, run.statuses.state)
                 print(io, "run the failing items again: ")
@@ -798,6 +786,30 @@ function conclusion_text(run, ended::Symbol = :finished)
         end
     end
     return label_block(head, body)
+end
+
+# The attempts whose evidence was kept, an item that passed on a retry among them,
+# each where it is: in the run's logs, or, without a run state, in a directory of its
+# own. Taken with `trylock`: the exit hook says this too, and a task the exit froze
+# may hold the lock.
+function print_evidence_kept(io::IO, run)
+    trylock(run.lock) || return nothing
+    kept = try
+        sort(run.evidence)
+    finally
+        unlock(run.lock)
+    end
+    isempty(kept) && return nothing
+    p = run.plan
+    println(io, "artifacts of ", plural(length(kept), "failed attempt"), ":")
+    for (i, attempt) in kept
+        # Which attempt, where the item could have had several.
+        which = attempts_for(p, p.items.unit[i]) > 1 ? string(" attempt ", attempt) : ""
+        print(io, "  ", repr(p.items.name[i]), which, ": ")
+        printstyled(io, attempt_artifacts(run, i, attempt); color = :light_black)
+        println(io)
+    end
+    return nothing
 end
 
 # Everything that is not a plain pass, in the order a reader cares about.
@@ -996,6 +1008,12 @@ function report_item!(run, i::ItemIdx, state::ItemState, n::Integer, msg::Abstra
         # would say it again, word for word.
         is_non_pass(state) && !run.statuses.synthetic[i] && print_failures(io, run, i)
         print_item_log(io, run, i, state)
+        # Where the attempt's evidence is: written, or about to be collected.
+        if is_non_pass(state) && run.statuses.artifacts[i] != 0
+            print(io, "artifacts: ")
+            printstyled(io, attempt_artifacts(run, i, run.statuses.attempt[i]); color = :light_black)
+            println(io)
+        end
     end
     isempty(body) && return nothing
     total = nitems(p)

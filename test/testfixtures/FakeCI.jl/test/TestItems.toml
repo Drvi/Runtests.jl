@@ -1,0 +1,4 @@
+[run]
+workers = 2
+# Short, so that the item whose producer hangs costs the run little.
+artifacts_timeout = 10

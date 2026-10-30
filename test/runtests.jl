@@ -24,7 +24,7 @@ let env = dirname(Base.active_project())
     env in LOAD_PATH || push!(LOAD_PATH, env)
 end
 
-const FIXTURES = joinpath(@__DIR__, "packages")
+const FIXTURES = joinpath(@__DIR__, "testfixtures")
 fixture(name) = joinpath(FIXTURES, name)
 
 include("helpers.jl")
@@ -37,6 +37,7 @@ const TEST_FILES = [
     "test_timeouts.jl",
     "test_sandbox.jl",
     "test_crashes.jl",
+    "test_artifacts.jl",
     "test_runner.jl",
     "test_execute.jl",
     "test_setups.jl",
@@ -57,6 +58,7 @@ const TEST_FILES = [
     "test_scan.jl",
     "test_plan.jl",
     "test_gating.jl",
+    "test_fixtures.jl",
     "test_config.jl",
     "test_precompile.jl",
     "test_debug.jl",

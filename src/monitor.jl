@@ -587,7 +587,19 @@ function print_status_line(io::IO, m::Monitor)
     print_age(io, run.t0 + Float64(s.t) - r.phase_entered)
     oldest = oldest_running(m)
     oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], RUNNING_WIDTH))
+    # A producer that takes long is not an item that hangs, and is said apart from one.
+    collecting = collecting_item(m)
+    collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
     return nothing
+end
+
+# An item whose failed attempt's producers a slot's worker is running, or 0 for none.
+function collecting_item(m::Monitor)
+    for slot in run_of(m).slots
+        i = @atomic slot.collecting
+        i == 0 || return i
+    end
+    return ItemIdx(0)
 end
 
 """
@@ -1014,12 +1026,12 @@ function guard!(m::Monitor)
     return nothing
 end
 
-# This process, and each worker not running an item: a request to one that is would
-# wait behind the item and hold up its `test_end`.
+# This process, and each worker not running an item or its producers: a request to
+# one that is would wait behind the item and hold up its `test_end`.
 function collect_idle_garbage!(run)
     GC.gc(true)
     for slot in run.slots
-        (@atomic slot.current) == 0 && collect_garbage(@atomic slot.worker)
+        (@atomic slot.current) == 0 && (@atomic slot.collecting) == 0 && collect_garbage(@atomic slot.worker)
     end
     return nothing
 end

@@ -96,15 +96,15 @@ function check_suite!(io::IO, target)
     # A package with no test files of any kind, a fixture package in another's
     # `test/` say, has no suite for chores to keep: nothing to do, where a run of it
     # has nothing to run and says so.
-    walked = walk_test_dir(target.testdir; claimed = claimed_environments(config_toml(target.testdir, nothing)...))
-    if all(isempty, (walked.tests, walked.strays, walked.templates, walked.unclaimed))
+    # The settings' own problems are said below, by the run's reading of them.
+    walked = walk_test_dir(target.testdir; claimed = suite_claims_or_none(target))
+    if all(isempty, (walked.tests, walked.strays, walked.templates))
         println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir, target.root), ""))
         return 0, Set{String}()
     end
     try
         p, _ = prepare((target.root,); announce = false, expansions = false, group = ALL_GROUP)
         println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
-        print_unclaimed(io, p)
         print(io, "config: ")
         if isfile(config)
             printstyled(io, relpath_or_path(config, target.root); color = :light_black)
@@ -117,7 +117,7 @@ function check_suite!(io::IO, target)
         e isa ConfigError && return print_problem(io, "config", e.msg), nothing
         e isa ScanFailure || e isa NoTestsError || rethrow()
         # Under a dry run the test files may be expansions `chores` has yet to write.
-        if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), walk_test_dir(target.testdir).templates)
+        if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), walked.templates)
             println(io, "test items: none to read until the templates are expanded")
             return 0, nothing
         end

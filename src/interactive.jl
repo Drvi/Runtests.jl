@@ -95,7 +95,7 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     setups = target === nothing ? Dict{Symbol, String}() : setup_modules(target.testdir)
     # An item from a file in a profile's environment runs under that profile, as in a run.
     owner = target === nothing ? DEFAULT_PROFILE :
-        owner_of(abspath(path), claimed_environments(config_toml(target.testdir, nothing)...))
+        owner_of(abspath(path), suite_claims(target))
     errors = ScanError[]
     item = parse_testitem(ex, path, Int32(source.line), errors, setups, owner)
     # `nothing` comes with the error that says why.
@@ -106,8 +106,10 @@ function run_interactive(ex::Expr, source::LineNumberNode)
         with_interactive_env(target) do
             sandboxed && return run_sandboxed(item, target).testset
             say(item, target, 1, nothing)
-            result = run_item(interactive_spec(item, target); printing = true)
+            spec = interactive_spec(item, target)
+            result = run_item(spec; printing = true)
             say(item, target, 1, outcome(result))
+            print_evidence(finish_here!(spec, result))
             return result.testset
         end
     end
@@ -172,11 +174,14 @@ item_location(item::RawItem, target) = string(
     isabspath(item.file) && target !== nothing ? relpath_or_path(item.file, target.root) : item.file, ":", item.line
 )
 
-function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UInt64 = rand(RandomDevice(), UInt64))
+# `prefix` is where its attempts keep their evidence (see `artifacts_path`), one for
+# all of them.
+function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UInt64 = rand(RandomDevice(), UInt64),
+                          prefix::String = interactive_artifacts_prefix())
     project = target === nothing ? "" : something(project_name_of(target.project), "")
     return ItemSpec(
         Int32(1), item.name, item.file, item.line, item.code, item.skip, item.failfast == 1,
-        project, item.profile, Int8(attempt), false, "", seed
+        project, item.profile, Int8(attempt), false, "", seed, artifacts_path(prefix, 1, attempt)
     )
 end
 
@@ -203,8 +208,10 @@ function run_sandboxed(item::RawItem, target)
     relay(io, pid, line) = let rec = parse_record(line)
         rec === nothing ? println(io, "      worker ", pid, " | ", line) : say(item, target, rec.attempt, rec.how)
     end
-    # One seed for every attempt, as a run's retries draw the same numbers.
+    # One seed for every attempt, as a run's retries draw the same numbers, and one
+    # place for their evidence.
     seed = rand(RandomDevice(), UInt64)
+    prefix = interactive_artifacts_prefix()
     for attempt in 1:attempts
         w = sandbox_worker(prof, target, relay)
         try
@@ -212,7 +219,7 @@ function run_sandboxed(item::RawItem, target)
                 RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)), limits.init_timeout_s,
                 TimeoutException(limits.init_timeout_s, "the `init` expression of profile `$(prof.name)`", "", "init_timeout")
             )
-            spec = interactive_spec(item, target, attempt, seed)
+            spec = interactive_spec(item, target, attempt, seed, prefix)
             fut = RuntestsWorkers.remote_run(w, spec)
             result = (
                 timeout === nothing ? fetch(fut) :
@@ -226,10 +233,17 @@ function run_sandboxed(item::RawItem, target)
                 )::ItemResult
                 result = merge_test_end(result, endres)
             end
+            print_evidence(finish_here!(spec, result; worker = w, limit = limits.artifacts_timeout_s))
             (!is_non_pass(result.state) || attempt == attempts) && break
         catch e
             e isa TimeoutException || rethrow()
             RuntestsWorkers.terminate!(w, :timeout)
+            wait(w)
+            # What the attempt wrote before it was stopped is kept, and said where.
+            dir = artifacts_path(prefix, 1, attempt)
+            isfile(artifacts_log_path(dir)) && note_evidence(dir, string("not collected: ", sprint(showerror, e),
+                                                                         ", so the producers did not run"))
+            (isdir(dir) || isfile(artifacts_log_path(dir))) && print_evidence(dir)
             attempt == attempts && rethrow()
         finally
             close(w)

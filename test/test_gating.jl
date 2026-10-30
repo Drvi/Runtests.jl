@@ -32,19 +32,19 @@ end
             "test/sub/more.jl" => "# and another\n",
             "test/testsetups/Setup.jl" => "module Setup end\n",
             "test/.hidden.jl" => "# not ours\n",
-            "test/vendor/Project.toml" => "name = \"Vendor\"\n",
-            "test/vendor/vendored.jl" => "# a subproject's own\n",
-            # A package of test helpers under the other name Julia gives a project
+            "test/testfixtures/vendor/Project.toml" => "name = \"Vendor\"\n",
+            "test/testfixtures/vendor/vendored.jl" => "# a subproject's own\n",
+            # A package the tests use, under the other name Julia gives a project
             # file, with tests of its own that are not this suite's.
-            "test/helpers/Tools/JuliaProject.toml" => "name = \"Tools\"\n",
-            "test/helpers/Tools/src/Tools.jl" => "module Tools end\n",
-            "test/helpers/Tools/test/runtests.jl" => "using Test\n",
-            "test/helpers/Tools/test/tools_test.jl" => "",
+            "test/testfixtures/Tools/JuliaProject.toml" => "name = \"Tools\"\n",
+            "test/testfixtures/Tools/src/Tools.jl" => "module Tools end\n",
+            "test/testfixtures/Tools/test/runtests.jl" => "using Test\n",
+            "test/testfixtures/Tools/test/tools_test.jl" => "",
         )
         tests, strays = walk_test_dir(joinpath(dir, "test"))
         @test map(basename, tests) == ["a_test.jl", "b_tests.jl"]
-        # `runtests.jl`, setups, hidden files and subprojects are all expected;
-        # the two loose files are not.
+        # `runtests.jl`, setups, hidden files and fixtures are all expected; the two
+        # loose files are not.
         @test map(e -> basename(e.file), strays) == ["helpers.jl", "more.jl"]
         @test discover(joinpath(dir, "test")) == tests
     end

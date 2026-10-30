@@ -36,7 +36,7 @@ using ..RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FA
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_test_run, run_item,
     with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK,
-    OncePerProcess
+    OncePerProcess, on_failure, artifacts_dir, ARTIFACT_FILES, ARTIFACT_PRODUCERS, artifacts_log_path
 
 include("types.jl")
 include("json.jl")
@@ -51,6 +51,7 @@ include("monitor.jl")
 include("coverage.jl")
 include("editor.jl")
 include("execute.jl")
+include("artifacts.jl")
 include("interactive.jl")
 include("debug.jl")
 include("setup_packages.jl")
@@ -93,6 +94,8 @@ is an error that says the nearest it does.
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
 expressions are timed separately from the items, and default to `timeout`),
+`artifacts_timeout` (what all the producers of one failed attempt may take together,
+see [`on_failure`](@ref); `timeout` by default),
 `retries`, `failfast`, `memory_threshold`, `full_stacktraces` (keep the
 framework's own frames in a failing item's stacktrace; trimmed by default), `seed`
 (every item draws its random numbers from this and its own name; random unless
@@ -176,8 +179,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     # Read before the test files: which directories the profiles' environments are
     # decides which files are read, and the group what is selected from them.
     config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
-    claimed = claimed_environments(config_path, toml)
-    rs === nothing || (claimed = replayed_claims(claimed, rs, target.root))
+    claimed = claimed_environments(target.testdir, config_path, toml)
+    rs === nothing || (claimed = replayed_claims(claimed, rs, target, config_path))
     selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
     filter = Filter(; name, tags, paths = target.paths, line = target.line,
                     group = select_group(read_groups(config_path, toml), config_path, group, selected))
@@ -191,16 +194,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
             is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
     t_files = time()
-    walked = walk_test_dir(target.testdir; claimed)
-    for path in target.paths, (dir, _) in walked.unclaimed
-        itself = rstrip_path(path) == dir
-        (itself || startswith(path, joinpath(dir, ""))) && throw(NoTestsError(string(
-            itself ? "" : string(relpath_or_path(path, target.root), " is in "), relpath_or_path(dir, target.root),
-            itself ? " has" : ", which has", " an environment of its own; a profile with `environment = ",
-            repr(relpath_or_path(dir, target.testdir)), "` runs the tests there"
-        )))
-    end
-    files, strays, templates = walked.tests, walked.strays, walked.templates
+    files, strays, templates = walk_test_dir(target.testdir; claimed)
     if isempty(files)
         # A stray file, or a template not expanded yet, is the likeliest reason there
         # is nothing to run, so it is what the run says rather than "no test files found".
@@ -254,8 +248,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
         strict_order = is_full_run(filter, target),
-        selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names,
-        unclaimed = walked.unclaimed
+        selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
@@ -311,15 +304,18 @@ end
 
 # The directories of the profiles' environments, with the recorded profiles in place
 # of this checkout's: a directory a recorded profile ran in is that profile's, and
-# its tests are read, whatever this checkout's TestItems.toml says of it now.
-function replayed_claims(claimed::Dict{String, Symbol}, rs::RunStateRecord, root::AbstractString)
-    out = Dict(dir => name for (dir, name) in claimed if !haskey(rs.profiles, name))
+# its tests are read, whatever this checkout's TestItems.toml, `config_path`, says of
+# it now. Checked as a config file's own are, before they are merged: a directory two
+# profiles name would otherwise go to whichever came last.
+function replayed_claims(claimed::Dict{String, Symbol}, rs::RunStateRecord, target, config_path::AbstractString)
+    owners = Pair{Symbol, String}[name => dir for (dir, name) in claimed if !haskey(rs.profiles, name)]
     for (name, prof) in rs.profiles
         isempty(prof.environment) && continue
-        env = isabspath(prof.environment) ? prof.environment : joinpath(root, prof.environment)
-        out[rstrip_path(normpath(env))] = name
+        env = isabspath(prof.environment) ? prof.environment : joinpath(target.root, prof.environment)
+        push!(owners, name => rstrip_path(normpath(env)))
     end
-    return out
+    check_environment_owners(string(config_path, " and the run state's profiles"), target.testdir, owners)
+    return Dict(dir => name for (name, dir) in owners)
 end
 
 # The recorded profiles in place of this checkout's, each preferences file written
@@ -409,7 +405,7 @@ end
 # Every item's name in the suite, read as a run reads it, the environments profiles
 # name included: a suite that does not parse throws here as it would there.
 function suite_item_names(target; config = nothing)
-    claimed = claimed_environments(config_toml(target.testdir, config)...)
+    claimed = suite_claims(target; config)
     files, strays, templates = walk_test_dir(target.testdir; claimed)
     names = String[]
     scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names, claimed)
@@ -456,17 +452,22 @@ function resolve_target(args)
     # paths too, since several paths select what any of them does.
     whole = false
     narrowing = String[]
+    fixtures = joinpath(t.testdir, TESTFIXTURES_DIR)
     for path in paths
         rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && (whole = true; continue)
-        if !startswith(path, joinpath(t.testdir, ""))
-            # In a monorepo, the likeliest path outside `test/` is another package's.
-            other = find_project(isdir(path) ? path : dirname(path))
-            other === nothing || dirname(other) == t.root || throw(ArgumentError(
-                "$(path) belongs to the package at $(dirname(other)), and $(first(paths)) to the one " *
-                    "at $(t.root): a call runs one package's tests, so give each package a call of its own"
-            ))
+        # Under `test/` too: a package kept there, a fixture say, is a suite of its own.
+        # In a monorepo, the likeliest path outside `test/` is another package's.
+        other = find_project(isdir(path) ? path : dirname(path))
+        other === nothing || dirname(other) == t.root || throw(ArgumentError(
+            "$(path) belongs to the package at $(dirname(other)), and $(first(paths)) to the one " *
+                "at $(t.root): a call runs one package's tests, so give each package a call of its own"
+        ))
+        startswith(path, joinpath(t.testdir, "")) ||
             throw(ArgumentError("$(path) is not under $(t.testdir); Runtests only reads test files from `test/`"))
-        end
+        (rstrip_path(path) == fixtures || startswith(path, joinpath(fixtures, ""))) && throw(ArgumentError(
+            "$(path) is in $(joinpath(fixtures, "")), which holds input for the tests and is not read as part of " *
+                "the suite; a package kept there runs as a suite of its own when a path inside it is given alone"
+        ))
         isdir(path) || is_test_file(path) || throw(
             ArgumentError(
                 "$(path) is not a test file; test files are named `*_test.jl` or `*_tests.jl`"
@@ -552,7 +553,9 @@ end
 # Whether `dir`, whose project file is `p`, is an environment of a package's tests
 # rather than a project of its own: a directory under the package's `test/` whose
 # project declares no package, or that a profile of the package names as its
-# `environment`. A package kept under `test/`, as a fixture is, is a project.
+# `environment`. A package kept under `test/`, as a fixture is, is a project. One in
+# `test/testfixtures/` is never a profile's, so the package's settings are not read
+# to find out, and a fixture runs whatever they hold.
 function is_test_environment(dir::AbstractString, p::AbstractString)
     testdir = dirname(rstrip_path(dir))
     while basename(testdir) != "test"
@@ -562,7 +565,8 @@ function is_test_environment(dir::AbstractString, p::AbstractString)
     end
     project_file_in(dirname(testdir)) === nothing && return false
     project_name_of(p) === nothing && return true
-    return haskey(claimed_environments(config_toml(testdir, nothing)...), rstrip_path(dir))
+    startswith(dir, joinpath(testdir, TESTFIXTURES_DIR, "")) && return false
+    return haskey(claimed_environments(testdir, config_toml(testdir, nothing)...), rstrip_path(dir))
 end
 
 # A run of a group is not of the whole suite, its default group's included: what a
@@ -693,7 +697,7 @@ end # module Private
 
 using Test
 using .Private: @testitem, @testtemplate, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
-    activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
+    on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 
 export @testitem, @testtemplate, runtests, runtestsf, chores
@@ -706,7 +710,7 @@ for name in names(Test)
     startswith(string(name), "@") && @eval export $name
 end
 
-public current_testitem, in_testitem, in_test_run,
+public current_testitem, in_testitem, in_test_run, on_failure, artifacts_dir,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 

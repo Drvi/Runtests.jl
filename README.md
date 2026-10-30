@@ -140,6 +140,9 @@ test/
   qa/
     Project.toml                   # an environment of its own, which a profile names
     aqua_tests.jl
+  testfixtures/                    # input for the tests, never read as part of the suite
+    Example/Project.toml
+    reference.png
   TestItems.toml                   # optional settings, ordering, groups, and profiles
 ```
 
@@ -150,9 +153,21 @@ across the suite.
 Every Julia file under `test/` must belong to one of the categories above.
 Unrecognized files stop the run with an error, so a misnamed test file cannot
 silently go untested. Hidden files and directories are excluded from discovery.
-A directory with its own `Project.toml` or `JuliaProject.toml` is read only when a
-profile names it as its [`environment`](#environments); a run lists the test files
-in any other such directory as not run.
+
+`test/testfixtures/` holds input for the tests: packages, projects and source that
+may be broken on purpose, reference images, data. A run, a dry run, `chores` and an
+editor never read it, count its tests or add it to `LOAD_PATH`. Only the directory
+of that name at the top of `test/` is reserved. A package kept there runs as a suite
+of its own when you give a path inside it alone, as in
+`runtests("test/testfixtures/Example")`. A path into it given with the suite's own
+paths is an error.
+
+Every other directory under `test/` with its own `Project.toml` or
+`JuliaProject.toml` must be a profile's [`environment`](#environments), whether or
+not it holds test files. A run stops on one that no profile names, and the error
+offers both fixes: declare a profile for it, or move it under `test/testfixtures/`.
+`test/Project.toml` itself is the test environment, and the setup packages in
+`test/testsetups/` are setups.
 
 **Filters select what runs, not what is validated.** Every run parses the entire
 suite and checks for duplicate names, even when you select a single item.
@@ -327,7 +342,7 @@ Runtests.chores()              # apply automatic fixes and report remaining prob
 - Expands templates and deletes generated files whose templates were removed.
 - Checks test items and `test/TestItems.toml`, reporting problems that need manual
   changes, including manually edited expansions. A package without test files, such
-  as a fixture package in another package's `test/`, has nothing to check.
+  as a fixture package in another package's `test/testfixtures/`, has nothing to check.
 - Deletes the run states that a run's own pruning deletes, by the same
   [retention rules](#storage-and-retention), with their logs, and those of a format
   this version does not read. Records from other machines are preserved.
@@ -448,9 +463,12 @@ environment's. The copy is resolved once a session, and again when a file it was
 built from changes; one that does not resolve stops the run before anything runs.
 
 The path is relative to the config file. A directory is one profile's
-environment, and never the `default` profile's. A directory with its own project
-that no profile names is not read; the dry run, the run's header and its closing
-block each say how many test files it holds.
+environment, and never the `default` profile's. It cannot be `test/` or a directory
+that holds it, and it cannot be in `test/testsetups/`, `test/testtemplates/` or
+`test/testfixtures/`, however the path is spelled. An environment outside `test/` is
+allowed, and the run still reads only `test/`. A directory with its own project
+that no profile names stops the run, as [Test files](#test-files) says. A replay
+holds the profiles it records to the same rules, together with this checkout's.
 
 ### Run options
 
@@ -460,6 +478,7 @@ block each say how many test files it holds.
 | `threads` | `"2,1"` | Each worker's Julia `--threads` value. |
 | `timeout` | `1800` | Seconds allowed per item attempt. |
 | `init_timeout`, `test_end_timeout` | `timeout` | Separate limits for profile hooks. |
+| `artifacts_timeout` | `timeout` | Seconds allowed for all the [producers](#evidence-from-a-failed-attempt) of one failed attempt together. |
 | `retries` | `0` | Additional attempts after failure, from 0 to 126. |
 | `failfast` | `false` | Stop the run after an item fails. |
 | `item_failfast` | `failfast` | Stop each item at its first failure. |
@@ -798,6 +817,89 @@ These are for test infrastructure: temporary directories, fixture paths, switchi
 off telemetry. Library code that changes what it does because it detects that it
 is under test stops testing the library. Loading Runtests in an item costs each worker
 a moment the first time.
+
+### Evidence from a failed attempt
+
+An item can keep files that explain a failure: outputs it writes while it runs, and
+files that producers (functions the item registers) write after the attempt has
+failed.
+
+```julia
+@testitem "image matches reference" begin
+    import Runtests
+    actual = render_scene()
+    reference = load_reference()
+
+    Runtests.on_failure() do dir
+        save(joinpath(dir, "actual.png"), actual)
+        save(joinpath(dir, "difference.png"), difference(actual, reference))
+    end
+
+    @test actual ≈ reference
+end
+
+@testitem "compiled program runs" begin
+    import Runtests
+    dir = Runtests.artifacts_dir()
+    executable = compile_program(dir)
+    @test success(run(ignorestatus(`$executable`)))
+end
+```
+
+`Runtests.artifacts_dir()` makes and returns the attempt's `files/` directory, the
+same one each time within an attempt. Write outputs there directly. Nothing is
+copied. `Runtests.on_failure(f)` registers a producer and returns `nothing`. It does
+not call `f`. If the attempt fails, Runtests calls each producer once, in the order
+of registration, with a directory of its own, `producer_<k>/`. The test owns the
+file names in both directories.
+
+An attempt fails when an assertion fails or the item throws, in its body or in its
+profile's `test_end`. A skipped item, an expected-broken assertion, and an attempt
+that passes do not run producers. An attempt that passes deletes what it wrote.
+
+Each attempt keeps its evidence beside its log in the run's logs:
+
+```text
+<run>.runstate
+<run>.logs/
+  item_7_1.log
+  item_7_1.failure.txt
+  item_7_1.artifacts/
+    files/                  # Runtests.artifacts_dir()
+    producer_1/             # the first producer's files
+    producer_2/
+  item_7_1.artifacts.log    # what the producers printed, their errors, and timings
+```
+
+The failure's report and the run's closing block print the path. A retry gets a
+directory of its own, so a failed attempt keeps its evidence when a later attempt
+passes. The evidence is deleted with the run state, and `RUNTESTS_ARTIFACT_DIR`
+copies it with the logs. In the CI example below, `if: failure()` uploads nothing
+when a retry passes. Use `if: always()` to keep that evidence too.
+
+Producers run after the verdict is recorded. They see their values as they are
+when they run, not as they were when registered. A file that a `mktempdir() do`
+block deletes is gone by then: write such files to `artifacts_dir()` instead. A
+producer that throws, or a `@test` in it that fails, is reported in the
+`.artifacts.log` and does not change the verdict. The next producer still runs.
+All the producers of an attempt together have `artifacts_timeout` seconds. If they
+take longer, or the worker dies, the worker is replaced and the files written so
+far are kept. If the item itself times out or its worker dies, its producers do not
+run, and the `.artifacts.log` says why. With `workers = 0`, nothing can stop a
+producer that hangs, as nothing can stop an item that hangs.
+
+Both functions work only in the item's body, and in the tasks it starts and waits
+for. They throw an `ArgumentError` in `init`, `skip`, `test_end`, a producer, or
+outside an item. They also throw for a task that the item did not wait for and that
+calls them after the body returned. Evidence is not passed between the items of a
+chain, because a passing item's directory is deleted.
+
+A registered producer keeps what it refers to, and the item's globals, until the
+verdict is known. A `test_end` such as `GC.gc(true)` does not free that memory. A
+passed attempt releases it before its worker runs the next item. A pasted item,
+and an item stepped into with `Runtests.debug`, keep their evidence in a new
+directory in the system's temporary files. The REPL prints its path, and you delete
+it when you no longer need it.
 
 ## The environment tests run in
 

@@ -173,6 +173,12 @@ end
             "test/qa/Project.toml" => "[deps]\n",
             "test/qa/qa.jl" => "run_qa(PortGroups)\n")
         out = port!(pkg)
+        # What ran in an environment of its own stays there, as it was, and a run
+        # stops on it until a person ports it; the rest is read without it.
+        @test occursin("test/qa/ is an environment of its own, where qa/qa.jl ran, and a run stops on it", out)
+        @test isfile(joinpath(pkg, "test", "qa", "qa.jl"))
+        @test_throws Runtests.ScanFailure ported_items(pkg)
+        rm(joinpath(pkg, "test", "qa"); recursive = true)
         items = ported_items(pkg)
         @test first(items["core"]) == [:core] && first(items["gpu"]) == [:gpu]
         # A tag is a name: GROUP=2D selects `:_2d`.
@@ -183,9 +189,6 @@ end
         @test occursin("runtests.jl runs code that is not a test, which nothing ports: prepare_gpu()", out)
         @test occursin("runtests.jl defines GROUP, prepare_gpu, which no test uses: dropped", out)
         @test !isdir(joinpath(pkg, "test", "testsetups"))
-        # What ran in an environment of its own stays there, as it was.
-        @test occursin("test/qa/ is an environment of its own, where qa/qa.jl ran", out)
-        @test isfile(joinpath(pkg, "test", "qa", "qa.jl"))
     end
 
     @testset "runtests.jl's own tests are a file and items named for the package; a condition on the platform is a skip" begin
@@ -230,7 +233,9 @@ end
             "test/qa/Project.toml" => "[deps]\n",
             "test/qa/qa.jl" => "@test true\n")
         out = port!(pkg)
-        @test occursin("group QA runs in an environment of its own", out)
+        @test occursin("group QA runs in an environment of its own, test/qa/, and a run stops on it", out)
+        @test_throws Runtests.ScanFailure ported_items(pkg)
+        rm(joinpath(pkg, "test", "qa"); recursive = true)
         items = ported_items(pkg)
         @test first(items["basic"]) == Symbol[] && first(items["iface"]) == [:interface]
         @test occursin("\"!interface\"", read(joinpath(pkg, "test", "runtests.jl"), String))

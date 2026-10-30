@@ -108,12 +108,7 @@ function list_items(root::AbstractString; config::Union{Nothing, AbstractString}
     config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
     # The environments profiles name hold items too; a config that cannot be read
     # names none, and says why below.
-    claimed = try
-        claimed_environments(config_toml(target.testdir, config)...)
-    catch e
-        e isa ConfigError || rethrow()
-        Dict{String, Symbol}()
-    end
+    claimed = suite_claims_or_none(target; config)
     files, strays, templates = walk_test_dir(target.testdir; claimed)
     setups = setup_modules(target.testdir)
     items, errors, _ = scan_files(files, Filter(), setups; strays, templates, claimed)

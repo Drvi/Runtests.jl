@@ -8,9 +8,12 @@
 #     EVAL  expr::Expr                       -> RESULT nothing            | ERROR message::String
 #     RUN   spec::ItemSpec                   -> RESULT result::ItemResult | ERROR message::String
 #     END   (spec::ItemSpec, test_end::Expr) -> RESULT result::ItemResult | ERROR message::String
+#     FINISH (index::Int32, attempt::Int8, collect::Bool)
+#                                            -> RESULT (; producers, failed, seconds) | ERROR message::String
 #
 # RUN and END are separate because they are timed separately: a profile's
-# `test_end` is the suite's code, not the item's.
+# `test_end` is the suite's code, not the item's. FINISH follows only an attempt that
+# registered producers and failed: it runs them, under a limit of its own.
 #
 # Errors cross as strings, because an exception can hold a type that exists only on
 # the worker. The only object that crosses is an item's result, and one that cannot
@@ -29,7 +32,7 @@
 # Closing the connection is the shutdown request: a worker exits when it reads EOF,
 # whether the coordinator closed the socket or died.
 
-export Worker, remote_eval, remote_fetch, remote_run, remote_end, inspect!, terminate!,
+export Worker, remote_eval, remote_fetch, remote_run, remote_end, remote_finish, inspect!, terminate!,
        WorkerTerminatedException, RemoteException
 
 const KIND_EVAL   = UInt8(1)
@@ -37,6 +40,7 @@ const KIND_RUN    = UInt8(2)
 const KIND_RESULT = UInt8(3)
 const KIND_ERROR  = UInt8(4)
 const KIND_END    = UInt8(5)
+const KIND_FINISH = UInt8(6)
 
 # Same value as Distributed's: 10 bytes, so hitting it inside a payload by chance
 # is not a practical concern.
@@ -902,6 +906,16 @@ expression recorded or threw.
 """
 remote_end(w::Worker, spec, test_end::Expr) = send_request(w, KIND_END, (spec, test_end))
 
+"""
+    remote_finish(w::Worker, index, attempt, collect) -> Future
+
+Run the producers attempt `attempt` at item `index` registered on the worker, when
+`collect`, and let go of them. Fetching the future returns what
+[`finish_artifacts`](@ref) returns, or throws a [`RemoteException`](@ref).
+"""
+remote_finish(w::Worker, index::Integer, attempt::Integer, collect::Bool) =
+    send_request(w, KIND_FINISH, (Int32(index), Int8(attempt), collect))
+
 function send_request(w::Worker, kind::UInt8, payload)
     id = @atomic w.next_id += 1
     # A payload that will not serialize leaves nothing registered.
@@ -1093,6 +1107,14 @@ function handle_request(frame::Frame)
             return KIND_RESULT, run_test_end(spec, test_end)
         catch e
             return KIND_ERROR, "the worker could not run the `test_end` expression: " *
+                format_error(e, catch_backtrace())
+        end
+    elseif frame.kind === KIND_FINISH
+        index, attempt, collect = frame.payload
+        try
+            return KIND_RESULT, finish_artifacts(index, attempt, collect)
+        catch e
+            return KIND_ERROR, "the worker could not collect this attempt's artifacts: " *
                 format_error(e, catch_backtrace())
         end
     end

@@ -10,9 +10,9 @@
 using Base: SIGKILL
 
 # A slot is its own task's, on the run's thread. The fields other threads read are
-# atomic: `worker` and `current`, which the monitor reads, and `dying_log`, which the
-# worker's output relay reads. `dying_lines` is the relay's while `dying_log` is set,
-# and the slot's again once it has joined the relay.
+# atomic: `worker`, `current` and `collecting`, which the monitor reads, and
+# `dying_log`, which the worker's output relay reads. `dying_lines` is the relay's
+# while `dying_log` is set, and the slot's again once it has joined the relay.
 mutable struct Slot
     const id::SlotIdx
     profile::Profile
@@ -33,6 +33,10 @@ mutable struct Slot
     # slot owns its worker, so the guard asks rather than kills: an item is never
     # stopped for memory the machine may be short of on someone else's account.
     @atomic recycle::Bool
+    # The item whose failed attempt's producers this slot's worker is running, 0 when
+    # none. Apart from `current`: the attempt's verdict is recorded by then, and nothing
+    # that stops the run may record another.
+    @atomic collecting::ItemIdx
 end
 
 """
@@ -277,12 +281,14 @@ struct Statuses
     elapsed::Vector{Float32}
     compile::Vector{Float32}
     testsets::Vector{Any}
+    # What its last attempt left of evidence, as `ItemResult.artifacts` says it.
+    artifacts::Vector{UInt8}
 end
 
 Statuses(n::Integer) = Statuses(
     falses(n), falses(n), fill(UNSEEN, n), zeros(Float32, n), zeros(Int8, n), fill(SlotIdx(0), n),
     zeros(Int32, n), zeros(Int16, n), zeros(Float32, n), zeros(Float32, n),
-    Vector{Any}(nothing, n)
+    Vector{Any}(nothing, n), zeros(UInt8, n)
 )
 
 mutable struct Run
@@ -299,6 +305,11 @@ mutable struct Run
     # (see `logs_dir`), once it is open; `scratch` until then.
     logdir::String
     logprefix::String   # `logdir` and the part of a log's name that never varies
+    # The same for the attempts' evidence (see `artifacts_path`), absolute: `logprefix`
+    # once the run state is open; until then, and without one, a directory of the run's
+    # own in the system's temporary files, made only if an attempt asks, which outlives
+    # the run.
+    artifacts_prefix::String
     # Where `RUNTESTS_ARTIFACT_DIR` had the run copy its run state and logs, once it
     # has; empty otherwise.
     exported::String
@@ -327,10 +338,12 @@ mutable struct Run
     const tasks::Vector{Task}
     # Workers `kill_workers!` took from their slots, for `shutdown!` to wait for.
     const killed::Vector{RuntestsWorkers.Worker}
-    # Guards `tasks`, `killed` and `item_pids`, which other tasks use as well.
+    # Guards `tasks`, `killed`, `item_pids` and `evidence`, which other tasks use as well.
     const lock::ReentrantLock
     # Every process an attempt ran in: under coverage, each should leave a tracefile.
     const item_pids::Set{Int32}
+    # The attempts whose evidence is kept, as (item, attempt), for the closing report.
+    const evidence::Vector{Tuple{ItemIdx, Int8}}
     coverage::Union{Nothing, CoverageSummary}
     # An editor's, when it asked for the run: each item's start and end go there.
     const events::Union{Nothing, EventStream}
@@ -380,9 +393,10 @@ function execute(p::Plan, target; on_item = nothing)
     names, column = item_names(p, name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)))
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch,
-        joinpath(scratch, "item_"), "", column, names,
+        joinpath(scratch, "item_"), joinpath(tempdir(), string("runtests_artifacts_", runid), "item_"), "", column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
-        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing, EVENTS[], on_item, ReentrantLock()
+        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_item,
+        ReentrantLock()
     )
     run.events === nothing || (run.events.run = run)
     cfg.coverage && mkpath(coverage_dir(scratch))
@@ -396,7 +410,7 @@ function execute(p::Plan, target; on_item = nothing)
         push!(
             run.slots, Slot(
                 SlotIdx(s), p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, ItemIdx(0), Int8(0), "", String[], false
+                nothing, 0.0, 0, ItemIdx(0), Int8(0), "", String[], false, ItemIdx(0)
             )
         )
     end
@@ -747,6 +761,8 @@ function keep_logs_by_runstate!(run::Run)
     end
     run.logdir = dir
     run.logprefix = joinpath(dir, "item_")
+    # Absolute: a worker runs in the package's directory, and an item is handed it.
+    run.artifacts_prefix = abspath(run.logprefix)
     return nothing
 end
 
@@ -802,6 +818,7 @@ end
 # A log an attempt left empty says nothing, and a directory of them is noise; what
 # is left is what the items printed, and the reports of those that did not pass.
 function tidy_logs(run::Run)
+    run.artifacts_prefix == abspath(run.logprefix) || remove_if_empty(dirname(run.artifacts_prefix))
     run.logdir == run.scratch && return nothing
     try
         for f in readdir(run.logdir; join = true)
@@ -1462,10 +1479,12 @@ const STALL_LIMIT_OVERRIDE = ScopedValue{Union{Nothing, Float64}}(nothing)
 
 The longest a run may go with no test item finishing, in seconds: one attempt at
 the item with the largest timeout, on a worker whose profile's `init` and `test_end`
-take all they are allowed, after the longest memory hold, with `STALL_MARGIN_S` for
-everything around it. An item that runs past its timeout is killed, which ends its
-attempt too, so nothing finishing for longer means something that should have
-stopped did not.
+take all they are allowed, or collecting a failed attempt's artifacts for as long
+as that may take, whichever is longer, after the longest memory hold, with
+`STALL_MARGIN_S` for everything around it. An item that runs past its timeout is
+killed, which ends its attempt too, and the end of a collection counts as an item
+finishing, so nothing finishing for longer means something that should have stopped
+did not.
 """
 function stall_limit(p::Plan)
     forced = STALL_LIMIT_OVERRIDE[]
@@ -1475,7 +1494,8 @@ function stall_limit(p::Plan)
     init = any(prof -> !isempty(prof.init.args), p.profiles) ? cfg.init_timeout_s : 0
     test_end = any(prof -> !isempty(prof.test_end.args), p.profiles) ? cfg.test_end_timeout_s : 0
     # Summed as floats: three limits of up to 2^31 - 1 seconds each overflow a 32-bit `Int`.
-    return Float64(item) + init + test_end + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S
+    attempt = max(Float64(item) + init + test_end, Float64(cfg.artifacts_timeout_s))
+    return attempt + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S
 end
 
 """
@@ -2078,7 +2098,8 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     @atomic slot.current = ItemIdx(0)
     slot.worker_items += 1
     record_result!(run, i, slot, attempt, result, max_attempts)
-    return true
+    # Then the evidence, before a retry, the chain's next item or a sandbox's end.
+    return finish_attempt!(run, slot, i, attempt, result, w)
 end
 
 # One attempt at item `i` in this process. There is no second process to kill, so
@@ -2103,6 +2124,7 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
         return true
     end
     record_result!(run, i, slot, attempt, res, max_attempts)
+    finish_attempt!(run, slot, i, attempt, res, nothing)
     return true
 end
 
@@ -2147,7 +2169,7 @@ function merge_test_end(res::ItemResult, endres::ItemResult)
     isempty(endres.testset.results) && Test.get_test_counts(endres.testset).passes == 0 && return res
     push!(res.testset.results, endres.testset)
     state = severity(endres.state) > severity(res.state) ? endres.state : res.state
-    return ItemResult(res.index, state, res.testset, res.stats)
+    return ItemResult(res.index, state, res.testset, res.stats, res.artifacts)
 end
 
 severity(s::ItemState) = s === ERRORED ? 2 : s === FAILED ? 1 : 0
@@ -2195,17 +2217,19 @@ function handle_dispatch_failure!(
         end
         @atomic slot.worker = nothing
         stopped_meanwhile(slot) && return false
+        artifacts = evidence_after_loss!(run, i, attempt, sprint(showerror, e))
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
             string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker"));
-            ended
+            ended, artifacts
         )
         return false
     elseif w !== nothing && !w.terminated
         # The request failed but the process is fine: a result that would not
         # serialize, a `skip` expression that threw. The worker keeps everything
         # it has compiled, and the item is an ordinary error.
-        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
+        artifacts = evidence_after_loss!(run, i, attempt, "its result could not be read")
+        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e); artifacts)
         return true
     else
         ended = time()
@@ -2225,14 +2249,13 @@ function handle_dispatch_failure!(
         if is_cancelled(run.queues)
             record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped"; ended)
         else
+            what = e isa RuntestsWorkers.WorkerTerminatedException ?
+                string("the worker running this item died: ", how) : sprint(showerror, e)
+            artifacts = evidence_after_loss!(run, i, attempt, what)
             record_error!(
                 run, i, slot, attempt, ERRORED,
-                string(
-                    e isa RuntestsWorkers.WorkerTerminatedException ?
-                        string("the worker running this item died: ", how) : sprint(showerror, e),
-                    " · ", retry_note(attempt, max_attempts, false, "on a new worker")
-                );
-                ended
+                string(what, " · ", retry_note(attempt, max_attempts, false, "on a new worker"));
+                ended, artifacts
             )
         end
         return false
@@ -2249,7 +2272,7 @@ function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
         p.items.code[i], p.items.skip[i],
         p.items.failfast[i] == -1 ? p.cfg.item_failfast : p.items.failfast[i] == 1,
         run.project_name, slot.profile.name, attempt, p.cfg.full_stacktraces, logpath,
-        item_seed(p.items.seed[i], p.items.name[i])
+        item_seed(p.items.seed[i], p.items.name[i]), attempt_artifacts(run, i, attempt)
     )
 end
 
@@ -2291,12 +2314,13 @@ dead worker, a chain cut short — and `testset` then holds a single error sayin
 function record!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
         testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool,
-        note::AbstractString; ended::Float64 = time()
+        note::AbstractString; ended::Float64 = time(), artifacts::UInt8 = 0x00
     )
     (state === UNSEEN || state === RUNNING) && error("Runtests internal error: item $i recorded as $state")
     st = run.statuses
     set_state!(run, i, state)
     st.synthetic[i] = synthetic
+    st.artifacts[i] = artifacts
     st.attempt[i] = attempt
     st.slot[i] = slot
     # An outcome the item reported took what the item measured; one the run decided
@@ -2408,7 +2432,7 @@ function record_result!(
     # retries configured explains itself.
     note = (is_non_pass(res.state) && max_attempts > 1) ?
         retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, run.plan.items.unit[i])) : ""
-    record!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false, note)
+    record!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false, note; artifacts = res.artifacts)
     return nothing
 end
 
@@ -2419,8 +2443,10 @@ next_attempt_where(p::Plan, u::UnitIdx) =
     p.units.exclusive[u] ? "on a new worker" :
     single_process(p) && !needs_worker(p, u) ? "in this process" : "on the same worker"
 
-record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString; ended::Float64 = time()) =
-    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), RuntestsWorkers.PerfStats(), true, msg; ended)
+record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString;
+              ended::Float64 = time(), artifacts::UInt8 = 0x00) =
+    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), RuntestsWorkers.PerfStats(), true, msg;
+            ended, artifacts)
 
 # The testset of an outcome the run decided: one error saying why, at the item's
 # own line, so the summary and the verdict count it like any other error.

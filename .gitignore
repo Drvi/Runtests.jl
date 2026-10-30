@@ -1,4 +1,4 @@
 Manifest*.toml
-test/packages/**/Manifest*.toml
+test/testfixtures/**/Manifest*.toml
 dev
 

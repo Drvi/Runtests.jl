@@ -7,7 +7,8 @@ of Runtests, which takes it little longer than this part alone, because Runtests
 loads `Pkg` only when it builds an environment, which a worker never does.
 
 Test code reaches this package through Runtests: `Runtests.current_testitem()`,
-`Runtests.in_testitem()` and `Runtests.in_test_run()` are defined here.
+`Runtests.in_testitem()`, `Runtests.in_test_run()`, `Runtests.on_failure()` and
+`Runtests.artifacts_dir()` are defined here.
 """
 module RuntestsWorkers
 
@@ -70,6 +71,7 @@ else
 end
 
 include("runitem.jl")
+include("artifacts.jl")
 include("workers.jl")
 
 using PrecompileTools: @setup_workload, @compile_workload
@@ -94,8 +96,11 @@ const PRECOMPILE_SIGNATURES = (
     (handle_request, (Frame,)),
     (send_request, (Worker, UInt8, ItemSpec)),
     (send_request, (Worker, UInt8, Tuple{ItemSpec, Expr})),
+    (send_request, (Worker, UInt8, Tuple{Int32, Int8, Bool})),
     (remote_run, (Worker, ItemSpec)),
     (remote_end, (Worker, ItemSpec, Expr)),
+    (remote_finish, (Worker, Int32, Int8, Bool)),
+    (finish_artifacts, (Int32, Int8, Bool)),
     (process_responses, (Worker, Base.Event)),
     (read_message, (IOBuffer,)),
     (read_message, (IOBuffer, FrameReader)),
@@ -112,7 +117,7 @@ const PRECOMPILE_SIGNATURES = (
         @test x == 2
     end
     spec = ItemSpec(Int32(1), "precompile", "precompile.jl", Int32(1), body, false, false,
-                    "", :default, Int8(1), false, "", UInt64(1))
+                    "", :default, Int8(1), false, "", UInt64(1), "")
     @compile_workload begin
         ts = Test.DefaultTestSet("precompile")
         Test.record(ts, Test.Pass(:test, :(1 == 1), nothing, true, LineNumberNode(1, "p.jl")))

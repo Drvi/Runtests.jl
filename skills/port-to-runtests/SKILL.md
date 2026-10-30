@@ -24,14 +24,15 @@ test/
   testsetups/MySetup.jl     code that items share: a module, loaded with `using MySetup`
   testtemplates/            loops that generate items (reference/templates.md)
   TestItems.toml            optional: workers, threads, timeouts, groups, profiles
+  testfixtures/             input for the tests (packages, projects, data), never read as tests
   .scripts/                 Julia files that tests run or read, out of Runtests' way
 ```
 
 - Test files are named `*_test.jl` or `*_tests.jl` and hold only `@testitem`
   declarations. Any other `.jl` file under `test/` stops the run. The exceptions are
-  `test/runtests.jl`, `testsetups/`, `testtemplates/`, hidden directories, and
-  directories with a `Project.toml` of their own, which are read only when a profile
-  names them as its `environment`.
+  `test/runtests.jl`, `testsetups/`, `testtemplates/`, `testfixtures/`, and hidden
+  directories. Any other directory with a `Project.toml` of its own must be a
+  profile's `environment`, or the run stops with an error that names it.
 - An item's name is a nonblank string literal, unique across the whole suite. Its
   keywords (`tags`, `timeout`, `retries`, `skip`, `failfast`, `chain`, `sandbox`)
   are literals, except `skip`, an expression evaluated before the body.
@@ -212,9 +213,11 @@ What it does with `runtests.jl`:
   stay out of a default run. Any other condition around files becomes
   `skip = <condition>` on their items.
 - Files under a directory with a `Project.toml` of its own ran in that environment.
-  They stay where they are, unported, and the list names them. To keep running them
-  there, port them in place and add a profile naming the directory,
-  `[profiles.qa] environment = "qa"` (reference/source-shapes.md).
+  They stay where they are, unported, and the list names them. A run stops on such a
+  directory until a profile names it. To keep running them there, port them in
+  place and add a profile naming the directory, `[profiles.qa] environment = "qa"`.
+  A directory that is input for the tests rather than tests, such as a package a
+  test loads, moves under `test/testfixtures/` instead (reference/source-shapes.md).
 
 Then go through its output:
 

@@ -1,0 +1,7 @@
+[deps]
+FakeCI = "1a2b3c4d-0000-4000-8000-000000000010"
+Runtests = "632efd68-cd41-4e05-bd25-b86dc2150078"
+
+[sources]
+FakeCI = {path = ".."}
+Runtests = {path = "../../../.."}

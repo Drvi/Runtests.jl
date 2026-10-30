@@ -139,7 +139,7 @@ end)
 
     @testset "a package without test files, a fixture in another's test/ say, has nothing to do" begin
         outer = make_pkg("Outer", "test/a_test.jl" => declared("one"))
-        fixture = mkpath(joinpath(outer, "test", "fixtures", "Inner"))
+        fixture = mkpath(joinpath(outer, "test", "testfixtures", "Inner"))
         write(joinpath(fixture, "Project.toml"), "name = \"Inner\"\nuuid = \"$(next_uuid())\"\nversion = \"0.1.0\"\n")
         mkpath(joinpath(fixture, "src"))
         write(joinpath(fixture, "src", "Inner.jl"), "module Inner\nend\n")
@@ -158,13 +158,13 @@ end)
         end
     end
 
-    @testset "a fixture package in test/ is no stray, however many threads read the suite" begin
+    @testset "a fixture package in test/testfixtures/ is no stray, however many threads read the suite" begin
         # The checks of the suite run in tasks, which move between threads. A walk
         # that `walkdir` led went into a fixture's `src/` while it was taking the
         # fixture out of the walk, and took its source for a misnamed test file.
         repo = dirname(@__DIR__)
         pkg = make_pkg("WithFixture", "test/a_test.jl" => declared("one"))
-        fixture = mkpath(joinpath(pkg, "test", "fixtures", "Inner", "src"))
+        fixture = mkpath(joinpath(pkg, "test", "testfixtures", "Inner", "src"))
         write(joinpath(dirname(fixture), "Project.toml"), "name = \"Inner\"\nuuid = \"$(next_uuid())\"\nversion = \"0.1.0\"\n")
         write(joinpath(fixture, "Inner.jl"), "module Inner\nend\n")
         script = """

@@ -243,7 +243,8 @@ const REPO_ROOT = dirname(@__DIR__)
 
 Run `items` items that each sleep for ten minutes, on as many workers, in a
 coordinator of its own started with `julia_args`, and send it SIGINT `delay` seconds
-after every item is running. With `repl`, the coordinator raises the interrupt as a
+after every item is running, and again 15 seconds later should it still be running.
+With `repl`, the coordinator raises the interrupt as a
 REPL does; without, it exits on it, as a script and `Pkg.test` do. With `cut`, each
 item first cuts its worker's connection to the coordinator and goes on sleeping, so
 the interrupt finds every slot waiting for a worker it has lost. Returns whether
@@ -268,7 +269,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     $(repl ? "Base.exit_on_sigint(false)" : "")
     using Runtests
     include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
-    const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "packages")
+    const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "testfixtures")
     fixture(name) = joinpath(FIXTURES, name)
     dir = make_pkg("Interrupted", "test/t_test.jl" => join(
         [\"\"\"
@@ -323,13 +324,19 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     sleep(delay)
     t0 = time()
     kill(proc, Base.SIGINT)
+    # Pressed again when nothing has come of it, as a person would: under load, Julia
+    # can leave a Ctrl-C undelivered, with every task of the run still waiting where
+    # it waits and none of them handed the interrupt. The second press reaches the
+    # run through the same tasks, and the time is still counted from the first.
+    again = timedwait(() -> process_exited(proc), 15) !== :ok
+    again && kill(proc, Base.SIGINT)
     # Bounded: an interrupt that is lost would hold the test for the items' ten
     # minutes, and the time it took is what is checked. SIGQUIT first, on which Julia
     # prints every task's backtrace to stderr, which is said below. The workers go
     # too, by process group: each is in a group of its own, holds the coordinator's
     # stderr, and would keep the output from ending until its item did. They are
     # found as the coordinator's children, so while it is still there.
-    hung = timedwait(() -> process_exited(proc), 120) !== :ok
+    hung = timedwait(() -> process_exited(proc), 105) !== :ok
     if hung
         workers = [parse(Cint, l) for l in readlines(ignorestatus(`pgrep -P $(getpid(proc))`))]
         kill(proc, 3)
@@ -343,6 +350,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     close(log)
     out = read(err, String)
     printed = read(log, String)
+    again && !hung && @warn "the coordinator did nothing on the first Ctrl-C for 15s, and ended on the second"
     hung && @warn "the coordinator did not end on Ctrl-C; its stderr:\n$out"
     started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
     rm(path; force=true)

@@ -134,9 +134,6 @@ struct Plan
     startup::Startup
     selection::String   # how the items were chosen, as the run says it; empty for all of them
     suite_names::Vector{String}   # every item's name in the suite, chosen or not, sorted
-    # Directories under `test/` with an environment of their own that no profile names,
-    # with how many test files each holds: tests the run does not run, and says so.
-    unclaimed::Vector{Pair{String, Int}}
 end
 
 nslots(p::Plan) = length(p.slot_pool)
@@ -174,7 +171,7 @@ History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::C
     History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known))
 
 """
-    plan(raw, cfg; history, root, strict_order, selection, suite_names, unclaimed) -> Plan
+    plan(raw, cfg; history, root, strict_order, selection, suite_names) -> Plan
 
 Validate, group into units, put each profile's units in the order they are handed
 out, and cut each pool's body into one stretch per slot.
@@ -182,8 +179,7 @@ out, and cut each pool's body into one stretch per slot.
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(),
         root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = "",
-        suite_names::Vector{String} = String[it.name for it in raw],
-        unclaimed::Vector{Pair{String, Int}} = Pair{String, Int}[]
+        suite_names::Vector{String} = String[it.name for it in raw]
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
     validate_profiles(raw, cfg)
@@ -199,7 +195,7 @@ function plan(
         order_pool!(pool, units, slots[k], cfg, history)
     end
     return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold,
-                       history.seconds, unclaimed)
+                       history.seconds)
 end
 
 # The file the settings came from, as a message names it.
@@ -469,8 +465,7 @@ end
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
         profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString,
-        suite_names::Vector{String}, cold::ColdCost, seconds::Dict{String, Float64},
-        unclaimed::Vector{Pair{String, Int}} = Pair{String, Int}[]
+        suite_names::Vector{String}, cold::ColdCost, seconds::Dict{String, Float64}
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -537,7 +532,7 @@ function materialize(
         items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
         profiles, ps, slot_pool, slot_units, pending, cold, sort!(unique!(all_setups)), cfg,
-        String(root), Startup(), String(selection), suite_names, unclaimed
+        String(root), Startup(), String(selection), suite_names
     )
 end
 

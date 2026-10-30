@@ -119,6 +119,13 @@ environment with the package added by path; nothing needs `Pkg.activate` or
 their own. If the environment was for something other than tests, such as
 downstream packages' suites, ask the user.
 
+A directory under `test/` with a `Project.toml` that is input for the tests, such as
+a package a test loads or a project a test reads, moves under `test/testfixtures/`.
+A run never reads that directory. Every other directory under `test/` with a
+`Project.toml` must be a profile's environment, or the run stops on it. A moved
+project that names others by a relative `path` in `[sources]` needs those paths
+changed by hand.
+
 `Pkg.test(test_args = …)` arrives as `ARGS`. A run selects items by path, name and
 tag, so map what `ARGS` selected onto those. If `ARGS` named files, pass the ported
 files' paths:

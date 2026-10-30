@@ -517,7 +517,8 @@ end
             end
             before = collections()
             slot = Runtests.Private.Slot(Runtests.Private.SlotIdx(1), p.profiles[1], w, 0.0, 0,
-                                         Runtests.Private.ItemIdx(0), Int8(0), "", String[], false)
+                                         Runtests.Private.ItemIdx(0), Int8(0), "", String[], false,
+                                         Runtests.Private.ItemIdx(0))
             Runtests.Private.set_paused!(q, true)
             released = @async (sleep(1); Runtests.Private.set_paused!(q, false))
             Runtests.Private.wait_while_paused(q, slot)

@@ -1304,8 +1304,9 @@ function sciml_folders!(s::Suite, ctx::Context, everything::Bool)
         end
         rel = names[folder]
         if any(p -> isfile(joinpath(testdir, rel, p)), ("Project.toml", "JuliaProject.toml"))
-            push!(s.notes, "SciMLTesting group $g runs in an environment of its own, test/$rel/; once its files are ported, " *
-                           "a profile with `environment = $(repr(rel))` in TestItems.toml runs them there")
+            push!(s.notes, "SciMLTesting group $g runs in an environment of its own, test/$rel/, and a run stops on it until " *
+                           "a profile names it: once its files are ported, a profile with `environment = $(repr(rel))` in " *
+                           "TestItems.toml runs them there; if it is input for the tests, move it under test/testfixtures/")
             continue
         end
         tag = group_tag(s, g)
@@ -1490,8 +1491,9 @@ function port_suite(testdir)
         end
     end
     for (d, files) in sort!(collect(elsewhere); by = first)
-        push!(s.notes, "test/$d/ is an environment of its own, where $(join(files, ", ")) ran; once they are ported, " *
-                       "a profile with `environment = $(repr(d))` in TestItems.toml runs them there")
+        push!(s.notes, "test/$d/ is an environment of its own, where $(join(files, ", ")) ran, and a run stops on it until " *
+                       "a profile names it: once they are ported, a profile with `environment = $(repr(d))` in " *
+                       "TestItems.toml runs them there")
     end
     for (file, (setup, main)) in helpers
         write_helper_setup(testdir, file, setup, pkg, main ? s.main_imports : String[])

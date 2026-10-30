@@ -42,6 +42,8 @@ Base.@kwdef struct RunConfig
     # The suite's code, not the item's, so limits of their own.
     init_timeout_s::Int = 30 * 60
     test_end_timeout_s::Int = 30 * 60
+    # All the producers of one failed attempt together (see `Runtests.on_failure`).
+    artifacts_timeout_s::Int = 30 * 60
     retries::Int = 0
     failfast::Bool = false
     item_failfast::Bool = false
@@ -90,7 +92,7 @@ Base.@kwdef struct RunConfig
 end
 
 const RUN_KEYS = (
-    :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries,
+    :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :artifacts_timeout, :retries,
     :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
     :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
 )
@@ -130,7 +132,7 @@ directory; named, it has to exist, where `test/TestItems.toml` may be absent.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
-    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
+    return build_config(path, toml; testdir, config_file = config === nothing ? "" : path, kwargs...)
 end
 
 """
@@ -220,7 +222,7 @@ function env_setting(key::Symbol, name::String, text::String)
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
 
-function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
+function build_config(path, toml; testdir::AbstractString, nunits = 0, config_file::AbstractString = "", kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
     end
@@ -297,6 +299,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         workers, threads, timeout_s = timeout,
         init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout)),
         test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout)),
+        artifacts_timeout_s = seconds(:artifacts_timeout, pick(:artifacts_timeout, timeout)),
         retries = Int(retries), failfast, item_failfast = flag(:item_failfast, failfast), logs,
         verbose = flag(:verbose, false),
         memory_threshold = Float64(mt), monitor = flag(:monitor, true),
@@ -304,7 +307,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml),
+        profiles = read_profiles(path, toml, testdir),
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
@@ -329,7 +332,7 @@ end
 default_logs(workers::Integer, interactive::Bool = isinteractive()) =
     interactive && workers <= 1 ? :eager : :issues
 
-function read_profiles(path, toml)
+function read_profiles(path, toml, testdir::AbstractString)
     profiles = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
@@ -356,7 +359,7 @@ function read_profiles(path, toml)
             profile_environment(path, name, get(p, "environment", ""))
         )
     end
-    check_environment_owners(path, Pair{Symbol, String}[n => p.environment for (n, p) in profiles if !isempty(p.environment)])
+    check_environment_owners(path, testdir, Pair{Symbol, String}[n => p.environment for (n, p) in profiles if !isempty(p.environment)])
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = ""))
     return profiles
@@ -390,14 +393,30 @@ end
 
 # Which profile an item in an environment's directory runs under has one answer: a
 # directory is one profile's environment, and the default profile runs in the test
-# environment.
-function check_environment_owners(path, owners::Vector{Pair{Symbol, String}})
+# environment, `testdir` and what holds it. Nor is an environment in what `testdir`
+# keeps for something else: setups, templates, fixtures. Every directory is as
+# `normpath` leaves it, so `qa/../testfixtures` is `testfixtures`.
+function check_environment_owners(path, testdir::AbstractString, owners::Vector{Pair{Symbol, String}})
     seen = Dict{String, Symbol}()
+    testdir = rstrip_path(normpath(testdir))
+    within(dir, at) = dir == at || startswith(dir, joinpath(at, ""))
     for (name, dir) in sort(owners; by = first)
         name === DEFAULT_PROFILE && throw(ConfigError(
             "`environment` of [profiles.$name] in $(relpath_or_path(path)): the default profile's workers run in " *
                 "the test environment; give $(relpath_or_path(dir)) a profile of its own"
         ))
+        within(testdir, dir) && throw(ConfigError(
+            "`environment` of [profiles.$name] in $(relpath_or_path(path)) names $(relpath_or_path(dir)), which holds " *
+                "the whole suite, `$(relpath_or_path(testdir))`; its tests run in the test environment, under the " *
+                "default profile, so a profile's environment is a directory inside it"
+        ))
+        for reserved in (TESTSETUPS_DIR, TESTTEMPLATES_DIR, TESTFIXTURES_DIR)
+            within(dir, joinpath(testdir, reserved)) && throw(ConfigError(
+                "`environment` of [profiles.$name] in $(relpath_or_path(path)) names $(relpath_or_path(dir)), which is " *
+                    "in `test/$reserved/`, kept for " * (reserved == TESTSETUPS_DIR ? "the suite's test setups" :
+                    reserved == TESTTEMPLATES_DIR ? "the suite's test templates" : "input to the tests, which the suite does not read")
+            ))
+        end
         other = get(seen, dir, nothing)
         other === nothing || throw(ConfigError(
             "$(relpath_or_path(dir)) is the `environment` of both [profiles.$other] and [profiles.$name] in " *
@@ -409,13 +428,13 @@ function check_environment_owners(path, owners::Vector{Pair{Symbol, String}})
 end
 
 """
-    claimed_environments(path, toml) -> Dict{String, Symbol}
+    claimed_environments(testdir, path, toml) -> Dict{String, Symbol}
 
-Every directory a profile of the config file names as its `environment`, with that
-profile: what reading the test directory needs to know before the rest of the
-settings are read. Checked as [`read_config`](@ref) checks it.
+Every directory a profile of the config file `path` names as its `environment`, with
+that profile: what reading the test directory `testdir` needs to know before the rest
+of the settings are read. Checked as [`read_config`](@ref) checks it.
 """
-function claimed_environments(path, toml)
+function claimed_environments(testdir::AbstractString, path, toml)
     claimed = Dict{String, Symbol}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || return claimed   # `read_config` says what is wrong with it
@@ -425,11 +444,26 @@ function claimed_environments(path, toml)
         dir = profile_environment(path, name, get(p, "environment", ""))
         isempty(dir) || push!(owners, Symbol(name) => dir)
     end
-    check_environment_owners(path, owners)
+    check_environment_owners(path, testdir, owners)
     for (name, dir) in owners
         claimed[dir] = name
     end
     return claimed
+end
+
+# The environments the profiles of a target's config file name, the file `config`
+# names or `test/TestItems.toml`: what every reading of its test directory goes by.
+suite_claims(target; config = nothing) = claimed_environments(target.testdir, config_toml(target.testdir, config)...)
+
+# The same, or none when the config file is wrong: for a reading that shows what it
+# can, and leaves saying what is wrong with the file to a check of its own.
+function suite_claims_or_none(target; config = nothing)
+    return try
+        suite_claims(target; config)
+    catch e
+        e isa ConfigError || rethrow()
+        Dict{String, Symbol}()
+    end
 end
 
 """

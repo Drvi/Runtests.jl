@@ -52,14 +52,25 @@ struct ItemSpec
     full_stacktraces :: Bool  # keep the frames belonging to the framework itself
     logpath      :: String    # "" to write to the worker's stdout instead
     seed         :: UInt64    # where the item's random numbers start
+    # Where this attempt keeps its evidence (see `artifacts_dir`), made only if the item
+    # asks; "" for nowhere.
+    artifacts    :: String
 end
+
+ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, attempt, full_stacktraces,
+         logpath, seed) =
+    ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, attempt, full_stacktraces,
+             logpath, seed, "")
 
 struct ItemResult
     index   :: Int32
     state   :: ItemState
     testset :: Test.AbstractTestSet
     stats   :: PerfStats
+    artifacts :: UInt8   # `ARTIFACT_FILES` and `ARTIFACT_PRODUCERS`: what the attempt left to keep or collect
 end
+
+ItemResult(index, state, testset, stats) = ItemResult(index, state, testset, stats, 0x00)
 
 """
     TestItemInfo
@@ -195,14 +206,18 @@ softscope_all!(@nospecialize ex) = (map!(softscope, ex.args, ex.args); ex)
     run_item(spec; printing=false, enter=nothing) -> ItemResult
 
 Evaluate one test item in a fresh module and return its results. Never throws for
-a failing test: a failure is a result, not an error.
+a failing test: a failure is a result, not an error. Producers the item registers
+wait for [`finish_artifacts`](@ref), or are let go of when the process runs its next
+item.
 
 With `enter`, the item's body becomes a function of no arguments that is handed to
 `enter(body)` to call, which is how a debugger steps into it (see
 [`enter_item`](@ref)).
 """
-run_item(spec::ItemSpec; printing::Bool=false, enter=nothing) =
-    in_item(() -> _run_item(spec, enter), spec; printing)
+function run_item(spec::ItemSpec; printing::Bool=false, enter=nothing)
+    discard_artifacts!()
+    return in_item(() -> _run_item(spec, enter), spec; printing)
+end
 
 # The lines a worker writes to its stdout as an item starts and finishes: data for
 # the coordinator, which draws the RUN and DONE lines from them. On stdout rather
@@ -297,13 +312,16 @@ function _run_item(spec::ItemSpec, enter=nothing)
     end
     ts = Test.DefaultTestSet(spec.name; failfast=spec.failfast)
     stats = PerfStats()
+    artifacts = AttemptArtifacts(spec)
     try
-        stats = eval_block!(ts, spec, spec.code, spec.name, enter)
+        stats = eval_block!(ts, spec, spec.code, spec.name, enter, artifacts)
     finally
         finish_testset!(ts)
     end
     spec.full_stacktraces || trim_recorded_errors!(ts)
-    return ItemResult(spec.index, state_of(ts), transferrable(ts), stats)
+    flags = artifact_flags(artifacts)
+    flags & ARTIFACT_PRODUCERS == 0 || (PENDING_ARTIFACTS[] = artifacts)
+    return ItemResult(spec.index, state_of(ts), transferrable(ts), stats, flags)
 end
 
 """
@@ -380,8 +398,10 @@ end
 @noinline __repl_entry_item(item::Expr) = Core.eval(Main, item)
 @noinline eval_item(item::Expr) = Core.eval(Main, item)
 
+# `artifacts`, an item's body's `AttemptArtifacts`, is in scope while the block runs, and
+# closed once it returns; `nothing` for what is not an item's body.
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString,
-                     enter=nothing)
+                     enter=nothing, artifacts=nothing)
     stats = Ref(PerfStats())
     prelude = item_prelude(spec)
     modsym = gensym(modname)
@@ -391,12 +411,13 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     else
         () -> enter_item(enter, prelude, code, modname, spec)
     end
+    body = artifacts === nothing ? evaluate : () -> with(evaluate, CURRENT_ARTIFACTS => artifacts)
     try
         with_testset(ts) do
             timed!(stats) do
                 capture_output(spec.logpath) do
                     with_seed(spec.seed) do
-                        with_source_path(evaluate, spec.file)
+                        with_source_path(body, spec.file)
                     end
                 end
             end
@@ -414,8 +435,10 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
             end
         end
     finally
-        # Under a debugger the item's module is the user's to look at afterwards.
-        enter === nothing && release_globals!(Main, modsym)
+        # Under a debugger the item's module is the user's to look at afterwards, and
+        # producers that may run need what it refers to until they have.
+        kept = artifacts !== nothing && close_registration!(artifacts, enter === nothing ? modsym : Symbol(""))
+        enter === nothing && !kept && release_globals!(Main, modsym)
     end
     return stats[]
 end

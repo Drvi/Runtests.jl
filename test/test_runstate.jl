@@ -383,36 +383,48 @@ end
         # A real SIGKILL, not a simulated one: the file has to be readable
         # without anything having closed it.
         dir = mktempdir()
+        # The second item has no timeout of its own, so it is in flight for as long as
+        # the run's, ten minutes: the moment the kill has to land in lasts that long.
+        pkg = make_pkg("Killed", "test/k_test.jl" => """
+            @testitem "passes" begin
+                @test true
+            end
+            @testitem "sleeps" begin
+                sleep(600)
+                @test true
+            end
+            """)
         script = joinpath(dir, "run.jl")
         write(script, """
         push!(LOAD_PATH, $(repr(dirname(@__DIR__))))
         using Runtests
-        Runtests.runtests($(repr(fixture("Faulty.jl"))); workers=1, logs=:issues, monitor=false,
-                      name=r"^(passes|hangs)\$", timeout=600)
+        Runtests.runtests($(repr(pkg)); workers=1, logs=:issues, monitor=false, timeout=600)
         """)
         child_log = joinpath(dir, "child.log")
         proc = run(pipeline(addenv(`$(Base.julia_cmd()) --startup-file=no $script`,
                                    "RUNTESTS_RUNSTATE_DIR" => dir);
                             stdout=child_log, stderr=child_log); wait=false)
-        # Wait until the run state shows the passing item is done, then kill. The
-        # ceiling is generous because the child starts a Julia process, resolves a
-        # test environment and starts a worker, and the files run several at a
-        # time; the loop leaves as soon as the condition holds, so a slack ceiling
+        # Wait until the run state shows the first item done and the second in flight,
+        # then kill. The ceiling is generous because the child starts a Julia process,
+        # resolves a test environment and starts a worker, and the files run several at
+        # a time; the loop leaves as soon as the condition holds, so a slack ceiling
         # costs nothing and a tight one is a flake on a busy machine.
         deadline = time() + 600
         seen = false
+        states = Dict{String, Any}()
         while time() < deadline && !seen
             files = filter!(endswith(".runstate"), readdir(dir; join=true))
             for f in files
                 rs = read_run_state(f)
                 rs === nothing && continue
-                any(s -> s.state === PASSED, rs.statuses) && (seen = true)
+                states = Dict(it.name => st.state for (it, st) in zip(rs.items, rs.statuses))
+                seen = get(states, "passes", UNSEEN) === PASSED && get(states, "sleeps", UNSEEN) === RUNNING
             end
             seen || sleep(0.2)
         end
         kill(proc, Base.SIGKILL)
         wait(proc)
-        seen || @info "the killed-run fixture never got going; its output was:\n" *
+        seen || @info "the killed-run fixture never got to its second item; the run state read $(states), and its output was:\n" *
                       (isfile(child_log) ? read(child_log, String) : "(no output)")
         @test seen
         files = filter!(endswith(".runstate"), readdir(dir; join=true))
@@ -420,7 +432,7 @@ end
         rs = read_run_state(last(sort!(files)))
         @test rs !== nothing
         # Killed that way, the coordinator never stopped its worker, which is asleep
-        # in "hangs" for ten minutes: it goes by itself, through the job that holds it
+        # in "sleeps" for ten minutes: it goes by itself, through the job that holds it
         # on Windows and its watch on the coordinator elsewhere.
         workers = rs === nothing ? Int32[] : Int32[e.pid for e in rs.events if e.kind === :worker_up]
         @test !isempty(workers)

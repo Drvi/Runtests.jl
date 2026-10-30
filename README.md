@@ -482,7 +482,7 @@ holds the profiles it records to the same rules, together with this checkout's.
 | `retries` | `0` | Additional attempts after failure, from 0 to 126. |
 | `failfast` | `false` | Stop the run after an item fails. |
 | `item_failfast` | `failfast` | Stop each item at its first failure. |
-| `logs` | `:issues` | Print output for nonpassing items. Use `:batched` for every item's output when it ends, or `:eager` to stream it. |
+| `logs` | `:issues` | Print output for nonpassing items. Use `:batched` for every item's output when it ends, `:eager` to stream it, or `:quiet` to keep it in the run's logs only. |
 | `verbose` | `false` | Print results and output for passing items too. |
 | `memory_threshold` | `0.9` | Fraction of machine memory in use at which new items wait; must be in `(0, 1]`. |
 | `monitor` | `true` | Monitor memory and display progress. |

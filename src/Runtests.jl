@@ -101,7 +101,8 @@ framework's own frames in a failing item's stacktrace; trimmed by default), `see
 (every item draws its random numbers from this and its own name; random unless
 given, and printed at the start of the run).
 
-Output: `logs` (`:issues`, `:batched`, `:eager`), `verbose`,
+Output: `logs` (`:issues`, `:batched`, `:eager`, or `:quiet`, which keeps every
+item's output in the run's logs and prints none of it), `verbose`,
 `monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
 `src/` and `ext/` the workers run, merged into `lcov.info` at the package's root;
 also `RUNTESTS_COVERAGE`, which a keyword overrides and which overrides the file).

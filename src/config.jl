@@ -115,7 +115,7 @@ end
 const ORDER_KEYS = (:first, :last)
 const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :environment)
 const TOP_KEYS = (:run, :order, :profiles, :groups)
-const LOG_MODES = (:eager, :batched, :issues)
+const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
 # The group a run selects when nothing else selects, the whole suite unless declared,
 # and the name of the whole suite, which no `[groups]` entry may take.

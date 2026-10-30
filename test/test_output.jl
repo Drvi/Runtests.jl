@@ -272,6 +272,34 @@ using Runtests: RuntestsWorkers
         @test !any(l -> occursin("Expression: 1 == 2", l), others)
     end
 
+    @testset "logs=:quiet prints a failure without its output, which stays in the logs" begin
+        work3 = mktempdir()
+        out3 = joinpath(work3, "run.log")
+        script3 = joinpath(work3, "run.jl")
+        write(script3, """
+        push!(LOAD_PATH, $(repr(dirname(@__DIR__))))
+        using Runtests
+        try
+            Runtests.runtests($(repr(fixture("Faulty.jl"))); workers=1, logs=:quiet, monitor=false,
+                          name="fails after logging")
+        catch
+        end
+        """)
+        runs = joinpath(work3, "runs")
+        run(pipeline(ignorestatus(addenv(plain_julia(script3),
+                                         "RUNTESTS_RUNSTATE_DIR" => runs,
+                                         "RUNTESTS_FAULTY_DIR" => work3));
+                     stdout=out3, stderr=out3))
+        text = read(out3, String)
+        @test occursin("FAIL", text)
+        @test occursin("Expression: 1 == 2", text)
+        @test !occursin("Captured logs", text)
+        @test !occursin("some output before the failure", text)
+        @test !occursin("something looked wrong", text)
+        logs = [joinpath(d, f) for (d, _, fs) in walkdir(runs) for f in fs if endswith(d, ".logs")]
+        @test any(f -> occursin("some output before the failure", read(f, String)), logs)
+    end
+
     @testset "no terminal control sequences when there is no terminal" begin
         @test !occursin("\e[2K", log)
         @test !occursin("\e[", log)

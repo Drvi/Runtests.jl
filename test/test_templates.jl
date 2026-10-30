@@ -271,6 +271,19 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         end
     end
 
+    @testset "the expansion shows its progress and nothing else it prints" begin
+        pkg = make_pkg("TemplateNoise", "test/a_tests.jl" => "@testitem \"a\" begin\n    @test true\nend\n",
+                       "test/testtemplates/noisy_tests_template.jl" =>
+                           "@testtemplate \"n \$n\" for n in (println(\"printed by the loop\"); 1:2)\n    @test \$n > 0\nend\n")
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            ok, out = template_chores(pkg)
+            @test ok === true
+            @test occursin("noisy_tests_template.jl:1: running the loop", out)
+            @test occursin(r"noisy_tests_template\.jl:1: 2 test items \(loading", out)
+            @test !occursin("printed by the loop", out)
+        end
+    end
+
     @testset "a loop sees each package the body imports by its name, and nothing it exports" begin
         # Packages of this test environment, as `Pkg.test` gives it no standard library
         # it does not list.
@@ -338,7 +351,7 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
             err, out = template_chores(pkg)
             @test err isa Runtests.ChoresError
-            @test occursin("templates: $(length(templates)), $(length(templates)) to fix by hand:", out)
+            @test occursin(Regex("templates: $(length(templates)), $(length(templates)) to fix by hand(, in \\S+)?:"), out)
             for msg in ["no list today",
                         "`\$f` would be written `Main.Template.var",
                         "UndefVarError: `Day` not defined",

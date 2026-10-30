@@ -1099,7 +1099,8 @@ function print_failures(io::IO, run, i::ItemIdx)
 end
 
 # `:eager` output was relayed as it happened; `:batched` prints every item's
-# output, `:issues` only that of items with something wrong.
+# output, `:issues` only that of items with something wrong, and `:quiet` none,
+# leaving it in the run's logs.
 wants_log(logs::Symbol, state::ItemState) =
     logs === :batched || (logs === :issues && is_non_pass(state))
 

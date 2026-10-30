@@ -271,9 +271,12 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
     return Dict{String, Any}("line" => line, "instances" => instances)
 end
 
-# A line of what the expansion is doing, out at once: the process that started this one
-# shows it as it comes.
-progress(parts...) = (println(stdout, parts...); flush(stdout); nothing)
+# A line of what the expansion is doing, out at once and marked: the process that started
+# this one shows these as they come, and keeps what else is printed, by the packages the
+# templates load say, for when the expansion fails.
+const PROGRESS_MARK = "\x1eRuntests progress "
+
+progress(parts...) = (println(stdout, PROGRESS_MARK, parts...); flush(stdout); nothing)
 
 seconds(s::Real) = string(round(s; digits = 1), "s")
 

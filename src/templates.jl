@@ -349,8 +349,9 @@ function expand_templates(target, templates::Vector{String})
 end
 
 # `nothing` once the process has exited cleanly; otherwise why it did not, with what it
-# said that shows why. What it says is shown as it says it, indented: loading what a
-# template imports can take minutes, and the process says what it is doing. One past
+# said that shows why. Its progress lines are shown as it says them, indented: loading
+# what a template imports can take minutes. The rest of what it says, the packages it
+# loads among it, is kept for the failure only. One past
 # `limit` gets SIGTERM first, on which Julia says which line of a template it was
 # running (on Windows it ends without a word), and SIGKILL if it is still there.
 function run_expander(cmd::Cmd, limit::Real)
@@ -359,8 +360,11 @@ function run_expander(cmd::Cmd, limit::Real)
     proc = run(pipeline(cmd; stdout = pipe, stderr = pipe); wait = false)
     close(pipe.in)
     relay = @async for line in eachline(pipe)
-        println(said, line)
-        println(stdout, "    ", line)
+        marked = startswith(line, Expander.PROGRESS_MARK)
+        text = marked ? chopprefix(line, Expander.PROGRESS_MARK) : line
+        println(said, text)
+        marked || continue
+        println(stdout, "    ", text)
         flush(stdout)
     end
     try

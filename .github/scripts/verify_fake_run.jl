@@ -68,7 +68,8 @@ arg(k, var) = length(ARGS) >= k ? ARGS[k] : get(ENV, var, "")
 const ARTIFACT = abspath(arg(1, "FAKECI_ARTIFACT"))
 const RUNSTATES = abspath(arg(2, "FAKECI_RUNSTATES"))
 isdir(ARTIFACT) || error("no artifact directory at $(repr(ARTIFACT)); give it as the first argument or FAKECI_ARTIFACT")
-isdir(RUNSTATES) || error("no run-state directory at $(repr(RUNSTATES)); give it as the second argument or FAKECI_RUNSTATES")
+# A missing run-state directory is what a cache that was not restored leaves, which the
+# checks of the cache report; the rest is checked all the same.
 
 logs_of(runstate) = string(chopsuffix(runstate, ".runstate"), ".logs")
 read_or_empty(path) = isfile(path) ? read(path, String) : ""
@@ -171,9 +172,12 @@ end
     end
 
     @testset "the cache for the next job holds the run state and leaves the logs out" begin
-        @test basename(RUNSTATE) in readdir(RUNSTATES)
-        @test !any(endswith(".logs"), (d for (_, ds, _) in walkdir(RUNSTATES) for d in ds))
-        @test Runtests.read_run_state(joinpath(RUNSTATES, basename(RUNSTATE))) !== nothing
+        @test isdir(RUNSTATES)
+        if isdir(RUNSTATES)
+            @test basename(RUNSTATE) in readdir(RUNSTATES)
+            @test !any(endswith(".logs"), (d for (_, ds, _) in walkdir(RUNSTATES) for d in ds))
+            @test Runtests.read_run_state(joinpath(RUNSTATES, basename(RUNSTATE))) !== nothing
+        end
     end
 
     @testset "the failing items run again from the record, as they ran on CI" begin

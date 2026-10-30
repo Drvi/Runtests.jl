@@ -290,6 +290,23 @@ using Runtests: RuntestsWorkers
         end
     end
 
+    @testset "a worker's label is as wide as the run's widest, so lines line up past the ninth" begin
+        P = Runtests.Private
+        how = (; state = P.PASSED, elapsed_ns = UInt64(1), compile_ns = UInt64(0), maxrss = UInt64(1))
+        at = (line, word) -> findfirst(word, line)
+        width = P.SLOT_LABEL_WIDTH[]
+        try
+            P.SLOT_LABEL_WIDTH[] = P.slot_label_width(12)
+            lines = [P.item_line(s, 1, 12, "\"x\"", 3, 1, 1, how) for s in (1, 9, 10, 12)]
+            @test allequal(at(l, "DONE") for l in lines)
+            @test startswith(lines[1], "🟢 w1  · ") && startswith(lines[3], "🟢 w10 · ")
+            P.SLOT_LABEL_WIDTH[] = P.slot_label_width(9)
+            @test startswith(P.item_line(9, 1, 12, "\"x\"", 3, 1, 1, how), "🟢 w9 · ")
+        finally
+            P.SLOT_LABEL_WIDTH[] = width
+        end
+    end
+
     @testset "the child that wrote that log was never asked for colour" begin
         # Every assertion above reads the log as plain text, so the child that
         # writes it must not colour it — and whether it does is decided by the

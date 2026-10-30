@@ -47,6 +47,17 @@ end)
         end
     end
 
+    @testset "a step that takes long says how long, after its first line's words" begin
+        with_duration = Runtests.Private.with_duration
+        @test with_duration("templates: 1, 1 expanded:\n  test/a_tests.jl: expanded\n", 6.61) ==
+              "templates: 1, 1 expanded, in 6.6s:\n  test/a_tests.jl: expanded\n"
+        @test with_duration("test items: 3 in 2 files, all valid\n", 4.0) == "test items: 3 in 2 files, all valid, in 4.0s\n"
+        @test with_duration("setups: none", 75.0) == "setups: none, in 1m15.0s"
+        # A quick one, and one that said nothing, are left as they are.
+        @test with_duration("setups: none\n", 2.9) == "setups: none\n"
+        @test with_duration("", 10.0) == ", in 10.0s"
+    end
+
     @testset "a dry run changes nothing, and a run does what it reported" begin
         dir = make_pkg("Untidy", "test/a_test.jl" => declared("one"),
                        "test/testsetups/Helpers.jl" => "module Helpers\nusing Random\nend\n")
@@ -58,7 +69,7 @@ end)
             ok, out = chores_out(dir; dry_run = true)
             @test ok === false
             @test occursin("chores, checking only", out)
-            @test occursin("setups: 1 of 1 to change:", out)
+            @test occursin(r"setups: 1 of 1 to change(, in \S+)?:", out)
             @test occursin("`Helpers`: would move to $(joinpath("Helpers", "src", "Helpers.jl"))", out)
             @test occursin("2 of this machine's to delete: beyond the newest $KEEP_RUNS", out)
             @test occursin("to do: 3, which `Runtests.chores()` does", out)
@@ -147,7 +158,8 @@ end)
             # Asked of the fixture, which is a package of its own and has no tests.
             ok, out = chores_out(fixture; dry_run = true)
             @test ok === true
-            @test occursin("test items: none, no test files under $(joinpath("test", ""))\n", out) && occursin("nothing to do", out)
+            @test occursin(Regex("test items: none, no test files under \\Q$(joinpath("test", ""))\\E(, in \\S+)?\n"), out) &&
+                  occursin("nothing to do", out)
             done, _ = chores_out(fixture)
             @test done === true
             # Asked of the package around it, the fixture is no test file of its own.
@@ -194,7 +206,7 @@ end)
             err, out = chores_out(dir)
             @test err isa Runtests.ChoresError
             @test occursin("2 problems to fix by hand", sprint(showerror, err))
-            @test occursin("test items: 1 problem:", out)
+            @test occursin(r"test items: 1 problem(, in \S+)?:", out)
             @test occursin("a_test.jl:", out)
             @test occursin("config: unknown key `workerz`", out)
             # What needs no person is done before it says what does.

@@ -54,10 +54,10 @@ function run_chores(args, dry_run::Bool, config)
         gone = chore_task(io -> chore_gone_checkouts!(io, fix))
         # Setups first, as expanding a template loads them, and the suite after the
         # templates, so that it is read with their new expansions.
-        n, bad = chore_setups!(io, target, fix)
+        n, bad = said!(io, chore_step(io -> chore_setups!(io, target, fix)))
         todo += n
         problems += bad
-        n, bad = chore_templates!(io, target, fix)
+        n, bad = said!(io, chore_step(io -> chore_templates!(io, target, fix)))
         todo += n
         problems += bad
         # The checks that read the suite read it at the same time, each in a task.
@@ -68,7 +68,7 @@ function run_chores(args, dry_run::Bool, config)
         for t in named
             problems += said!(io, t)
         end
-        todo += chore_runstates!(io, target, fix, names)
+        todo += said!(io, chore_step(io -> chore_runstates!(io, target, fix, names)))
         todo += said!(io, gone)
         if problems > 0
             fix && todo > 0 && print(io, "done: ", todo, " · ")
@@ -192,19 +192,38 @@ function check_groups!(io::IO, target, groups::Dict{String, TagExpr}; config = n
     return bad
 end
 
-# A step of the chores in a task of its own: what it says, styled as the report is,
-# and what it returns. `said!` prints the first and returns the second, once the task
-# is done, so the report reads in the order of its steps whatever order they end in.
-chore_task(f) = Threads.@spawn begin
+# A step of the chores: what it says, styled as the report is, with how long it took
+# when that was long, and what it returns. `said!` prints the first and returns the
+# second. A step in a task of its own is said once the task is done, so the report
+# reads in the order of its steps whatever order they end in.
+function chore_step(f)
+    t0 = time()
     out = Ref{Any}(nothing)
     text = styled(io -> (out[] = f(io)))
-    (text, out[])
+    return (with_duration(text, time() - t0), out[])
 end
 
-function said!(io::IO, t::Task)
-    text, out = fetch_result(t)
+chore_task(f) = Threads.@spawn chore_step(f)
+
+said!(io::IO, t::Task) = said!(io, fetch_result(t))
+
+function said!(io::IO, (text, out)::Tuple{String, Any})
     print(io, text)
     return out
+end
+
+# A step that takes longer than this says how long it took, so that a person who
+# waited knows which step it was.
+const SLOW_STEP_S = 3.0
+
+# `text`, a step's report, with how long the step took after its first line's words,
+# ahead of a colon that leads into the lines under it: `templates: 1, 1 expanded, in 1m30s:`.
+function with_duration(text::String, seconds::Real)
+    seconds < SLOW_STEP_S && return text
+    nl = something(findfirst('\n', text), ncodeunits(text) + 1)
+    head, rest = text[1:prevind(text, nl)], text[nl:end]
+    took = string(", in ", fmt_seconds(seconds))
+    return endswith(head, ":") ? string(chop(head), took, ":", rest) : string(head, took, rest)
 end
 
 # What a task returned, or what it threw, as itself rather than wrapped.

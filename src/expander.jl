@@ -243,9 +243,18 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
     # the item will see them, among its imports, and the values' code is checked there,
     # where nothing the loop itself defined, a closure in its header say, is any more
     # visible than it is to the item.
+    # Said as each phase starts and ends, for whoever waits on a slow one: loading the
+    # imports can precompile them, and the loop and the checks run the template's code.
+    at = string(basename(path), ":", line)
+    imports = [string(ex) for ex in body.args if is_import(ex)]
+    progress(at, ": loading what the body imports", isempty(imports) ? "" : string(", ", join(imports, "; ")))
+    t0 = time()
     item = item_module(body, project, line)
+    t1 = time()
+    progress(at, ": running the loop")
     found = run_loop(loop_module(body, project, line), item, specs, name, vars, Any[last(p) for p in computed],
                      LineNumberNode(line, Symbol(path)))
+    t2 = time()
     isempty(found) && throw(TemplateError(line, "the `for` of this `@testtemplate` ran no iteration, so it declares no test item"))
     instances = Dict{String, Any}[]
     for (n, values, results) in found
@@ -257,8 +266,16 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
         sums = Vector{String}[[key, value_code(item, label(a), x, n, line)] for ((key, a), x) in zip(computed, results)]
         push!(instances, Dict{String, Any}("name" => n, "values" => codes, "computed" => sums))
     end
+    progress(at, ": ", length(instances), length(instances) == 1 ? " test item" : " test items",
+             " (loading ", seconds(t1 - t0), ", loop ", seconds(t2 - t1), ", values ", seconds(time() - t2), ")")
     return Dict{String, Any}("line" => line, "instances" => instances)
 end
+
+# A line of what the expansion is doing, out at once: the process that started this one
+# shows it as it comes.
+progress(parts...) = (println(stdout, parts...); flush(stdout); nothing)
+
+seconds(s::Real) = string(round(s; digits = 1), "s")
 
 function claim!(names::Dict{String, Int}, name::String, line::Int)
     at = get(names, name, 0)

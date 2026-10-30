@@ -464,12 +464,24 @@ function clock_now()
     return text
 end
 
+# How wide a worker's label, `w` and its number, is written: as wide as the run's
+# widest, so that what follows lines up past the ninth worker. Set as a run starts; a
+# process runs one at a time.
+const SLOT_LABEL_WIDTH = Ref(2)
+
+slot_label_width(nslots::Integer) = 1 + ndigits(max(nslots, 1))
+
 # The start every line shares: glyph, the worker it is about (none in a run
 # without workers), and the time. The clock is passed in because the status line,
 # redrawn after everything the run prints, has a cheaper way to get it.
 function print_line_head(io::IO, mark::AbstractString, slot_id, clock::AbstractString)
     print(io, mark, " ")
-    slot_id === nothing || (print(io, "w"); print_int(io, slot_id); print(io, FIELD))
+    if slot_id !== nothing
+        print(io, "w")
+        print_int(io, slot_id)
+        pad_to(io, SLOT_LABEL_WIDTH[], 1 + ndigits(slot_id))
+        print(io, FIELD)
+    end
     print(io, clock, FIELD)
     return nothing
 end

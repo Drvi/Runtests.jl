@@ -349,32 +349,38 @@ function expand_templates(target, templates::Vector{String})
 end
 
 # `nothing` once the process has exited cleanly; otherwise why it did not, with what it
-# said that shows why. One past `limit` gets SIGTERM first, on which Julia says which
-# line of a template it was running (on Windows it ends without a word), and SIGKILL
-# if it is still there.
+# said that shows why. What it says is shown as it says it, indented: loading what a
+# template imports can take minutes, and the process says what it is doing. One past
+# `limit` gets SIGTERM first, on which Julia says which line of a template it was
+# running (on Windows it ends without a word), and SIGKILL if it is still there.
 function run_expander(cmd::Cmd, limit::Real)
-    said = tempname()
-    try
-        proc = open(io -> run(pipeline(cmd; stdout = io, stderr = io); wait = false), said, "w")
-        try
-            if timedwait(() -> process_exited(proc), limit; pollint = 0.2) === :timed_out
-                kill(proc, Base.SIGTERM)
-                timedwait(() -> process_exited(proc), 5.0; pollint = 0.2) === :timed_out && kill(proc, Base.SIGKILL)
-                wait(proc)
-                return "the process expanding the templates took longer than $(fmt_seconds(limit)), " *
-                    "the `init_timeout` setting, and was stopped" * why_it_failed(read(said, String))
-            end
-        catch
-            process_exited(proc) || kill(proc)
-            rethrow()
-        end
-        success(proc) && return nothing
-        return "the process expanding the templates failed" *
-            (proc.termsignal != 0 ? ", killed by signal $(proc.termsignal)" : ", exiting with $(proc.exitcode)") *
-            why_it_failed(read(said, String))
-    finally
-        rm(said; force = true)
+    said = IOBuffer()
+    pipe = Pipe()
+    proc = run(pipeline(cmd; stdout = pipe, stderr = pipe); wait = false)
+    close(pipe.in)
+    relay = @async for line in eachline(pipe)
+        println(said, line)
+        println(stdout, "    ", line)
+        flush(stdout)
     end
+    try
+        if timedwait(() -> process_exited(proc), limit; pollint = 0.2) === :timed_out
+            kill(proc, Base.SIGTERM)
+            timedwait(() -> process_exited(proc), 5.0; pollint = 0.2) === :timed_out && kill(proc, Base.SIGKILL)
+            wait(proc)
+            wait(relay)
+            return "the process expanding the templates took longer than $(fmt_seconds(limit)), " *
+                "the `init_timeout` setting, and was stopped" * why_it_failed(String(take!(said)))
+        end
+    catch
+        process_exited(proc) || kill(proc)
+        rethrow()
+    end
+    wait(relay)
+    success(proc) && return nothing
+    return "the process expanding the templates failed" *
+        (proc.termsignal != 0 ? ", killed by signal $(proc.termsignal)" : ", exiting with $(proc.exitcode)") *
+        why_it_failed(String(take!(said)))
 end
 
 # What a failed expanding process said that shows why, indented under the report's
@@ -419,6 +425,9 @@ function chore_templates!(io::IO, target, fix::Bool)
     end
     if fix
         todo = filter(t -> !(states[t] in (:edited, :in_the_way)), templates)
+        # Said now rather than in the report: the expansion can take minutes.
+        isempty(todo) || println(stdout, label_prefix(), "expanding ", plural(length(todo), "template"), " in a process ",
+                                 "with the test environment: ", join((relpath_or_path(t) for t in todo), ", "))
         answers = isempty(todo) ? Dict{String, Any}[] : expand_templates(target, todo)
         answers isa String && push!(problems, target.testdir => answers)
         for answer in (answers isa String ? Dict{String, Any}[] : answers)

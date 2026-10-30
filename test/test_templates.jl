@@ -183,7 +183,13 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
             err, out = template_chores(pkg)
             @test err isa Runtests.ChoresError
-            @test occursin("templates: 1, 1 expanded:", out) && occursin("move it there", out)
+            # A step that took long says so, after its words: `, in 3.4s`.
+            @test occursin(r"templates: 1, 1 expanded(, in \S+)?:", out) && occursin("move it there", out)
+            # The expansion says what it is doing as it does it, before the report.
+            @test occursin("expanding 1 template in a process with the test environment: " *
+                           joinpath("test", "testtemplates", "placed_tests_template.jl"), out)
+            @test occursin(r"placed_tests_template\.jl:1: 2 test items \(loading \S+, loop \S+, values \S+\)", out)
+            @test findfirst("placed_tests_template.jl:1: 2 test items", out) < findfirst("[TEST] chores", out)
             @test isfile(joinpath(pkg, "test", "placed_tests.jl"))
             @test !isfile(joinpath(pkg, "test", "beside_tests.jl")) && !isfile(joinpath(pkg, "test", "deep_tests.jl"))
         end

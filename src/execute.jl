@@ -399,6 +399,7 @@ function execute(p::Plan, target; on_item = nothing)
         ReentrantLock()
     )
     run.events === nothing || (run.events.run = run)
+    SLOT_LABEL_WIDTH[] = slot_label_width(nslots(p))
     cfg.coverage && mkpath(coverage_dir(scratch))
     # Ctrl-C caught by any task the run starts is thrown into this one, which is
     # where the run knows how to stop.
@@ -1696,7 +1697,7 @@ function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::Abstrac
         within[] = rec.how === nothing
         return printline(run, item_line(run, slot.id, rec.i, rec.attempt, rec.how))
     end
-    return printline(run, string(within[] ? MARK_ITEM : MARK_WORKER, " w", slot.id, FIELD, line))
+    return printline(run, string(within[] ? MARK_ITEM : MARK_WORKER, " ", rpad(string("w", slot.id), SLOT_LABEL_WIDTH[]), FIELD, line))
 end
 
 # An item's RUN or DONE line, drawn from what this run knows about the item.

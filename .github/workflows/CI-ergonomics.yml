@@ -35,14 +35,14 @@ jobs:
         with:
           version: '1'
       - uses: julia-actions/cache@v2
-      # Every cache step names the same paths, the exclusion too: a cache is found by its
-      # key and by its paths, and a restore that names other paths misses it.
+      # Every cache step names the same path: a cache is found by its key and by its paths,
+      # and a restore that names other paths misses it. The run states are named rather
+      # than their directory less the logs: the cache archives a directory it is given
+      # whole, whatever an exclusion says.
       - name: Restore the run states of earlier runs
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ${{ runner.temp }}/runtests
-            !${{ runner.temp }}/runtests/**/*.logs
+          path: ${{ runner.temp }}/runtests/*.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fakeci-runstates-
       - name: Run the fake suite, whose tests fail on purpose
@@ -66,9 +66,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            ${{ runner.temp }}/runtests
-            !${{ runner.temp }}/runtests/**/*.logs
+          path: ${{ runner.temp }}/runtests/*.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload this run's run state, logs and evidence
         if: ${{ !cancelled() }}
@@ -91,9 +89,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ${{ runner.temp }}/runtests
-            !${{ runner.temp }}/runtests/**/*.logs
+          path: ${{ runner.temp }}/runtests/*.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
           fail-on-cache-miss: true
       - name: Instantiate the fake suite's test environment

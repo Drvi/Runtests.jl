@@ -1004,9 +1004,7 @@ and a [`group`](#groups) per job:
 ```yaml
 - uses: actions/cache/restore@v4
   with:
-    path: |
-      ${{ runner.temp }}/runtests
-      !${{ runner.temp }}/runtests/**/*.logs
+    path: ${{ runner.temp }}/runtests/*.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
     restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
@@ -1018,9 +1016,7 @@ and a [`group`](#groups) per job:
 - uses: actions/cache/save@v4
   if: always()
   with:
-    path: |
-      ${{ runner.temp }}/runtests
-      !${{ runner.temp }}/runtests/**/*.logs
+    path: ${{ runner.temp }}/runtests/*.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
@@ -1029,10 +1025,12 @@ and a [`group`](#groups) per job:
     path: ${{ runner.temp }}/runtests-artifact
 ```
 
-The cache leaves the logs out, because the next job plans from the records alone.
-The restore step and the save step must list the same `path`, the exclusion
-included. The cache finds an entry by its key and by its paths, so a restore that
-lists other paths does not find it.
+The cache holds the records and leaves the logs out, because the next job plans
+from the records alone. Name the records with `*.runstate`. Do not name the
+directory with an exclusion such as `!**/*.logs`: the cache archives a directory
+whole, and the exclusion has no effect. The restore step and the save step must
+list the same `path`. The cache finds an entry by its key and by its paths, so a
+restore that lists other paths does not find it.
 The artifact holds this job's records and logs and none of the history. On your
 machine, run the failures of a downloaded record with
 `Runtests.runtestsf(replay = "<file>")`.

@@ -640,7 +640,7 @@ end
 
 # A worker loads Runtests, of which this is a part, by UUID rather than by name.
 # `using Runtests` at the top level of the worker's `Main` needs the package in the
-# active project's `[deps]`, which a profile's environment need not have;
+# active project's `[deps]`, which an environment directory's need not have;
 # `Base.require` on the `PkgId` finds it through the load path either way.
 const PKGID = Base.PkgId(Base.moduleroot(@__MODULE__))
 

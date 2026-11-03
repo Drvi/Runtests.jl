@@ -62,11 +62,14 @@ function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UIn
     return nothing
 end
 
-# Only profiles that actually change something are worth a line.
+# Only profiles that actually change something are worth a line, one each however
+# many environments they run in, and the environments the items run in one more.
 function print_profiles(io::IO, p::Plan)
+    seen = Set{Symbol}()
     for prof in p.profiles
+        prof.name in seen && continue
+        push!(seen, prof.name)
         parts = String[]
-        isempty(prof.environment) || push!(parts, string("environment ", relpath_or_path(prof.environment, p.root)))
         isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
         prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
         isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
@@ -74,6 +77,8 @@ function print_profiles(io::IO, p::Plan)
         isempty(prof.test_end.args) || push!(parts, "test end expression")
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
     end
+    envs = unique!(String[relpath_or_path(prof.environment, p.root) for prof in p.profiles if !isempty(prof.environment)])
+    isempty(envs) || println(io, length(envs) == 1 ? "environment: " : "environments: ", join(envs, ", "))
     return nothing
 end
 

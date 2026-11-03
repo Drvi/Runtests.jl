@@ -458,7 +458,7 @@ end
         dir = make_pkg(
             "Sandboxed",
             "test/a_test.jl" => """
-            @testitem "bounded" sandbox=:bounds begin
+            @testitem "bounded" profile=:bounds begin
                 @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)  # what it asked for
                 @test Main.FROM_PROFILE_INIT == 7                             # and its profile's init
                 @test getpid() != parse(Int, ENV["RUNTESTS_SOLO_PID"])
@@ -519,7 +519,7 @@ end
         @test isempty(filter(r -> r.level == Logging.Warn, first(logs)))
     end
 
-    @testset "a sandbox profile really changes the worker's julia flags" begin
+    @testset "a profile really changes the worker's julia flags" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "Project.toml"), "name = \"Flagged\"\nuuid = \"1a2b3c4d-0000-4000-8000-000000000004\"\n")
         mkpath(joinpath(dir, "src")); write(joinpath(dir, "src", "Flagged.jl"), "module Flagged end\n")
@@ -527,7 +527,7 @@ end
         @testitem "default flags" begin
             @test Base.JLOptions().check_bounds == $(Base.JLOptions().check_bounds)
         end
-        @testitem "checked flags" sandbox=:bounds begin
+        @testitem "checked flags" profile=:bounds begin
             @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
         end
         """)

@@ -86,21 +86,20 @@ repl_ignored(sandboxed::Bool) = sandboxed ? REPL_IGNORED[3:3] : REPL_IGNORED
 
 Run one `@testitem` that was evaluated rather than scanned, and return its
 testset. It is read by the scanner's parser and evaluated by the worker's code;
-`sandbox` and profiles start a worker, and the keywords only a scheduler can
-honour are ignored with a warning.
+`sandbox`, a profile and an environment directory start a worker, and the keywords
+only a scheduler can honour are ignored with a warning.
 """
 function run_interactive(ex::Expr, source::LineNumberNode)
     path = source.file === nothing ? "REPL" : String(source.file)
     target = interactive_target()
     setups = target === nothing ? Dict{Symbol, String}() : setup_modules(target.testdir)
-    # An item from a file in a profile's environment runs under that profile, as in a run.
-    owner = target === nothing ? DEFAULT_PROFILE :
-        owner_of(abspath(path), suite_claims(target))
+    # An item from a file in an environment directory runs in that environment, as in a run.
+    environment = target === nothing ? "" : environment_of(abspath(path), target.testdir)
     errors = ScanError[]
-    item = parse_testitem(ex, path, Int32(source.line), errors, setups, owner)
+    item = parse_testitem(ex, path, Int32(source.line), errors, setups, environment)
     # `nothing` comes with the error that says why.
     (item === nothing || !isempty(errors)) && throw(ScanFailure(errors))
-    sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE
+    sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE || !isempty(item.environment)
     warn_ignored(item, sandboxed)
     return exclusively() do
         with_interactive_env(target) do
@@ -142,8 +141,8 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
 end
 
 # The run's environment for the length of one item. After `activate` the session is
-# already in it, and `with_test_env` leaves it alone. For an item of a profile that
-# names an environment, `prof`, that environment over it, as its workers have it.
+# already in it, and `with_test_env` leaves it alone. For a profile in an environment
+# directory, `prof`, that environment over it, as its workers have it.
 function with_interactive_env(f, target, prof::Union{Nothing, Profile} = nothing)
     target === nothing && return f()
     return with_test_env(target) do
@@ -186,7 +185,7 @@ function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UIn
 end
 
 # A worker configured as a run would configure it, in the profile's own project
-# when it declares preferences or an environment.
+# when it declares preferences or runs in an environment directory.
 function sandbox_worker(prof, target, redirect_fn)
     env = Base.active_project()
     project = something(profile_project(prof, env, target === nothing ? nothing : target.root), Some(env))
@@ -257,20 +256,21 @@ function run_sandboxed(item::RawItem, target)
 end
 
 # The profile from the project's TestItems.toml, `default` included, as a run reads
-# it. Only a session without a project has the built-in default.
+# it, in the item's environment. Only a session without a project has the built-in
+# default.
 function interactive_profile(item::RawItem, target)
     if target === nothing
         item.profile === DEFAULT_PROFILE && return Profile(DEFAULT_PROFILE)
-        throw(ConfigError("`sandbox=:$(item.profile)` needs a TestItems.toml, and there is no project here"))
+        throw(ConfigError("`profile = :$(item.profile)` needs a TestItems.toml, and there is no project here"))
     end
     cfg = read_config(target.testdir)
     haskey(cfg.profiles, item.profile) || throw(
         ConfigError(
-            "`sandbox=:$(item.profile)` has no [profiles.$(item.profile)] in " *
+            "`profile = :$(item.profile)` has no [profiles.$(item.profile)] in " *
                 relpath_or_path(joinpath(target.testdir, "TestItems.toml"), target.root)
         )
     )
-    return run_profile(cfg.profiles[item.profile], cfg.threads)
+    return in_environment(run_profile(cfg.profiles[item.profile], cfg.threads), item.environment)
 end
 
 function print_interactive_result(result::ItemResult)

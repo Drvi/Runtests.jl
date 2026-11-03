@@ -18,35 +18,29 @@ Every test file under `testdir`, sorted. See [`walk_test_dir`](@ref).
 discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 
 """
-    walk_test_dir(testdir; claimed) -> (; tests, strays, templates)
+    walk_test_dir(testdir) -> (; tests, strays, templates, environments)
 
 Every test file under `testdir`; an error for every other Julia file there, each
-saying where such a file belongs; and every test template, a `*_tests_template.jl`
-in `testtemplates/` (see [`expansion_errors`](@ref)). Each is sorted by path.
-Hidden files and directories, `testsetups/`, and `testfixtures/` at the top of
-`testdir` are skipped. A directory with an environment of its own, a `Project.toml`
-or a `JuliaProject.toml`, is read when a profile names it as its `environment`
-(`claimed`, from [`claimed_environments`](@ref)), and its items run under that
-profile; any other is an error among the strays, whether or not it holds tests. The
-strays are reported, not skipped: a file of tests not named `*_test.jl` would
-otherwise never run, and the run would pass without it, a template anywhere but
-`testtemplates/` would never be expanded, and the tests of an environment nothing
-names would never run.
+saying where such a file belongs; every test template, a `*_tests_template.jl` in
+`testtemplates/` (see [`expansion_errors`](@ref)); and every directory with an
+environment of its own, a `Project.toml` or a `JuliaProject.toml`, whose items run
+in that environment (see [`environment_of`](@ref)). Each is sorted by path. Hidden
+files and directories, `testsetups/`, and `testfixtures/` at the top of `testdir`
+are skipped. The strays are reported, not skipped: a file of tests not named
+`*_test.jl` would otherwise never run, and the run would pass without it, and a
+template anywhere but `testtemplates/` would never be expanded.
 """
-function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = Dict{String, Symbol}())
-    tests, strays, templates = String[], ScanError[], String[]
-    isdir(testdir) || return (; tests, strays, templates)
+function walk_test_dir(testdir::AbstractString)
+    tests, strays, templates, environments = String[], ScanError[], String[], String[]
+    isdir(testdir) || return (; tests, strays, templates, environments)
     templates_dir = joinpath(testdir, TESTTEMPLATES_DIR)
     # Told from the listing the walk reads anyway.
     function enter(dir, entries)
         dir == testdir && return true
-        i = findfirst(e -> !entry_isdir(e) && entry_name(e) in PROJECT_NAMES, entries)
-        (i === nothing || haskey(claimed, dir)) && return true
-        push!(strays, unclaimed_error(joinpath(dir, entry_name(entries[i])), testdir))
-        return false
+        any(e -> !entry_isdir(e) && entry_name(e) in PROJECT_NAMES, entries) && push!(environments, dir)
+        return true
     end
-    descend(dir, d) = !(startswith(d, '.') || d == TESTSETUPS_DIR ||
-                        (dir == testdir && (d == TESTTEMPLATES_DIR || d == TESTFIXTURES_DIR)))
+    descend(dir, d) = suite_descends(testdir, dir, d)
     walk_dirs(testdir; enter, descend) do dir, n
         startswith(n, '.') && return
         if is_test_file(n)
@@ -68,19 +62,8 @@ function walk_test_dir(testdir::AbstractString; claimed::Dict{String, Symbol} = 
             push!(strays, misplaced_template_error(path))
         end
     end
-    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates))
-end
-
-# An environment under `test/` that no profile names: one error for the directory,
-# at its project file, which is what either fix changes.
-function unclaimed_error(projectfile::AbstractString, testdir::AbstractString)
-    dir = dirname(projectfile)
-    return ScanError(
-        projectfile, 0,
-        "$(relpath_or_path(dir)) has an environment of its own, which no profile names. To run its tests, " *
-            "declare a profile with `environment = $(repr(relpath_or_path(dir, testdir)))` in test/TestItems.toml; " *
-            "if it is input for the tests, move it under `test/$TESTFIXTURES_DIR/`, which the suite does not read."
-    )
+    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates),
+            environments = sort!(environments))
 end
 
 """
@@ -129,15 +112,74 @@ stat_listing(dir::AbstractString) = Tuple{String, Bool}[(n, isdir(lstat(joinpath
 entry_name(e::Tuple{String, Bool}) = e[1]
 entry_isdir(e::Tuple{String, Bool}) = e[2]
 
-# The profile whose environment holds `path`, the innermost when several do, or the
-# default profile when none does.
-function owner_of(path::AbstractString, claimed::Dict{String, Symbol})
-    best, len = DEFAULT_PROFILE, 0
-    for (dir, prof) in claimed
-        startswith(path, joinpath(dir, "")) && ncodeunits(dir) > len && ((best, len) = (prof, ncodeunits(dir)))
+"""
+    environment_of(path, environments) -> String
+
+The directory whose environment the items of the test file `path` run in: the
+innermost of `environments`, as [`walk_test_dir`](@ref) finds them, that holds the
+file, or `""` for the test environment.
+"""
+function environment_of(path::AbstractString, environments::Vector{String})
+    best = ""
+    for dir in environments
+        startswith(path, joinpath(dir, "")) && ncodeunits(dir) > ncodeunits(best) && (best = dir)
     end
     return best
 end
+
+# An environment as a message names it.
+environment_name(dir::AbstractString) = isempty(dir) ? "the test environment" : "the environment of $(relpath_or_path(dir))"
+
+"""
+    environment_of(path, testdir) -> String
+
+The same for one file, `path`, read from the disk rather than from a walk of
+`testdir`: the innermost directory between the file and `testdir` with a project of
+its own, when the walk reads the file's directory (see [`suite_reads`](@ref)).
+"""
+function environment_of(path::AbstractString, testdir::AbstractString)
+    testdir = rstrip_path(testdir)
+    dir = dirname(path)
+    (startswith(dir, joinpath(testdir, "")) && suite_reads(testdir, dir)) || return ""
+    while dir != testdir
+        project_file_in(dir) === nothing || return dir
+        dir = dirname(dir)
+    end
+    return ""
+end
+
+# Whether the walk of `testdir` goes from `dir` into its directory `d`: never into a
+# hidden one or a setup's, nor into the templates and fixtures at the top.
+suite_descends(testdir::AbstractString, dir::AbstractString, d::AbstractString) =
+    !(startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && (d == TESTTEMPLATES_DIR || d == TESTFIXTURES_DIR)))
+
+"""
+    suite_reads(testdir, dir) -> Bool
+
+Whether [`walk_test_dir`](@ref) reads `dir`, a directory under `testdir`: what tells
+an environment of the suite from a project the suite does not read.
+"""
+function suite_reads(testdir::AbstractString, dir::AbstractString)
+    at = testdir
+    for d in splitpath(relpath(dir, testdir))
+        d == "." && continue
+        suite_descends(testdir, at, d) || return false
+        at = joinpath(at, d)
+    end
+    return true
+end
+
+"""
+    packages_among(environments) -> Vector{Pair{String, String}}
+
+Each of `environments` whose project declares a package, with the package's name. A
+package belongs in `test/testfixtures/` when the tests take it as input, or in
+`test/testsetups/` when it is a setup; anywhere else the suite reads, its test
+files run in it as in any environment.
+"""
+packages_among(environments::Vector{String}) =
+    Pair{String, String}[dir => name for dir in environments
+                         for name in (project_name_of(something(project_file_in(dir), "")),) if name isa String]
 
 # `Pkg.test` runs this one, so it belongs at the top of `test/` and nowhere else.
 const RUNTESTS_FILE = "runtests.jl"
@@ -187,10 +229,10 @@ end
 # `Meta.parseall` returns a syntax error as a statement at the line where parsing
 # stopped, rather than throwing. Nothing after it can be trusted, so it is the
 # file's one error. `tags` gets every tag an item of the file carries, selected or
-# not, and `profile` is the one its items run under unless they say otherwise.
+# not, and `environment` is the directory whose environment its items run in.
 function scan_file!(
         items::Vector{RawItem}, errors::Vector{ScanError}, names::Vector{ItemName}, tags::Set{Symbol},
-        path::String, filter::Filter, known_setups, profile::Symbol = DEFAULT_PROFILE
+        path::String, filter::Filter, known_setups, environment::String = ""
     )
     src = try
         read(path, String)
@@ -215,7 +257,7 @@ function scan_file!(
             next_line = k < lastindex(statements) && statements[k + 1] isa LineNumberNode ?
                 Int((statements[k + 1]::LineNumberNode).line) : 0
             hash = text_hash(src, starts, Int(line), next_line)
-            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, profile, hash)
+            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, environment, hash)
         end
     end
     return
@@ -252,13 +294,13 @@ end
 
 # One method whatever the statement is, so that the call is direct, not a dispatch
 # that boxes every argument once per item.
-function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, profile,
+function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, environment,
                            hash::UInt32 = UInt32(0))
     if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
         push!(errors, ScanError(path, line, not_an_item(ex)))
         return
     end
-    item = parse_testitem(ex, path, line, errors, known_setups, profile; hash)
+    item = parse_testitem(ex, path, line, errors, known_setups, environment; hash)
     item === nothing && return
     union!(tags, item.tags)
     if !(matches_path(filter.paths, path) && matches_name(filter.name, item.name) &&
@@ -285,16 +327,16 @@ end
 # The keywords a `@testitem` accepts. A position in this tuple is a bit in the
 # `seen` mask below, which is how a keyword given twice is caught without a set
 # per item.
-const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :chain, :sandbox)
+const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :chain, :sandbox, :profile)
 
 function keyword_bit(key::Symbol)
     i = findfirst(==(key), ITEM_KEYWORDS)
     return i === nothing ? UInt8(0) : UInt8(1) << (i - 1)
 end
 
-# `default_profile` is the profile of the environment the item's file is in: one a
-# `sandbox` keyword may repeat but not change.
-function parse_testitem(ex::Expr, path, line, errors, known_setups, default_profile::Symbol = DEFAULT_PROFILE;
+# `environment` is the directory whose environment the item's file is in (see
+# `environment_of`), or empty for the test environment.
+function parse_testitem(ex::Expr, path, line, errors, known_setups, environment::String = "";
                         hash::UInt32 = UInt32(0))
     # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
@@ -316,7 +358,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, default_prof
 
     tags = nothing; setups = Symbol[]
     timeout = USE_RUN_DEFAULT; retries = USE_RUN_DEFAULT
-    failfast = Int8(-1); chain = NO_CHAIN; profile = default_profile
+    failfast = Int8(-1); chain = NO_CHAIN; profile = DEFAULT_PROFILE
     exclusive = false; skip = false
     seen = UInt8(0)
     for k in (lo + 1):(hi - 1)
@@ -357,21 +399,20 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, default_prof
             chain = v
         elseif key === :sandbox
             v = literal(val)
-            if v isa Bool
-                exclusive = v
-            elseif v isa Symbol
-                (default_profile === DEFAULT_PROFILE || v === default_profile) || return scan_error!(errors, path, at,
-                    "`@testitem $(repr(name))`: its file is in the environment of profile `$default_profile`, " *
-                        "so it runs under `$default_profile`, and `sandbox = :$v` asks for another profile"
-                )
-                profile = v
-            else
-                return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `sandbox` must be `true` or a profile name, got `$(_show(val))`")
-            end
+            v isa Symbol && return scan_error!(errors, path, at,
+                "`@testitem $(repr(name))`: `sandbox` is `true` or `false`, whether the item runs alone in a " *
+                    "process of its own; to run it under [profiles.$v], write `profile = :$v`"
+            )
+            v isa Bool || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `sandbox` must be `true` or `false`, got `$(_show(val))`")
+            exclusive = v
+        elseif key === :profile
+            v = literal(val)
+            v isa Symbol || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `profile` must be a profile name, as in `profile = :fast`, got `$(_show(val))`")
+            profile = v
         else
             return scan_error!(errors, path, at, 
                 "`@testitem $(repr(name))`: unknown keyword `$key`; " *
-                    "known keywords are tags, timeout, retries, skip, failfast, chain, sandbox"
+                    "known keywords are tags, timeout, retries, skip, failfast, chain, sandbox, profile"
             )
         end
     end
@@ -384,7 +425,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, default_prof
     collect_setups!(setups, body, known_setups)
     return RawItem(
         name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
-        timeout, retries, failfast, chain, profile, exclusive, hash
+        timeout, retries, failfast, chain, profile, exclusive, environment, hash
     )
 end
 
@@ -461,15 +502,15 @@ end
 ### Driver #################################################################
 
 """
-    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names, claimed) -> Vector{RawItem}
+    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names, environments) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
 (file, line). Throws a `ScanFailure` listing every problem, so one run surfaces every
 broken file: among them the `strays`, and, unless `expansions` is false, every
 expansion of a template that is not the template's as it is now (see
 [`expansion_errors`](@ref)). `suite_names`, when given, gets the name of every item
-read, the filter's rejects included. An item in a directory a profile names as its
-environment (`claimed`) runs under that profile.
+read, the filter's rejects included. An item in one of `environments`, as
+[`walk_test_dir`](@ref) finds them, runs in that directory's environment.
 
 A tag the filter names that no item of the suite carries is a slip, not a selection:
 `tags = "!slw"` would select everything and say nothing. It throws an `ArgumentError`
@@ -482,9 +523,9 @@ function scan(
         templates::Vector{String} = String[],
         expansions::Bool = true,
         suite_names::Union{Nothing, Vector{String}} = nothing,
-        claimed::Dict{String, Symbol} = Dict{String, Symbol}()
+        environments::Vector{String} = String[]
     )
-    items, errors, rejected, tags = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, claimed)
+    items, errors, rejected, tags = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, environments)
     isempty(errors) || throw(ScanFailure(errors))
     check_tags_exist(filter, tags)
     if suite_names !== nothing
@@ -531,7 +572,7 @@ function no_such_tags(missing_::Vector{Symbol}, tags::Set{Symbol})
 end
 
 """
-    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, claimed) -> (items, errors, rejected, tags)
+    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, environments) -> (items, errors, rejected, tags)
 
 What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
 by (file, line), every problem found sorted the same way, the name and place of each
@@ -542,7 +583,7 @@ function scan_files(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(), strays::Vector{ScanError} = ScanError[],
         templates::Vector{String} = String[], expansions::Bool = true,
-        claimed::Dict{String, Symbol} = Dict{String, Symbol}()
+        environments::Vector{String} = String[]
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64), Set{Symbol}()) for _ in 1:nt]
@@ -554,7 +595,7 @@ function scan_files(
         Threads.@spawn begin
             its, errs, nms, tgs = $items, $errors, $names, $tags
             for path in ch
-                scan_file!(its, errs, nms, tgs, path, filter, known_setups, owner_of(path, claimed))
+                scan_file!(its, errs, nms, tgs, path, filter, known_setups, environment_of(path, environments))
             end
         end
     end

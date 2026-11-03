@@ -105,24 +105,17 @@ On CI, `RUNTESTS_GROUP` selects a group without any of this in `runtests.jl`.
 Some groups build an environment of their own: `Pkg.activate` and `Pkg.develop` in
 `runtests.jl`, often for downstream or QA tests. The converter leaves the files of a
 directory with a `Project.toml` of its own where they are, and lists them. To run
-them in that environment, port them in place and add a profile naming the
-directory:
-
-```toml
-[profiles.qa]
-environment = "qa"        # test/qa/Project.toml: Aqua, JET, ...
-```
-
-Every item under `test/qa/` then runs under that profile, in a copy of that
-environment with the package added by path; nothing needs `Pkg.activate` or
-`Pkg.develop` any more. Give the items a tag as well if CI runs them as a group of
+them in that environment, port them in place. Every item under `test/qa/` then runs
+in a copy of `test/qa/Project.toml`'s environment, with the package added by path;
+nothing needs `Pkg.activate` or `Pkg.develop` any more. An item that also needs
+Julia flags or preferences of its own gives itself a profile with `profile = :name`. Give the items a tag as well if CI runs them as a group of
 their own. If the environment was for something other than tests, such as
 downstream packages' suites, ask the user.
 
 A directory under `test/` with a `Project.toml` that is input for the tests, such as
 a package a test loads or a project a test reads, moves under `test/testfixtures/`.
 A run never reads that directory. Every other directory under `test/` with a
-`Project.toml` must be a profile's environment, or the run stops on it. A moved
+`Project.toml` is the environment of the test files in it. A moved
 project that names others by a relative `path` in `[sources]` needs those paths
 changed by hand.
 

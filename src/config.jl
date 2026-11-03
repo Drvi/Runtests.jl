@@ -24,8 +24,9 @@ struct Profile
     # from the environment that owns it, so this becomes the worker's own project
     # rather than anything layered on the test environment.
     preferences::String
-    # An absolute path to a directory with an environment of its own, its workers'
-    # in place of the test environment, or empty. Its tests run under this profile.
+    # An absolute path to the directory whose environment the workers run in, in
+    # place of the test environment, or empty. Never declared: a plan gives each pool
+    # the environment of its items' directory (see `in_environment`).
     environment::String
 end
 
@@ -113,7 +114,7 @@ function unknown_keyword(k::Symbol)
 end
 
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :environment)
+const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
 const TOP_KEYS = (:run, :order, :profiles, :groups)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
@@ -132,7 +133,7 @@ directory; named, it has to exist, where `test/TestItems.toml` may be absent.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
-    return build_config(path, toml; testdir, config_file = config === nothing ? "" : path, kwargs...)
+    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
 end
 
 """
@@ -222,7 +223,7 @@ function env_setting(key::Symbol, name::String, text::String)
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
 
-function build_config(path, toml; testdir::AbstractString, nunits = 0, config_file::AbstractString = "", kwargs...)
+function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
     end
@@ -307,7 +308,7 @@ function build_config(path, toml; testdir::AbstractString, nunits = 0, config_fi
         full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml, testdir),
+        profiles = read_profiles(path, toml),
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
@@ -332,7 +333,7 @@ end
 default_logs(workers::Integer, interactive::Bool = isinteractive()) =
     interactive && workers <= 1 ? :eager : :issues
 
-function read_profiles(path, toml, testdir::AbstractString)
+function read_profiles(path, toml)
     profiles = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
@@ -341,6 +342,12 @@ function read_profiles(path, toml, testdir::AbstractString)
         throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $(typemax(ProfileIdx) - 1) fit"))
     for name in keys(tbl)
         label = "profiles.$name"
+        given = tbl[name]
+        given isa AbstractDict && haskey(given, "environment") && throw(ConfigError(
+            "`environment` of [$label] in $(relpath_or_path(path)): a profile has no environment. The test items in " *
+                "a directory under `test/` with a Project.toml of its own run in that environment, under any " *
+                "profile; remove the key, and give those items `profile = :$name` where they need this profile"
+        ))
         p = section(path, tbl, name, PROFILE_KEYS, label)
         args = string_list(path, p, "julia_args", label)
         vars = get(Dict{String, Any}, p, "env")
@@ -355,11 +362,9 @@ function read_profiles(path, toml, testdir::AbstractString)
             haskey(p, "threads") ? threads_spec("threads of [$label]", p["threads"]) : "", env,
             parse_expr(path, name, "init", string_setting(path, p, "init", label)),
             parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
-            profile_preferences(path, name, get(p, "preferences", "")),
-            profile_environment(path, name, get(p, "environment", ""))
+            profile_preferences(path, name, get(p, "preferences", "")), ""
         )
     end
-    check_environment_owners(path, testdir, Pair{Symbol, String}[n => p.environment for (n, p) in profiles if !isempty(p.environment)])
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = ""))
     return profiles
@@ -371,100 +376,10 @@ run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
     Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment) :
     prof
 
-"""
-    profile_environment(config_path, name, value) -> String
-
-The absolute path to the directory a profile names as its `environment`, or `""`
-when it names none. Relative to the directory of the config file, as `preferences`
-is, and checked here, before any worker starts: a directory holding a `Project.toml`
-or a `JuliaProject.toml`.
-"""
-function profile_environment(config_path, name, value)
-    bad(what) = ConfigError("`environment` of [profiles.$name] in $(relpath_or_path(config_path))" * what)
-    value isa AbstractString ||
-        throw(bad(" must be the path of a directory with a Project.toml, as in `environment = \"qa\"`, got $(repr(value))"))
-    isempty(value) && return ""
-    dir = rstrip_path(normpath(isabspath(value) ? value : joinpath(dirname(config_path), value)))
-    isdir(dir) || throw(bad(" names $(relpath_or_path(dir)), which is not a directory"))
-    any(n -> isfile(joinpath(dir, n)), PROJECT_NAMES) ||
-        throw(bad(" names $(relpath_or_path(dir)), which has no Project.toml: an environment is a directory with one"))
-    return dir
-end
-
-# Which profile an item in an environment's directory runs under has one answer: a
-# directory is one profile's environment, and the default profile runs in the test
-# environment, `testdir` and what holds it. Nor is an environment in what `testdir`
-# keeps for something else: setups, templates, fixtures. Every directory is as
-# `normpath` leaves it, so `qa/../testfixtures` is `testfixtures`.
-function check_environment_owners(path, testdir::AbstractString, owners::Vector{Pair{Symbol, String}})
-    seen = Dict{String, Symbol}()
-    testdir = rstrip_path(normpath(testdir))
-    within(dir, at) = dir == at || startswith(dir, joinpath(at, ""))
-    for (name, dir) in sort(owners; by = first)
-        name === DEFAULT_PROFILE && throw(ConfigError(
-            "`environment` of [profiles.$name] in $(relpath_or_path(path)): the default profile's workers run in " *
-                "the test environment; give $(relpath_or_path(dir)) a profile of its own"
-        ))
-        within(testdir, dir) && throw(ConfigError(
-            "`environment` of [profiles.$name] in $(relpath_or_path(path)) names $(relpath_or_path(dir)), which holds " *
-                "the whole suite, `$(relpath_or_path(testdir))`; its tests run in the test environment, under the " *
-                "default profile, so a profile's environment is a directory inside it"
-        ))
-        for reserved in (TESTSETUPS_DIR, TESTTEMPLATES_DIR, TESTFIXTURES_DIR)
-            within(dir, joinpath(testdir, reserved)) && throw(ConfigError(
-                "`environment` of [profiles.$name] in $(relpath_or_path(path)) names $(relpath_or_path(dir)), which is " *
-                    "in `test/$reserved/`, kept for " * (reserved == TESTSETUPS_DIR ? "the suite's test setups" :
-                    reserved == TESTTEMPLATES_DIR ? "the suite's test templates" : "input to the tests, which the suite does not read")
-            ))
-        end
-        other = get(seen, dir, nothing)
-        other === nothing || throw(ConfigError(
-            "$(relpath_or_path(dir)) is the `environment` of both [profiles.$other] and [profiles.$name] in " *
-                "$(relpath_or_path(path)), and the items in it can run under one profile only"
-        ))
-        seen[dir] = name
-    end
-    return nothing
-end
-
-"""
-    claimed_environments(testdir, path, toml) -> Dict{String, Symbol}
-
-Every directory a profile of the config file `path` names as its `environment`, with
-that profile: what reading the test directory `testdir` needs to know before the rest
-of the settings are read. Checked as [`read_config`](@ref) checks it.
-"""
-function claimed_environments(testdir::AbstractString, path, toml)
-    claimed = Dict{String, Symbol}()
-    tbl = get(Dict{String, Any}, toml, "profiles")
-    tbl isa AbstractDict || return claimed   # `read_config` says what is wrong with it
-    owners = Pair{Symbol, String}[]
-    for (name, p) in tbl
-        p isa AbstractDict || continue
-        dir = profile_environment(path, name, get(p, "environment", ""))
-        isempty(dir) || push!(owners, Symbol(name) => dir)
-    end
-    check_environment_owners(path, testdir, owners)
-    for (name, dir) in owners
-        claimed[dir] = name
-    end
-    return claimed
-end
-
-# The environments the profiles of a target's config file name, the file `config`
-# names or `test/TestItems.toml`: what every reading of its test directory goes by.
-suite_claims(target; config = nothing) = claimed_environments(target.testdir, config_toml(target.testdir, config)...)
-
-# The same, or none when the config file is wrong: for a reading that shows what it
-# can, and leaves saying what is wrong with the file to a check of its own.
-function suite_claims_or_none(target; config = nothing)
-    return try
-        suite_claims(target; config)
-    catch e
-        e isa ConfigError || rethrow()
-        Dict{String, Symbol}()
-    end
-end
+# The profile as its workers start in the environment of the directory `environment`,
+# or in the test environment when it is empty.
+in_environment(prof::Profile, environment::AbstractString) =
+    Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, prof.preferences, String(environment))
 
 """
     read_groups(path, toml) -> Dict{String, TagExpr}

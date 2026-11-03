@@ -208,7 +208,7 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
-    @testset "sandbox=:profile uses that profile's flags and init" begin
+    @testset "profile=:profile uses that profile's flags and init" begin
         dir = make_pkg(
             "PastedProfile",
             "test/TestItems.toml" =>
@@ -216,7 +216,7 @@ const DEPS = fixture("TestDeps.jl")
         )
         with_activated(dir) do _
             ts, _ = capture_run() do
-                @testitem "pasted profile" sandbox=:bounds begin
+                @testitem "pasted profile" profile=:bounds begin
                     @test Base.JLOptions().check_bounds == 1
                     @test Main.FROM_INIT == 7
                 end
@@ -247,7 +247,7 @@ const DEPS = fixture("TestDeps.jl")
         uuid = Runtests.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["uuid"]
         with_activated(dir) do _
             ts, _ = capture_run() do
-                Core.eval(Main, :(@testitem "pasted preferences" sandbox=:tuned begin
+                Core.eval(Main, :(@testitem "pasted preferences" profile=:tuned begin
                     @test get(Base.get_preferences(Base.UUID($uuid)), "mode", "unset") == "fast"
                 end))
             end
@@ -259,12 +259,12 @@ const DEPS = fixture("TestDeps.jl")
         dir = make_pkg("PastedEnd", "test/TestItems.toml" => "[profiles.checked]\ntest_end = \"@test false\"\n")
         with_activated(dir) do _
             failed, _ = capture_run() do
-                @testitem "pasted checked" sandbox=:checked begin
+                @testitem "pasted checked" profile=:checked begin
                     @test true
                 end
             end
             skipped, _ = capture_run() do
-                @testitem "pasted checked skip" sandbox=:checked skip=true begin
+                @testitem "pasted checked skip" profile=:checked skip=true begin
                     @test true
                 end
             end
@@ -274,10 +274,10 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
-    @testset "a sandbox profile that does not exist says so" begin
+    @testset "a profile that does not exist says so" begin
         with_activated(DEPS) do _
             err = try
-                @testitem "pasted missing profile" sandbox=:nope begin
+                @testitem "pasted missing profile" profile=:nope begin
                     @test true
                 end
                 nothing
@@ -407,7 +407,7 @@ end
             """)
         with_activated(dir) do _
             for profile in (:slow_init, :slow_end)
-                ex = :(@testitem $("pasted $profile") sandbox=$(QuoteNode(profile)) begin
+                ex = :(@testitem $("pasted $profile") profile=$(QuoteNode(profile)) begin
                     @test true
                 end)
                 took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)

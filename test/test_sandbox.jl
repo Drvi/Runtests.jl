@@ -240,13 +240,13 @@ end
         @test [r.name for r in rows] == ["head", "hangs"]
     end
 
-    @testset "a chain in a sandbox profile runs in order under that profile's flags" begin
+    @testset "a chain in a profile runs in order under that profile's flags" begin
         dir = make_pkg(
             "ChainProfile",
             "test/t_test.jl" => string(
-                journal_item("checked one"; opts="chain=:p sandbox=:bounds",
+                journal_item("checked one"; opts="chain=:p profile=:bounds",
                              body="@test Base.JLOptions().check_bounds == 1"),
-                journal_item("checked two"; opts="chain=:p sandbox=:bounds",
+                journal_item("checked two"; opts="chain=:p profile=:bounds",
                              body="@test Base.JLOptions().check_bounds == 1"),
             ),
             "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n"
@@ -271,11 +271,11 @@ end
             "NoCrossPoolSteal",
             "test/t_test.jl" => string(
                 journal_item("quick"),
-                journal_item("checked one"; opts="sandbox=:bounds",
+                journal_item("checked one"; opts="profile=:bounds",
                              body="sleep(0.5)\n@test Base.JLOptions().check_bounds == 1"),
-                journal_item("checked two"; opts="sandbox=:bounds",
+                journal_item("checked two"; opts="profile=:bounds",
                              body="sleep(0.5)\n@test Base.JLOptions().check_bounds == 1"),
-                journal_item("checked three"; opts="sandbox=:bounds",
+                journal_item("checked three"; opts="profile=:bounds",
                              body="sleep(0.5)\n@test Base.JLOptions().check_bounds == 1"),
             ),
             "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n"
@@ -299,7 +299,7 @@ end
         dir = make_pkg(
             "Refilled",
             "test/t_test.jl" => string(
-                journal_item("tiny"; opts = "sandbox=:tiny", body = "@test ENV[\"TINY\"] == \"1\""),
+                journal_item("tiny"; opts = "profile=:tiny", body = "@test ENV[\"TINY\"] == \"1\""),
                 (journal_item("d$i"; body = "sleep(0.1)\n@test !haskey(ENV, \"TINY\")") for i in 1:20)...,
             ),
             "test/TestItems.toml" => "[profiles.tiny]\nenv = { TINY = \"1\" }\n",

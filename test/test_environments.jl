@@ -1,13 +1,12 @@
-# Profiles that name an environment. A directory under `test/` with a Project.toml of
-# its own is read only when a profile names it as its `environment`; its items then
-# run under that profile, in a copy of that environment with the package under test
-# added by path, and a directory no profile names is an error. See test_fixtures.jl
-# for `test/testfixtures/`, which holds the projects the suite does not read.
+# Environment directories. A directory under `test/` with a Project.toml of its own is
+# the environment of the test files in it: its items run in a copy of that
+# environment with the package under test added by path, under whatever profile they
+# ask for. See test_fixtures.jl for `test/testfixtures/`, which holds the projects the
+# suite does not read.
 
-using Runtests.Private: prepare, nitems, read_config, claimed_environments, config_toml, ConfigError,
-    ScanFailure, NoTestsError, environment_project, write_environment, replayed_config, read_run_state,
-    runstate_files, failing_items, suite_item_names, resolve_target, list_items, Profile, PASSED, FAILED,
-    init_run_state, finish_run_state!
+using Runtests.Private: prepare, nitems, read_config, ConfigError, ScanFailure, environment_project,
+    write_environment, read_run_state, runstate_files, failing_items, suite_item_names, resolve_target,
+    list_items, Profile, PASSED, FAILED, init_run_state, finish_run_state!, walk_test_dir, in_environment
 using Runtests.RuntestsWorkers: state_of
 using Runtests.Private: TOML
 
@@ -16,7 +15,7 @@ using Runtests.Private: TOML
 
 A package that takes a sibling, `<name>Core` under `lib/`, by `[sources]`, as a package
 of a monorepo does; and `test/qa`, an environment of its own holding `<name>Tools`, a
-package the package under test does not depend on, which `[profiles.qa]` names.
+package the package under test does not depend on.
 """
 function env_pkg(name::AbstractString, files::Pair{<:AbstractString, <:AbstractString}...)
     core, tools = name * "Core", name * "Tools"
@@ -29,7 +28,6 @@ function env_pkg(name::AbstractString, files::Pair{<:AbstractString, <:AbstractS
         "deps/$tools/src/$tools.jl" => "module $tools\nmarker() = :tools\nend\n",
         "src/$name.jl" => "module $name\nusing $core\ndouble(x) = 2 * $core.one_more(x)\nend\n",
         "test/qa/Project.toml" => "[deps]\n$tools = \"$utools\"\n\n[sources]\n$tools = {path = \"../../deps/$tools\"}\n",
-        "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n",
         files...,
     )
     open(joinpath(dir, "Project.toml"), "a") do io
@@ -40,10 +38,12 @@ end
 
 uuid_of(project_dir) = TOML.parsefile(joinpath(project_dir, "Project.toml"))["uuid"]
 
-# Each item's profile and whether it has a process of its own, by name.
-function profiles_of(p)
-    return Dict(p.items.name[i] => (p.profiles[p.units.profile[p.items.unit[i]]].name, p.units.exclusive[p.items.unit[i]])
-                for i in 1:nitems(p))
+# Each item's profile, environment and whether it has a process of its own, by name.
+function pools_of(p)
+    return Dict(begin
+                    prof = p.profiles[p.units.profile[p.items.unit[i]]]
+                    p.items.name[i] => (prof.name, prof.environment, p.units.exclusive[p.items.unit[i]])
+                end for i in 1:nitems(p))
 end
 
 plan_of(dir; kwargs...) = first(prepare((dir,); announce = false, kwargs...))
@@ -62,7 +62,7 @@ const QA_ITEMS = """
     @test EnvRunTools.marker() === :tools
     # The package under test, and the sibling it takes by `[sources]`.
     @test EnvRun.double(1) == 4
-    @test Main.Runtests.current_testitem().profile === :qa
+    @test Main.Runtests.current_testitem().profile === :default
 end
 
 @testitem "qa fails" begin
@@ -74,69 +74,16 @@ end
     # Run states go to a directory of this file's, not to the depot.
     withenv("RUNTESTS_GROUP" => nothing) do; with_runstate_dir() do _
 
-    @testset "the `environment` setting" begin
-        dir = env_pkg("EnvConfig", "test/qa/qa_tests.jl" => "")
-        qa = joinpath(dir, "test", "qa")
-        cfg(text) = (write(joinpath(dir, "test", "TestItems.toml"), text); read_config(joinpath(dir, "test")))
-
-        @testset "relative to the config file's directory, however it is written" begin
-            for text in ("qa", "qa/", "./qa", "qa/../qa", qa, qa * "/")
-                @test cfg("[profiles.qa]\nenvironment = $(repr(text))\n").profiles[:qa].environment == qa
-            end
-            # A profile without one, and one that names none, run in the test environment.
-            @test cfg("[profiles.qa]\nthreads = \"1\"\n").profiles[:qa].environment == ""
-            @test cfg("[profiles.qa]\nenvironment = \"\"\n").profiles[:qa].environment == ""
-        end
-
-        @testset "a JuliaProject.toml is a project file too" begin
-            other = joinpath(dir, "test", "other")
-            mkpath(other)
-            write(joinpath(other, "JuliaProject.toml"), "[deps]\n")
-            @test cfg("[profiles.other]\nenvironment = \"other\"\n").profiles[:other].environment == other
-        end
-
-        @testset "what is not an environment is a config error that says why" begin
-            for (text, why) in (
-                    "environment = \"nowhere\"" => "which is not a directory",
-                    "environment = \"qa/qa_tests.jl\"" => "which is not a directory",
-                    "environment = \"../src\"" => "has no Project.toml",
-                    "environment = 1" => "must be the path of a directory with a Project.toml",
-                    "environment = [\"qa\"]" => "must be the path of a directory with a Project.toml",
-                )
-                msg = message_of(() -> cfg("[profiles.qa]\n$text\n"))
-                @test occursin(why, msg)
-                @test occursin("`environment` of [profiles.qa]", msg)
-            end
-        end
-
-        @testset "a directory is one profile's environment, and never the default profile's" begin
-            msg = message_of(() -> cfg("[profiles.default]\nenvironment = \"qa\"\n"))
-            @test occursin("the default profile's workers run in the test environment", msg)
-            # However the two spell it.
-            msg = message_of(() -> cfg("[profiles.a]\nenvironment = \"qa\"\n[profiles.b]\nenvironment = \"./qa/\"\n"))
-            @test occursin("is the `environment` of both [profiles.a] and [profiles.b]", msg)
-            # Reading the test files checks the same, before the rest of the settings.
-            write(joinpath(dir, "test", "TestItems.toml"), "[profiles.a]\nenvironment = \"qa\"\n[profiles.b]\nenvironment = \"qa\"\n")
-            @test_throws ConfigError claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...)
-            @test_throws ConfigError plan_of(dir)
-        end
-
-        @testset "the directories profiles name, and nothing else, are claimed" begin
-            write(joinpath(dir, "test", "TestItems.toml"),
-                  "[profiles.qa]\nenvironment = \"qa\"\n[profiles.fast]\nthreads = \"1\"\n")
-            @test claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...) == Dict(qa => :qa)
-            rm(joinpath(dir, "test", "TestItems.toml"))
-            @test isempty(claimed_environments(joinpath(dir, "test"), config_toml(joinpath(dir, "test"), nothing)...))
-        end
-
-        @testset "a config file elsewhere names an environment relative to itself" begin
-            elsewhere = joinpath(dir, "ci")
-            mkpath(joinpath(elsewhere, "env"))
-            write(joinpath(elsewhere, "env", "Project.toml"), "[deps]\n")
-            write(joinpath(elsewhere, "TestItems.toml"), "[profiles.ci]\nenvironment = \"env\"\n")
-            c = read_config(joinpath(dir, "test"); config = joinpath(elsewhere, "TestItems.toml"))
-            @test c.profiles[:ci].environment == joinpath(elsewhere, "env")
-        end
+    @testset "a profile has no environment, and says where environments come from" begin
+        dir = env_pkg("EnvConfig", "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n",
+                      "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n")
+        msg = message_of(() -> read_config(joinpath(dir, "test")))
+        @test occursin("`environment` of [profiles.qa]", msg)
+        @test occursin("a directory under `test/` with a Project.toml of its own run in that environment", msg)
+        @test occursin("`profile = :qa`", msg)
+        @test occursin("`environment` of [profiles.qa]", message_of(() -> plan_of(dir)))
+        _, out = capture_run(() -> Runtests.chores(dir; dry_run = true))
+        @test occursin("`environment` of [profiles.qa]", out)
     end
 
     @testset "reading the test files" begin
@@ -145,7 +92,7 @@ end
             "test/main_tests.jl" => """
             @testitem "main" begin
             end
-            @testitem "main opts in" sandbox=:qa begin
+            @testitem "main profiled" profile=:fast begin
             end
             """,
             "test/qa/qa_tests.jl" => """
@@ -153,60 +100,79 @@ end
             end
             @testitem "qa alone" sandbox=true begin
             end
-            @testitem "qa names its own profile" sandbox=:qa begin
+            @testitem "qa profiled" profile=:fast begin
+            end
+            @testitem "qa alone profiled" sandbox=true profile=:fast begin
             end
             """,
             "test/qa/sub/deeper_tests.jl" => """
             @testitem "qa deeper" begin
             end
             """,
+            "test/qa/inner/JuliaProject.toml" => "[deps]\n",
+            "test/qa/inner/inner_tests.jl" => """
+            @testitem "qa inner" begin
+            end
+            """,
+            # A project without test files is an environment nothing runs in.
+            "test/vendor/Project.toml" => "[deps]\n",
+            # Not environments: what the suite keeps for something else, and hidden.
+            "test/testfixtures/Fixture/Project.toml" => "[deps]\n",
+            "test/.hidden/Project.toml" => "[deps]\n",
+            "test/TestItems.toml" => "[profiles.fast]\nthreads = \"1\"\n",
         )
+        qa = joinpath(dir, "test", "qa")
 
-        @testset "an item in the environment's directory runs under its profile, wherever below it" begin
-            byname = profiles_of(plan_of(dir))
-            @test byname["main"] == (:default, false)
-            @test byname["main opts in"] == (:qa, false)
-            @test byname["qa plain"] == (:qa, false)
-            @test byname["qa alone"] == (:qa, true)
-            @test byname["qa names its own profile"] == (:qa, false)
-            @test byname["qa deeper"] == (:qa, false)
+        @testset "every directory with a project under test/ is an environment" begin
+            walked = walk_test_dir(joinpath(dir, "test"))
+            @test walked.environments == [qa, joinpath(qa, "inner"), joinpath(dir, "test", "vendor")]
+        end
+
+        @testset "an item runs in the innermost environment that holds its file, under the profile it asks for" begin
+            byname = pools_of(plan_of(dir))
+            @test byname["main"] == (:default, "", false)
+            @test byname["main profiled"] == (:fast, "", false)
+            @test byname["qa plain"] == (:default, qa, false)
+            @test byname["qa alone"] == (:default, qa, true)
+            @test byname["qa profiled"] == (:fast, qa, false)
+            @test byname["qa alone profiled"] == (:fast, qa, true)
+            @test byname["qa deeper"] == (:default, qa, false)
+            @test byname["qa inner"] == (:default, joinpath(qa, "inner"), false)
+        end
+
+        @testset "each pair of a profile and an environment is a pool of its own" begin
+            p = plan_of(dir)
+            pairs = [(pr.name, pr.environment) for pr in p.profiles]
+            @test first(pairs) == (:default, "")
+            @test allunique(pairs)
+            @test (:fast, qa) in pairs && (:default, joinpath(qa, "inner")) in pairs
+            # The dry run's header names the profiles once and the environments the items use.
+            _, out = capture_run(() -> Runtests.runtests(dir; dry_run = true))
+            @test count("profile `fast`: ", out) == 1
+            @test occursin("environments: $(joinpath("test", "qa")), $(joinpath("test", "qa", "inner"))", out)
         end
 
         @testset "every entry point reads the environment's items" begin
             target = resolve_target((dir,))
-            @test suite_item_names(target) ==
-                Set(["main", "main opts in", "qa plain", "qa alone", "qa names its own profile", "qa deeper"])
+            @test suite_item_names(target) == Set(["main", "main profiled", "qa plain", "qa alone", "qa profiled",
+                                                   "qa alone profiled", "qa deeper", "qa inner"])
             listed = Dict(it.name => it for it in list_items(dir).items)
-            @test (listed["qa plain"].profile, listed["qa plain"].sandbox) == ("qa", true)
-            @test (listed["main"].profile, listed["main"].sandbox) === (nothing, false)
-            @test listed["qa deeper"].file == joinpath(dir, "test", "qa", "sub", "deeper_tests.jl")
+            @test (listed["qa plain"].profile, listed["qa plain"].sandbox, listed["qa plain"].environment) == (nothing, false, qa)
+            @test (listed["qa alone profiled"].profile, listed["qa alone profiled"].sandbox) == ("fast", true)
+            @test (listed["main"].profile, listed["main"].sandbox, listed["main"].environment) === (nothing, false, nothing)
+            @test listed["qa deeper"].file == joinpath(qa, "sub", "deeper_tests.jl")
             # A selection by path reaches into the environment.
-            p = plan_of(joinpath(dir, "test", "qa", "sub"))
+            p = plan_of(joinpath(qa, "sub"))
             @test p.items.name == ["qa deeper"]
-        end
-
-        @testset "an item there that asks for another profile is a scan error" begin
-            for other in (":default", ":fast")
-                bad = env_pkg("EnvOther", "test/qa/qa_tests.jl" => "@testitem \"wanders\" sandbox=$other begin\nend\n",
-                              "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n[profiles.fast]\nthreads = \"1\"\n")
-                err = try
-                    plan_of(bad)
-                    nothing
-                catch e
-                    e
-                end
-                @test err isa ScanFailure
-                msg = sprint(showerror, err)
-                @test occursin("`@testitem \"wanders\"`: its file is in the environment of profile `qa`, " *
-                               "so it runs under `qa`, and `sandbox = $other` asks for another profile", msg)
-            end
         end
 
         @testset "a chain cannot reach across environments" begin
             bad = env_pkg("EnvChain", "test/a_tests.jl" => "@testitem \"here\" chain=:c begin\nend\n",
                           "test/qa/qa_tests.jl" => "@testitem \"there\" chain=:c begin\nend\n")
             msg = message_of(() -> plan_of(bad))
-            @test occursin("chain `:c` mixes sandbox profiles", msg)
+            @test occursin("chain `:c` spans environments", msg)
+            @test occursin("in the environment of $(joinpath("test", "qa"))", msg)
+            @test occursin("in the test environment", msg)
         end
 
         @testset "a file there that is not a test file is a stray, as anywhere under test/" begin
@@ -224,29 +190,45 @@ end
                 "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n",
                 "test/vendor/Project.toml" => "[deps]\n",
                 "test/vendor/v_tests.jl" => "@testitem \"vendored\" begin\nend\n",
-                "test/fixture/Project.toml" => "name = \"Fixture\"\nuuid = \"$(next_uuid())\"\n",
-                "test/fixture/test/f_tests.jl" => "@testitem \"fixture\" begin\nend\n",
+                "test/named/Project.toml" => "name = \"Named\"\nuuid = \"$(next_uuid())\"\n",
+                "test/named/n_tests.jl" => "@testitem \"named\" begin\nend\n",
+                "test/testfixtures/Fixture/Project.toml" => "name = \"Fixture\"\nuuid = \"$(next_uuid())\"\n",
+                "test/testfixtures/Fixture/test/f_tests.jl" => "@testitem \"fixture\" begin\nend\n",
+                "test/.cache/Hidden/Project.toml" => "name = \"Hidden\"\nuuid = \"$(next_uuid())\"\n",
+                "test/.cache/Hidden/test/h_tests.jl" => "@testitem \"hidden\" begin\nend\n",
             )
             root(path...) = resolve_target((joinpath(paths, "test", path...),)).root
             @test root("qa") == paths
             @test root("qa", "") == paths
             @test root("qa", "qa_tests.jl") == paths
-            # One whose project declares no package is an environment, named or not.
             @test root("vendor", "v_tests.jl") == paths
-            # A package kept there is a package of its own, until a profile names it.
-            @test root("fixture", "test", "f_tests.jl") == joinpath(paths, "test", "fixture")
-            write(joinpath(paths, "test", "TestItems.toml"),
-                  "[profiles.qa]\nenvironment = \"qa\"\n[profiles.fx]\nenvironment = \"fixture\"\n")
-            @test root("fixture", "test", "f_tests.jl") == paths
-            # A path into one no profile names stops the run as the whole suite does,
-            # and says how to fix it; so does the directory itself.
-            for path in (joinpath(paths, "test", "vendor", "v_tests.jl"), joinpath(paths, "test", "vendor"))
-                msg = message_of(() -> plan_of(path))
-                @test occursin("$(joinpath("test", "vendor")) has an environment of its own, which no profile names", msg)
-                @test occursin("`environment = \"vendor\"`", msg)
-            end
-            open(io -> println(io, "[profiles.vendor]\nenvironment = \"vendor\""), joinpath(paths, "test", "TestItems.toml"), "a")
-            @test profiles_of(plan_of(joinpath(paths, "test", "fixture")))["fixture"] == (:fx, false)
+            # One whose project declares a package is an environment of the tests too.
+            @test root("named", "n_tests.jl") == paths
+            @test pools_of(plan_of(joinpath(paths, "test", "named")))["named"] == (:default, joinpath(paths, "test", "named"), false)
+            # A package in `test/testfixtures/` is a package of its own, and so is one in a
+            # hidden directory: the suite reads neither.
+            @test root("testfixtures", "Fixture", "test", "f_tests.jl") == joinpath(paths, "test", "testfixtures", "Fixture")
+            @test root(".cache", "Hidden", "test", "h_tests.jl") == joinpath(paths, "test", ".cache", "Hidden")
+        end
+
+        @testset "a package where the suite reads is warned about, with where it belongs" begin
+            pkgs = env_pkg(
+                "EnvPackage",
+                "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n",
+                "test/vendored/Project.toml" => "name = \"Vendored\"\nuuid = \"$(next_uuid())\"\n",
+                "test/testfixtures/Fixture/Project.toml" => "name = \"Fixture\"\nuuid = \"$(next_uuid())\"\n",
+                "test/testsetups/Setup/Project.toml" => "name = \"Setup\"\nuuid = \"$(next_uuid())\"\n",
+                "test/testsetups/Setup/src/Setup.jl" => "module Setup end\n",
+                "test/.cache/Hidden/Project.toml" => "name = \"Hidden\"\nuuid = \"$(next_uuid())\"\n",
+            )
+            logs, p = Test.collect_test_logs(() -> plan_of(pkgs))
+            said = [string(l.message) for l in logs if l.level == Base.CoreLogging.Warn && occursin("holds the package", string(l.message))]
+            # The vendored package alone: not the plain environment, the fixture, the setup or the hidden one.
+            @test length(said) == 1
+            @test occursin("holds the package `Vendored`. The suite reads it as an environment", only(said))
+            @test occursin("move it to `test/testfixtures/`", only(said)) && occursin("move it to `test/testsetups/`", only(said))
+            # A warning, not an error: the run goes on.
+            @test p.items.name == ["qa"]
         end
 
         @testset "item names are one namespace across environments" begin
@@ -254,87 +236,26 @@ end
                           "test/qa/qa_tests.jl" => "@testitem \"same\" begin\nend\n")
             @test occursin("duplicate test item name", message_of(() -> plan_of(bad)))
         end
-    end
 
-    @testset "directories no profile names" begin
-        dir = make_pkg(
-            "EnvUnclaimed",
-            "test/a_test.jl" => "@testitem \"main\" begin\n    @test true\nend\n",
-            "test/qa/Project.toml" => "[deps]\n",
-            "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test false\nend\n",
-            "test/qa/sub/more_tests.jl" => "@testitem \"qa more\" begin\n    @test false\nend\n",
-            "test/qa/notes.jl" => "# not a test file, and not this suite's to judge\n",
-            # No test files, and an error all the same.
-            "test/vendor/Project.toml" => "[deps]\n",
-            "test/vendor/vendored.jl" => "x = 1\n",
-        )
-        # The error of each, at its project file.
-        unclaimed(rel) = "$(joinpath("test", rel)) has an environment of its own, which no profile names"
-
-        @testset "are an error, with tests or without, that says both ways to fix it" begin
-            msg = message_of(() -> plan_of(dir))
-            @test occursin(unclaimed("qa"), msg)
-            @test occursin(unclaimed("vendor"), msg)
-            @test occursin("declare a profile with `environment = \"qa\"` in test/TestItems.toml", msg)
-            @test occursin("move it under `test/testfixtures/`", msg)
-            # Neither is read: the stray in `qa` is not this suite's to judge yet.
-            @test !occursin("notes.jl", msg)
-            @test !occursin("vendored.jl", msg)
-        end
-
-        @testset "the dry run and chores say the same" begin
-            err = try
-                capture_run(() -> Runtests.runtests(dir; dry_run = true))
-                nothing
-            catch e
-                e
-            end
-            @test err isa ScanFailure
-            @test occursin(unclaimed("qa"), sprint(showerror, err))
-            _, out = capture_run(() -> Runtests.chores(dir; dry_run = true))
-            @test occursin(unclaimed("qa"), out)
-            @test occursin(unclaimed("vendor"), out)
-        end
-
-        @testset "naming it runs it, and a project inside it that nothing names is an error" begin
-            rm(joinpath(dir, "test", "vendor"); recursive = true)
-            write(joinpath(dir, "test", "TestItems.toml"), "[profiles.qa]\nenvironment = \"qa\"\n")
-            inner = joinpath(dir, "test", "qa", "inner")
-            mkpath(inner)
-            write(joinpath(inner, "JuliaProject.toml"), "[deps]\n")
-            # Read now, it is held to what any directory under `test/` is held to.
-            msg = message_of(() -> plan_of(dir))
-            @test occursin(joinpath("qa", "notes.jl"), msg)
-            @test occursin(unclaimed(joinpath("qa", "inner")), msg)
-            @test occursin("`environment = $(repr(joinpath("qa", "inner")))`", msg)
-            @test occursin(joinpath("qa", "inner", "JuliaProject.toml"), msg)
-            rm(joinpath(dir, "test", "qa", "notes.jl"))
-            rm(inner; recursive = true)
-            @test sort(plan_of(dir).items.name) == ["main", "qa", "qa more"]
-            rm(joinpath(dir, "test", "TestItems.toml"))
-        end
-
-        @testset "a suite whose only tests are in one is told why there is nothing to run" begin
+        @testset "a suite whose only tests are in an environment runs them" begin
             only_there = make_pkg("EnvOnlyThere", "test/qa/Project.toml" => "[deps]\n",
                                   "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\nend\n")
-            @test occursin(unclaimed("qa"), message_of(() -> plan_of(only_there)))
+            @test plan_of(only_there).items.name == ["qa"]
         end
 
-        @testset "a replay reads the ones its recorded profiles ran in" begin
-            # The recorded profiles stand in for this checkout's, so a directory one of
-            # them ran in is read whatever TestItems.toml says now.
-            replayed = make_pkg(
-                "EnvReplayClaims",
-                "test/main_tests.jl" => "@testitem \"main\" begin\n    @test true\nend\n",
-                "test/qa/Project.toml" => "[deps]\n",
-                "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test true\nend\n",
-                "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n",
-            )
+        @testset "a replay finds each item's environment where its file is" begin
+            replayed = env_pkg("EnvReplay",
+                               "test/main_tests.jl" => "@testitem \"main\" begin\n    @test true\nend\n",
+                               "test/qa/qa_tests.jl" => "@testitem \"qa\" profile=:fast begin\n    @test true\nend\n",
+                               "test/TestItems.toml" => "[profiles.fast]\nthreads = \"1\"\n")
             with_runstate_dir() do states
                 path = joinpath(states, "recorded.runstate")
                 finish_run_state!(init_run_state(path, plan_of(replayed)))
+                # The recorded profile stands in for the checkout's, which is gone now.
                 write(joinpath(replayed, "test", "TestItems.toml"), "")
-                @test sort(plan_of(replayed; replay = path).items.name) == ["main", "qa"]
+                p = plan_of(replayed; replay = path)
+                @test sort(p.items.name) == ["main", "qa"]
+                @test pools_of(p)["qa"] == (:fast, joinpath(replayed, "test", "qa"), false)
                 # A recorded item the suite no longer has cannot run again, and is named.
                 rm(joinpath(replayed, "test", "main_tests.jl"))
                 p = @test_logs (:warn, r"the run state recorded.*\"main\"") match_mode=:any plan_of(replayed; replay = path)
@@ -348,7 +269,7 @@ end
                       "test/qa/LocalPreferences.toml" => "[EnvBuildTools]\nmode = \"env\"\n\n[EnvBuild]\nlevel = 1\nother = true\n",
                       "test/qa_prefs.toml" => "[EnvBuild]\nlevel = 3\n")
         qa = joinpath(dir, "test", "qa")
-        prof = Profile(:qa; environment = qa, preferences = joinpath(dir, "test", "qa_prefs.toml"))
+        prof = Profile(:tuned; environment = qa, preferences = joinpath(dir, "test", "qa_prefs.toml"))
 
         @testset "the copy holds the environment, the package by path, and the preferences" begin
             out = mktempdir()
@@ -391,6 +312,11 @@ end
             rm(build(); recursive = true)
             @test isdir(build())
             @test builds[] == n + 1
+            # Two profiles without preferences in one environment share one copy.
+            plain(name) = environment_project(Profile(name; environment = qa), dir, () -> builds[] += 1)
+            n = builds[]
+            @test plain(:default) == plain(:fast)
+            @test builds[] == n + 1
         end
 
         @testset "nothing is written to the environment's own directory" begin
@@ -413,8 +339,7 @@ end
                     e
                 end
                 @test err isa ConfigError
-                @test occursin("could not build the environment of profile `qa` from $(joinpath("test", "qa"))",
-                               sprint(showerror, err))
+                @test occursin("could not build the environment of $(joinpath("test", "qa"))", sprint(showerror, err))
                 @test isempty(runstate_files(bad))
                 @test live_worker_processes() == 0
             end
@@ -427,15 +352,9 @@ end
             "test/main_tests.jl" => """
             @testitem "main sees the package" begin
                 @test EnvRun.double(1) == 4
-                # The environment's packages are its profile's alone.
+                # The environment's packages are its directory's alone.
                 @test Base.find_package("EnvRunTools") === nothing
                 @test Main.Runtests.current_testitem().profile === :default
-            end
-            """,
-            "test/opts_in_tests.jl" => """
-            @testitem "elsewhere opts in" sandbox=:qa begin
-                using EnvRunTools
-                @test EnvRunTools.marker() === :tools
             end
             """,
             "test/qa/qa_tests.jl" => QA_ITEMS,
@@ -443,29 +362,29 @@ end
             @testitem "qa nested" begin
                 using EnvRunTools
                 @test EnvRunTools.marker() === :tools
-                @test Main.Runtests.current_testitem().profile === :qa
+                @test Main.Runtests.current_testitem().profile === :default
             end
             """,
             "test/qa/LocalPreferences.toml" => "[EnvRunTools]\nmode = \"env\"\n",
             "test/qa_prefs.toml" => "[EnvRun]\nlevel = 3\n",
-            "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\npreferences = \"qa_prefs.toml\"\n",
+            "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"qa_prefs.toml\"\n",
         )
         pkg_uuid, tools_uuid = uuid_of(dir), uuid_of(joinpath(dir, "deps", "EnvRunTools"))
         write(joinpath(dir, "test", "qa", "prefs_tests.jl"), """
-        @testitem "qa sees both preferences" begin
+        @testitem "qa sees both preferences" profile=:tuned begin
             @test get(Base.get_preferences(Base.UUID("$tools_uuid")), "mode", "unset") == "env"
             @test get(Base.get_preferences(Base.UUID("$pkg_uuid")), "level", 0) == 3
+            @test Main.Runtests.current_testitem().profile === :tuned
         end
         """)
         qa = joinpath(dir, "test", "qa")
         before = sort(readdir(qa))
 
         with_runstate_dir() do _
-            (states, run, p), out = capture_run(() -> run_states(dir; workers = 1, monitor = false))
+            (states, run, _), out = capture_run(() -> run_states(dir; workers = 1, monitor = false))
 
-            @testset "each item runs where its profile says, with what that environment holds" begin
+            @testset "each item runs in its directory's environment, under the profile it asks for" begin
                 @test states["main sees the package"] === PASSED
-                @test states["elsewhere opts in"] === PASSED
                 @test states["qa sees its environment"] === PASSED
                 @test states["qa nested"] === PASSED
                 @test states["qa sees both preferences"] === PASSED
@@ -473,29 +392,25 @@ end
             end
 
             @testset "the run says which environment, and builds it outside the package" begin
-                @test occursin("profile `qa`: environment $(joinpath("test", "qa"))", out)
-                # In a run of several profiles each worker says whose it is, the
-                # default profile's included.
+                @test occursin("environment: $(joinpath("test", "qa"))", out)
+                # Each worker says whose profile and which environment it is.
                 ups = filter(l -> occursin("· UP ", l), split(out, '\n'))
-                @test all(l -> endswith(l, "· profile default") || endswith(l, "· profile qa"), ups)
-                @test any(l -> endswith(l, "· profile default"), ups) && any(l -> endswith(l, "· profile qa"), ups)
-                @test occursin("resolving the environment of profile qa, $(joinpath("test", "qa"))", out)
-                project = run.profile_projects[:qa]
+                @test any(l -> occursin("· profile default · test environment", l), ups)
+                @test any(l -> occursin("· profile default · environment $(joinpath("test", "qa"))", l), ups)
+                @test any(l -> occursin("· profile tuned · environment $(joinpath("test", "qa"))", l), ups)
+                @test occursin("resolving the environment of $(joinpath("test", "qa"))", out)
+                project = run.profile_projects[(:default, qa)]
                 @test !startswith(project, dir)
                 @test isfile(joinpath(project, "Manifest.toml"))
+                @test run.profile_projects[(:tuned, qa)] != project   # its preferences make it a copy of its own
                 @test sort(readdir(qa)) == before
             end
 
-            @testset "the run state records the environment, relative to the package" begin
+            @testset "a replay runs them in the environment of this checkout" begin
                 rs = read_run_state(only(runstate_files(dir)))
-                @test rs.profiles[:qa].environment == joinpath("test", "qa")
-                # A replay finds it in the checkout it runs in.
-                @test replayed_config(p.cfg, rs, dir).profiles[:qa].environment == qa
-                elsewhere = make_pkg("EnvReplayElsewhere")
-                msg = message_of(() -> replayed_config(p.cfg, rs, elsewhere))
-                @test occursin("the run state's profile `qa` runs in $(joinpath("test", "qa")), which this checkout does not have", msg)
                 replayed = plan_of(dir; replay = rs.path)
-                @test only(pr for pr in replayed.profiles if pr.name === :qa).environment == qa
+                @test pools_of(replayed)["qa nested"] == (:default, qa, false)
+                @test pools_of(replayed)["qa sees both preferences"] == (:tuned, qa, false)
             end
 
             @testset "its failures are the suite's failures" begin
@@ -511,33 +426,46 @@ end
                 @test !occursin("resolving the environment", out2)
             end
 
-            @testset "a run of the default profile's items alone names no profile" begin
+            @testset "a run of the test environment's items alone names no profile and no environment" begin
                 (alone, _, _), out3 = capture_run(() -> run_states(dir; workers = 1, monitor = false, name = "main sees the package"))
                 @test alone["main sees the package"] === PASSED
                 ups = filter(l -> occursin("· UP ", l), split(out3, '\n'))
-                @test length(ups) == 1 && !occursin("· profile", only(ups))
+                @test length(ups) == 1 && !occursin("· profile", only(ups)) && !occursin("environment", only(ups))
             end
         end
 
-        @testset "a pasted item from the environment's directory runs under its profile" begin
+        @testset "workers=0 runs the default profile's init only where items run" begin
+            # The init loads what only the environment has: it runs on the environment's
+            # worker, and this process, where no item runs, does not run it.
+            only_qa = env_pkg("EnvInit",
+                              "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test isdefined(Main, :EnvInitTools)\nend\n",
+                              "test/TestItems.toml" => "[profiles.default]\ninit = \"using EnvInitTools\"\n")
+            with_runstate_dir() do _
+                (states, _, _), _ = capture_run(() -> run_states(only_qa; workers = 0, monitor = false))
+                @test states["qa"] === PASSED
+            end
+        end
+
+        @testset "a pasted item from the environment's directory runs in it" begin
             with_activated(dir) do _
                 ts, _ = capture_run() do
                     include_string(Main, """
                     @testitem "pasted in qa" begin
                         using EnvRunTools
-                        @test Main.Runtests.current_testitem().profile === :qa
+                        @test Main.Runtests.current_testitem().profile === :default
                     end
                     """, joinpath(qa, "pasted_tests.jl"))
                 end
                 @test state_of(ts) === PASSED
-                err = try
-                    include_string(Main, "@testitem \"pasted elsewhere\" sandbox=:default begin\nend\n",
-                                   joinpath(qa, "pasted_tests.jl"))
-                    nothing
-                catch e
-                    e isa LoadError ? e.error : e
+                ts, _ = capture_run() do
+                    include_string(Main, """
+                    @testitem "pasted in qa, tuned" profile=:tuned begin
+                        using EnvRunTools
+                        @test Main.Runtests.current_testitem().profile === :tuned
+                    end
+                    """, joinpath(qa, "pasted_tests.jl"))
                 end
-                @test err isa ScanFailure
+                @test state_of(ts) === PASSED
             end
         end
 
@@ -558,14 +486,14 @@ end
             active = Base.active_project()
             try
                 Base.set_active_project(test_env)
-                @test test_env in given(Profile(:qa; environment = qa))
+                @test test_env in given(Profile(:default; environment = qa))
                 @test given(Profile(:plain)) == LOAD_PATH
             finally
                 Base.set_active_project(active)
             end
             # An item run here has what its workers have.
             with_activated(dir) do env
-                prof = read_config(joinpath(dir, "test")).profiles[:qa]
+                prof = in_environment(read_config(joinpath(dir, "test")).profiles[:default], qa)
                 before = copy(LOAD_PATH)
                 Runtests.Private.with_interactive_env(Runtests.Private.interactive_target(), prof) do
                     @test Base.active_project() != env
@@ -580,8 +508,8 @@ end
         @testset "debugging an item of the environment steps into it there" begin
             with_activated(dir) do _
                 active = Base.active_project()
-                ts, out = capture_run(() -> Runtests.Private.debug_item(body -> body(), "qa nested", nothing))
-                @test ts.n_passed == 2
+                ts, out = capture_run(() -> Runtests.Private.debug_item(body -> body(), "qa sees both preferences", nothing))
+                @test ts.n_passed == 3
                 # The environment's copy holds the profile's preferences, so they apply here.
                 @test !occursin("preferences of profile", out)
                 # Back in the test environment afterwards.

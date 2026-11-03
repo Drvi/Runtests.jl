@@ -64,7 +64,7 @@ using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, 
             using $setup
             @test $setup.value() == 7
         end
-        @testitem "checked" sandbox=:checked begin
+        @testitem "checked" profile=:checked begin
             @test Base.isprecompiled(Base.identify_package("$setup"))
             using $setup
             @test $setup.value() == 7
@@ -404,7 +404,7 @@ end
             using PrefTarget
             @test PrefTarget.MODE == "unset"
         end
-        @testitem "tuned sees it" sandbox=:tuned begin
+        @testitem "tuned sees it" profile=:tuned begin
             using PrefTarget
             @test PrefTarget.MODE == "fast"
         end
@@ -419,7 +419,7 @@ end
         @test states["default sees no preference"] === PASSED
         @test states["tuned sees it"] === PASSED
         # The tuned profile ran in a project of its own, carrying the same manifest.
-        proj = run.profile_projects[:tuned]
+        proj = run.profile_projects[(:tuned, "")]
         @test isfile(joinpath(proj, "Manifest.toml"))
         @test occursin("fast", read(joinpath(proj, "LocalPreferences.toml"), String))
         # Every package that manifest names is findable from where it now sits.

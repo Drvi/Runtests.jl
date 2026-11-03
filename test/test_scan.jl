@@ -81,16 +81,19 @@ end
             @test true
         end
 
-        @testitem "two" chain=:c sandbox=:bounds skip=(Sys.iswindows()) begin
+        @testitem "two" chain=:c profile=:bounds skip=(Sys.iswindows()) begin
             @test false
         end
 
         @testitem "three" sandbox=true begin
             x = 1
         end
+
+        @testitem "four" sandbox=true profile=:bounds begin
+        end
         """
         a, _ = scan_source(src; setups=Dict(:MySetup => "x.jl"))
-        @test a isa Vector && length(a) == 3
+        @test a isa Vector && length(a) == 4
         @test a[1].tags == [:a, :b]
         @test a[1].timeout_s == 120              # literal arithmetic is folded
         @test a[1].retries == 3
@@ -107,6 +110,9 @@ end
         @test a[2].skip isa Expr                 # evaluated on the worker, not here
         @test a[3].exclusive
         @test a[3].profile === DEFAULT_PROFILE
+        # Isolation and a profile are separate keywords, and combine.
+        @test a[4].exclusive && a[4].profile === :bounds
+        @test !a[2].exclusive
     end
 
     @testset "defaults" begin
@@ -146,6 +152,11 @@ end
             ("""@testitem "a" bogus=1 begin\n end\n""", "unknown keyword `bogus`"),
             ("""@testitem "a" tags=[foo] begin\n end\n""", "vector of symbols"),
             ("""@testitem "a" sandbox=true chain=:c begin\n end\n""", "cannot be combined"),
+            # A profile is chosen with `profile`, and the message says so.
+            ("""@testitem "a" sandbox=:bounds begin\n end\n""", "write `profile = :bounds`"),
+            ("""@testitem "a" sandbox=1 begin\n end\n""", "`sandbox` must be `true` or `false`"),
+            ("""@testitem "a" profile=true begin\n end\n""", "`profile` must be a profile name"),
+            ("""@testitem "a" profile=:a profile=:b begin\n end\n""", "`profile` given twice"),
             ("""@testitem "a" timeout=CONST begin\n end\n""", "positive number"),
             # Too large for what holds them, and said as a problem with the file.
             ("""@testitem "a" timeout=5/0 begin\n end\n""", "at most 2147483647"),

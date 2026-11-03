@@ -174,8 +174,8 @@ end
             "test/qa/qa.jl" => "run_qa(PortGroups)\n")
         out = port!(pkg)
         # What ran in an environment of its own stays there, as it was, and a run
-        # stops on it until a person ports it; the rest is read without it.
-        @test occursin("test/qa/ is an environment of its own, where qa/qa.jl ran, and a run stops on it", out)
+        # reads its files, which stop it until a person ports them.
+        @test occursin("test/qa/ is an environment of its own, where qa/qa.jl ran, and a run reads its files", out)
         @test isfile(joinpath(pkg, "test", "qa", "qa.jl"))
         @test_throws Runtests.ScanFailure ported_items(pkg)
         rm(joinpath(pkg, "test", "qa"); recursive = true)
@@ -233,7 +233,7 @@ end
             "test/qa/Project.toml" => "[deps]\n",
             "test/qa/qa.jl" => "@test true\n")
         out = port!(pkg)
-        @test occursin("group QA runs in an environment of its own, test/qa/, and a run stops on it", out)
+        @test occursin("group QA runs in an environment of its own, test/qa/, and a run reads its files", out)
         @test_throws Runtests.ScanFailure ported_items(pkg)
         rm(joinpath(pkg, "test", "qa"); recursive = true)
         items = ported_items(pkg)

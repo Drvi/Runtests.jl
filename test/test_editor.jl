@@ -96,7 +96,10 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             "test/a_test.jl" => string(item("first"), "\n# a comment\n\n",
                                        item("second"; opts = "tags=[:fast, :db] timeout=30 retries=2 skip=(1 == 2)"),
                                        item("chained"; opts = "chain=:c failfast=true")),
-            "test/b_test.jl" => item("alone"; opts = "sandbox=true") * item("profiled"; opts = "sandbox=:big"),
+            "test/b_test.jl" => item("alone"; opts = "sandbox=true") * item("profiled"; opts = "profile=:big") *
+                                item("alone profiled"; opts = "sandbox=true profile=:big"),
+            "test/qa/Project.toml" => "[deps]\n",
+            "test/qa/q_test.jl" => item("in qa"),
             "test/broken_test.jl" => "@testitem \"broken\" begin\n",
             "test/TestItems.toml" => "[profiles.big]\nthreads = \"1\"\n",
         )
@@ -104,7 +107,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         @test r.root == dir
         @test r.failed == String[]          # no run recorded yet
         byname = Dict(it.name => it for it in r.items)
-        @test sort(collect(keys(byname))) == ["alone", "chained", "first", "profiled", "second"]
+        @test sort(collect(keys(byname))) == ["alone", "alone profiled", "chained", "first", "in qa", "profiled", "second"]
         first_ = byname["first"]
         @test first_.file == joinpath(dir, "test", "a_test.jl")
         # An item's lines run to the one before the next item, or to the end of the file.
@@ -115,7 +118,11 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         @test (first_.tags, first_.timeout, first_.retries, first_.skip) == (String[], nothing, nothing, false)
         @test (byname["chained"].chain, byname["chained"].failfast) == ("c", true)
         @test (byname["alone"].sandbox, byname["alone"].profile) == (true, nothing)
-        @test (byname["profiled"].sandbox, byname["profiled"].profile) == (true, "big")
+        @test (byname["profiled"].sandbox, byname["profiled"].profile) == (false, "big")
+        @test (byname["alone profiled"].sandbox, byname["alone profiled"].profile) == (true, "big")
+        # The environment is where the file is, whatever the keywords say.
+        @test byname["in qa"].environment == joinpath(dir, "test", "qa")
+        @test byname["first"].environment === nothing
         # The broken file is an error beside the items of the files that read.
         @test only(r.errors).file == joinpath(dir, "test", "broken_test.jl")
 
@@ -244,7 +251,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
     end
 
     @testset "a session reads the config file it was started with, to list and to run" begin
-        dir = make_pkg("ServedConfig", "test/a_test.jl" => string(item("plain"), item("fast"; opts = "sandbox=:fast")))
+        dir = make_pkg("ServedConfig", "test/a_test.jl" => string(item("plain"), item("fast"; opts = "profile=:fast")))
         config = joinpath(mktempdir(), "editor.toml")
         write(config, "[run]\nworkers = 1\n[profiles.fast]\nthreads = \"1\"\n")
         with_runstate_dir() do _

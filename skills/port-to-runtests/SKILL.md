@@ -31,10 +31,11 @@ test/
 - Test files are named `*_test.jl` or `*_tests.jl` and hold only `@testitem`
   declarations. Any other `.jl` file under `test/` stops the run. The exceptions are
   `test/runtests.jl`, `testsetups/`, `testtemplates/`, `testfixtures/`, and hidden
-  directories. Any other directory with a `Project.toml` of its own must be a
-  profile's `environment`, or the run stops with an error that names it.
+  directories. Any other directory with a `Project.toml` of its own is an
+  environment: the test files in it run there.
 - An item's name is a nonblank string literal, unique across the whole suite. Its
-  keywords (`tags`, `timeout`, `retries`, `skip`, `failfast`, `chain`, `sandbox`)
+  keywords (`tags`, `timeout`, `retries`, `skip`, `failfast`, `chain`, `sandbox`,
+  `profile`)
   are literals, except `skip`, an expression evaluated before the body.
 - Each item runs in a fresh module, with `Test` and the package already imported.
   Anything else it uses, it imports in its own body.
@@ -42,14 +43,11 @@ test/
 ## 1. Make an environment to run Runtests from
 
 The package's own project cannot load a test-only dependency, so make a separate
-environment outside the repository. If Runtests is in the General registry, add it
-there with `Pkg.add("Runtests")`; to find out, run
-`julia -e 'using Pkg; Pkg.activate(; temp = true); Pkg.add("Runtests")'`. If it isn't,
-add it by URL:
+environment outside the repository and add Runtests to it:
 
 ```sh
 RT=$(mktemp -d)/runner
-julia --project=$RT -e 'using Pkg; Pkg.add(url = "https://github.com/Drvi/Runtests.jl")'
+julia --project=$RT -e 'using Pkg; Pkg.add("Runtests")'
 ```
 
 With the package directory as the working directory,
@@ -115,15 +113,11 @@ Check: you have the baseline totals and the list of checks that did not pass.
 ## 3. Add Runtests to the test dependencies
 
 Add it next to the package's other test dependencies: `[extras]` and `[targets]` in
-`Project.toml`, or `test/Project.toml` if the package has one. While Runtests is not
-registered, it comes by URL:
+`Project.toml`, or `test/Project.toml` if the package has one:
 
 ```toml
 [extras]            # [deps] in test/Project.toml
 Runtests = "632efd68-cd41-4e05-bd25-b86dc2150078"
-
-[sources]
-Runtests = {url = "https://github.com/Drvi/Runtests.jl"}
 
 [targets]           # Project.toml only
 test = ["Test", "Runtests"]   # the existing entries, plus this one
@@ -133,10 +127,10 @@ If the tests run Aqua's `test_all` or `test_deps_compat`, also add
 `Runtests = "0.1"` under `[compat]`. Aqua asks every test dependency for a compat
 bound.
 
-For a trial against a local checkout of Runtests, a path works:
+For a trial against a local checkout of Runtests, a path under `[sources]` works:
 `Runtests = {path = "../../Runtests"}`, relative to the project file. But a path names
 that local checkout only. CI, and every script that checks the package out somewhere else, such
-as a git worktree in a temporary directory, need the URL form. Tell the user which one
+as a git worktree in a temporary directory, need the registered package. Tell the user which one
 the port uses.
 
 Check: `julia --project=. -e 'using Pkg; Pkg.test()'` resolves the new test
@@ -213,9 +207,9 @@ What it does with `runtests.jl`:
   stay out of a default run. Any other condition around files becomes
   `skip = <condition>` on their items.
 - Files under a directory with a `Project.toml` of its own ran in that environment.
-  They stay where they are, unported, and the list names them. A run stops on such a
-  directory until a profile names it. To keep running them there, port them in
-  place and add a profile naming the directory, `[profiles.qa] environment = "qa"`.
+  They stay where they are, unported, and the list names them. A run reads such a
+  directory's Julia files as test files, so it stops on them until they are ported.
+  Port them in place: they then run in that directory's environment.
   A directory that is input for the tests rather than tests, such as a package a
   test loads, moves under `test/testfixtures/` instead (reference/source-shapes.md).
 

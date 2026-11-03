@@ -119,7 +119,7 @@ Problems discovered before execution also throw:
 |:------|:------|
 | `Runtests.ScanFailure` | Invalid test files, duplicate names, or missing or stale template expansions. |
 | `Runtests.NoTestsError` | No test files, or no matching items. |
-| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, another config file or an environment variable: an invalid setting, profile or group, an undeclared group in `RUNTESTS_GROUP`, or a profile's environment that does not resolve. |
+| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, another config file or an environment variable: an invalid setting, profile or group, an undeclared group in `RUNTESTS_GROUP`, or an environment directory that does not resolve. |
 | `ArgumentError` | A mistake in the call: a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a tag no item carries, an undeclared group, or a path outside `test/`, in another package, or at a line the file does not have. |
 
 See [Configuration](#testtestitemstoml) for worker counts, timeouts, output,
@@ -138,7 +138,7 @@ test/
   testtemplates/
     periods_tests_template.jl      # @testtemplate declarations
   qa/
-    Project.toml                   # an environment of its own, which a profile names
+    Project.toml                   # an environment of its own, for the test files in qa/
     aqua_tests.jl
   testfixtures/                    # input for the tests, never read as part of the suite
     Example/Project.toml
@@ -163,11 +163,11 @@ of its own when you give a path inside it alone, as in
 paths is an error.
 
 Every other directory under `test/` with its own `Project.toml` or
-`JuliaProject.toml` must be a profile's [`environment`](#environments), whether or
-not it holds test files. A run stops on one that no profile names, and the error
-offers both fixes: declare a profile for it, or move it under `test/testfixtures/`.
-`test/Project.toml` itself is the test environment, and the setup packages in
-`test/testsetups/` are setups.
+`JuliaProject.toml` is an [environment](#environments): the test files in it run
+there. `test/Project.toml` itself is the test environment, and the setup packages
+in `test/testsetups/` are setups. A run warns about a directory there whose project
+declares a package: a package that the tests take as input belongs in
+`test/testfixtures/`, and one that is a setup in `test/testsetups/`.
 
 **Filters select what runs, not what is validated.** Every run parses the entire
 suite and checks for duplicate names, even when you select a single item.
@@ -197,7 +197,7 @@ work without the test environment having to declare `Test` itself.
 | `failfast=true` | stop this item at its first failure |
 | `chain=:sym` | items sharing a chain run in sequence, on one worker |
 | `sandbox=true` | run alone in a process that is torn down afterwards (not with `chain`) |
-| `sandbox=:name` | run in the worker pool for `[profiles.name]` of `TestItems.toml` |
+| `profile=:name` | run on the workers of `[profiles.name]` of `TestItems.toml` |
 
 Every keyword except `skip` must be a literal; arithmetic on numeric literals,
 such as `timeout=5*60`, is also accepted. Invalid values are rejected:
@@ -206,8 +206,10 @@ such as `timeout=5*60`, is also accepted. Invalid values are rejected:
 result is reported as an item error.
 
 A retry uses the same worker unless the worker timed out or crashed, or the item
-uses `sandbox=true`. A chain retries from its first item. Named profiles share
-workers; use `sandbox=true` when an item needs a fresh process of its own.
+uses `sandbox=true`. A chain retries from its first item. The items of a profile
+share its workers; add `sandbox=true` when an item needs a fresh process of its
+own, of its profile or of the default one. Neither keyword chooses the item's
+packages: its [environment](#environments) is where its file is.
 
 An item's body runs at the top level of a fresh module, with the REPL's soft scope:
 `x = 1` followed by a loop that updates `x` works as it does at the prompt. As in a
@@ -380,9 +382,6 @@ default = "!gpu"               # what a run selects when nothing else does
 gpu = "gpu"
 quick = "fast && !slow"
 
-[profiles.qa]
-environment = "qa"             # test/qa, with a Project.toml of its own
-
 [profiles.bounds]
 julia_args = ["--check-bounds=yes"]
 threads = "4"
@@ -392,9 +391,9 @@ test_end = "GC.gc(true)"
 preferences = "prefs/bounds.toml"  # optional; this file must exist
 ```
 
-Select the example profile with `sandbox=:bounds` on an item. Replace `MyPkg`
-with your package's name. `[profiles.default]` configures ordinary workers and
-the fresh workers used by `sandbox=true`.
+Select the example profile with `profile=:bounds` on an item. Replace `MyPkg`
+with your package's name. `[profiles.default]` configures the workers of every item
+without a `profile`, sandboxed or not.
 
 `config="path/to/file.toml"` selects a file instead of `test/TestItems.toml`.
 The path is relative to the current directory and must exist. No environment
@@ -402,16 +401,17 @@ variable or neighbouring file selects a config implicitly. Unknown keys and
 invalid values are errors. On a full run, `[order]` must name existing items;
 filtered runs allow names of items outside the selection.
 
-**Ordering across profiles or sandbox boundaries is not sequential.** Those
-items can run concurrently. Use a `chain` for items that must run in sequence
-on one worker; all items in a chain must use the same profile.
+**Ordering across profiles, environments or sandbox boundaries is not
+sequential.** Those items can run concurrently. Use a `chain` for items that must
+run in sequence on one worker; all items in a chain must use the same profile and
+be in the same environment.
 
 A profile's `init` runs once per worker before its items; `test_end` runs after
 each item. Each has its own timeout, separate from the item's budget. Failures
 in `test_end` count toward the item's result.
 
 The `preferences` path is relative to the config file. Its contents overlay
-`LocalPreferences.toml` in a temporary copy of the test environment, with separate
+`LocalPreferences.toml` in a temporary copy of the item's environment, with separate
 precompilation for the profile's preferences.
 
 ### Groups
@@ -438,37 +438,35 @@ is (see [retention](#storage-and-retention)).
 
 ### Environments
 
-A profile with `environment` runs in that directory's environment instead of the
-test environment. This is how a suite keeps tests whose dependencies the test
-environment should not carry, such as Aqua or JET checks, or a group that needs
-other versions:
+A directory under `test/` with a `Project.toml` of its own is an environment: the
+test files in it run in that environment instead of the test environment. This is
+how a suite keeps tests whose dependencies the test environment should not carry,
+such as Aqua or JET checks, or a group that needs other versions:
 
 ```text
 test/
-  TestItems.toml                   # [profiles.qa] environment = "qa"
   qa/
     Project.toml                   # Aqua, JET, ...
-    aqua_tests.jl                  # its items run under the qa profile
+    aqua_tests.jl                  # its items run in the qa environment
 ```
 
-Every test item under the directory runs under that profile, and an item
-elsewhere can ask for it with `sandbox=:qa`. The workers run in a copy of the
-environment, in the system's temporary files, with the package under test added by
-path, which brings the packages its `[sources]` name, such as its siblings in a
-monorepo; and with the directory's `LocalPreferences.toml` under the profile's
-`preferences`. Nothing is written into the directory. The copy is stacked over the
-test environment, as `Pkg.test` stacks its sandbox over the active project: an
-item loads the environment's packages first, and can still load the test
-environment's. The copy is resolved once a session, and again when a file it was
-built from changes; one that does not resolve stops the run before anything runs.
+Every test item under the directory runs there, in the innermost such directory
+that holds its file, whatever its `profile` and `sandbox` say: a profile chooses
+the workers' flags and preferences, and the environment chooses their packages. An
+item elsewhere cannot borrow it. The workers run in a copy of the environment, in
+the system's temporary files, with the package under test added by path, which
+brings the packages its `[sources]` name, such as its siblings in a monorepo; and
+with the directory's `LocalPreferences.toml` under the profile's `preferences`.
+Nothing is written into the directory. The copy is stacked over the test
+environment, as `Pkg.test` stacks its sandbox over the active project: an item
+loads the environment's packages first, and can still load the test environment's.
+The copy is resolved once a session, and again when a file it was built from
+changes; one that does not resolve stops the run before anything runs.
 
-The path is relative to the config file. A directory is one profile's
-environment, and never the `default` profile's. It cannot be `test/` or a directory
-that holds it, and it cannot be in `test/testsetups/`, `test/testtemplates/` or
-`test/testfixtures/`, however the path is spelled. An environment outside `test/` is
-allowed, and the run still reads only `test/`. A directory with its own project
-that no profile names stops the run, as [Test files](#test-files) says. A replay
-holds the profiles it records to the same rules, together with this checkout's.
+The directories in `test/testsetups/`, `test/testtemplates/` and `test/testfixtures/`
+are never environments, nor are hidden ones. A profile has no `environment` key:
+one is an error that says to give the items `profile = :name` instead. A replay
+finds each item's environment where its file is, in the checkout it runs in.
 
 ### Run options
 
@@ -512,8 +510,9 @@ Timeouts must be positive and at most 2,147,483,647 seconds; fractional values
 round up to whole seconds. Invalid settings are rejected before execution.
 
 With `workers = 0` the items run in this process, one after another. An item that
-needs a process of its own (`sandbox=true`, or a profile) still gets one, started
-and stopped around it, and the run lists which items did.
+needs a process of its own (`sandbox=true`, a profile, or an
+[environment](#environments) directory) still gets one, started and stopped around
+it, and the run lists which items did.
 
 ## Coverage
 
@@ -765,9 +764,11 @@ adds numbers  |    1      1  0.0s
 It is read by the same parser as a test file, so a keyword that would be an error
 in a file is an error here, and it runs the same way: fresh module, soft scope,
 `Test` and the package in scope. `skip` and `failfast` are honoured, and so is
-`sandbox`, by starting a worker for the item under the profile a run would give it
-(`[profiles.default]` for `sandbox=true`): its flags, environment, preferences,
-`init`, and `test_end`, whose failures count. `timeout`, `retries` and `chain` need
+`sandbox` and `profile`, by starting a worker for the item under the profile and
+in the environment a run would give it (`[profiles.default]` without a `profile`):
+its flags, environment variables, preferences, `init`, and `test_end`, whose
+failures count. An item from a file in an [environment](#environments) directory
+gets a worker of its own in that environment too. `timeout`, `retries` and `chain` need
 a run around the item, so they are ignored with a warning, except that an item
 with a worker of its own keeps its `timeout` and `retries`. `tags` are ignored.
 
@@ -795,7 +796,7 @@ Without a name it steps into the most recent failure among the items that are
 failing, with the seed it failed with, and names the other failing items. When
 nothing is failing, there is nothing to step into, and it says so. A failing item
 named in the call runs with the seed it failed with too. The item gets what a run gives it: its
-module and imports, the test environment and setups, and its profile's `env`,
+module and imports, its environment and the setups, and its profile's `env`,
 `init` and `test_end`. Its body is a function the debugger enters at the first
 call, in the test file. What cannot be part of a function (`using`, `struct`,
 `const`, a method on `Base.show` and the like) has run by then. Only that item
@@ -916,8 +917,8 @@ Environments are cached for the session, so calling `runtests()` again
 at the REPL does not re-resolve and re-precompile. The cache notices when you
 change `Project.toml` or a manifest, and rebuilds.
 
-The items of a profile that names an [environment](#environments) run in that one
-instead, stacked over this one.
+The items in an [environment](#environments) directory run in that one instead,
+stacked over this one.
 
 ## Run state
 
@@ -948,8 +949,8 @@ runs started after it. Earlier runs contribute durations only.
 - Worker starts and exits, including whether a worker timed out, crashed, or
   received an external signal.
 - The commit, Julia version and build, machine, settings, the selection and the
-  group that made it, profiles and the environment each names, preferences, and
-  random seed. A replay finds a profile's environment in the checkout it runs in.
+  group that made it, profiles, preferences, and random seed. A replay finds each
+  item's environment where its file is, in the checkout it runs in.
 - Each item's seed, and a hash of its source, which tells an edited item from one
   that only moved.
 - The Julia flags that change compiled code, such as `--check-bounds` and `-O`.

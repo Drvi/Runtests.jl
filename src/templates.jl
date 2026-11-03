@@ -413,7 +413,7 @@ end
 # computes can change while its text does not. The number of expansions written or
 # deleted, or to be, and of problems a person has to fix.
 function chore_templates!(io::IO, target, fix::Bool)
-    files, _, templates = walk_test_dir(target.testdir; claimed = suite_claims_or_none(target))
+    files, _, templates = walk_test_dir(target.testdir)
     orphans = String[f for f in files if !isfile(template_of(f)) && read_stamp(f) !== nothing]
     if isempty(templates) && isempty(orphans)
         println(io, "templates: none")

@@ -21,9 +21,9 @@
 # them; files that only run other files, read the same way; the tests `runtests.jl`
 # holds itself; and the files of definitions the tests include, which become setups.
 # A file that ran in `Main` gets what `runtests.jl` imported before it. Files under a
-# directory with a project of its own are left as they are, for a person to port and
-# a profile naming that directory as its `environment` to run, and Julia files
-# nothing runs move to `.scripts/`. It writes a new `runtests.jl`, and lists what
+# directory with a project of its own are left as they are, for a person to port in
+# place, where they run in that directory's environment, and Julia files nothing runs
+# move to `.scripts/`. It writes a new `runtests.jl`, and lists what
 # moved where. Given a list of files, it ports those.
 #
 # The ported files are written next to the originals as `<stem>_tests.jl` (a file
@@ -1077,7 +1077,7 @@ function run_files!(s::Suite, src, @nospecialize(ex), dir, ctx::Context)
         walk_runs!(s, statements(node_text(src, last(kids(n)))), dir, inner)
     elseif ex.head === :macrocall && macro_name(ex.args[1]) === Symbol("@include")
         add_file!(s, ex.args[end], dir, ctx, src)
-        push!(s.notes, "runtests.jl runs a file in a process of its own, with julia flags of its own: give its items a profile with those flags, `sandbox = :name`: $(snippet(src))")
+        push!(s.notes, "runtests.jl runs a file in a process of its own, with julia flags of its own: give its items a profile with those flags, `profile = :name`: $(snippet(src))")
     elseif ex.head === :macrocall
         # A testset around the includes, `@time`, and the like: what is inside.
         walk_runs!(s, statements(node_text(src, last(kids(n)))), dir, ctx)
@@ -1255,7 +1255,7 @@ function sciml!(s::Suite, src, n, @nospecialize(ex), dir, ctx::Context)
         fields = Dict(a.args[1] => a.args[2] for p in value.args if p isa Expr && p.head === :parameters for a in p.args if a isa Expr)
         if haskey(fields, :env)
             push!(s.notes, "runtests.jl runs `$(snippet(node_text(src, valnode)))` in an environment of its own; " *
-                           "Runtests runs such tests under a profile whose `environment` is a directory under test/ holding them and its Project.toml")
+                           "Runtests runs the tests in a directory under test/ with a Project.toml of its own in that environment")
         elseif haskey(fields, :body)
             add_file!(s, fields[:body], dir, within(c; isolated = true), src)
         end
@@ -1304,9 +1304,9 @@ function sciml_folders!(s::Suite, ctx::Context, everything::Bool)
         end
         rel = names[folder]
         if any(p -> isfile(joinpath(testdir, rel, p)), ("Project.toml", "JuliaProject.toml"))
-            push!(s.notes, "SciMLTesting group $g runs in an environment of its own, test/$rel/, and a run stops on it until " *
-                           "a profile names it: once its files are ported, a profile with `environment = $(repr(rel))` in " *
-                           "TestItems.toml runs them there; if it is input for the tests, move it under test/testfixtures/")
+            push!(s.notes, "SciMLTesting group $g runs in an environment of its own, test/$rel/, and a run reads its files " *
+                           "as test files: port them in place, and they run in that environment; if it is input for the " *
+                           "tests, move it under test/testfixtures/")
             continue
         end
         tag = group_tag(s, g)
@@ -1491,9 +1491,8 @@ function port_suite(testdir)
         end
     end
     for (d, files) in sort!(collect(elsewhere); by = first)
-        push!(s.notes, "test/$d/ is an environment of its own, where $(join(files, ", ")) ran, and a run stops on it until " *
-                       "a profile names it: once they are ported, a profile with `environment = $(repr(d))` in " *
-                       "TestItems.toml runs them there")
+        push!(s.notes, "test/$d/ is an environment of its own, where $(join(files, ", ")) ran, and a run reads its files " *
+                       "as test files: port them in place, and they run in that environment")
     end
     for (file, (setup, main)) in helpers
         write_helper_setup(testdir, file, setup, pkg, main ? s.main_imports : String[])

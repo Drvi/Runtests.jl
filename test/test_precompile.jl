@@ -98,7 +98,7 @@ end
         # worker recompiles into the same file and the next run under the ordinary
         # flags finds it stale.
         write(joinpath(dir, "test", "a_test.jl"), """
-        @testitem "checked" sandbox=:bounds begin
+        @testitem "checked" profile=:bounds begin
             using $setup
             @test $setup.f1(1) == 2
             @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
@@ -149,10 +149,10 @@ end
             @testitem "plain" begin
                 @test true
             end
-            @testitem "checked" sandbox=:bounds begin
+            @testitem "checked" profile=:bounds begin
                 @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
             end
-            @testitem "hushed" sandbox=:quiet begin
+            @testitem "hushed" profile=:quiet begin
                 @test true
             end
             """,
@@ -182,7 +182,7 @@ end
         dir = make_pkg(
             "SelfPrecompile",
             "test/t_test.jl" => """
-            @testitem "checked" sandbox=:bounds begin
+            @testitem "checked" profile=:bounds begin
                 @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
             end
             """,

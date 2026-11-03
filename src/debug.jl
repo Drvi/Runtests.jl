@@ -15,7 +15,7 @@ numbers it failed with. When no run of the project is recorded, or no item is
 failing, there is nothing to step into, and it says so.
 
 The item runs here, in this process, as a run would run it: its module and imports,
-the test environment, or the environment its profile names, and the setups, and
+the test environment, or the environment of the directory its file is in, and the setups, and
 its profile's `env`, `init` and `test_end`. Its body is a function the debugger enters at the body's first call.
 What cannot be part of a function, `using` and `struct` among it, has run by then.
 Only this item runs: the items before it in a chain do not.
@@ -122,9 +122,8 @@ end
 # The one item `what` picks from the whole suite, read the way a run reads it: an
 # exact name first, then a `Regex` matched against the names, or a path.
 function find_item(target, what::Union{String, Regex})
-    claimed = suite_claims(target)
-    files, strays, templates = walk_test_dir(target.testdir; claimed)
-    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, claimed)
+    files, strays, templates, environments = walk_test_dir(target.testdir)
+    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, environments)
     if what isa String
         i = findfirst(it -> it.name == what, items)
         i === nothing || return items[i]
@@ -208,7 +207,7 @@ function debug_ignored(item::RawItem, prof::Profile)
     isempty(prof.julia_args) || push!(out, string("`", join(prof.julia_args, " "), "`", of))
     here = string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive))
     prof.threads == here || push!(out, string("threads ", prof.threads, of))
-    # A profile's environment is activated here, and its copy holds the preferences.
+    # An environment directory's copy is activated here, and it holds the preferences.
     isempty(prof.preferences) || !isempty(prof.environment) || push!(out, string("preferences", of))
     item.exclusive && push!(out, "sandbox=true")
     item.timeout_s == USE_RUN_DEFAULT || push!(out, string("timeout=", item.timeout_s))

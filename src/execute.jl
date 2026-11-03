@@ -325,7 +325,7 @@ mutable struct Run
     monitor::Union{Nothing, Monitor}
     # Profile name -> the project directory its workers run in. Only profiles that
     # declare preferences have one; everything else uses the test environment.
-    const profile_projects::Dict{Symbol, String}
+    const profile_projects::Dict{Tuple{Symbol, String}, String}   # by `pool_key`
     @atomic ndone::Int
     # Items whose state does not pass, kept by `set_state!` for the status line,
     # which is drawn from other threads than the one the states are written on.
@@ -394,7 +394,7 @@ function execute(p::Plan, target; on_item = nothing)
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch,
         joinpath(scratch, "item_"), joinpath(tempdir(), string("runtests_artifacts_", runid), "item_"), "", column, names,
-        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
+        ReentrantLock(), time(), nothing, nothing, Dict{Tuple{Symbol, String}, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_item,
         ReentrantLock()
     )
@@ -434,7 +434,7 @@ end
 function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
     return with_logger(RunLogger(current_logger(), run)) do
         with_test_env(target, run) do
-            # Before the run state: a profile's environment that does not resolve
+            # Before the run state: an environment directory that does not resolve
             # stops the run before anything has run to record.
             profile_projects!(run, p)
             # Opened once the test environment is active: its manifest is part of
@@ -836,15 +836,20 @@ end
     needs_worker(p, u) -> Bool
 
 Whether this unit needs a process of its own however the run is configured:
-`--check-bounds=yes` cannot be applied to a running process, and one process
-cannot give an item a process to itself. Such an item gets a worker even under
-`workers=0`; passing it here would pass a test that never ran as written.
+`--check-bounds=yes` cannot be applied to a running process, one process cannot
+give an item a process to itself, and it loads the packages of one environment.
+Such an item gets a worker even under `workers=0`; passing it here would pass a test
+that never ran as written.
 """
-needs_worker(p::Plan, u::UnitIdx) =
-    p.units.exclusive[u] || p.profiles[p.units.profile[u]].name !== DEFAULT_PROFILE
+needs_worker(p::Plan, u::UnitIdx) = p.units.exclusive[u] || !is_plain(p.profiles[p.units.profile[u]])
 
-# Whether any of the run's items runs under a profile other than the default.
+# The default profile in the test environment: what this process can be.
+is_plain(prof::Profile) = prof.name === DEFAULT_PROFILE && isempty(prof.environment)
+
+# Whether any of the run's items runs under a profile other than the default, or in
+# an environment other than the test environment.
 uses_profiles(p::Plan) = any(i -> p.profiles[i].name !== DEFAULT_PROFILE, p.units.profile)
+uses_environments(p::Plan) = any(i -> !isempty(p.profiles[i].environment), p.units.profile)
 
 # `workers=0` is a promise about the pool, not about never starting a process.
 # Starting one anyway is the right thing and a surprising thing, so it is said out
@@ -856,8 +861,8 @@ function warn_sandboxed_workers(p::Plan)
         needs_worker(p, u) && append!(names, (p.items.name[i] for i in p.units.span[u]))
     end
     isempty(names) && return nothing
-    @warn "Runtests: workers=0, but these items ask for a sandbox that this process cannot " *
-        "provide, so each one gets a worker of its own that is torn down afterwards:\n" *
+    @warn "Runtests: workers=0, but these items need a process this one cannot be, for a sandbox, " *
+        "a profile or an environment, so each one gets a worker of its own that is torn down afterwards:\n" *
         join(("  " * repr(n) for n in names), "\n")
     return nothing
 end
@@ -888,25 +893,29 @@ end
 """
     profile_projects!(run, p)
 
-Give every profile that declares preferences or an environment a project of its
-own. A package takes its preferences from the environment that owns it, and a
-stacked environment is not consulted, so a profile's preferences have to arrive as
-the worker's own project: the test environment's `Project.toml` and `Manifest.toml`,
-over a `LocalPreferences.toml` of the environment's preferences with the profile's
-on top. Preferences are part of a cache's identity, so these projects keep caches of
-their own. A profile that names an environment runs in a copy of it instead (see
+Give every pool's profile that declares preferences, or runs in an environment
+directory, a project of its own. A package takes its preferences from the
+environment that owns it, and a stacked environment is not consulted, so a profile's
+preferences have to arrive as the worker's own project: the test environment's
+`Project.toml` and `Manifest.toml`, over a `LocalPreferences.toml` of the
+environment's preferences with the profile's on top. Preferences are part of a
+cache's identity, so these projects keep caches of their own. A pool in an
+environment directory runs in a copy of it instead (see
 [`environment_project`](@ref)).
 """
 function profile_projects!(run::Run, p::Plan)
     env = Base.active_project()
     for prof in values(p.profiles)
-        announce = () -> say(run, "resolving the environment of profile ", prof.name, ", ",
-                             relpath_or_path(prof.environment, p.root))
+        announce = () -> say(run, "resolving the environment of ", relpath_or_path(prof.environment, p.root))
         dir = profile_project(prof, env, p.root, announce)
-        dir === nothing || (run.profile_projects[prof.name] = dir)
+        dir === nothing || (run.profile_projects[pool_key(prof)] = dir)
     end
     return nothing
 end
+
+# What tells the plan's profiles apart: a declared profile runs in several
+# environments, one pool each.
+pool_key(prof::Profile) = (prof.name, prof.environment)
 
 # The project `prof`'s workers run in, or `nothing` for a profile without
 # preferences or an environment, whose workers run in the environment `env` itself.
@@ -942,9 +951,9 @@ const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
 """
     environment_project(prof, root, announce = nothing) -> String
 
-The project the workers of a profile that names an environment run in. A copy of
+The project the workers of a profile in an environment directory run in. A copy of
 that environment, in the system's temporary files so that nothing is written to the
-directory the profile names, which is the package's own; with the package under
+directory, which is the package's own; with the package under
 test at `root` developed into it by path, as it is in the test environment, which
 brings the packages its `[sources]` name with it; resolved; and with the
 environment's `LocalPreferences.toml` under the profile's preferences, as
@@ -955,7 +964,7 @@ before building.
 """
 function environment_project(prof::Profile, root, announce = nothing)
     root === nothing && throw(ConfigError(
-        "profile `$(prof.name)` runs in an environment of its own, and there is no package here to test in it"
+        "the tests in $(relpath_or_path(prof.environment)) run in an environment of their own, and there is no package here to test in it"
     ))
     key = (prof.environment, String(root), prof.preferences)
     return @lock ENVIRONMENT_PROJECTS_LOCK begin
@@ -1023,8 +1032,7 @@ function resolve_environment(dir::AbstractString, prof::Profile)
     catch e
         is_interrupt(e) && rethrow()
         throw(ConfigError(string(
-            "could not build the environment of profile `", prof.name, "` from ",
-            relpath_or_path(prof.environment), ": ", sprint(showerror, e)
+            "could not build the environment of ", relpath_or_path(prof.environment), ": ", sprint(showerror, e)
         )))
     finally
         Base.set_active_project(original)
@@ -1032,7 +1040,7 @@ function resolve_environment(dir::AbstractString, prof::Profile)
     return nothing
 end
 
-# When the files a profile's environment was built from were last written: the
+# When the files an environment directory's copy was built from were last written: the
 # environment's own, the package's project, the preferences, and the project of every
 # package the built one at `dir` holds by path, which is how a package's siblings in
 # a monorepo come in.
@@ -1163,19 +1171,20 @@ function precompile_env(run::Run, p::Plan)
         flags == Base.CacheFlags() || flags in last.(others) || push!(others, Cmd(prof.julia_args) => flags)
         # A profile with preferences runs in a project of its own, which `configs`
         # cannot carry; it gets a call of its own below.
-        (haskey(run.profile_projects, prof.name) || flags in last.(configs)) && continue
+        (haskey(run.profile_projects, pool_key(prof)) || flags in last.(configs)) && continue
         push!(configs, Cmd(prof.julia_args) => flags)
         push!(names, String(prof.name))
     end
     # One call each: a project is part of a cache's identity, so two profiles with
     # different preferences are two environments, not two configurations of one.
-    for (name, dir) in run.profile_projects
-        prof = p.profiles[findfirst(q -> q.name === name, p.profiles)]
+    for (key, dir) in run.profile_projects
+        prof = p.profiles[findfirst(q -> pool_key(q) == key, p.profiles)]
         flags = flags_of(prof)
         flags === nothing && continue
-        say(run, "precompiling ", isempty(prof.environment) ? "the test environment for" : "the environment of",
-            " profile ", name)
-        precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$name`")
+        where_ = isempty(prof.environment) ? "the test environment" :
+            string("the environment of ", relpath_or_path(prof.environment, p.root))
+        say(run, "precompiling ", where_, " for profile ", prof.name)
+        precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$(prof.name)` in $where_")
     end
     # Named only when there is something to name: `Pkg` narrates the rest, and says
     # nothing when there is nothing to do.
@@ -1597,7 +1606,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                 julia_args = run.plan.cfg.coverage ?
                     [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args,
                 threads = prof.threads,
-                extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, slot.profile.name, Base.active_project()), slot.profile),
+                extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, pool_key(slot.profile), Base.active_project()), slot.profile),
                 dir = target.root,
                 project = Base.active_project(),
                 redirect_io = stdout,
@@ -1630,6 +1639,8 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                     # In a run of several profiles, the default's too: a slot can
                     # move from one profile's pool to another's.
                     uses_profiles(run.plan) ? string(" · profile ", prof.name) : "",
+                    uses_environments(run.plan) ? string(" · ", isempty(prof.environment) ? "test environment" :
+                        string("environment ", relpath_or_path(prof.environment, run.plan.root))) : "",
                     isempty(prof.julia_args) ? "" : string(" · ", join(prof.julia_args, " "))
                 )
             )
@@ -1745,7 +1756,7 @@ function worker_env(run_id, slot_id, project, prof::Profile)
     return append!(env, prof.env)
 end
 
-# The load path of an item of a profile that names an environment: that environment,
+# The load path of an item in an environment directory: that environment,
 # `@`, over the test environment `test_env`, as `Pkg.test` stacks its sandbox over the
 # active project. The worker loads RuntestsWorkers through the test environment's
 # manifest, and the environment's own packages come first.
@@ -2504,9 +2515,14 @@ end
 function run_in_process(run::Run, target)
     p = run.plan
     @lock run.lock push!(run.tasks, current_task())
-    isempty(p.profiles[1].init.args) ||
-        @warn "Runtests: the profile's `init` expression is evaluated in this process (workers=0)"
-    Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
+    # The default profile's `init` readies this process for the items that run in it.
+    # When every item gets a worker, as one in an environment directory does, each
+    # worker runs its own `init` where its items run, and this process has none to run.
+    if any(u -> !needs_worker(p, u), UnitIdx(1):UnitIdx(length(p.units)))
+        isempty(p.profiles[1].init.args) ||
+            @warn "Runtests: the profile's `init` expression is evaluated in this process (workers=0)"
+        Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
+    end
     slot = run.slots[1]
     # Every unit, not just the one slot's queue: a pool that would have had a
     # worker of its own has none here, and its items still have to run.

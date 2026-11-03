@@ -355,8 +355,8 @@ class Suite {
 function describe(it) {
     const parts = [];
     if (it.tags.length) parts.push(it.tags.join(', '));
+    if (it.sandbox) parts.push('sandbox');
     if (it.profile) parts.push(`profile ${it.profile}`);
-    else if (it.sandbox) parts.push('sandbox');
     if (it.chain) parts.push(`chain ${it.chain}`);
     if (it.skip !== false) parts.push(it.skip === true ? 'skipped' : `skip if ${it.skip}`);
     return parts.join(' · ');

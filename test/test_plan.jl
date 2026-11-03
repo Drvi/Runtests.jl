@@ -72,24 +72,24 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test plan(items, cfg; root=dir, strict_order=false) isa Runtests.Private.Plan
     end
 
-    @testset "an unknown sandbox profile is an error naming the items" begin
+    @testset "an unknown profile is an error naming the items" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "test", "a_test.jl"),
-              """@testitem "x" sandbox=:nope begin\n @test true\n end\n""")
+              """@testitem "x" profile=:nope begin\n @test true\n end\n""")
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         err = try; plan(items, read_config(joinpath(dir, "test")); root=dir); catch e; e; end
         @test err isa ConfigError
-        @test occursin("sandbox=:nope", sprint(showerror, err))
+        @test occursin("`profile = :nope` has no [profiles.nope]", sprint(showerror, err))
         @test occursin("\"x\"", sprint(showerror, err))
     end
 
     @testset "a chain may not mix profiles" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "test", "a_test.jl"), """
-        @testitem "one" chain=:c sandbox=:a begin
+        @testitem "one" chain=:c profile=:a begin
             @test true
         end
-        @testitem "two" chain=:c sandbox=:b begin
+        @testitem "two" chain=:c profile=:b begin
             @test true
         end
         """)
@@ -98,7 +98,19 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         err = try; plan(items, read_config(joinpath(dir, "test")); root=dir); catch e; e; end
         @test err isa ScanFailure
-        @test occursin("mixes sandbox profiles", sprint(showerror, err))
+        @test occursin("mixes profiles", sprint(showerror, err))
+    end
+
+    @testset "a chain may not span environments" begin
+        dir = mktempdir(); mkpath(joinpath(dir, "test", "qa"))
+        write(joinpath(dir, "test", "qa", "Project.toml"), "[deps]\n")
+        write(joinpath(dir, "test", "a_test.jl"), "@testitem \"one\" chain=:c begin\nend\n")
+        write(joinpath(dir, "test", "qa", "b_test.jl"), "@testitem \"two\" chain=:c begin\nend\n")
+        walked = Runtests.Private.walk_test_dir(joinpath(dir, "test"))
+        items = scan(walked.tests, Filter(), Dict{Symbol,String}(); environments = walked.environments)
+        err = try; plan(items, read_config(joinpath(dir, "test")); root=dir); catch e; e; end
+        @test err isa ScanFailure
+        @test occursin("chain `:c` spans environments", sprint(showerror, err))
     end
 
     @testset "workers are capped by the work available" begin
@@ -203,8 +215,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "Claiming",
             "test/a_test.jl" => declared("a1", "a2", "a3") * declared("c1", "c2", "c3"; opts = "chain=:c"),
             "test/b_test.jl" => declared("b1", "b2", "b3", "b4") * declared("d1", "d2"; opts = "chain=:d"),
-            "test/p_test.jl" => declared("p1", "p2", "p3"; opts = "sandbox=:bounds") *
-                                declared("e1", "e2"; opts = "chain=:e sandbox=:bounds"),
+            "test/p_test.jl" => declared("p1", "p2", "p3"; opts = "profile=:bounds") *
+                                declared("e1", "e2"; opts = "chain=:e profile=:bounds"),
             "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n",
         )
         for workers in (1, 2, 3, 5)
@@ -252,8 +264,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         dir = make_pkg(
             "Refill",
             "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
-            "test/p_test.jl" => declared("p1"; opts = "sandbox=:tiny"),
-            "test/b_test.jl" => declared(("b$i" for i in 1:8)...; opts = "sandbox=:big"),
+            "test/p_test.jl" => declared("p1"; opts = "profile=:tiny"),
+            "test/b_test.jl" => declared(("b$i" for i in 1:8)...; opts = "profile=:big"),
             "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"1\"\n",
         )
         second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
@@ -266,7 +278,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
         # Without `big`: default has two slots, `tiny` one.
         solo = make_pkg("RefillTwo", "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
-                        "test/p_test.jl" => declared("p1"; opts = "sandbox=:tiny"),
+                        "test/p_test.jl" => declared("p1"; opts = "profile=:tiny"),
                         "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n")
         p = plan_dir(solo; workers = 3, history = known)
         s = tiny_slot(p)

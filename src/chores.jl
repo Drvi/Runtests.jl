@@ -22,12 +22,12 @@ Look after a package's suite: do what needs no person, then say what does.
   expansions' stamps instead and runs nothing. An expansion edited by hand, and a
   test file in a template's way that `chores` did not write, are left to a person.
 - run states: this machine's are pruned as a run prunes them, the same ones and no
-  others (see [`prunable_runstates`](@ref)), with their logs; and those of a format
+  others (see `prunable_runstates`), with their logs; and those of a format
   older than any this version reads are deleted. One recorded elsewhere, a CI
   artifact say, and one that cannot be read otherwise are never deleted.
 - checkouts that are gone: when the project keeps its run states in the default
   location, the run states there of every checkout that no longer exists, as
-  [`sweep_runstate_dirs`](@ref) finds them, the directories that held them with them.
+  `sweep_runstate_dirs` finds them, the directories that held them with them.
   Nothing else deletes them: a run reads its own directory and no other.
 
 Returns whether nothing is left to do. Having done the rest, it throws a
@@ -97,7 +97,7 @@ function check_suite!(io::IO, target)
     # `test/` say, has no suite for chores to keep: nothing to do, where a run of it
     # has nothing to run and says so.
     # The settings' own problems are said below, by the run's reading of them.
-    walked = walk_test_dir(target.testdir; claimed = suite_claims_or_none(target))
+    walked = walk_test_dir(target.testdir)
     if all(isempty, (walked.tests, walked.strays, walked.templates))
         println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir, target.root), ""))
         return 0, Set{String}()

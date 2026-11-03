@@ -54,7 +54,7 @@ const STEPPED = make_pkg(
         @test false
     end
 
-    @testitem "profiled" sandbox=:flagged timeout=30 begin
+    @testitem "profiled" profile=:flagged timeout=30 begin
         @test ENV["RUNTESTS_FROM_PROFILE"] == "env"
         @test Main.RUNTESTS_FROM_INIT == 7
     end

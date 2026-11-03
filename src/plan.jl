@@ -187,7 +187,7 @@ function plan(
     # so the check is strict there and permissive under a filter.
     strict_order && validate_order(raw, cfg)
 
-    profiles, profile_idx = profile_table(cfg)
+    profiles, profile_idx = profile_table(cfg, raw)
     units = build_units(raw, profile_idx, history)
     pools = [findall(d -> d.profile == k, units) for k in sort!(unique(d.profile for d in units))]
     slots = count_slots(pools, units, cfg)
@@ -210,9 +210,9 @@ function validate_profiles(raw, cfg)
     isempty(bad) && return
     known = sort!(string.(collect(keys(cfg.profiles))))
     throw(ConfigError(sprint() do io
-        println(io, "unknown sandbox profiles (known: ", join(known, ", "), "):")
+        println(io, "unknown profiles (known: ", join(known, ", "), "):")
         for (name, items) in sort!(collect(bad); by = first)
-            println(io, "  `sandbox=:$name` has no [profiles.$name] in ", config_name(cfg), ", used by:")
+            println(io, "  `profile = :$name` has no [profiles.$name] in ", config_name(cfg), ", used by:")
             foreach(it -> println(io, "    ", repr(it.name), " at ", relpath_or_path(it.file), ":", it.line), items)
         end
     end))
@@ -278,10 +278,19 @@ function levenshtein(a::AbstractString, b::AbstractString)
     return prev[n + 1]
 end
 
-function profile_table(cfg::RunConfig)
-    names = sort!(collect(keys(cfg.profiles)); by = n -> (n !== DEFAULT_PROFILE, string(n)))
-    profiles = Profile[run_profile(cfg.profiles[n], cfg.threads) for n in names]
-    idx = Dict{Symbol, ProfileIdx}(n => ProfileIdx(i) for (i, n) in enumerate(names))
+# The profiles the pools run under: each declared one in the test environment, and
+# each pair of a profile and an environment directory that the items of `raw` use. A
+# pool's workers are one pair's. The default profile in the test environment is first.
+function profile_table(cfg::RunConfig, raw::Vector{RawItem})
+    pairs = Set{Tuple{Symbol, String}}((n, "") for n in keys(cfg.profiles))
+    foreach(it -> push!(pairs, (it.profile, it.environment)), raw)
+    keys_ = sort!(collect(pairs); by = ((n, env),) -> (n !== DEFAULT_PROFILE, string(n), env))
+    length(keys_) < typemax(ProfileIdx) || throw(ConfigError(string(
+        "the test items use ", length(keys_), " pairs of a profile and an environment; at most ",
+        typemax(ProfileIdx) - 1, " fit"
+    )))
+    profiles = Profile[in_environment(run_profile(cfg.profiles[n], cfg.threads), env) for (n, env) in keys_]
+    idx = Dict{Tuple{Symbol, String}, ProfileIdx}(k => ProfileIdx(i) for (i, k) in enumerate(keys_))
     return profiles, idx
 end
 
@@ -303,7 +312,7 @@ end
 
 function build_units(raw::Vector{RawItem}, profile_idx, history::History)
     draft(its, exclusive, chain) = UnitDraft(
-        its, profile_idx[its[1].profile], exclusive, chain,
+        its, profile_idx[(its[1].profile, its[1].environment)], exclusive, chain,
         sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
         IN_FILE_ORDER, Int32(-1), 0, false, 0, false
     )
@@ -325,9 +334,19 @@ function build_units(raw::Vector{RawItem}, profile_idx, history::History)
                 push!(
                     errors, ScanError(
                         it.file, it.line,
-                        "chain `:$name` mixes sandbox profiles: $(repr(it.name)) uses " *
+                        "chain `:$name` mixes profiles: $(repr(it.name)) uses " *
                             "`:$(it.profile)` but $(repr(first_.name)) uses `:$(first_.profile)`; " *
                             "a chain runs in one process, so it must have one profile"
+                    )
+                )
+            elseif it.environment != first_.environment
+                push!(
+                    errors, ScanError(
+                        it.file, it.line,
+                        "chain `:$name` spans environments: $(repr(it.name)) runs in " *
+                            environment_name(it.environment) * " but $(repr(first_.name)) in " *
+                            environment_name(first_.environment) * "; a chain runs in one process, " *
+                            "so its items must be in one environment"
                     )
                 )
             end

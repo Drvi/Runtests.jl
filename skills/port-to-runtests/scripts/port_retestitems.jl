@@ -169,7 +169,7 @@ function main(args)
     files = String[]
     for (dir, dirs, names) in walkdir(testdir)
         # Hidden directories, setups already moved, and directories with an
-        # environment of their own (a profile's, ported in place on its own).
+        # environment of their own (ported in place, on their own).
         filter!(d -> !startswith(d, '.') && d != "testsetups" &&
                      !any(p -> isfile(joinpath(dir, d, p)), ("Project.toml", "JuliaProject.toml")), dirs)
         append!(files, (joinpath(dir, f) for f in names if endswith(f, ".jl") && !(dir == testdir && f == "runtests.jl")))

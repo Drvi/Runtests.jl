@@ -7,7 +7,7 @@ const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 const { EventEmitter } = require('node:events');
 
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 
 class RuntestsServer extends EventEmitter {
     /**

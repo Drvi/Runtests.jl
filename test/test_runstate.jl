@@ -272,7 +272,7 @@ end
     @testset "profiles survive the round trip, expressions and all" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "Project.toml"), "name = \"P\"\nuuid = \"1a2b3c4d-0000-4000-8000-00000000000a\"\n")
-        write(joinpath(dir, "test", "a_test.jl"), """@testitem "x" sandbox=:p begin\n @test true\n end\n""")
+        write(joinpath(dir, "test", "a_test.jl"), """@testitem "x" profile=:p begin\n @test true\n end\n""")
         write(joinpath(dir, "test", "TestItems.toml"), """
         [profiles.p]
         julia_args = ["--check-bounds=yes"]
@@ -1201,7 +1201,7 @@ end
     @testset "replay applies the worker configuration a run state recorded" begin
         dir = make_pkg(
             "Replayed",
-            "test/a_test.jl" => """@testitem "x" sandbox=:p begin\n @test true\nend\n""",
+            "test/a_test.jl" => """@testitem "x" profile=:p begin\n @test true\nend\n""",
             "test/TestItems.toml" =>
                 "[profiles.p]\njulia_args = [\"--check-bounds=yes\"]\nthreads = \"3\"\n"
         )
@@ -1227,24 +1227,24 @@ end
         @test_throws Runtests.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.runstate"))
     end
 
-    @testset "a replay keeps the recorded [order] and reads the recorded profiles' environments" begin
+    @testset "a replay keeps the recorded [order], and finds each item's environment where its file is" begin
         dir = make_pkg("RecordedOrder",
             "test/a_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n@testitem \"b\" begin\n    @test true\nend\n",
             "test/qa/Project.toml" => "",
             "test/qa/q_test.jl" => "@testitem \"q\" begin\n    @test true\nend\n",
-            "test/TestItems.toml" => "[order]\nfirst = [\"b\"]\n\n[profiles.qa]\nenvironment = \"qa\"\n")
+            "test/TestItems.toml" => "[order]\nfirst = [\"b\"]\n")
         with_runstate_dir() do _
             p, _ = prepare((dir,); announce = false)
             path = joinpath(mktempdir(), "run.runstate")
             rsf = init_run_state(path, p)
             write_status!(rsf, findfirst(==("q"), p.items.name), FAILED, 1, 1; elapsed = 1.0)
             finish_run_state!(rsf)
-            # The checkout drops the order and the profile since.
+            # The checkout drops the order since.
             write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"a\"]\n")
             (replayed, _), _ = capture_run(() -> prepare((dir,); replay = path))
             @test replayed.cfg.order_first == ["b"]
-            # `runtestsf` reads the suite as the replay does, the recorded environment's
-            # items with it, and finds the failure there.
+            # `runtestsf` reads the suite as the replay does, the environment's items
+            # with it, and finds the failure there.
             _, out = capture_run(() -> Runtests.runtestsf(dir; replay = path, dry_run = true))
             @test occursin("1 test item", out) && occursin("\"q\"", out)
         end
@@ -1280,8 +1280,8 @@ end
         dir = make_pkg(
             "ReplayedThreads",
             "test/a_test.jl" => """
-            @testitem "own" sandbox=:own begin\n @test true\nend
-            @testitem "inherits" sandbox=:inherits begin\n @test true\nend
+            @testitem "own" profile=:own begin\n @test true\nend
+            @testitem "inherits" profile=:inherits begin\n @test true\nend
             """,
             "test/TestItems.toml" => "[profiles.own]\nthreads = \"3\"\n[profiles.inherits]\nenv = { X = \"1\" }\n"
         )

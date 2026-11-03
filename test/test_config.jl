@@ -310,7 +310,7 @@ end
 
     @testset "a run reads the config file it is given, and runtestsf passes it on" begin
         dir = make_pkg("CustomConfig", "test/t_test.jl" => """
-        @testitem "fast" sandbox=:fast begin
+        @testitem "fast" profile=:fast begin
             @test true
         end
         @testitem "fails" begin

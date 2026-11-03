@@ -1,9 +1,9 @@
 # The fixture boundary. `test/testfixtures/` holds input to the suite's tests, which
 # the suite itself never reads; every other directory under `test/` with a project of
-# its own is a profile's environment, or an error.
+# its own is the environment of the test files in it.
 
-using Runtests.Private: prepare, walk_test_dir, list_items, find_item, resolve_target, read_config, Plan,
-    Profile, init_run_state, finish_run_state!, ScanFailure, ConfigError, NoTestsError, PASSED
+using Runtests.Private: prepare, walk_test_dir, list_items, find_item, resolve_target, init_run_state,
+    finish_run_state!, ScanFailure, NoTestsError, PASSED
 
 # A suite with one item of its own and a `test/testfixtures/` full of what the suite
 # must not read: a package with tests, a template and a setup of its own; a project
@@ -41,8 +41,6 @@ function fx_thrown(f)
     end
     return nothing
 end
-
-fx_message(f) = (e = fx_thrown(f); e === nothing ? "" : sprint(showerror, e))
 
 # Every file under `dir` with what it holds, to tell that nothing changed it.
 function fx_snapshot(dir::AbstractString)
@@ -120,24 +118,18 @@ end
         @test states_ == Dict("inner" => PASSED)
     end
 
-    @testset "a nested project nothing names is an error, wherever it is and whatever it holds" begin
-        unnamed(rel) = "$(joinpath("test", rel)) has an environment of its own, which no profile names"
+    @testset "a nested project is an environment of the suite, wherever it is and whatever it holds" begin
         for (rel, file) in (("qa", "Project.toml"), ("tools", "JuliaProject.toml"),
-                            # A package is held to it too: it is not a suite of its own here.
+                            # A package too: it is not a suite of its own here.
                             (joinpath("packages", "Pkg"), "Project.toml"),
                             # Only the `testfixtures` at the top of `test/` is reserved.
                             (joinpath("sub", "testfixtures"), "Project.toml"))
-            bad = fixtured_pkg("FxNested", "test/$rel/$file" => "name = \"Nested\"\n")
-            e = fx_thrown(() -> fx_plan(bad))
-            @test e isa ScanFailure
-            @test only(e.errors).file == joinpath(bad, "test", rel, file)
-            @test occursin(unnamed(rel), only(e.errors).msg)
-            @test occursin("`environment = $(repr(rel))`", only(e.errors).msg)
-            @test occursin("move it under `test/testfixtures/`", only(e.errors).msg)
-            # The editor shows the items it can read beside the problem.
-            listed = list_items(bad)
+            nested = fixtured_pkg("FxNested", "test/$rel/$file" => "name = \"Nested\"\n")
+            @test walk_test_dir(joinpath(nested, "test")).environments == [joinpath(nested, "test", rel)]
+            @test fx_plan(nested).items.name == ["main"]
+            listed = list_items(nested)
             @test [it.name for it in listed.items] == ["main"]
-            @test [e.file for e in listed.errors] == [joinpath(bad, "test", rel, file)]
+            @test isempty(listed.errors)
         end
         deeper = fixtured_pkg("FxDeeper", "test/sub/testfixtures/deep_tests.jl" => "@testitem \"deep\" begin\nend\n")
         @test sort(fx_plan(deeper).items.name) == ["deep", "main"]
@@ -147,48 +139,13 @@ end
         for files in (("test/Project.toml" => "[deps]\n",), ("test/JuliaProject.toml" => "[deps]\n",),
                       ("test/testsetups/S/Project.toml" => "name = \"S\"\nuuid = \"$(next_uuid())\"\n",
                        "test/testsetups/S/src/S.jl" => "module S end\n"),
-                      ("test/.cache/Project.toml" => "[deps]\n",))
-            @test fx_plan(fixtured_pkg("FxAllowed", files...)).items.name == ["main"]
+                      ("test/.cache/Project.toml" => "[deps]\n",),
+                      ("test/testtemplates/env/Project.toml" => "[deps]\n",))
+            allowed = fixtured_pkg("FxAllowed", files...)
+            @test fx_plan(allowed).items.name == ["main"]
+            # None of them is an environment the suite's items run in.
+            @test isempty(walk_test_dir(joinpath(allowed, "test")).environments)
         end
-    end
-
-    @testset "a profile's environment is never in reserved storage, nor the suite itself" begin
-        claims = fixtured_pkg(
-            "FxClaims",
-            "test/testsetups/S/Project.toml" => "[deps]\n",
-            "test/testtemplates/env/Project.toml" => "[deps]\n",
-            "test/Project.toml" => "[deps]\n",
-            "envs/ext/Project.toml" => "[deps]\n",
-            "envs/ext/ext_tests.jl" => "@testitem \"ext\" begin\nend\n",
-        )
-        testdir = joinpath(claims, "test")
-        config(text) = write(joinpath(testdir, "TestItems.toml"), "[profiles.p]\nenvironment = $(repr(text))\n")
-        for (text, why) in ("testfixtures/Inner" => "kept for input to the tests",
-                            # However it is spelled.
-                            "qa/../testfixtures/Inner" => "kept for input to the tests",
-                            "testsetups/S" => "kept for the suite's test setups",
-                            "testtemplates/env" => "kept for the suite's test templates",
-                            "." => "which holds the whole suite",
-                            ".." => "which holds the whole suite")
-            config(text)
-            for f in (() -> read_config(testdir), () -> fx_plan(claims), () -> list_items(claims).errors)
-                got = fx_thrown(f)
-                msg = got isa Exception ? sprint(showerror, got) : join((e.message for e in f()), "\n")
-                @test occursin(why, msg)
-            end
-        end
-        # A config file elsewhere is read relative to itself, and the reserved
-        # directories are still the suite's.
-        ci = mkpath(joinpath(claims, "ci"))
-        write(joinpath(ci, "TestItems.toml"), "[profiles.p]\nenvironment = \"../test/testfixtures/Inner\"\n")
-        rm(joinpath(testdir, "TestItems.toml"))
-        e = fx_thrown(() -> fx_plan(claims; config = joinpath(ci, "TestItems.toml")))
-        @test e isa ConfigError && occursin("kept for input to the tests", sprint(showerror, e))
-        # An environment outside the suite is a profile's, and the suite is still what
-        # is read: its own tests are not.
-        config("../envs/ext")
-        @test fx_plan(claims).items.name == ["main"]
-        @test read_config(testdir).profiles[:p].environment == joinpath(claims, "envs", "ext")
     end
 
     @testset "a link to a directory is not followed" begin
@@ -197,28 +154,6 @@ end
             symlink(joinpath(linked, "test", "testfixtures", "Inner"), joinpath(linked, "test", "inner"))
             @test fx_plan(linked).items.name == ["main"]
         end
-    end
-
-    @testset "a replay's profiles are held to the same" begin
-        replayed = fixtured_pkg("FxReplay", "test/qa/Project.toml" => "[deps]\n",
-                                "test/TestItems.toml" => "[profiles.qa]\nenvironment = \"qa\"\n")
-        recorded = joinpath(states, "replayed.runstate")
-        finish_run_state!(init_run_state(recorded, fx_plan(replayed)))
-        # A directory this checkout gives another profile is two profiles' at once.
-        write(joinpath(replayed, "test", "TestItems.toml"), "[profiles.other]\nenvironment = \"qa\"\n")
-        msg = fx_message(() -> fx_plan(replayed; replay = recorded))
-        @test occursin("is the `environment` of both [profiles.other] and [profiles.qa]", msg)
-        # A recorded profile whose environment is in reserved storage, as no config
-        # file of this version could have declared it.
-        write(joinpath(replayed, "test", "TestItems.toml"), "[profiles.qa]\nenvironment = \"qa\"\n")
-        p = fx_plan(replayed)
-        profiles = [prof.name === :qa ? Profile(:qa; environment = joinpath(replayed, "test", "testfixtures", "Inner")) : prof
-                    for prof in p.profiles]
-        forged = Plan((f === :profiles ? profiles : getfield(p, f) for f in fieldnames(Plan))...)
-        finish_run_state!(init_run_state(recorded, forged))
-        msg = fx_message(() -> fx_plan(replayed; replay = recorded))
-        @test occursin("kept for input to the tests", msg)
-        @test occursin("the run state's profiles", msg)
     end
 
     end; end

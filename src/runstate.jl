@@ -309,12 +309,6 @@ function run_meta(p::Plan)
     for key in RUN_KEYS
         push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
     end
-    # Where each profile that names an environment found it: in the project, as the
-    # project's path, so that a replay elsewhere finds it in its own checkout.
-    for prof in p.profiles
-        isempty(prof.environment) ||
-            push!(meta, string(PROFILE_ENVIRONMENT, prof.name) => relpath_or_path(prof.environment, p.root))
-    end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     return meta
 end
@@ -685,7 +679,7 @@ function read_run_state(path::AbstractString)
         end
 
         seek(io, Int(h.off_profiles))
-        profiles, preferences = read_profiles_section(io, strings, meta)
+        profiles, preferences = read_profiles_section(io, strings)
 
         seek(io, Int(h.off_units))
         # A `Symbol` per chain name, not per unit: nearly every unit has the same one.
@@ -828,11 +822,7 @@ end
 
 lookup(strings::Vector{String}, i::UInt32) = (1 <= i <= length(strings)) ? strings[i] : ""
 
-# The meta key under which a profile's environment is recorded, the profile's name
-# after it. The profiles section has no room for it, and its layout is the format's.
-const PROFILE_ENVIRONMENT = "profile_environment."
-
-function read_profiles_section(io::IO, strings, meta::Dict{String, String} = Dict{String, String}())
+function read_profiles_section(io::IO, strings)
     n = bounded(read(io, UInt32), bytesavailable(io))
     profiles = Dict{Symbol, Profile}()
     preferences = Dict{Symbol, String}()
@@ -851,8 +841,7 @@ function read_profiles_section(io::IO, strings, meta::Dict{String, String} = Dic
         test_end = parse_block(lookup(strings, read(io, UInt32)))
         path = lookup(strings, read(io, UInt32))
         content = lookup(strings, read(io, UInt32))
-        environment = get(meta, string(PROFILE_ENVIRONMENT, name), "")
-        profiles[name] = Profile(name, args, threads, env, init, test_end, path, environment)
+        profiles[name] = Profile(name, args, threads, env, init, test_end, path, "")
         isempty(content) || (preferences[name] = content)
     end
     return profiles, preferences

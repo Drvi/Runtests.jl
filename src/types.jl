@@ -38,6 +38,9 @@ struct RawItem
     chain::Symbol          # NO_CHAIN when the item stands alone
     profile::Symbol        # DEFAULT_PROFILE, or a name from TestItems.toml
     exclusive::Bool        # sandbox=true: alone in a process, torn down after
+    # The directory whose environment the item runs in: the innermost one between its
+    # file and `test/` with a project of its own, or empty for the test environment.
+    environment::String
     # CRC32c of the item's source text, from its first line to the line before the
     # next statement: what a later run compares to tell an edited item from one that
     # only moved. 0 when there is no file to read it from, as for a pasted item.

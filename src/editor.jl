@@ -4,7 +4,7 @@
 # goes to stderr, so nothing but events reaches the stream. What a command holds is
 # read in `command!`, and what an event holds is where it is emitted.
 
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = 2
 
 """
     EventStream
@@ -106,12 +106,9 @@ the lines where `runtests("file.jl:line")` picks that item.
 function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     target = resolve_target((root,))
     config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
-    # The environments profiles name hold items too; a config that cannot be read
-    # names none, and says why below.
-    claimed = suite_claims_or_none(target; config)
-    files, strays, templates = walk_test_dir(target.testdir; claimed)
+    files, strays, templates, environments = walk_test_dir(target.testdir)
     setups = setup_modules(target.testdir)
-    items, errors, _ = scan_files(files, Filter(), setups; strays, templates, claimed)
+    items, errors, _ = scan_files(files, Filter(), setups; strays, templates, environments)
     if !isempty(items)
         # What a run would refuse to start on beyond the files: the settings, the
         # profiles items name, the items `[order]` names.
@@ -129,7 +126,8 @@ function list_items(root::AbstractString; config::Union{Nothing, AbstractString}
         (; name = it.name, file = it.file, line = Int(it.line), end_line = Int(max(next, it.line)),
             tags = String.(it.tags), setups = String.(it.setups),
             profile = it.profile === DEFAULT_PROFILE ? nothing : String(it.profile),
-            sandbox = it.exclusive || it.profile !== DEFAULT_PROFILE,
+            sandbox = it.exclusive,
+            environment = isempty(it.environment) ? nothing : it.environment,
             chain = it.chain === NO_CHAIN ? nothing : String(it.chain),
             skip = it.skip isa Bool ? it.skip : string(it.skip),
             timeout = it.timeout_s == USE_RUN_DEFAULT ? nothing : Int(it.timeout_s),

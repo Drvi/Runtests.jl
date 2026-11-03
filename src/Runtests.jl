@@ -177,11 +177,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
         selected || (name = recorded = Set(it.name for it in rs.items))
         kwargs = merge(recorded_settings(rs), kwargs)
     end
-    # Read before the test files: which directories the profiles' environments are
-    # decides which files are read, and the group what is selected from them.
+    # Read before the test files: the group decides what is selected from them.
     config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
-    claimed = claimed_environments(target.testdir, config_path, toml)
-    rs === nothing || (claimed = replayed_claims(claimed, rs, target, config_path))
     selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
     filter = Filter(; name, tags, paths = target.paths, line = target.line,
                     group = select_group(read_groups(config_path, toml), config_path, group, selected))
@@ -195,7 +192,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
             is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
     )
     t_files = time()
-    files, strays, templates = walk_test_dir(target.testdir; claimed)
+    files, strays, templates, environments = walk_test_dir(target.testdir)
+    warn_packages(environments)
     if isempty(files)
         # A stray file, or a template not expanded yet, is the likeliest reason there
         # is nothing to run, so it is what the run says rather than "no test files found".
@@ -211,7 +209,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     end
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
-    items = scan(files, filter, setups; strays, templates, expansions, suite_names, claimed)
+    items = scan(files, filter, setups; strays, templates, expansions, suite_names, environments)
     # The failing items on record may all be of items the suite no longer has, which
     # is nothing failing rather than a selection that matched nothing.
     if name isa FailingItems
@@ -244,7 +242,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
-    rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
+    rs === nothing || (cfg = replayed_config(cfg, rs))
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
@@ -303,37 +301,15 @@ function recorded_settings(rs::RunStateRecord)
     return NamedTuple(out)
 end
 
-# The directories of the profiles' environments, with the recorded profiles in place
-# of this checkout's: a directory a recorded profile ran in is that profile's, and
-# its tests are read, whatever this checkout's TestItems.toml, `config_path`, says of
-# it now. Checked as a config file's own are, before they are merged: a directory two
-# profiles name would otherwise go to whichever came last.
-function replayed_claims(claimed::Dict{String, Symbol}, rs::RunStateRecord, target, config_path::AbstractString)
-    owners = Pair{Symbol, String}[name => dir for (dir, name) in claimed if !haskey(rs.profiles, name)]
-    for (name, prof) in rs.profiles
-        isempty(prof.environment) && continue
-        env = isabspath(prof.environment) ? prof.environment : joinpath(target.root, prof.environment)
-        push!(owners, name => rstrip_path(normpath(env)))
-    end
-    check_environment_owners(string(config_path, " and the run state's profiles"), target.testdir, owners)
-    return Dict(dir => name for (name, dir) in owners)
-end
-
 # The recorded profiles in place of this checkout's, each preferences file written
-# back out from what was recorded, each environment found in this checkout, under
-# `root`, where the recording's was in its own, and the recorded manifest kept for
-# comparison.
-function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractString)
+# back out from what was recorded, and the recorded manifest kept for comparison. The
+# items' environments are this checkout's, found where their files are.
+function replayed_config(cfg::RunConfig, rs::RunStateRecord)
     profiles = copy(cfg.profiles)
     for (name, prof) in rs.profiles
         prefs = get(rs.preferences, name, "")
         path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
-        env = isempty(prof.environment) || isabspath(prof.environment) ? prof.environment :
-            normpath(joinpath(root, prof.environment))
-        isempty(env) || isdir(env) || throw(ConfigError(
-            "the run state's profile `$name` runs in $(prof.environment), which this checkout does not have"
-        ))
-        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, env)
+        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, "")
     end
     # The code its workers compiled, which this process's flags need not match: the
     # recorded flags go first, before each profile's own, as the recorded workers had
@@ -363,7 +339,7 @@ failures again does not forget the others, and a run stopped before it reached a
 item leaves that item's verdict as it was. Only items the suite still has run: one
 renamed or deleted since it failed has nothing to run. With `replay`, the verdicts
 are that run's and those of the runs that started after it. See
-[`failing_items`](@ref).
+`failing_items`.
 
 Every other selection narrows the failing items: `name` keeps those it matches, as
 paths, a `file.jl:line`, `tags` and `group` do, so nothing that is not failing runs.
@@ -403,13 +379,23 @@ function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
     end
 end
 
-# Every item's name in the suite, read as a run reads it, the environments profiles
-# name included: a suite that does not parse throws here as it would there.
-function suite_item_names(target; config = nothing)
-    claimed = suite_claims(target; config)
-    files, strays, templates = walk_test_dir(target.testdir; claimed)
+# A package where the suite reads is an environment of the suite, which is seldom what
+# it is there for: each says where it belongs.
+function warn_packages(environments::Vector{String})
+    for (dir, name) in packages_among(environments)
+        @warn "Runtests: $(relpath_or_path(dir)) holds the package `$name`. The suite reads it as an environment, " *
+            "so its test files run in it. If the tests take it as input, move it to `test/$TESTFIXTURES_DIR/`. " *
+            "If it is a test setup, move it to `test/$TESTSETUPS_DIR/`."
+    end
+    return nothing
+end
+
+# Every item's name in the suite, read as a run reads it: a suite that does not parse
+# throws here as it would there.
+function suite_item_names(target)
+    files, strays, templates, environments = walk_test_dir(target.testdir)
     names = String[]
-    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names, claimed)
+    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names, environments)
     return Set(names)
 end
 
@@ -553,10 +539,10 @@ end
 
 # Whether `dir`, whose project file is `p`, is an environment of a package's tests
 # rather than a project of its own: a directory under the package's `test/` whose
-# project declares no package, or that a profile of the package names as its
-# `environment`. A package kept under `test/`, as a fixture is, is a project. One in
-# `test/testfixtures/` is never a profile's, so the package's settings are not read
-# to find out, and a fixture runs whatever they hold.
+# project declares no package, or whose test files run in it (see `walk_test_dir`).
+# A package kept where the suite does not read, in `test/testfixtures/` as a fixture
+# is, in `test/testsetups/` as a setup is, or in a hidden directory, is a project of
+# its own.
 function is_test_environment(dir::AbstractString, p::AbstractString)
     testdir = dirname(rstrip_path(dir))
     while basename(testdir) != "test"
@@ -566,8 +552,7 @@ function is_test_environment(dir::AbstractString, p::AbstractString)
     end
     project_file_in(dirname(testdir)) === nothing && return false
     project_name_of(p) === nothing && return true
-    startswith(dir, joinpath(testdir, TESTFIXTURES_DIR, "")) && return false
-    return haskey(claimed_environments(testdir, config_toml(testdir, nothing)...), rstrip_path(dir))
+    return suite_reads(testdir, rstrip_path(dir))
 end
 
 # A run of a group is not of the whole suite, its default group's included: what a

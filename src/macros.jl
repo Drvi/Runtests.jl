@@ -40,7 +40,12 @@ must give a `Bool`, and an error in it is the item's error.
 | `failfast=true` | stop this item at its first failure |
 | `chain=:sym` | items sharing a chain run in sequence on one worker |
 | `sandbox=true` | run alone in a process that is torn down afterwards |
-| `sandbox=:profile` | run in the pool for `[profiles.profile]` of `TestItems.toml` |
+| `profile=:name` | run on the workers of `[profiles.name]` of `TestItems.toml` |
+
+`sandbox` and `profile` combine: `sandbox=true profile=:name` runs alone in a process
+of that profile. Neither chooses the item's packages: it runs in the environment of
+the innermost directory between its file and `test/` with a `Project.toml` of its
+own, and otherwise in the test environment.
 """
 macro testitem(args...)
     # The call goes to `run_interactive` whole, to be read by the scanner's own

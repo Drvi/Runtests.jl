@@ -24,10 +24,12 @@ coverage_flags(root::AbstractString, dir::AbstractString) =
     ["--code-coverage=@" * realpath(root), "--code-coverage=" * joinpath(dir, "%p.info")]
 
 """
-    merge_coverage(tracedir, root, out) -> (files, lines, hit)
+    merge_coverage(tracedir, roots, out) -> (files, lines, hit)
 
-Sum the LCOV tracefiles in `tracedir` over the package's `src/` and `ext/`, and
-write them to `out` as one. Paths are relative to the root of the repository `root`
+Sum the LCOV tracefiles in `tracedir` over the `src/` and `ext/` of each package at
+`roots`, one or several, and write them to `out` as one. Outside a checkout, a path is
+relative to `base` when it is given, the root of a workspace, so that the files of
+two packages keep apart. Paths are relative to the root of the repository `root`
 is in (see [`repository_root`](@ref)), which is what Codecov and Coveralls resolve
 them against, so a package in a subdirectory, as in a monorepo, has its own path in
 front of them; outside a checkout they are relative to `root`. A tracefile has the
@@ -35,11 +37,18 @@ lines of the functions that were compiled and no others, so every other line of 
 function body in those directories goes in as not run: a function nothing called,
 in a file nothing loaded, counts against the package.
 """
-function merge_coverage(tracedir::AbstractString, root::AbstractString, out::AbstractString)
-    roots = unique([abspath(root), realpath(root)])
-    repo = repository_root(root)
-    # The package's own path from the repository's root, empty at the root.
-    prefix = repo === nothing ? String[] : filter!(!=("."), splitpath(relpath(abspath(root), repo)))
+merge_coverage(tracedir::AbstractString, root::AbstractString, out::AbstractString) = merge_coverage(tracedir, [root], out)
+
+function merge_coverage(tracedir::AbstractString, packages::Vector{String}, out::AbstractString;
+                        base::Union{Nothing, AbstractString} = nothing)
+    # Each package's own path from the repository's root, or from `base` outside one,
+    # empty at the root. A path in one package's `src/` is in no other package's `src/`
+    # or `ext/`.
+    sources = map(packages) do root
+        repo = something(repository_root(root), base, Some(nothing))
+        (unique([abspath(root), realpath(root)]),
+         repo === nothing ? String[] : filter!(!=("."), splitpath(relpath(abspath(root), repo))))
+    end
     # Line => times run, which several workers add to: an `Int64`, as a 32-bit `Int`
     # passes 2^31 and turns negative, and a negative count reads as a line not run.
     counts = Dict{String, Dict{Int, Int64}}()
@@ -48,7 +57,11 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
         file = nothing
         for line in eachline(f)
             if startswith(line, "SF:")
-                file = package_source(line[4:end], roots, prefix)
+                file = nothing
+                for (roots, prefix) in sources
+                    file = package_source(line[4:end], roots, prefix)
+                    file === nothing || break
+                end
             elseif startswith(line, "DA:") && file !== nothing
                 fields = split(line[4:end], ',')
                 length(fields) >= 2 || continue
@@ -61,7 +74,7 @@ function merge_coverage(tracedir::AbstractString, root::AbstractString, out::Abs
             end
         end
     end
-    for dir in ("src", "ext")
+    for (root, (_, prefix)) in zip(packages, sources), dir in ("src", "ext")
         isdir(joinpath(root, dir)) || continue
         for (d, _, names) in walkdir(joinpath(root, dir)), name in names
             endswith(name, ".jl") || continue
@@ -184,8 +197,9 @@ end
 """
     collect_coverage(run) -> CoverageSummary
 
-The run's tracefiles merged into `lcov.info` at the package's root, once every worker
-has exited, and how many workers that ran items left none. Never throws: a report
+The run's tracefiles merged into `lcov.info` at the package's root, or the workspace
+root for a run of several packages, over each package's `src/` and `ext/`, once every
+worker has exited, and how many workers that ran items left none. Never throws: a report
 that cannot be written is said in the closing block, and the run's verdict stands.
 """
 function collect_coverage(run)
@@ -200,7 +214,7 @@ function collect_coverage(run)
     end
     lost = count(!in(written), @lock run.lock collect(run.item_pids))
     try
-        files, lines, hit = merge_coverage(dir, root, out)
+        files, lines, hit = merge_coverage(dir, run.plan.packages.root, out; base = root)
         return CoverageSummary(out, files, lines, hit, lost, "")
     catch e
         is_interrupt(e) && rethrow()

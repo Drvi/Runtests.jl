@@ -6,6 +6,7 @@ This page defines the terms of this manual, in alphabetical order.
 |:-----|:-----------|
 | attempt | One execution of a test item. A retry is a new attempt. |
 | chain | A set of test items with the same `chain` keyword. They run in sequence, on one worker. |
+| combined run | One call to `runtests_mono`. It runs the suites of several packages of one workspace in one run. |
 | coordinator | The process that calls `runtests`. It plans the run, starts the workers and prints the output. |
 | dry run | A run with `dry_run = true`. It prints the plan and runs nothing. |
 | environment directory | A directory under `test/` with a `Project.toml` of its own. The test files in it run in that environment. |
@@ -28,6 +29,7 @@ This page defines the terms of this manual, in alphabetical order.
 | test fixture | Input for tests in `test/testfixtures/`. Runtests never reads it as part of the suite. |
 | test item | A named block of tests, declared with `@testitem`. It runs alone, in a module of its own. |
 | test setup | A module in `test/testsetups/` that test items load with `using`. |
+| union environment | The environment of the shared workers of a combined run. It holds the test dependencies of all its packages that are not isolated. |
 | test template | A file in `test/testtemplates/` of `@testtemplate` loops. `chores` expands it into a test file. |
 | verdict | The latest recorded pass or failure of an item. Failures include errors, timeouts and lost-worker outcomes. A skip or explicit cancellation leaves the previous verdict unchanged. See [Run states and history](@ref history). |
 | worker | A Julia process that a run starts to run test items. |

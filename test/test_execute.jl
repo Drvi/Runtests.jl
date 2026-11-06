@@ -450,6 +450,22 @@ end
         end
     end
 
+    @testset "what loading the package prints while `skip` is decided is in the item's log" begin
+        # A `skip` that is not a literal loads the package to be evaluated, and a
+        # package can print as it loads.
+        dir = make_pkg("PrintsOnLoad", "test/p_test.jl" => """
+            @testitem "skip by an expression" skip=(VERSION < v"1.0") begin
+                @test false
+            end
+            """)
+        write(joinpath(dir, "src", "PrintsOnLoad.jl"),
+              "module PrintsOnLoad\n__init__() = println(stderr, \"printed as it loads\")\nend\n")
+        (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+        @test states["skip by an expression"] === FAILED
+        @test occursin("printed as it loads", out)
+        @test !occursin("w1 · printed as it loads", out)
+    end
+
     @testset "workers=0 still gives a sandboxed item its process" begin
         # `workers=0` is a promise about the pool, not about never starting a
         # process. An item that asked for its own `--check-bounds` is testing
@@ -536,6 +552,52 @@ end
         states, _, _ = run_states(dir; workers=2, logs=:issues)
         @test states["default flags"] === PASSED
         @test states["checked flags"] === PASSED
+    end
+
+    @testset "profiles that differ only in test_end share workers, each item running its own" begin
+        # A `test_end` that leaves an entry in the journal, as the items do.
+        end_mark(tag) = string("test_end = '''open(joinpath(ENV[\"RUNTESTS_JOURNAL\"], string(time_ns(), \"-\", getpid())), ",
+                               "\"w\") do io; println(io, \"end ", tag, "\\t\", getpid(), \"\\t\", time()); end'''")
+        dir = make_pkg(
+            "EndOnly",
+            "test/a_test.jl" => journal_item("a1"; opts = "profile=:a", body = "@test Main.Runtests.current_testitem().profile === :a") *
+                                journal_item("skipped"; opts = "profile=:a skip=true"),
+            "test/b_test.jl" => journal_item("b1"; opts = "profile=:b", body = "@test Main.Runtests.current_testitem().profile === :b") *
+                                journal_item("b2"; opts = "profile=:b retries=1", body = """
+                                    flag = joinpath(ENV["RUNTESTS_JOURNAL"], "b2 tried")
+                                    tried = isfile(flag)
+                                    touch(flag)
+                                    @test tried
+                                    """),
+            "test/TestItems.toml" => "[profiles.a]\n$(end_mark("a"))\n\n[profiles.b]\n$(end_mark("b"))\n",
+        )
+        with_journal() do journal_dir
+            (states, _, p), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+            @test (states["a1"], states["b1"], states["b2"], states["skipped"]) == (PASSED, PASSED, PASSED, SKIPPED)
+            @test length(p.pools) == 1
+            rows = journal(journal_dir)
+            names = [r.name for r in rows]
+            # One process ran both profiles' items.
+            @test length(unique(r.pid for r in rows)) == 1
+            # Each attempt that ran, a failed one before its retry too, ran its own
+            # profile's `test_end` right after it; the skipped item ran none.
+            @test count(==("end a"), names) == 1
+            @test count(==("end b"), names) == 3
+            for (k, name) in enumerate(names)
+                startswith(name, "end") && continue
+                @test names[k + 1] == (name == "a1" ? "end a" : "end b")
+            end
+        end
+        # In this process, with `workers = 0`, the default profile's own `test_end`.
+        solo = make_pkg("EndInProcess", "test/a_test.jl" => journal_item("d1"),
+                        "test/TestItems.toml" => "[profiles.default]\n$(end_mark("d"))\n")
+        with_journal() do journal_dir
+            states, _, _ = run_states(solo; workers = 0, logs = :issues, monitor = false)
+            @test states["d1"] === PASSED
+            rows = journal(journal_dir)
+            @test [r.name for r in rows] == ["d1", "end d"]
+            @test all(r -> r.pid == getpid(), rows)
+        end
     end
 
     @testset "no worker processes are left behind" begin

@@ -44,7 +44,9 @@ include("macros.jl")
 include("scan.jl")
 include("config.jl")
 include("plan.jl")
+include("monorepo.jl")
 include("runstate.jl")
+include("runstate_set.jl")
 include("report.jl")
 include("platform.jl")
 include("monitor.jl")
@@ -242,7 +244,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
-    rs === nothing || (cfg = replayed_config(cfg, rs))
+    rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
@@ -303,13 +305,22 @@ end
 
 # The recorded profiles in place of this checkout's, each preferences file written
 # back out from what was recorded, and the recorded manifest kept for comparison. The
-# items' environments are this checkout's, found where their files are.
-function replayed_config(cfg::RunConfig, rs::RunStateRecord)
+# items' environments are this checkout's, found where their files are, and so is the
+# directory a shared profile's `init` ran in, recorded relative to the package at `root`.
+function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractString)
+    dirs = Dict{Symbol, String}()
+    for line in split(get(rs.meta, "profile_dirs", ""), '\n'; keepempty = false)
+        parts = split(line, '\t')
+        length(parts) == 2 || throw(ConfigError("the run state's `profile_dirs` is unreadable: $(repr(line))"))
+        dir = normpath(joinpath(root, parts[2]))
+        dirs[Symbol(parts[1])] = isdirpath(dir) ? dirname(dir) : dir
+    end
     profiles = copy(cfg.profiles)
     for (name, prof) in rs.profiles
         prefs = get(rs.preferences, name, "")
         path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
-        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, "")
+        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, "",
+                                 get(dirs, name, ""))
     end
     # The code its workers compiled, which this process's flags need not match: the
     # recorded flags go first, before each profile's own, as the recorded workers had
@@ -322,12 +333,71 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord)
     if !isempty(julia_flags)
         for (name, prof) in profiles
             profiles[name] = Profile(prof.name, [julia_flags; prof.julia_args], prof.threads, prof.env, prof.init,
-                                     prof.test_end, prof.preferences, prof.environment)
+                                     prof.test_end, prof.preferences, prof.environment, prof.dir)
         end
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
     return RunConfig(; merge(fields, (; profiles, julia_flags, order_first, order_last,
                                         replayed_manifest = recorded_manifest(rs), replayed_from = rs.path))...)
+end
+
+"""
+    runtests_mono([paths...]; packages, kwargs...)
+
+Run the test suites of several packages of one Julia workspace in one run: one plan,
+one set of workers and one report. Items of different packages share workers when
+their profiles start workers the same way. Julia 1.12 or later.
+
+The packages are the workspace's members that have a suite, or those that
+`packages` of a `[monorepo]` table in `test/TestItems.toml` of the workspace root
+lists, by directory or glob, and `isolated` there lists those that run in their own
+test environment, on workers of their own. The keyword `packages` narrows them to
+the names or directories it gives. Each package's test project has to be a member of
+the workspace. With no `paths`, the workspace of the active project; a path selects
+within the package that holds it, and the workspace root, a package's root or its
+`test/` selects all of it.
+
+Each package's items run under its own profiles, setups and settings. The settings
+of the run itself (`workers`, `memory_threshold`, `logs`, `verbose`, `monitor`,
+`monitor_interval`, `full_stacktraces`, `full_names`, `testset_name`, `coverage`,
+`seed`, `failfast`) come from the call, the `RUNTESTS_` variables and `[run]` of the
+workspace root's `test/TestItems.toml`; one in another package's `[run]` has no
+effect, and the run says so. The others are each package's own: a keyword or a
+variable gives every package its value. `name`, `tags` and `group` select within each
+package; a group or tag only some packages have is no error. `config` is an error.
+
+Before any worker starts, a `using` or `import` written in an item, a setup or a
+profile's `init` or `test_end` that the package's own test environment could not
+load stops the run, as do two packages' setups of one name. Each package gets a run
+state of its own, which its `runtestsf`, `debug` and next runs read as one of its own
+runs. Returns a [`RunTestSet`](@ref) with a testset for each package, and throws as
+[`runtests`](@ref) does when an item did not pass.
+"""
+function runtests_mono(args...; packages = nothing, name = nothing, tags = nothing, dry_run::Bool = false,
+                       on_item = nothing, kwargs...)
+    on_item === nothing || hasmethod(on_item, Tuple{ItemEvent}) || throw(ArgumentError(
+        "`on_item` must be a function that takes a `Runtests.ItemEvent`, got $(repr(on_item))"
+    ))
+    return exclusively() do
+        r = prepare_mono(args; packages, name, tags, announce = !dry_run, kwargs...)
+        p = r.plan
+        # One process holds one test environment.
+        p.cfg.workers == 0 && length(p.packages) > 1 && throw(ArgumentError(
+            "`workers = 0` runs the items in this process, which holds one package's test environment, and this " *
+                "run has $(length(p.packages)) packages: give it one worker or more, or `packages` to run one"
+        ))
+        if dry_run
+            print_plan(stdout, p)
+            return nothing
+        end
+        project = something(project_file(p.root), joinpath(p.root, "Project.toml"))
+        run = execute(p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)); on_item)
+        try
+            return RunTestSet(report(run))
+        finally
+            rm(run.scratch; force = true, recursive = true)
+        end
+    end
 end
 
 """
@@ -682,11 +752,12 @@ end
 end # module Private
 
 using Test
-using .Private: @testitem, @testtemplate, runtests, runtestsf, current_testitem, in_testitem, in_test_run,
+using .Private: @testitem, @testtemplate, runtests, runtestsf, runtests_mono, chores_mono, activate_mono, current_testitem,
+    in_testitem, in_test_run, serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 
-export @testitem, @testtemplate, runtests, runtestsf, chores
+export @testitem, @testtemplate, runtests, runtestsf, chores, runtests_mono, chores_mono
 
 # Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test
@@ -696,7 +767,7 @@ for name in names(Test)
     startswith(string(name), "@") && @eval export $name
 end
 
-public current_testitem, in_testitem, in_test_run, on_failure, artifacts_dir,
+public activate_mono, serve_mono, current_testitem, in_testitem, in_test_run, on_failure, artifacts_dir,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 

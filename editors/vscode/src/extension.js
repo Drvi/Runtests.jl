@@ -1,6 +1,7 @@
 // The Test Explorer side: one Runtests server per workspace folder with a test suite,
-// its items as a tree of files, runs as test runs. What is decided without VS Code
-// is in `model.js`, and the protocol is in `server.js`.
+// its items as a tree of files, under a node for each package when the folder is a
+// workspace of several, and runs as test runs. What is decided without VS Code is
+// in `model.js`, and the protocol is in `server.js`.
 'use strict';
 
 const vscode = require('vscode');
@@ -34,7 +35,8 @@ function activate(context) {
     const announce = () => vscode.commands.executeCommand('setContext', 'runtests.active', suites.size > 0);
 
     async function addFolder(folder) {
-        const found = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, 'test/**/{*_test.jl,*_tests.jl}'), null, 1);
+        // The test directory of the folder's package, or of a package under it.
+        const found = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/test/**/{*_test.jl,*_tests.jl}'), null, 1);
         if (found.length === 0 || suites.has(folder.uri.toString())) return;
         const wasMulti = multiRoot();
         const suite = new Suite(folder, ctrl, diagnostics, log, multiRoot);
@@ -120,13 +122,15 @@ class Suite {
         this.log = log;
         this.multiRoot = multiRoot;
         this.server = null;
-        this.byName = new Map();    // item name -> TestItem
-        this.under = new Map();     // node id -> names of the items at or below it
+        this.byKey = new Map();     // item key (`model.keyOf`) -> TestItem
+        this.keyById = new Map();   // TestItem id -> item key
+        this.under = new Map();     // node id -> keys of the items at or below it
         this.queue = Promise.resolve();
         this.root = folder.uri.fsPath;
+        this.combined = this.mode();
         this.disposables = [];
         // Test files and settings changing change the listing.
-        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, 'test/**/*.{jl,toml}'));
+        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, '**/test/**/*.{jl,toml}'));
         let timer = null;
         const later = () => {
             clearTimeout(timer);
@@ -135,7 +139,41 @@ class Suite {
         watcher.onDidChange(later);
         watcher.onDidCreate(later);
         watcher.onDidDelete(later);
-        this.disposables.push(watcher, { dispose: () => clearTimeout(timer) });
+        // The root's project and the settings decide how the folder is served, and the
+        // root's project which packages a workspace has: a change there can call for
+        // another server, and calls for a new listing at least.
+        const projects = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, '{Project,JuliaProject}.toml'));
+        const changed = () => {
+            const now = this.serving();
+            if (!this.server?.running) {
+                this.combined = now.combined;
+                later();
+            } else if (model.folderChange({ combined: this.combined, environment: this.server.options.environment }, now) === 'restart') {
+                this.restart();
+            } else {
+                later();
+            }
+        };
+        projects.onDidChange(changed);
+        projects.onDidCreate(changed);
+        projects.onDidDelete(changed);
+        const settings = vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('runtests', folder)) changed();
+        });
+        this.disposables.push(watcher, projects, settings, { dispose: () => clearTimeout(timer) });
+    }
+
+    // Whether the folder is served as a workspace of several packages, as the setting
+    // `runtests.monorepo` and the folder's project say now.
+    mode() {
+        return model.isCombined(vscode.workspace.getConfiguration('runtests', this.folder).get('monorepo') ?? 'auto', this.root, read);
+    }
+
+    // How the folder would be served now: its mode, and the environment of its server.
+    serving() {
+        const combined = this.mode();
+        const setting = vscode.workspace.getConfiguration('runtests', this.folder).get('environment');
+        return { combined, environment: model.serverEnvironment({ root: this.root, combined, setting, read }) };
     }
 
     id(kind, rest) { return `${this.folder.uri.toString()}::${kind}::${rest}`; }
@@ -157,12 +195,15 @@ class Suite {
         if (this.server?.running) return this.server;
         const config = vscode.workspace.getConfiguration('runtests', this.folder);
         const julia = config.get('julia.executable') || vscode.workspace.getConfiguration('julia').get('executablePath') || 'julia';
-        const environment = config.get('environment')
-            ? path.resolve(this.root, config.get('environment'))
-            : fs.existsSync(path.join(this.root, 'test', 'Project.toml')) ? path.join(this.root, 'test') : this.root;
+        const environment = model.serverEnvironment({ root: this.root, combined: this.combined, setting: config.get('environment'), read });
+        const problem = model.configProblem(this.combined, config.get('config'));
+        if (problem) {
+            this.log.appendLine(`[${this.folder.name}] ${problem}`);
+            vscode.window.showWarningMessage(`Runtests: ${problem}`);
+        }
         this.server = new RuntestsServer({
-            julia, juliaArgs: config.get('julia.args') ?? [], environment, root: this.root,
-            config: config.get('config') ? path.resolve(this.root, config.get('config')) : undefined,
+            julia, juliaArgs: config.get('julia.args') ?? [], environment, root: this.root, combined: this.combined,
+            config: config.get('config') && !this.combined ? path.resolve(this.root, config.get('config')) : undefined,
             // What Runtests writes for people: into the output of the run in progress,
             // shown in a terminal, and into the log.
             onLog: line => {
@@ -189,25 +230,45 @@ class Suite {
 
     show(listing) {
         const container = this.container();
-        const files = model.groupByFile(listing.items, listing.testdir);
-        const all = files.flatMap(f => f.items.map(it => it.name));
-        this.byName.clear();
+        // A server of several packages: a node for each package, its files under it.
+        const groups = this.combined ? model.groupByPackage(listing.items, listing.packages ?? []) :
+            [{ package: null, files: model.groupByFile(listing.items, listing.testdir) }];
+        this.byKey.clear();
+        this.keyById.clear();
         this.under.clear();
+        const all = [];
         const nodes = [];
-        for (const f of files) {
-            const uri = vscode.Uri.file(f.file);
-            const fileNode = this.ctrl.createTestItem(this.id('file', f.relpath), f.relpath, uri);
-            fileNode.children.replace(f.items.map(it => {
-                const node = this.ctrl.createTestItem(this.id('item', it.name), it.name, uri);
-                node.range = new vscode.Range(it.line - 1, 0, it.end_line - 1, 0);
-                node.tags = it.tags.map(t => new vscode.TestTag(t));
-                node.description = describe(it);
-                this.byName.set(it.name, node);
-                this.under.set(node.id, [it.name]);
-                return node;
-            }));
-            this.under.set(fileNode.id, f.items.map(it => it.name));
-            nodes.push(fileNode);
+        for (const g of groups) {
+            const fileNodes = [];
+            const keys = [];
+            for (const f of g.files) {
+                const uri = vscode.Uri.file(f.file);
+                const fileNode = this.ctrl.createTestItem(this.id('file', `${g.package ?? ''}/${f.relpath}`), f.relpath, uri);
+                fileNode.children.replace(f.items.map(it => {
+                    const key = model.itemKey(it);
+                    const node = this.ctrl.createTestItem(this.id('item', key), it.name, uri);
+                    node.range = new vscode.Range(it.line - 1, 0, it.end_line - 1, 0);
+                    node.tags = it.tags.map(t => new vscode.TestTag(t));
+                    node.description = describe(it);
+                    this.byKey.set(key, node);
+                    this.keyById.set(node.id, key);
+                    this.under.set(node.id, [key]);
+                    return node;
+                }));
+                const fileKeys = f.items.map(model.itemKey);
+                this.under.set(fileNode.id, fileKeys);
+                keys.push(...fileKeys);
+                fileNodes.push(fileNode);
+            }
+            all.push(...keys);
+            if (g.package === null) {
+                nodes.push(...fileNodes);
+            } else {
+                const pkgNode = this.ctrl.createTestItem(this.id('package', g.package), g.package, vscode.Uri.file(g.root));
+                pkgNode.children.replace(fileNodes);
+                this.under.set(pkgNode.id, keys);
+                nodes.push(pkgNode);
+            }
         }
         container.replace(nodes);
         if (this.multiRoot()) this.under.set(this.id('folder', ''), all);
@@ -230,24 +291,24 @@ class Suite {
     // The items that are failing, as the server lists them now.
     async failedItems() {
         await this.refresh();
-        return (this.failed ?? []).map(n => this.byName.get(n)).filter(Boolean);
+        return (this.failed ?? []).map(k => this.byKey.get(model.itemKey(k))).filter(Boolean);
     }
 
-    // The part of `request` that is this folder's, as item names; `undefined` when
+    // The part of `request` that is this folder's, as item keys; `undefined` when
     // none of it is.
-    namesFor(request) {
+    keysFor(request) {
         const mine = node => this.under.has(node.id);
         const include = request.include?.filter(mine).map(n => n.id);
         const exclude = (request.exclude ?? []).filter(mine).map(n => n.id);
         if (request.include && include.length === 0) return undefined;
-        return model.selectedNames(include, exclude, this.under, this.all ?? []);
+        return model.selectedKeys(include, exclude, this.under, this.all ?? []);
     }
 
     async run(request, run, token) {
         if (!this.all) await this.refresh();
-        const names = this.namesFor(request);
-        if (names === undefined || (names !== null && names.length === 0)) return;
-        const targets = (names ?? this.all ?? []).map(n => this.byName.get(n)).filter(Boolean);
+        const keys = this.keysFor(request);
+        if (keys === undefined || (keys !== null && keys.length === 0)) return;
+        const targets = (keys ?? this.all ?? []).map(k => this.byKey.get(k)).filter(Boolean);
         for (const t of targets) run.enqueued(t);
         // One run at a time per server: the next waits for this one.
         const previous = this.queue;
@@ -259,13 +320,13 @@ class Suite {
                 for (const t of targets) run.skipped(t);
                 return;
             }
-            await this.runOnServer(names, run, token, targets);
+            await this.runOnServer(keys, run, token, targets);
         } finally {
             done();
         }
     }
 
-    async runOnServer(names, run, token, targets) {
+    async runOnServer(keys, run, token, targets) {
         const server = this.ensureServer();
         const options = vscode.workspace.getConfiguration('runtests', this.folder).get('run.options') ?? {};
         // Stopped from wherever it was started, and from the run's own Stop.
@@ -275,25 +336,25 @@ class Suite {
         let unknownSeen = false;
         const settled = new Set();
         try {
-            const end = await server.run(names, options, ev => {
-                const item = ev.name !== undefined ? this.byName.get(ev.name) : undefined;
+            const end = await server.run(keys, options, ev => {
+                const item = ev.name !== undefined ? this.byKey.get(model.itemKey(ev)) : undefined;
                 if (ev.event === 'run_started') {
-                    for (const n of ev.unknown) {
-                        const t = this.byName.get(n);
+                    for (const k of ev.unknown) {
+                        const t = this.byKey.get(model.itemKey(k));
                         if (t) run.errored(t, new vscode.TestMessage('not in the suite any more'));
                         unknownSeen = true;
                     }
                     // Queued, but not what the run selected: outside its default group.
-                    for (const n of model.unselected(targets.map(t => t.label), ev)) {
-                        const t = this.byName.get(n);
+                    for (const k of model.unselected(targets.map(t => this.keyById.get(t.id)), ev)) {
+                        const t = this.byKey.get(k);
                         if (t) run.skipped(t);
-                        settled.add(n);
+                        settled.add(k);
                     }
                 } else if (ev.event === 'item_started') {
                     if (item) run.started(item);
                     else unknownSeen = true;
                 } else if (ev.event === 'item_finished' && item) {
-                    settled.add(ev.name);
+                    settled.add(model.itemKey(ev));
                     this.finish(run, item, ev);
                 }
             });
@@ -301,11 +362,11 @@ class Suite {
                 // What had an outcome keeps it; the rest could not run.
                 const text = end.event === 'error' ? end.message : end.event === 'exit' ? end.error.message :
                     'the run stopped with an error; see the Runtests log';
-                for (const t of targets) if (!settled.has(t.label)) run.errored(t, new vscode.TestMessage(text));
+                for (const t of targets) if (!settled.has(this.keyById.get(t.id))) run.errored(t, new vscode.TestMessage(text));
                 run.appendOutput(model.crlf(`Runtests: ${text}\n`));
             } else {
-                for (const n of end.not_run ?? []) {
-                    const t = this.byName.get(n);
+                for (const k of end.not_run ?? []) {
+                    const t = this.byKey.get(model.itemKey(k));
                     if (t) run.skipped(t);
                 }
             }
@@ -339,7 +400,9 @@ class Suite {
         for (const [file] of this.reported ?? []) this.diagnostics.delete(vscode.Uri.file(file));
     }
 
+    // A new server, in the mode the folder has now, and a new listing.
     async restart() {
+        this.combined = this.mode();
         if (this.server) await this.server.stop();
         this.server = null;
         await this.refresh();
@@ -348,6 +411,17 @@ class Suite {
     dispose() {
         this.server?.stop();
         for (const d of this.disposables) d.dispose();
+    }
+}
+
+// Whether the folder is served as a workspace of several packages: as the setting
+// `runtests.monorepo` says, or, `auto`, when its project lists such members.
+// A file's text, or null when there is none.
+function read(file) {
+    try {
+        return fs.readFileSync(file, 'utf8');
+    } catch {
+        return null;
     }
 }
 

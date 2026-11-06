@@ -12,7 +12,8 @@ beside its log, with `prefix` the part of the path a log's shares.
 artifacts_path(prefix::String, index::Integer, attempt::Integer) =
     string(chopsuffix(item_log_path(prefix, index, attempt), ".log"), ".artifacts")
 
-attempt_artifacts(run::Run, i::Integer, attempt::Integer) = artifacts_path(run.artifacts_prefix, i, attempt)
+attempt_artifacts(run::Run, i::Integer, attempt::Integer) =
+    artifacts_path(run.artifacts_prefixes[run.plan.items.package[i]], run.local_item[i], attempt)
 
 # A line in the log beside the evidence in `dir`, as a person reads it. Never a reason
 # to fail: the verdict is recorded already, and the evidence is what it is.
@@ -80,7 +81,7 @@ function finish_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, res::I
     keep_evidence!(run, i, attempt)
     res.artifacts & ARTIFACT_PRODUCERS == 0 && return true
     name = run.plan.items.name[i]
-    limit = run.plan.cfg.artifacts_timeout_s
+    limit = item_cfg(run.plan, i).artifacts_timeout_s
     survived = true
     said = ""
     @atomic slot.collecting = i

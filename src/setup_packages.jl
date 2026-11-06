@@ -32,10 +32,11 @@ test environment nor the standard library provides, a relative `include` and
 """
 function setups_to_packages(args...)
     target = resolve_target(args)
+    PROJECT_ROOT[] = target.root
     dir = joinpath(target.testdir, TESTSETUPS_DIR)
     modules = setup_modules(target.testdir)
     if isempty(modules)
-        println(stdout, label_prefix(), "no setups in ", relpath_or_path(dir, target.root))
+        println(stdout, label_prefix(), "no setups in ", relpath_or_path(dir))
         return nothing
     end
     plans = plan_setup_packages(target, dir, modules)
@@ -64,7 +65,7 @@ moves(p::SetupPackage) = p.source != p.entry
 function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
     names = sort!([String(n) for n in keys(modules)])
     problems = String[]
-    shown(path) = relpath_or_path(path, target.root)
+    shown(path) = relpath_or_path(path)
     # Every setup's UUID first: a setup can import another.
     tomls = Dict{String, Dict{String, Any}}()
     uuids = Dict{String, Base.UUID}()

@@ -425,7 +425,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
     collect_setups!(setups, body, known_setups)
     return RawItem(
         name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
-        timeout, retries, failfast, chain, profile, exclusive, environment, hash
+        timeout, retries, failfast, chain, profile, exclusive, environment, hash, Int32(1)
     )
 end
 
@@ -514,7 +514,9 @@ read, the filter's rejects included. An item in one of `environments`, as
 
 A tag the filter names that no item of the suite carries is a slip, not a selection:
 `tags = "!slw"` would select everything and say nothing. It throws an `ArgumentError`
-for the `tags` keyword and a `ConfigError` for the group's tag expression.
+for the `tags` keyword and a `ConfigError` for the group's tag expression. Given
+`suite_tags`, it adds the suite's tags to it instead, for a combined run, where a tag
+has to be in one of its packages' suites.
 """
 function scan(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
@@ -523,11 +525,12 @@ function scan(
         templates::Vector{String} = String[],
         expansions::Bool = true,
         suite_names::Union{Nothing, Vector{String}} = nothing,
-        environments::Vector{String} = String[]
+        environments::Vector{String} = String[],
+        suite_tags::Union{Nothing, Set{Symbol}} = nothing
     )
     items, errors, rejected, tags = scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, environments)
     isempty(errors) || throw(ScanFailure(errors))
-    check_tags_exist(filter, tags)
+    suite_tags === nothing ? check_tags_exist(filter, tags) : union!(suite_tags, tags)
     if suite_names !== nothing
         append!(suite_names, (it.name for it in items))
         append!(suite_names, (r.name for r in rejected))

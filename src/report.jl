@@ -23,6 +23,7 @@ function plan_block(p::Plan, order)
         print_work(io, p, single_process(p) ? 0 : nslots(p))
     end
     body = sprint() do io
+        print_packages(io, p)
         print_startup(io, p.startup)
         isempty(p.setups) || println(io, "setups: ", join(("`$s`" for s in p.setups), ", "))
         println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
@@ -52,7 +53,7 @@ function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UIn
     rev = project_revision(p.root)
     isempty(rev) || print(io, " · rev ", first(rev, 10))
     seed === nothing || print(io, " · seed ", seed_text(seed))
-    own = count(n -> haskey(p.cfg.item_seeds, n), p.items.name)
+    own = count(i -> haskey(item_cfg(p, i).item_seeds, p.items.name[i]), 1:nitems(p))
     own == 0 || print(io, " · ", plural(own, "item"), " with ", own == 1 ? "its" : "their", " own seed")
     p.cfg.workers == 0 ? print(io, " · in this process") :
         print(io, " · ", plural(nworkers, "worker"), " · threads ", p.profiles[1].threads)
@@ -62,6 +63,18 @@ function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UIn
     return nothing
 end
 
+# What a profile sets, each said briefly; `threads` is what a profile that sets none
+# runs with, which is not said.
+function profile_parts(prof::Profile, threads::AbstractString)
+    parts = String[]
+    isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
+    (isempty(prof.threads) || prof.threads == threads) || push!(parts, string("threads ", prof.threads))
+    isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
+    isempty(prof.init.args) || push!(parts, "init expression")
+    isempty(prof.test_end.args) || push!(parts, "test end expression")
+    return parts
+end
+
 # Only profiles that actually change something are worth a line, one each however
 # many environments they run in, and the environments the items run in one more.
 function print_profiles(io::IO, p::Plan)
@@ -69,12 +82,7 @@ function print_profiles(io::IO, p::Plan)
     for prof in p.profiles
         prof.name in seen && continue
         push!(seen, prof.name)
-        parts = String[]
-        isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
-        prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
-        isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
-        isempty(prof.init.args) || push!(parts, "init expression")
-        isempty(prof.test_end.args) || push!(parts, "test end expression")
+        parts = profile_parts(prof, p.profiles[1].threads)
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
     end
     envs = unique!(String[relpath_or_path(prof.environment, p.root) for prof in p.profiles if !isempty(prof.environment)])
@@ -130,6 +138,15 @@ end
 # duration, but a sub-second one to two figures, which a tenth would round to 0.0s.
 est_text(s::Real) = s < 1 ? string(round(s; sigdigits = 2), "s") : fmt_seconds(s)
 
+# Seconds with one decimal at any size, so that a column of them lines up on the point
+# and reads at a glance. A time no run takes, which only a damaged run state holds, is
+# said as it is.
+function tenths_text(s::Real)
+    0 <= s < 1.0e12 || return string(s, "s")
+    tenths = round(Int, 10s)
+    return string(div(tenths, 10), ".", rem(tenths, 10), "s")
+end
+
 """
     why_text(p, u) -> String
 
@@ -144,7 +161,8 @@ function why_text(p::Plan, u::UnitIdx)
     chain = p.units.chain[u]
     name(i) = repr(p.items.name[i])
     if why === PINNED_FIRST || why === PINNED_LAST
-        which, listed = why === PINNED_FIRST ? ("first", p.cfg.order_first) : ("last", p.cfg.order_last)
+        cfg = item_cfg(p, first(span))
+        which, listed = why === PINNED_FIRST ? ("first", cfg.order_first) : ("last", cfg.order_last)
         # The member listed earliest is the one that set the chain's place.
         i = argmin(i -> something(findfirst(==(p.items.name[i]), listed), typemax(Int)), span)
         return i == first(span) ? "[order] $which" : string("[order] ", which, " names ", name(i))
@@ -287,7 +305,7 @@ function print_plan_table(io::IO, p::Plan, order)
     shown, column = item_names(p, name_width(it.name))
     names = [shown[i] for i in rows]
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
-    ests = [it.est_s[i] > 0 ? est_text(it.est_s[i]) : "" for i in rows]
+    ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     # A chain's reason is its first item's: the unit is placed, not each member.
     whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i]) : "" for i in rows]
@@ -295,6 +313,8 @@ function print_plan_table(io::IO, p::Plan, order)
     columns = Tuple{String, Vector{String}}[]
     push!(columns, ("#", [string(i) for i in 1:n]))
     solo || push!(columns, ("worker", workers))
+    # In a run of several packages, the package whose suite holds the item.
+    is_combined(p) && push!(columns, ("package", [p.packages.name[it.package[i]] for i in rows]))
     push!(columns, ("test item", names))
     push!(columns, ("at", locations))
     any(!isempty, ests) && push!(columns, ("est", ests))
@@ -546,14 +566,21 @@ An item's RUN line when `how` is where it is, and its DONE line when `how` is ho
 it went: `(; state, elapsed_ns, compile_ns, maxrss)`. `shown` is its name as the
 line writes it, quoted or shortened (see [`item_names`](@ref)), in a column `width`
 wide. A retry is the same item again, so it gets the same line with a field of its
-own; `total` is 0 when there is no count to give.
+own; `total` is 0 when there is no count to give. In a run of several packages,
+`package` names the item's, in a column `package_width` wide.
 """
-item_line(slot_id, i, total, shown, width, attempt, attempts, how) = styled() do io
+item_line(slot_id, i, total, shown, width, attempt, attempts, how; package::AbstractString = "", package_width::Integer = 0) =
+styled() do io
     done = !(how isa AbstractString)
     print_line_head(io, done ? state_mark(how.state) : MARK_RUNNING, slot_id, clock_now())
     print_word(io, done ? "DONE" : "RUN")
     if total > 0
         print_int(io, i, ndigits(total)); write(io, UInt8('/')); print_int(io, total); print(io, FIELD)
+    end
+    if !isempty(package)
+        print(io, package)
+        pad_to(io, package_width, textwidth(package))
+        print(io, FIELD)
     end
     # A name longer than the column pushes the rest out rather than being cut: the
     # name is what identifies the item, and a shortened one still does.
@@ -629,11 +656,24 @@ end
 What the call does not show: which Runtests and Julia, how much work, how many
 processes with what given to them, and the environment it resolved to.
 """
+# The packages of a run of several: each with its items, the isolated ones said so,
+# and what the plan notes of those left out.
+function print_packages(io::IO, p::Plan)
+    is_combined(p) || return nothing
+    counts = zeros(Int, length(p.packages))
+    foreach(k -> counts[k] += 1, p.items.package)
+    println(io, "packages: ", join((string(p.packages.name[k], " (", plural(counts[k], "item"),
+                                          p.packages.isolated[k] ? ", isolated" : "", ")") for k in eachindex(counts)), ", "))
+    foreach(note -> println(io, note), p.notes)
+    return nothing
+end
+
 function print_run_header(run)
     p = run.plan
     head = sprint(io -> print_work(io, p, length(run.slots); seed = p.cfg.seed))
     body = sprint() do io
         println(io, "env: ", something(Base.active_project(), "none"))
+        print_packages(io, p)
         print_startup(io, p.startup)
         print_profiles(io, p)
         print_env_settings(io, p.cfg)
@@ -771,9 +811,11 @@ function conclusion_text(run, ended::Symbol = :finished)
         monitor, coverage = run.monitor, run.coverage
         monitor === nothing || print_memory_summary(io, monitor; indent = "")
         coverage === nothing || print_coverage(io, coverage, p.root)
-        if run.runstate !== nothing
+        rs = run.runstate
+        rs isa RunStateSet && print_package_lines(io, run, rs)
+        if rs isa RunStateFile
             print(io, "run state: ")
-            printstyled(io, run.runstate.path; color = :light_black)
+            printstyled(io, rs.path; color = :light_black)
             println(io)
             # Whatever the run printed of its items, and more: what the passing ones
             # printed, which only `logs = :batched` shows.
@@ -789,20 +831,51 @@ function conclusion_text(run, ended::Symbol = :finished)
             end
         end
         print_evidence_kept(io, run)
-        if run.runstate !== nothing
-            # What to type next, for whoever reads this in a CI log as much as here.
-            if any(s -> is_non_pass(s) && s !== CANCELLED && s !== RUNNING, run.statuses.state)
+        # What to type next, for whoever reads this in a CI log as much as here.
+        failing(i) = is_non_pass(st.state[i]) && st.state[i] !== CANCELLED && st.state[i] !== RUNNING
+        if rs isa RunStateFile && any(failing, 1:nitems(p))
+            print(io, "run the failing items again: ")
+            printstyled(io, "Runtests.runtestsf()"; bold = true)
+            if !isempty(run.exported)
+                print(io, ", or where the copy is: ")
+                printstyled(io, "Runtests.runtestsf(replay = ", repr(basename(rs.path)), ")"; bold = true)
+            end
+            println(io)
+        elseif rs isa RunStateSet
+            ks = unique!([p.items.package[i] for i in 1:nitems(p) if failing(i) && rs.files[p.items.package[i]] !== nothing])
+            if !isempty(ks)
                 print(io, "run the failing items again: ")
                 printstyled(io, "Runtests.runtestsf()"; bold = true)
-                if !isempty(run.exported)
-                    print(io, ", or where the copy is: ")
-                    printstyled(io, "Runtests.runtestsf(replay = ", repr(basename(run.runstate.path)), ")"; bold = true)
-                end
-                println(io)
+                println(io, " in ", join((rel_slash(p.packages.root[k], p.root) for k in sort!(ks)), ", "))
             end
         end
     end
     return label_block(head, body)
+end
+
+# A line for each package of a run of several: its items, those that did not pass,
+# and where its run state and logs are.
+function print_package_lines(io::IO, run, rs::RunStateSet)
+    p, st = run.plan, run.statuses
+    for k in eachindex(rs.files)
+        is = [i for i in 1:nitems(p) if p.items.package[i] == k]
+        bad = count(i -> is_non_pass(st.state[i]), is)
+        print(io, p.packages.name[k], ": ", plural(length(is), "test item"), bad == 0 ? "" : string(", ", bad, " not passed"))
+        if rs.files[k] === nothing
+            print(io, " · no run state, it could not be written; logs in ")
+            printstyled(io, run.logdirs[k]; color = :light_black)
+        else
+            print(io, " · run state ")
+            printstyled(io, rs.files[k].path; color = :light_black)
+        end
+        println(io)
+    end
+    if !isempty(run.exported)
+        print(io, "copied to: ")
+        printstyled(io, run.exported; color = :light_black)
+        println(io)
+    end
+    return nothing
 end
 
 # The attempts whose evidence was kept, an item that passed on a retry among them,
@@ -880,7 +953,9 @@ function file_testset(run, fid::Int32)
         first_start = min(first_start, st.start[i])
         last_end = max(last_end, st.start[i] + st.elapsed[i])
     end
-    name = p.relfiles[fid]
+    # In a run of several packages, as its package names it, under the package's testset.
+    name = is_combined(p) ? relpath_or_path(p.files[fid], p.packages.root[p.items.package[findfirst(==(fid), p.items.fileidx)]]) :
+        p.relfiles[fid]
     isfinite(first_start) || return Test.DefaultTestSet(name; verbose = p.cfg.verbose)
     ts = started_testset(name; verbose = p.cfg.verbose, at = run.t0 + first_start)
     finished_at!(ts, run.t0 + last_end)
@@ -909,8 +984,17 @@ function report(run)
         ts === nothing && continue
         Test.record(byfile[p.items.fileidx[i]], ts)
     end
+    # A run of several packages: a testset for each package, its files in it.
+    combined = is_combined(p)
+    file_package = Dict{Int32, Int32}(p.items.fileidx[i] => p.items.package[i] for i in 1:nitems(p))
+    packages = combined ? [started_testset(name; verbose = true, at = run.t0) for name in p.packages.name] :
+        Test.DefaultTestSet[]
     for fid in sort!(collect(keys(byfile)))
-        Test.record(root, byfile[fid])
+        Test.record(combined ? packages[file_package[fid]] : root, byfile[fid])
+    end
+    for ts in packages
+        finished_at!(ts, time())
+        Test.record(root, ts)
     end
     record_unrun!(root, run)
     print_conclusion(run)
@@ -1139,8 +1223,7 @@ on_worker(run, i::ItemIdx) =
     (single_process(run.plan) || run.statuses.slot[i] == 0) ? "" :
     string(" on worker ", run.statuses.slot[i])
 
-item_logpath(run, i::ItemIdx) =
-    item_log_path(run.logprefix, i, max(run.statuses.attempt[i], 1))
+item_logpath(run, i::ItemIdx) = item_log(run, i, max(run.statuses.attempt[i], 1))
 
 # The failure report of an attempt, beside its log.
 failure_path(prefix::String, index::Integer, attempt::Integer) =

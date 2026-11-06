@@ -26,6 +26,7 @@ struct Items
     # The seed each item draws its numbers from, mixed with its name: the run's, or
     # for an item `runtestsf` runs again, the one it failed with.
     seed::Vector{UInt64}
+    package::Vector{Int32}   # the package whose suite holds it, an index into `Plan.packages`
 end
 
 Base.length(it::Items) = length(it.name)
@@ -116,6 +117,35 @@ struct ColdCost
 end
 ColdCost() = ColdCost(0.0, 0.0)
 
+"""
+    Packages
+
+The packages whose suites a run runs, one row each: the one package of a standalone
+run, or each participant of a combined one. `cfg` is a package's own configuration,
+whose per-package settings its items run with: `timeout`, `retries`,
+`item_failfast`, `init_timeout`, `test_end_timeout`, `artifacts_timeout`,
+`threads`, and its profiles, groups and `[order]`. The run's own settings are
+`Plan.cfg`, which is the package's own in a standalone run.
+"""
+struct Packages
+    name::Vector{String}
+    uuid::Vector{Base.UUID}
+    root::Vector{String}
+    isolated::Vector{Bool}   # runs in its own test environment, on workers of its own
+    cfg::Vector{RunConfig}
+    suite_names::Vector{Vector{String}}   # every item's name in its suite, chosen or not
+end
+
+Base.length(ps::Packages) = length(ps.name)
+
+# The one package of a standalone run at `root`, with the run's configuration.
+function single_package(cfg::RunConfig, root::AbstractString, suite_names::Vector{String})
+    project = isempty(root) ? nothing : project_file(root)
+    t = project === nothing ? Dict{String, Any}() : parse_project(project)
+    uuid = something(tryparse(Base.UUID, string(get(t, "uuid", ""))), Base.UUID(0))
+    return Packages([string(get(t, "name", ""))], [uuid], [String(root)], [false], [cfg], [suite_names])
+end
+
 struct Plan
     items::Items
     units::Units
@@ -123,6 +153,7 @@ struct Plan
     relfiles::Vector{String}    # `files` relative to the project
     locations::Vector{String}   # `file:line` per item
     profiles::Vector{Profile}
+    profile_package::Vector{Int32}   # per profile: the package that declares it
     pools::Vector{Pool}
     slot_pool::Vector{Int32}                 # slot -> pool
     slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its stretch of its pool's body
@@ -130,10 +161,14 @@ struct Plan
     cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
+    packages::Packages
     root::String
     startup::Startup
     selection::String   # how the items were chosen, as the run says it; empty for all of them
     suite_names::Vector{String}   # every item's name in the suite, chosen or not, sorted
+    # Lines the run's header adds: in a run of several packages, those left out and
+    # settings that have no effect.
+    notes::Vector{String}
 end
 
 nslots(p::Plan) = length(p.slot_pool)
@@ -141,6 +176,10 @@ nitems(p::Plan) = length(p.items)
 
 # No workers: everything happens in this process.
 single_process(p::Plan) = p.cfg.workers == 0
+
+# The configuration of the package that holds item `i`, whose per-package settings it
+# runs with.
+item_cfg(p::Plan, i::Integer) = p.packages.cfg[p.items.package[i]]
 
 # Where an item is, as the run reports it.
 itemfile(p::Plan, i::Integer) = p.relfiles[p.items.fileidx[i]]
@@ -171,68 +210,92 @@ History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::C
     History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known))
 
 """
-    plan(raw, cfg; history, root, strict_order, selection, suite_names) -> Plan
+    plan(raw, cfg; history, histories, root, packages, strict_order, selection, suite_names) -> Plan
 
 Validate, group into units, put each profile's units in the order they are handed
-out, and cut each pool's body into one stretch per slot.
+out, and cut each pool's body into one stretch per slot. `cfg` holds the run's own
+settings; `packages` the packages whose items `raw` holds, each with its own
+configuration, and `histories` what earlier runs of each measured.
 """
 function plan(
-        raw::Vector{RawItem}, cfg::RunConfig; history::History = History(),
+        raw::Vector{RawItem}, cfg::RunConfig; history::History = History(), histories::Vector{History} = [history],
         root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = "",
-        suite_names::Vector{String} = String[it.name for it in raw]
+        suite_names::Vector{String} = String[it.name for it in raw], packages::Packages = single_package(cfg, root, suite_names)
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
-    validate_profiles(raw, cfg)
+    length(histories) == length(packages) || throw(DimensionMismatch("one history per package"))
+    validate_profiles(raw, packages)
     # Only a full run can tell a typo in [order] from an item the filter removed,
     # so the check is strict there and permissive under a filter.
-    strict_order && validate_order(raw, cfg)
+    strict_order && validate_order(raw, packages)
 
-    profiles, profile_idx = profile_table(cfg, raw)
-    units = build_units(raw, profile_idx, history)
-    pools = [findall(d -> d.profile == k, units) for k in sort!(unique(d.profile for d in units))]
-    slots = count_slots(pools, units, cfg)
+    profiles, profile_package, profile_idx = profile_table(packages, raw)
+    units = build_units(raw, profile_idx, histories)
+    # Pools in order of estimated completion, the latest first: the order they get
+    # their first workers in, and the pickup order of those left without one.
+    pools = pool_units(units, profiles, profile_package, packages)
+    estimate = pool_estimate(pools, units, histories)
+    order = sortperm(eachindex(pools); by = k -> (-estimate(k, 1), minimum(u -> units[u].profile, pools[k])))
+    pools = pools[order]
+    slots = count_slots(pools, (k, n) -> estimate(order[k], n), cfg)
     for (k, pool) in enumerate(pools)
-        order_pool!(pool, units, slots[k], cfg, history)
+        order_pool!(pool, units, slots[k], packages, histories)
     end
-    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold,
-                       history.seconds)
+    return materialize(units, pools, slots, profiles, profile_package, cfg, packages, root, selection,
+                       sort(suite_names), histories)
 end
 
 # The file the settings came from, as a message names it.
 config_name(cfg) = isempty(cfg.config_file) ? "TestItems.toml" : relpath_or_path(cfg.config_file)
 
-function validate_profiles(raw, cfg)
-    bad = Dict{Symbol, Vector{RawItem}}()
+# The configuration file of package `k`, as a message names it: with the package's
+# name when the run has several.
+config_name(packages::Packages, k::Integer) = length(packages) == 1 ? config_name(packages.cfg[k]) :
+    string(packages.name[k], "'s ", config_name(packages.cfg[k]))
+
+function validate_profiles(raw, packages::Packages)
+    bad = Dict{Tuple{Int32, Symbol}, Vector{RawItem}}()
     for it in raw
         it.profile === DEFAULT_PROFILE && continue
-        haskey(cfg.profiles, it.profile) || push!(get!(Vector{RawItem}, bad, it.profile), it)
+        haskey(packages.cfg[it.package].profiles, it.profile) ||
+            push!(get!(Vector{RawItem}, bad, (it.package, it.profile)), it)
     end
     isempty(bad) && return
-    known = sort!(string.(collect(keys(cfg.profiles))))
     throw(ConfigError(sprint() do io
-        println(io, "unknown profiles (known: ", join(known, ", "), "):")
-        for (name, items) in sort!(collect(bad); by = first)
-            println(io, "  `profile = :$name` has no [profiles.$name] in ", config_name(cfg), ", used by:")
+        if length(packages) == 1
+            println(io, "unknown profiles (known: ", join(sort!(string.(collect(keys(packages.cfg[1].profiles)))), ", "), "):")
+        else
+            println(io, "unknown profiles:")
+        end
+        for ((k, name), items) in sort!(collect(bad); by = first)
+            known = length(packages) == 1 ? "" :
+                string(" (known: ", join(sort!(string.(collect(keys(packages.cfg[k].profiles)))), ", "), ")")
+            println(io, "  `profile = :$name` has no [profiles.$name] in ", config_name(packages, k), known, ", used by:")
             foreach(it -> println(io, "    ", repr(it.name), " at ", relpath_or_path(it.file), ":", it.line), items)
         end
     end))
 end
 
-function validate_order(raw, cfg)
-    names = Set(it.name for it in raw)
-    missing_ = String[]
-    for n in Iterators.flatten((cfg.order_first, cfg.order_last))
-        n in names || push!(missing_, n)
-    end
-    check_order_conflicts(raw, cfg)
-    isempty(missing_) && return
-    throw(ConfigError(sprint() do io
-        println(io, "[order] of ", config_name(cfg), " names test items that do not exist:")
-        for n in missing_
-            near = nearest(n, names)
-            println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+# Each package's `[order]` names items of its own suite.
+function validate_order(raw, packages::Packages)
+    for k in eachindex(packages.name)
+        cfg = packages.cfg[k]
+        names = Set(it.name for it in raw if it.package == k)
+        missing_ = String[]
+        for n in Iterators.flatten((cfg.order_first, cfg.order_last))
+            n in names || push!(missing_, n)
         end
-    end))
+        check_order_conflicts([it for it in raw if it.package == k], cfg)
+        isempty(missing_) && continue
+        throw(ConfigError(sprint() do io
+            println(io, "[order] of ", config_name(packages, k), " names test items that do not exist:")
+            for n in missing_
+                near = nearest(n, names)
+                println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+            end
+        end))
+    end
+    return nothing
 end
 
 # A chain runs as one, so it cannot go both first and last; neither can an item.
@@ -278,20 +341,32 @@ function levenshtein(a::AbstractString, b::AbstractString)
     return prev[n + 1]
 end
 
-# The profiles the pools run under: each declared one in the test environment, and
-# each pair of a profile and an environment directory that the items of `raw` use. A
-# pool's workers are one pair's. The default profile in the test environment is first.
-function profile_table(cfg::RunConfig, raw::Vector{RawItem})
-    pairs = Set{Tuple{Symbol, String}}((n, "") for n in keys(cfg.profiles))
-    foreach(it -> push!(pairs, (it.profile, it.environment)), raw)
-    keys_ = sort!(collect(pairs); by = ((n, env),) -> (n !== DEFAULT_PROFILE, string(n), env))
+# The profiles the pools run under: of each package, each declared one in the test
+# environment, and each pair of a profile and an environment directory that the
+# package's items in `raw` use. A pool's workers are one pair's. Package by package,
+# its default profile in the test environment first. Also the package of each.
+function profile_table(packages::Packages, raw::Vector{RawItem})
+    triples = Set{Tuple{Int32, Symbol, String}}()
+    for k in eachindex(packages.name), n in keys(packages.cfg[k].profiles)
+        push!(triples, (Int32(k), n, ""))
+    end
+    foreach(it -> push!(triples, (it.package, it.profile, it.environment)), raw)
+    keys_ = sort!(collect(triples); by = ((k, n, env),) -> (k, n !== DEFAULT_PROFILE, string(n), env))
+    for k in eachindex(packages.name)
+        used = count(t -> t[1] == k, keys_)
+        used <= MAX_PACKAGE_PROFILES || throw(ConfigError(string(
+            "the test items", length(packages) == 1 ? "" : " of $(packages.name[k])", " use ", used,
+            " pairs of a profile and an environment; at most ", MAX_PACKAGE_PROFILES, " fit"
+        )))
+    end
     length(keys_) < typemax(ProfileIdx) || throw(ConfigError(string(
-        "the test items use ", length(keys_), " pairs of a profile and an environment; at most ",
-        typemax(ProfileIdx) - 1, " fit"
+        "the packages' test items use ", length(keys_), " pairs of a profile and an environment; at most ",
+        typemax(ProfileIdx) - 1, " fit in one run"
     )))
-    profiles = Profile[in_environment(run_profile(cfg.profiles[n], cfg.threads), env) for (n, env) in keys_]
-    idx = Dict{Tuple{Symbol, String}, ProfileIdx}(k => ProfileIdx(i) for (i, k) in enumerate(keys_))
-    return profiles, idx
+    profiles = Profile[in_environment(run_profile(packages.cfg[k].profiles[n], packages.cfg[k].threads), env)
+                       for (k, n, env) in keys_]
+    idx = Dict{Tuple{Int32, Symbol, String}, ProfileIdx}(t => ProfileIdx(i) for (i, t) in enumerate(keys_))
+    return profiles, Int32[k for (k, _, _) in keys_], idx
 end
 
 # A unit under construction: its items, and what the scheduler decides with.
@@ -310,23 +385,24 @@ mutable struct UnitDraft
     changed_new::Bool # whether that one never ran
 end
 
-function build_units(raw::Vector{RawItem}, profile_idx, history::History)
+# A chain is one package's: two packages that name the same chain have one each.
+function build_units(raw::Vector{RawItem}, profile_idx, histories::Vector{History})
     draft(its, exclusive, chain) = UnitDraft(
-        its, profile_idx[(its[1].profile, its[1].environment)], exclusive, chain,
-        sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
+        its, profile_idx[(its[1].package, its[1].profile, its[1].environment)], exclusive, chain,
+        sum(it -> get(histories[it.package].seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
         IN_FILE_ORDER, Int32(-1), 0, false, 0, false
     )
-    chains = Dict{Symbol, Vector{RawItem}}()
+    chains = Dict{Tuple{Int32, Symbol}, Vector{RawItem}}()
     units = UnitDraft[]
     for it in raw
         if it.chain === NO_CHAIN
             push!(units, draft([it], it.exclusive, NO_CHAIN))
         else
-            push!(get!(Vector{RawItem}, chains, it.chain), it)
+            push!(get!(Vector{RawItem}, chains, (it.package, it.chain)), it)
         end
     end
     errors = ScanError[]
-    for (name, its) in chains
+    for ((_, name), its) in sort!(collect(chains); by = first)
         sort!(its; by = i -> (i.file, i.line))
         first_ = its[1]
         for it in its
@@ -357,27 +433,80 @@ function build_units(raw::Vector{RawItem}, profile_idx, history::History)
     return units
 end
 
+# The units of each pool: one pool for each `pool_key` of the units' profiles. In the
+# order of their first profile.
+function pool_units(units::Vector{UnitDraft}, profiles::Vector{Profile}, profile_package::Vector{Int32}, packages::Packages)
+    groups = Dict{Any, Vector{Int}}()
+    for (u, d) in enumerate(units)
+        k = profile_package[d.profile]
+        push!(get!(Vector{Int}, groups, pool_key(profiles[d.profile], k, packages.root[k], packages.isolated[k])), u)
+    end
+    return sort!(collect(values(groups)); by = pool -> minimum(u -> units[u].profile, pool))
+end
+
+"""
+    pool_key(prof, k, root, isolated)
+
+What tells the workers of profile `prof` of package `k`, whose root is `root`, from
+others: equal keys, interchangeable workers. Its start configuration
+(`start_configuration`), so that profiles that differ only in `test_end`, which runs
+after each item rather than when a worker starts, share workers, whichever packages
+declare them. A profile with an `init` shares only with profiles whose `init` runs in
+the same directory (`init_dir`): its package's root, or the workspace root for a
+profile that the workspace shares. The profiles of an isolated package, which runs
+in its own test environment, are its own.
+"""
+function pool_key(prof::Profile, k::Integer, root::AbstractString, isolated::Bool)
+    owner = isolated ? (:package, Int(k)) : isempty(prof.init.args) ? nothing : (:init_dir, init_dir(prof, root))
+    return (start_configuration(prof), owner)
+end
+
+"""
+    pool_estimate(pools, units, histories) -> completion(k, n)
+
+The estimated completion of pool `k` with `n` workers, in seconds: the time a worker
+takes to be ready for its first item, as earlier runs measured it, then the larger of
+the pool's work shared among its workers and its longest unit, which no number of
+workers shortens. An item without a recorded duration counts as the typical item,
+also in a chain whose other items have one.
+"""
+function pool_estimate(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, histories::Vector{History})
+    recorded(it) = get(histories[it.package].seconds, it.name, 0.0)
+    typical = typical_estimate([recorded(it) for d in units for it in d.items])
+    est(u) = sum(it -> (s = recorded(it); s > 0 ? s : typical), units[u].items; init = 0.0)
+    work = [sum(est, pool; init = 0.0) for pool in pools]
+    longest = [maximum(est, pool; init = 0.0) for pool in pools]
+    cold = combined_cold(histories)
+    ready = cold.start_s + cold.compile_s
+    return (k, n) -> ready + max(work[k] / n, longest[k])
+end
+
+# What a fresh worker cost in the earlier runs of the packages: the mean of what each
+# package's runs measured, of those that measured it.
+function combined_cold(histories::Vector{History})
+    mean_of(f) = (xs = [f(h.cold) for h in histories if f(h.cold) > 0]; isempty(xs) ? 0.0 : sum(xs) / length(xs))
+    return ColdCost(mean_of(c -> c.start_s), mean_of(c -> c.compile_s))
+end
+
 # `workers` is a hard cap on live processes, because that cap is what bounds
 # memory and duplicated compilation. Every pool gets a slot while there are slots
-# to give, the most work first; the rest go where the most work per slot is, never
-# more slots than a pool has units. A pool left without a slot is taken by the
-# first slot whose own pool runs out of work, and a slot whose pool runs out goes
-# on where it takes the most off the others (`claim!`).
-function count_slots(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, cfg::RunConfig)
-    work = map(pools) do pool
-        w = sum(u -> units[u].est_s, pool; init = 0.0)
-        w > 0 ? w : Float64(length(pool))
-    end
+# to give, in the order the pools come in, the latest estimated completion first.
+# Each remaining slot goes to the pool whose completion is latest among those it
+# shortens, never more slots than a pool has units. A pool left without a slot is
+# taken by the first slot whose own pool runs out of work, and a slot whose pool
+# runs out goes on where it takes the most off the others (`claim!`).
+function count_slots(pools::Vector{Vector{Int}}, completion, cfg::RunConfig)
     n = zeros(Int, length(pools))
     budget = max(cfg.workers, 1)
-    for k in sortperm(work; rev = true)
+    for k in eachindex(pools)
         budget == 0 && break
         n[k] = 1
         budget -= 1
     end
+    helps(k) = 0 < n[k] < length(pools[k]) && completion(k, n[k] + 1) < completion(k, n[k])
     while budget > 0
-        k = argmax(k -> 0 < n[k] < length(pools[k]) ? work[k] / n[k] : -Inf, eachindex(pools))
-        0 < n[k] < length(pools[k]) || break
+        k = argmax(k -> helps(k) ? completion(k, n[k]) : -Inf, eachindex(pools))
+        helps(k) || break
         n[k] += 1
         budget -= 1
     end
@@ -398,7 +527,7 @@ const TAIL_CLASS = Int(PINNED_LAST)
 const LONG_FLOOR_S = 3.0
 
 """
-    order_pool!(pool, units, nslots, cfg, history)
+    order_pool!(pool, units, nslots, packages, histories)
 
 Sort a pool's units into the order they are handed out, by class and then within
 it:
@@ -419,23 +548,30 @@ it:
 
 Classes 0–3 are the pool's head, 4 its body and 5 its tail. A chain goes where
 its most urgent member would. The class is recorded as a [`Why`](@ref), whose
-values are these numbers.
+values are these numbers. Each package's `[order]` names its own items; in a pool
+that serves several packages, see [`order_blocks!`](@ref).
 """
-function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, cfg, history::History)
-    pin = Dict{String, Int}()
-    for (i, n) in enumerate(cfg.order_first)
-        pin[n] = i - length(cfg.order_first) - 1
+function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, packages::Packages,
+                     histories::Vector{History})
+    pin = [Dict{String, Int}() for _ in eachindex(packages.name)]
+    for (k, cfg) in enumerate(packages.cfg)
+        for (i, n) in enumerate(cfg.order_first)
+            pin[k][n] = i - length(cfg.order_first) - 1
+        end
+        for (i, n) in enumerate(cfg.order_last)
+            pin[k][n] = i
+        end
     end
-    for (i, n) in enumerate(cfg.order_last)
-        pin[n] = i
-    end
+    # The pinned member listed earliest places a chain, whichever its unpinned
+    # members are; `validate_order` rules out a chain on both lists.
+    pinned = Dict{Int, Int}(u => (p = minimum(it -> get(pin[it.package], it.name, typemax(Int)), units[u].items);
+                                  p == typemax(Int) ? 0 : p) for u in pool)
+    order_blocks!(pinned, pool, units)
     share = sum(u -> units[u].est_s, pool; init = 0.0) / max(nslots, 1)
     for u in pool
         d = units[u]
-        # The pinned member listed earliest places a chain, whichever its unpinned
-        # members are; `validate_order` rules out a chain on both lists.
-        p = minimum(it -> get(pin, it.name, typemax(Int)), d.items)
-        p == typemax(Int) && (p = 0)
+        history = histories[d.items[1].package]
+        p = pinned[u]
         at = (d.items[1].file, d.items[1].line)
         ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
         d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
@@ -454,9 +590,38 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, c
     return sort!(pool; by = u -> units[u].key)
 end
 
-# What a unit without an estimate counts as: the median of the estimates there are,
-# or a second when there are none, so that units with nothing known still count
-# the same as one another.
+"""
+    order_blocks!(pinned, pool, units)
+
+Where `[order]` puts the units of a pool that several packages' lists pin: each
+package's `first` items stay one block of the head, in the order of its list, and
+the blocks go the longest estimated first; the same for `last` and the tail.
+`pinned` holds each unit's place, below 0 in the head and above 0 in the tail, each
+ascending in the order handed out, and is shifted in place.
+"""
+function order_blocks!(pinned::Dict{Int, Int}, pool::Vector{Int}, units::Vector{UnitDraft})
+    for side in (-1, 1)
+        on_side = [u for u in pool if sign(pinned[u]) == side]
+        est = Dict{Int32, Float64}()
+        for u in on_side
+            k = units[u].items[1].package
+            est[k] = get(est, k, 0.0) + units[u].est_s
+        end
+        length(est) > 1 || continue
+        ranked = sort!(collect(keys(est)); by = k -> (-est[k], k))
+        rank = Dict{Int32, Int}(k => r for (r, k) in enumerate(ranked))
+        span = maximum(u -> abs(pinned[u]), on_side) + 1
+        for u in on_side
+            r = rank[units[u].items[1].package]
+            pinned[u] += side < 0 ? -(length(ranked) - r) * span : (r - 1) * span
+        end
+    end
+    return pinned
+end
+
+# What a unit or an item without an estimate counts as: the median of the estimates
+# there are, or a second when there are none, so that those with nothing known still
+# count the same as one another.
 function typical_estimate(est::AbstractVector{Float64})
     known = sort!(filter(>(0), est))
     return isempty(known) ? 1.0 : known[(end + 1) ÷ 2]
@@ -483,8 +648,8 @@ end
 
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
-        profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString,
-        suite_names::Vector{String}, cold::ColdCost, seconds::Dict{String, Float64}
+        profiles::Vector{Profile}, profile_package::Vector{Int32}, cfg::RunConfig, packages::Packages,
+        root::AbstractString, selection::AbstractString, suite_names::Vector{String}, histories::Vector{History}
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -494,7 +659,7 @@ function materialize(
     setups = Symbol[]; setup_span = UnitRange{Int32}[]
     code = Expr[]; skip = Any[]; timeout = Int32[]; retries = Int32[]
     failfast = Int8[]; est = Float64[]; item_unit = UnitIdx[]
-    item_hash = UInt32[]; item_seed_ = UInt64[]
+    item_hash = UInt32[]; item_seed_ = UInt64[]; item_package = Int32[]
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
     uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
@@ -517,9 +682,11 @@ function materialize(
                 append!(all_setups, it.setups)
                 push!(code, it.code); push!(skip, it.skip)
                 push!(timeout, it.timeout_s); push!(retries, it.retries)
-                push!(failfast, it.failfast); push!(est, get(seconds, it.name, 0.0))
+                push!(failfast, it.failfast); push!(est, get(histories[it.package].seconds, it.name, 0.0))
                 push!(item_unit, UnitIdx(length(uspan) + 1))
-                push!(item_hash, it.hash); push!(item_seed_, get(cfg.item_seeds, it.name, cfg.seed))
+                push!(item_hash, it.hash); push!(item_package, it.package)
+                # The run's seed is every package's; a failure's own is its package's.
+                push!(item_seed_, get(packages.cfg[it.package].item_seeds, it.name, cfg.seed))
             end
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
@@ -535,7 +702,10 @@ function materialize(
         stop = length(uspan)
         between(a, b) = UnitIdx(a):UnitIdx(b)
         body = between(start + nhead + 1, stop - ntail)
-        push!(ps, Pool(units[pool[1]].profile, between(start + 1, start + nhead), body, between(stop - ntail + 1, stop)))
+        # Its workers start with the configuration of its first profile, which its
+        # other profiles share.
+        push!(ps, Pool(minimum(u -> units[u].profile, pool), between(start + 1, start + nhead), body,
+                       between(stop - ntail + 1, stop)))
         slots[k] == 0 && push!(pending, Int32(k))
         for r in stretches(body, uest, ufile, slots[k])
             push!(slot_pool, Int32(k)); push!(slot_units, r)
@@ -544,14 +714,14 @@ function materialize(
 
     items = Items(
         name, fileidx, line, tags, tag_span, setups, setup_span,
-        code, skip, timeout, retries, failfast, est, item_unit, item_hash, item_seed_
+        code, skip, timeout, retries, failfast, est, item_unit, item_hash, item_seed_, item_package
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
         items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
-        profiles, ps, slot_pool, slot_units, pending, cold, sort!(unique!(all_setups)), cfg,
-        String(root), Startup(), String(selection), suite_names
+        profiles, profile_package, ps, slot_pool, slot_units, pending, combined_cold(histories),
+        sort!(unique!(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
     )
 end
 

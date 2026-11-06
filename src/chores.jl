@@ -52,38 +52,66 @@ function run_chores(args, dry_run::Bool, config)
         # The checkouts that are gone are no other step's business, and reading the
         # default location takes its own time: in a task of its own from the start.
         gone = chore_task(io -> chore_gone_checkouts!(io, fix))
-        # Setups first, as expanding a template loads them, and the suite after the
-        # templates, so that it is read with their new expansions.
-        n, bad = said!(io, chore_step(io -> chore_setups!(io, target, fix)))
-        todo += n
-        problems += bad
-        n, bad = said!(io, chore_step(io -> chore_templates!(io, target, fix)))
-        todo += n
-        problems += bad
-        # The checks that read the suite read it at the same time, each in a task.
-        suite = chore_task(io -> check_suite!(io, target))
-        named = [chore_task(io -> check_named_config!(io, target, path)) for path in configs]
-        (bad, names) = said!(io, suite)
-        problems += bad
-        for t in named
-            problems += said!(io, t)
-        end
-        todo += said!(io, chore_step(io -> chore_runstates!(io, target, fix, names)))
+        todo, problems = package_chores!(io, target, fix, configs)
         todo += said!(io, gone)
-        if problems > 0
-            fix && todo > 0 && print(io, "done: ", todo, " · ")
-            print(io, "to fix by hand: ", problems)
-            !fix && todo > 0 && print(io, " · the rest `Runtests.chores()` does")
-        elseif todo > 0
-            print(io, fix ? "done: $todo" : "to do: $todo, which `Runtests.chores()` does")
-        else
-            print(io, "nothing to do")
-        end
+        print_chores_outcome(io, fix, todo, problems, "Runtests.chores()")
     end
     print(stdout, bracket(body, "[TEST]", fix ? "chores" : "chores, checking only", "", :default))
     dry_run && return problems == 0 && todo == 0
     problems == 0 || throw(ChoresError(string(plural(problems, "problem"), " to fix by hand, as the report says")))
     return true
+end
+
+# The chores of the suite of `target`, each step said into `io` in turn, with paths
+# from `PROJECT_ROOT`: the number of things done, or to do on a dry run, and the number
+# of problems a person has to fix.
+function package_chores!(io::IO, target, fix::Bool, configs::Vector{String})
+    todo = problems = 0
+    # Setups first, as expanding a template loads them, and the suite after the
+    # templates, so that it is read with their new expansions.
+    n, bad = said!(io, chore_step(io -> chore_setups!(io, target, fix)))
+    todo += n
+    problems += bad
+    n, bad = said!(io, chore_step(io -> chore_templates!(io, target, fix)))
+    todo += n
+    problems += bad
+    # The checks that read the suite read it at the same time, each in a task.
+    suite = chore_task(io -> check_suite!(io, target))
+    named = [chore_task(io -> check_named_config!(io, target, path)) for path in configs]
+    (bad, names) = said!(io, suite)
+    problems += bad
+    for t in named
+        problems += said!(io, t)
+    end
+    todo += said!(io, chore_step(io -> chore_runstates!(io, target, fix, names)))
+    return todo, problems
+end
+
+# The last line of a chores report: what was done, or is to do and which call does it,
+# and what is left to a person.
+function print_chores_outcome(io::IO, fix::Bool, todo::Integer, problems::Integer, call::AbstractString)
+    if problems > 0
+        fix && todo > 0 && print(io, "done: ", todo, " · ")
+        print(io, "to fix by hand: ", problems)
+        !fix && todo > 0 && print(io, " · the rest `", call, "` does")
+    elseif todo > 0
+        print(io, fix ? "done: $todo" : "to do: $todo, which `$call` does")
+    else
+        print(io, "nothing to do")
+    end
+    return nothing
+end
+
+# `prepare` of the package of `target` as a check does it, quietly and without
+# expanding templates. A run shows paths from its package's root, and the report
+# keeps showing them from the root it had.
+function prepare_to_check(target; kwargs...)
+    shown_from = PROJECT_ROOT[]
+    try
+        return prepare((target.root,); announce = false, expansions = false, kwargs...)
+    finally
+        PROJECT_ROOT[] = shown_from
+    end
 end
 
 # The suite as a full run would read it: its items, all of them whatever group the
@@ -99,15 +127,15 @@ function check_suite!(io::IO, target)
     # The settings' own problems are said below, by the run's reading of them.
     walked = walk_test_dir(target.testdir)
     if all(isempty, (walked.tests, walked.strays, walked.templates))
-        println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir, target.root), ""))
+        println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir), ""))
         return 0, Set{String}()
     end
     try
-        p, _ = prepare((target.root,); announce = false, expansions = false, group = ALL_GROUP)
+        p, _ = prepare_to_check(target; group = ALL_GROUP)
         println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
         print(io, "config: ")
         if isfile(config)
-            printstyled(io, relpath_or_path(config, target.root); color = :light_black)
+            printstyled(io, relpath_or_path(config); color = :light_black)
             println(io, ", valid")
         else
             println(io, "none")
@@ -137,7 +165,7 @@ function check_suite!(io::IO, target)
         end
         if isfile(config)
             print(io, "config: ")
-            printstyled(io, relpath_or_path(config, target.root); color = :light_black)
+            printstyled(io, relpath_or_path(config); color = :light_black)
             println(io, " reads; the items it names are checked once the test items read")
         end
         return n, nothing
@@ -152,7 +180,7 @@ function check_named_config!(io::IO, target, path::AbstractString)
     items_read = true
     groups = Dict{String, TagExpr}()
     try
-        p, _ = prepare((target.root,); config = path, announce = false, expansions = false, group = ALL_GROUP)
+        p, _ = prepare_to_check(target; config = path, group = ALL_GROUP)
         groups = p.cfg.groups
     catch e
         e isa ConfigError && return print_problem(io, "config", e.msg)
@@ -166,7 +194,7 @@ function check_named_config!(io::IO, target, path::AbstractString)
         end
     end
     print(io, "config: ")
-    printstyled(io, relpath_or_path(abspath(path), target.root); color = :light_black)
+    printstyled(io, relpath_or_path(abspath(path)); color = :light_black)
     println(io, items_read ? ", valid" : " reads; the items it names are checked once the test items read")
     return check_groups!(io, target, groups; config = path)
 end
@@ -177,7 +205,7 @@ end
 function check_groups!(io::IO, target, groups::Dict{String, TagExpr}; config = nothing)
     checks = map(sort!(collect(keys(groups)))) do name
         Threads.@spawn try
-            prepare((target.root,); config, announce = false, expansions = false, group = name)
+            prepare_to_check(target; config, group = name)
             nothing
         catch e
             e isa ConfigError || e isa NoTestsError || rethrow()
@@ -274,7 +302,7 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
     print(io, "run states: ")
     isempty(files) && (println(io, "none"); return 0)
     print(io, length(files), " in ")
-    printstyled(io, relpath_or_path(runstate_dir(target.root), target.root); color = :light_black)
+    printstyled(io, relpath_or_path(runstate_dir(target.root)); color = :light_black)
     stale = prunable_runstates(target.root; names)
     old = old_format_runstates(target.root)
     if isempty(stale) && isempty(old)

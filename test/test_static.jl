@@ -25,6 +25,10 @@ const OURS = (P, W)
     @testset "JET: no error the analysis can find from $name" for (name, f, types) in (
             ("runtests", Runtests.runtests, (String,)),
             ("runtestsf", Runtests.runtestsf, (String,)),
+            ("runtests_mono", Runtests.runtests_mono, (String,)),
+            ("chores_mono", Runtests.chores_mono, (String,)),
+            ("activate_mono", Runtests.activate_mono, (String,)),
+            ("serve_mono", Runtests.serve_mono, (String,)),
             ("chores", Runtests.chores, (String,)),
             ("setups_to_packages", Runtests.setups_to_packages, (String,)),
             ("activate", Runtests.activate, (String,)),

@@ -150,4 +150,40 @@ using TOML: TOML
         target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
         @test !samefile(test_env(target), joinpath(pkg, "test", "Project.toml"))
     end
+
+    @testset "a vendored package's test project in a monorepo's workspace is used as it is" begin
+        # A flat workspace lists the package and its tests at the root; a nested one
+        # lists the package, which lists its tests. Either way the test project shares
+        # the root's manifest, though its workspace parents differ.
+        for nested in (false, true)
+            name = nested ? "NestedVendored" : "FlatVendored"
+            root = mktempdir()
+            uuid = next_uuid()
+            a = joinpath(root, "lib", name)
+            files = (
+                "Project.toml" => "name = \"$(name)Root\"\nuuid = \"$(next_uuid())\"\nversion = \"0.1.0\"\n\n[workspace]\n" *
+                    (nested ? "projects = [\"lib/$name\"]\n" : "projects = [\"lib/$name\", \"lib/$name/test\"]\n"),
+                "src/$(name)Root.jl" => "module $(name)Root end\n",
+                "lib/$name/Project.toml" => "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n" *
+                    (nested ? "\n[workspace]\nprojects = [\"test\"]\n" : ""),
+                "lib/$name/src/$name.jl" => "module $name\nanswer() = 42\nend\n",
+                "lib/$name/test/Project.toml" => "[deps]\n$name = \"$uuid\"\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n",
+                "lib/$name/test/a_test.jl" => "@testitem \"answers\" begin\n    using Random\n    @test $name.answer() == 42\nend\n",
+            )
+            for (path, text) in files
+                mkpath(dirname(joinpath(root, path)))
+                write(joinpath(root, path), text)
+            end
+            testproj = joinpath(a, "test", "Project.toml")
+            target = Target(a, joinpath(a, "Project.toml"), joinpath(a, "test"), String[], Int32(0))
+            @test samefile(test_env(target), testproj) == (VERSION >= v"1.12")
+            if VERSION >= v"1.12"
+                parent = Base.base_project(testproj)
+                @test samefile(parent, joinpath(nested ? a : root, "Project.toml"))
+                @test isfile(joinpath(root, "Manifest.toml")) && !isfile(joinpath(a, "Manifest.toml"))
+            end
+            states, _, _ = run_states(a; workers=1, logs=:issues, monitor=false)
+            @test states == Dict("answers" => PASSED)
+        end
+    end
 end

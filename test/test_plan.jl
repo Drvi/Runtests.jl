@@ -207,9 +207,10 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
     declared(names...; opts = "") = join(("@testitem \"$n\" $opts begin\n    @test true\nend\n" for n in names))
 
-    @testset "however the slots take turns, a unit goes out once, whole, to a slot of its own profile" begin
-        # Two profiles with a chain in each, and slot counts from fewer than the
-        # profiles to more than one per pool, so a slot rebinds to a pool no slot
+    @testset "however the slots take turns, a unit goes out once, whole, to a slot started as its profile starts" begin
+        # Two pools with chains in each. The default profile shares its pool with
+        # `ends`, which differs from it only in `test_end`. Slot counts go from fewer
+        # than the pools to more than one per pool, so a slot rebinds to a pool no slot
         # serves, or steals from another slot of its own pool.
         dir = make_pkg(
             "Claiming",
@@ -217,13 +218,18 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/b_test.jl" => declared("b1", "b2", "b3", "b4") * declared("d1", "d2"; opts = "chain=:d"),
             "test/p_test.jl" => declared("p1", "p2", "p3"; opts = "profile=:bounds") *
                                 declared("e1", "e2"; opts = "chain=:e profile=:bounds"),
-            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n",
+            "test/t_test.jl" => declared("t1", "t2"; opts = "profile=:ends") *
+                                declared("f1", "f2"; opts = "chain=:f profile=:ends"),
+            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n" *
+                                     "[profiles.ends]\ntest_end = \"nothing\"\n",
         )
+        starts(p, prof) = Runtests.Private.start_configuration(p.profiles[prof])
         for workers in (1, 2, 3, 5)
             p = plan_dir(dir; workers)
+            @test length(p.pools) == 2
             # A chain is one unit, its items in declaration order: handed out whole or
             # not at all.
-            for (chain, links) in (:c => ["c1", "c2", "c3"], :d => ["d1", "d2"], :e => ["e1", "e2"])
+            for (chain, links) in (:c => ["c1", "c2", "c3"], :d => ["d1", "d2"], :e => ["e1", "e2"], :f => ["f1", "f2"])
                 u = findfirst(==(chain), p.units.chain)
                 @test [p.items.name[i] for i in p.units.span[u]] == links
             end
@@ -248,13 +254,117 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                         serves[s] = c.pool
                     else
                         handed[c.unit] += 1
-                        p.units.profile[c.unit] == p.pools[serves[s]].profile ||
+                        starts(p, p.units.profile[c.unit]) == starts(p, p.pools[serves[s]].profile) ||
                             push!(wrong, "seed $seed: slot $s, serving pool $(serves[s]), took unit $(c.unit)")
                     end
                 end
                 all(==(1), handed) || push!(wrong, "seed $seed: units handed out $(handed)")
             end
             @test isempty(wrong)
+        end
+    end
+
+    @testset "pools start in order of estimated completion, an item no run timed at the typical duration" begin
+        # `slow` has three items of five seconds; `many` has ten that no run has timed,
+        # which count as the typical duration, five seconds, rather than one.
+        dir = make_pkg("Completion",
+            "test/s_test.jl" => declared("s1", "s2", "s3"; opts = "profile=:slow"),
+            "test/m_test.jl" => declared(("m$i" for i in 1:10)...; opts = "profile=:many"),
+            "test/q_test.jl" => declared("q1"; opts = "profile=:quick"),
+            "test/TestItems.toml" => "[profiles.slow]\nthreads = \"1\"\n[profiles.many]\nthreads = \"2\"\n" *
+                                     "[profiles.quick]\nthreads = \"3\"\n")
+        h = History(Dict("s1" => 5.0, "s2" => 5.0, "s3" => 5.0, "q1" => 1.0), Dict{String, Int}())
+        names_of(p) = [p.profiles[pool.profile].name for pool in p.pools]
+        p = plan_dir(dir; history = h, workers = 1)
+        @test names_of(p) == [:many, :slow, :quick]
+        # One worker: the latest pool gets it, and the others wait in the same order.
+        @test p.slot_pool == [1]
+        @test p.pending == [2, 3]
+        # Every pool gets a worker first; the rest go where they shorten the latest
+        # completion: `many` has fifty seconds of work and `slow` fifteen.
+        p = plan_dir(dir; history = h, workers = 5)
+        @test [count(==(k), p.slot_pool) for k in 1:3] == [3, 1, 1]
+        @test isempty(p.pending)
+        # A worker that cannot shorten a pool's completion is not planned: one long
+        # item outlasts the others shared among any number of workers.
+        long = make_pkg("CompletionLong", "test/a_test.jl" => declared("long", "a1", "a2", "a3"))
+        p = plan_dir(long; history = History(Dict("long" => 30.0, "a1" => 1.0, "a2" => 1.0, "a3" => 1.0), Dict{String, Int}()),
+                     workers = 4)
+        @test p.slot_pool == [1, 1]
+    end
+
+    @testset "an item no run timed counts as the typical item, also in a chain whose other items were timed" begin
+        # Chain `c` has one item timed at ten seconds and one that no run timed, which
+        # counts as the typical item, ten seconds. `b` has one item of fifteen. By its
+        # timed item alone, `c` would finish first.
+        dir = make_pkg("MixedChain",
+            "test/a_test.jl" => declared("c1", "c2"; opts = "chain=:c profile=:a"),
+            "test/b_test.jl" => declared("b1"; opts = "profile=:b"),
+            "test/TestItems.toml" => "[profiles.a]\nthreads = \"1\"\n[profiles.b]\nthreads = \"2\"\n")
+        p = plan_dir(dir; history = History(Dict("c1" => 10.0, "b1" => 15.0), Dict{String, Int}()), workers = 1)
+        @test [p.profiles[pool.profile].name for pool in p.pools] == [:a, :b]
+        # The run counts the chain as the plan does, until the pool has timed items.
+        q = Runtests.Private.Queues(p)
+        @test Runtests.Private.unclaimed_work(q, 1) == [20.0]
+        # Then it scales a recorded duration by how the pool's items took against
+        # theirs, and counts an item without one as the pool's average item.
+        q.stats[1].estimated_s, q.stats[1].estimated_took_s = 10.0, 5.0
+        q.stats[1].items, q.stats[1].took_s = 2, 8.0
+        @test Runtests.Private.unclaimed_work(q, 1) == [9.0]
+    end
+
+    @testset "a slot whose pool runs dry moves only where one more worker makes a pool finish sooner" begin
+        # `long` has one unit of thirty seconds and one slot: a second worker cannot
+        # finish it sooner. `many` has twenty units of a second and two slots, ten
+        # seconds each. `dry`'s slot goes to `many`, although `long` has more work
+        # for each slot.
+        dir = make_pkg("Replacement",
+            "test/d_test.jl" => declared("d1"; opts = "profile=:dry"),
+            "test/l_test.jl" => declared("l1"; opts = "profile=:long"),
+            "test/m_test.jl" => declared(("m$i" for i in 1:20)...; opts = "profile=:many"),
+            "test/TestItems.toml" => "[profiles.dry]\nthreads = \"1\"\n[profiles.long]\nthreads = \"2\"\n" *
+                                     "[profiles.many]\nthreads = \"3\"\n")
+        seconds = Dict("d1" => 1.0, "l1" => 30.0, ("m$i" => 1.0 for i in 1:20)...)
+        p = plan_dir(dir; history = History(seconds, Dict{String, Int}()), workers = 4)
+        pool_named(name) = findfirst(k -> p.profiles[k.profile].name === name, p.pools)
+        @test [count(==(pool_named(n)), p.slot_pool) for n in (:dry, :long, :many)] == [1, 1, 2]
+        s = findfirst(==(pool_named(:dry)), p.slot_pool)
+        claim!, Q = Runtests.Private.claim!, Runtests.Private.Queues
+        q = Q(p)
+        @test claim!(q, s).kind === :unit
+        c = claim!(q, s)
+        @test c.kind === :rebind && c.pool == pool_named(:many)
+        # With `many` all handed out, no move makes a pool finish sooner: the slot is
+        # done.
+        q = Q(p)
+        claim!(q, s)
+        many = p.pools[pool_named(:many)]
+        q.claimed[first(many.head):last(many.tail)] .= true
+        @test claim!(q, s).kind === :done
+    end
+
+    @testset "a slot whose pool runs dry does not start a worker that would be ready after the work is claimed" begin
+        # `target` has five units of four seconds and two slots, which claim them at 0,
+        # 0, 4, 4 and 8 seconds and are done at 12. A third worker ready at 9 finds
+        # nothing left to claim; one ready at 3 takes the third unit and they are done at 8.
+        dir = make_pkg("LateWorker",
+            "test/d_test.jl" => declared("d1"; opts = "profile=:dry"),
+            "test/t_test.jl" => declared(("t$i" for i in 1:5)...; opts = "profile=:target"),
+            "test/TestItems.toml" => "[profiles.dry]\nthreads = \"1\"\n[profiles.target]\nthreads = \"2\"\n")
+        seconds = Dict("d1" => 1.0, ("t$i" => 4.0 for i in 1:5)...)
+        p = plan_dir(dir; history = History(seconds, Dict{String, Int}()), workers = 3)
+        target = findfirst(k -> p.profiles[k.profile].name === :target, p.pools)
+        @test count(==(target), p.slot_pool) == 2
+        s = findfirst(k -> p.profiles[p.pools[k].profile].name === :dry, p.slot_pool)
+        finish_time = Runtests.Private.finish_time
+        @test finish_time(fill(4.0, 5), [0.0, 0.0]) == 12.0
+        @test finish_time(fill(4.0, 5), [0.0, 0.0, 9.0]) == 12.0
+        @test finish_time(fill(4.0, 5), [0.0, 0.0, 3.0]) == 8.0
+        for (start_s, kind) in ((9.0, :done), (3.0, :rebind))
+            q = Runtests.Private.Queues(p)
+            Runtests.Private.claim!(q, s)
+            q.stats[target].starts, q.stats[target].start_s = 1, start_s
+            @test Runtests.Private.claim!(q, s).kind === kind
         end
     end
 
@@ -266,7 +376,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
             "test/p_test.jl" => declared("p1"; opts = "profile=:tiny"),
             "test/b_test.jl" => declared(("b$i" for i in 1:8)...; opts = "profile=:big"),
-            "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"1\"\n",
+            "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"2\"\n",
         )
         second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
         known = History(second, Dict{String, Int}())
@@ -301,20 +411,20 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test claim!(q, s).kind === :done
         @test q.serving[pool_named(p, :tiny)] == 0
 
-        # A unit without an estimate counts as the pool's own average so far: twelve
-        # of a hundredth of a second each leave a default slot nothing a worker that
-        # takes half a second to start would save it.
+        # An item without a recorded duration counts as the pool's own average so
+        # far: twelve of a hundredth of a second each leave a default slot nothing a
+        # worker that takes half a second to start would save it.
         p0 = plan_dir(solo; workers = 3)
         q = Q(p0)
         claim!(q, s)
         q.stats[default].starts, q.stats[default].start_s = 1, 0.5
-        q.stats[default].units, q.stats[default].took_s = 4, 0.04
+        q.stats[default].items, q.stats[default].took_s = 4, 0.04
         @test claim!(q, s).kind === :done
-        q = Q(p0)                      # before any has run, a unit counts as a second
+        q = Q(p0)                      # before any has run, an item counts as a second
         claim!(q, s)
         q.stats[default].starts, q.stats[default].start_s = 1, 0.5
         @test claim!(q, s).kind === :rebind
-        # An estimate is scaled by how the run's units took against theirs.
+        # A recorded duration is scaled by how the run's items took against theirs.
         q = Q(p)
         claim!(q, s)
         q.stats[default].starts, q.stats[default].start_s = 1, 1.0
@@ -731,23 +841,28 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test w["in file order"] == ""
     end
 
-    @testset "the dry run shows each item's expected time, when one is recorded" begin
+    @testset "the dry run shows each item's expected time in seconds, with one decimal, when one is recorded" begin
         lines(p) = split(sprint(print_plan, p), '\n')
         header(p) = only(filter(l -> occursin("test item", l) && occursin(" at ", l), lines(p)))
         @test !occursin(r"\best\b", header(make_plan()))
-        h = History(Dict("uses setup" => 100.0, "add works" => 0.25, "chain one" => 2.0), Dict{String, Int}())
+        h = History(Dict("uses setup" => 100.0, "add works" => 0.26, "chain one" => 2.0), Dict{String, Int}())
         p = make_plan(; workers = 2, history = h)
         row(name) = collect(only(filter(l -> occursin(repr(name), l) && occursin("_test.jl:", l), lines(p))))
-        # Right-aligned, ending under the title's last letter; a member of a chain has
-        # its own, and an item nothing was recorded for has none.
+        # Right-aligned, ending under the title's last letter, so that the points line
+        # up; a member of a chain has its own, and an item nothing was recorded for has none.
         hdr = header(p)
         stop = length(hdr[1:prevind(hdr, findfirst("est ·", hdr).start)]) + 3
-        cell(name) = strip(String(row(name)[(stop - length("1m40.0s") + 1):stop]))
-        @test cell("uses setup") == "1m40.0s"
-        @test cell("add works") == "0.25s" && row("add works")[stop] == 's'
+        cell(name) = strip(String(row(name)[(stop - length("100.0s") + 1):stop]))
+        @test cell("uses setup") == "100.0s"
+        @test cell("add works") == "0.3s" && row("add works")[stop] == 's'
         @test cell("chain one") == "2.0s"
         @test cell("chain two") == ""
         @test cell("mul works") == ""
+        # Never in minutes, and a tenth at any size.
+        tenths = Runtests.Private.tenths_text
+        @test tenths(3725.0) == "3725.0s"
+        @test tenths(0.04) == "0.0s"
+        @test tenths(Inf) == "Infs"
     end
 
     @testset "a chain's reason is its own, naming the member it is owed to" begin

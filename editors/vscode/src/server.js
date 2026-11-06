@@ -6,17 +6,20 @@
 const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 const { EventEmitter } = require('node:events');
+const { keyObject } = require('./model');
 
-const PROTOCOL = 2;
+const PROTOCOL = 3;
 
 class RuntestsServer extends EventEmitter {
     /**
-     * @param {{julia: string, juliaArgs?: string[], environment: string, root: string,
+     * @param {{julia: string, juliaArgs?: string[], environment: string, root: string, combined?: boolean,
      *          config?: string, env?: NodeJS.ProcessEnv, onLog?: (line: string) => void}} options
      *   `julia` and `juliaArgs` start Julia (`juliaArgs` go first, so `+1.12` works
      *   for juliaup); `environment` is the project it runs in, which must have
-     *   Runtests; `root` the package whose suite it serves; `config` a file every
-     *   listing and run reads in place of `test/TestItems.toml`.
+     *   Runtests; `root` the package whose suite it serves, or with `combined` the
+     *   root of the workspace whose packages it serves (`Runtests.serve_mono`);
+     *   `config` a file every listing and run of one package reads in place of
+     *   `test/TestItems.toml`.
      */
     constructor(options) {
         super();
@@ -36,14 +39,22 @@ class RuntestsServer extends EventEmitter {
         if (this.proc) return this.ready;
         const o = this.options;
         // In colour: what it writes for people is shown in a terminal, which renders it.
+        const serve = o.combined ? 'using Runtests; Runtests.serve_mono(ARGS[1])' :
+            'using Runtests; Runtests.serve(ARGS[1]; config = get(ARGS, 2, nothing))';
         const args = [...(o.juliaArgs ?? []), `--project=${o.environment}`, '--startup-file=no', '--color=yes',
-            '-e', 'using Runtests; Runtests.serve(ARGS[1]; config = get(ARGS, 2, nothing))', o.root,
-            ...(o.config ? [o.config] : [])];
+            '-e', serve, o.root, ...(o.config && !o.combined ? [o.config] : [])];
         this.onLog(`starting: ${o.julia} ${args.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
         const proc = spawn(o.julia, args, { cwd: o.root, env: o.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
         this.proc = proc;
         this.ready = new Promise((resolve, reject) => {
-            this.once('hello', resolve);
+            const settle = f => value => {
+                this.off('hello', ready);
+                this.off('incompatible', refused);
+                f(value);
+            };
+            const ready = settle(resolve), refused = settle(reject);
+            this.on('hello', ready);
+            this.on('incompatible', refused);
             proc.once('error', reject);                   // no such julia, say
             proc.once('exit', (code, signal) =>
                 reject(new Error(`the Runtests server exited before it was ready (${signal ?? `code ${code}`}); see its log`)));
@@ -76,8 +87,16 @@ class RuntestsServer extends EventEmitter {
             return;
         }
         if (ev.event === 'hello') {
+            // A server of another protocol reads other commands, so a run of one item
+            // could run others: it gets none, and stops.
             if (ev.protocol !== PROTOCOL) {
-                this.onLog(`the server speaks protocol ${ev.protocol}; this extension speaks ${PROTOCOL}`);
+                const err = new Error(
+                    `Runtests in ${this.options.environment} speaks editor protocol ${ev.protocol}, and this extension ` +
+                    `speaks protocol ${PROTOCOL}. Use the Runtests that comes with this extension in that environment.`);
+                this.onLog(err.message);
+                this.emit('incompatible', err);
+                this.proc?.kill();
+                return;
             }
             this.hello = ev;
             this.emit('hello', ev);
@@ -108,15 +127,18 @@ class RuntestsServer extends EventEmitter {
     }
 
     /**
-     * Run `names` (every item when null), handing each of the run's events to
-     * `onEvent` as it comes. Resolves with the event that ends it: `run_finished`,
-     * an `error` when the run could not start, or `exit` when the server died.
+     * Run the items of `keys` (`model.keyOf`; every item when null), handing each of
+     * the run's events to `onEvent` as it comes. Resolves with the event that ends it:
+     * `run_finished`, an `error` when the run or the server could not start, or `exit`
+     * when the server died.
      */
-    async run(names, options, onEvent) {
+    async run(keys, options, onEvent) {
         const waiting = { cancelled: false };
         this.waiting = waiting;
         try {
             await this.start();
+        } catch (err) {
+            return { event: 'error', message: err.message };
         } finally {
             if (this.waiting === waiting) this.waiting = null;
         }
@@ -133,7 +155,7 @@ class RuntestsServer extends EventEmitter {
                 }
             });
             const command = { id, command: 'run', options: options ?? {} };
-            if (names !== null) command.names = names;
+            if (keys !== null) command.items = keys.map(keyObject);
             this.send(command);
             // The server reads commands in order, so it cancels this run as it would
             // one already going, and says what did not run.

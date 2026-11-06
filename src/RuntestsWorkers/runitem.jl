@@ -55,12 +55,16 @@ struct ItemSpec
     # Where this attempt keeps its evidence (see `artifacts_dir`), made only if the item
     # asks; "" for nowhere.
     artifacts    :: String
+    # The directory the item, its `test_end` and its failure producers run in: the root
+    # of its package in a run of several packages, whose workers serve them all. ""
+    # leaves the process's working directory as it is.
+    root         :: String
 end
 
 ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, attempt, full_stacktraces,
-         logpath, seed) =
+         logpath, seed, artifacts = "") =
     ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, attempt, full_stacktraces,
-             logpath, seed, "")
+             logpath, seed, artifacts, "")
 
 struct ItemResult
     index   :: Int32
@@ -254,12 +258,18 @@ end
 # them. Straight from a REPL there is no coordinator, and `printing` says so.
 function in_item(f, spec::ItemSpec; printing::Bool=false)
     info = TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile)
-    return with(CURRENT_TESTITEM => info) do
-        with_testset_printing(printing) do
-            f()
+    return in_dir(spec.root) do
+        with(CURRENT_TESTITEM => info) do
+            with_testset_printing(printing) do
+                f()
+            end
         end
     end
 end
+
+# `f()` with `dir` as the working directory, the one before restored however `f`
+# ends; in place when `dir` is empty.
+in_dir(f, dir::AbstractString) = isempty(dir) ? f() : cd(f, dir)
 
 """
     trim_internal_frames(stack)
@@ -580,14 +590,18 @@ function item_prelude(spec::ItemSpec)
     return prelude
 end
 
-# `skip` sees what the body does before its own imports: `Test` and the package.
+# `skip` sees what the body does before its own imports: `Test` and the package. What
+# evaluating it prints is the item's, in its log: the first item of a package on a
+# worker loads the package here, and a package can print as it loads.
 function should_skip(spec::ItemSpec)
     spec.skip isa Bool && return spec.skip
     mod = Module(Symbol("skip_", spec.name))
-    foreach(ex -> Core.eval(mod, ex), item_prelude(spec))
     # From the item's seed, as its body draws, which then starts from the seed again.
-    skip = with_seed(spec.seed) do
-        Core.eval(mod, softscope_all!(Expr(:block, deepcopy(spec.skip))))
+    skip = capture_output(spec.logpath) do
+        foreach(ex -> Core.eval(mod, ex), item_prelude(spec))
+        with_seed(spec.seed) do
+            Core.eval(mod, softscope_all!(Expr(:block, deepcopy(spec.skip))))
+        end
     end
     # Shown in the latest world: the expression may have defined how its value prints.
     skip isa Bool || error("test item $(repr(spec.name)): `skip` must evaluate to a Bool, " *

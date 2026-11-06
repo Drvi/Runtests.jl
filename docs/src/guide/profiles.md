@@ -46,7 +46,7 @@ end
 
 ## init and test_end
 
-`init` runs once in each worker of the profile, before the first item. `test_end` runs after each item. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
+`init` runs once in each worker of the profile, before the first item. `test_end` runs after each attempt at an item that was not skipped, a failed attempt before its retry too. Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
 
 ## Preferences
 
@@ -89,8 +89,8 @@ Discovery does not follow directory symlinks. A replay finds the environment of 
 
 ## Pools of workers
 
-A run keeps a pool of workers for each pair of a profile and an environment that its items use. Thus an item with `profile = :bounds` in `test/qa/` runs on a worker with the flags of `bounds` and the packages of `test/qa`. The run says the profile and the environment of each worker on its `UP` line.
+A run keeps a pool of workers for each start configuration that its items use. The start configuration of a worker is what it gets when it starts: Julia flags, threads, environment variables, `init`, preferences and environment. Thus an item with `profile = :bounds` in `test/qa/` runs on a worker with the flags of `bounds` and the packages of `test/qa`. Two profiles that differ only in `test_end` share a pool. The run says the profile and the environment of each worker on its `UP` line.
 
 Items of different pools run on different workers, and can run at the same time. `[order]` does not make them run one after the other. A `chain` runs its items in sequence on one worker. Thus all items of a chain must use the same profile and be in the same environment.
 
-When a pool has no items left, its workers can restart for another pool. A worker restarts for the pool whose workers have the most work left each, when the restart saves more time than a new worker costs. [How a run works](@ref plan) explains this.
+When a pool has no items left, its workers can restart for another pool. A worker restarts only for a pool that the restart makes finish sooner. Of those pools, it restarts for the pool that finishes last. [How a run works](@ref plan) explains this.

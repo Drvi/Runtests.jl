@@ -358,7 +358,7 @@ using Runtests: RuntestsWorkers
         write(path, "what the item printed\n")     # the worker's own capture
         slot = Runtests.Private.Slot(
             Runtests.Private.SlotIdx(1),
-            Runtests.Private.Profile(Runtests.Private.DEFAULT_PROFILE), nothing, 0.0, 0, Runtests.Private.ItemIdx(0),
+            Runtests.Private.ProfileIdx(1), nothing, 0.0, 0, Runtests.Private.ItemIdx(0),
             Int8(0), path, String[], false, Runtests.Private.ItemIdx(0)
         )
         for i in 1:3

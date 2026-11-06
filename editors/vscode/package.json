@@ -14,7 +14,9 @@
     "main": "./src/extension.js",
     "activationEvents": [
         "workspaceContains:test/**/*_test.jl",
-        "workspaceContains:test/**/*_tests.jl"
+        "workspaceContains:test/**/*_tests.jl",
+        "workspaceContains:**/test/**/*_test.jl",
+        "workspaceContains:**/test/**/*_tests.jl"
     ],
     "contributes": {
         "commands": [
@@ -51,10 +53,16 @@
                     "default": [],
                     "markdownDescription": "Arguments given to `julia` first, such as `+1.12` to pick a juliaup channel."
                 },
+                "runtests.monorepo": {
+                    "type": "string",
+                    "enum": ["auto", "on", "off"],
+                    "default": "auto",
+                    "markdownDescription": "Serve the folder as a workspace of several packages, with `Runtests.serve_mono`: their items in one tree, under a node for each package, and runs as combined runs. `auto`: when the folder's `Project.toml` lists workspace members other than its own `test`. The server restarts when this setting, or the folder's `Project.toml`, changes the choice."
+                },
                 "runtests.environment": {
                     "type": "string",
                     "default": "",
-                    "markdownDescription": "The environment the server runs in, relative to the workspace folder; it must have Runtests. Empty: `test` when `test/Project.toml` exists, the folder itself otherwise."
+                    "markdownDescription": "The environment the server runs in, relative to the workspace folder; it must have Runtests. Empty, for a folder of one package: `test` when `test/Project.toml` exists, the folder itself otherwise. Empty, for a workspace of several packages: the first of the root's `test`, the root and each member's `test` that has Runtests in `[deps]`."
                 },
                 "runtests.run.options": {
                     "type": "object",
@@ -64,7 +72,7 @@
                 "runtests.config": {
                     "type": "string",
                     "default": "",
-                    "markdownDescription": "A config file to read in place of `test/TestItems.toml`, relative to the workspace folder, for listing the items and for every run. Empty: `test/TestItems.toml`. Read when the server starts: run `Runtests: Restart Server` after changing it."
+                    "markdownDescription": "A config file to read in place of `test/TestItems.toml`, relative to the workspace folder, for listing the items and for every run. Empty: `test/TestItems.toml`. Read when the server starts: run `Runtests: Restart Server` after changing it. Not used for a workspace of several packages: each package reads its own `test/TestItems.toml`."
                 }
             }
         },

@@ -3,8 +3,9 @@
 # A pasted item is read by the scanner's parser, run by the worker's evaluator and
 # surrounded by the run's environment, so it behaves as it does under `runtests`.
 
-# What `activate` changed, for `deactivate` to undo: `(; project, setups, target)`,
-# or `nothing` when Runtests has not touched the session.
+# What `activate` changed, for `deactivate` to undo: `(; project, setups, target, dir,
+# participants)`, or `nothing` when Runtests has not touched the session. `target` is
+# the package of `activate`; `participants` the packages of `activate_mono`.
 const ACTIVATION = Ref{Any}(nothing)
 
 """
@@ -33,7 +34,7 @@ function activate(args...)
     pushed && push!(LOAD_PATH, setups)
     # Kept because it cannot be found again: with the generated environment active,
     # the session's project is the environment, not the package.
-    ACTIVATION[] = (project = previous, setups = pushed ? setups : nothing, target = target)
+    ACTIVATION[] = (project = previous, setups = pushed ? [setups] : String[], target = target, dir = "", participants = nothing)
     active = something(Base.active_project(), "")
     println(
         stdout, label_prefix(), "activated ", relpath_or_path(active, target.root),
@@ -52,13 +53,65 @@ function deactivate()
     state = ACTIVATION[]
     state === nothing && return nothing
     ACTIVATION[] = nothing
-    if state.setups !== nothing
-        i = findlast(==(state.setups), LOAD_PATH)
+    for setups in state.setups
+        i = findlast(==(setups), LOAD_PATH)
         i === nothing || deleteat!(LOAD_PATH, i)
     end
     Base.set_active_project(state.project)
+    # The union environment `activate_mono` wrote.
+    isempty(state.dir) || rm(state.dir; force = true, recursive = true)
     println(stdout, label_prefix(), "deactivated")
     return nothing
+end
+
+"""
+    activate_mono([root]) -> String
+
+[`activate`](@ref) for the packages of a workspace, as `runtests_mono` runs them: the
+union environment of their test dependencies active, and the setups of each package
+that shares workers on `LOAD_PATH`, so that the REPL loads what a shared worker loads.
+An isolated package is not part of it; `activate` it on its own. A test item runs as
+an item of the package whose directory holds its file, as on a shared worker: in the
+union environment, with its package loaded, in its package's root. For an item pasted
+at the REPL, that is the package whose directory holds the REPL's current directory.
+Two setups of one name stop it before anything changes. [`deactivate`](@ref) undoes
+it. Returns the active project.
+"""
+function activate_mono(root::Union{Nothing, AbstractString} = nothing)
+    ACTIVATION[] === nothing || throw(
+        ConfigError(
+            "Runtests is already active in this session (" * something(Base.active_project(), "no project") *
+                "); call `Runtests.deactivate()` first"
+        )
+    )
+    ps = find_participants(root)
+    PROJECT_ROOT[] = ps.workspace
+    check_setup_names(ps, [setup_modules(joinpath(r, "test")) for r in ps.root])
+    instantiate_workspace(ps.workspace)
+    dir = mktempdir(; prefix = "runtests_union_", cleanup = false)
+    previous = Base.active_project()
+    pushed = String[]
+    try
+        union = union_environment(ps, dir)
+        Base.set_active_project(union)
+        for k in eachindex(ps.root)
+            ps.isolated[k] && continue
+            setups = joinpath(ps.root[k], "test", TESTSETUPS_DIR)
+            (isdir(setups) && !(setups in LOAD_PATH)) || continue
+            push!(LOAD_PATH, setups)
+            push!(pushed, setups)
+        end
+        ACTIVATION[] = (project = previous, setups = pushed, target = nothing, dir = dir, participants = ps)
+    catch
+        foreach(s -> (i = findlast(==(s), LOAD_PATH); i === nothing || deleteat!(LOAD_PATH, i)), pushed)
+        Base.set_active_project(previous)
+        rm(dir; force = true, recursive = true)
+        rethrow()
+    end
+    shared = count(!, ps.isolated)
+    println(stdout, label_prefix(), "activated the union environment of ", plural(shared, "package"),
+            isempty(pushed) ? "" : string(" · setups of ", plural(length(pushed), "package")))
+    return Base.active_project()::String
 end
 
 """
@@ -91,7 +144,7 @@ only a scheduler can honour are ignored with a warning.
 """
 function run_interactive(ex::Expr, source::LineNumberNode)
     path = source.file === nothing ? "REPL" : String(source.file)
-    target = interactive_target()
+    target, combined = paste_target(path)
     setups = target === nothing ? Dict{Symbol, String}() : setup_modules(target.testdir)
     # An item from a file in an environment directory runs in that environment, as in a run.
     environment = target === nothing ? "" : environment_of(abspath(path), target.testdir)
@@ -102,10 +155,10 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     sandboxed = item.exclusive || item.profile !== DEFAULT_PROFILE || !isempty(item.environment)
     warn_ignored(item, sandboxed)
     return exclusively() do
-        with_interactive_env(target) do
-            sandboxed && return run_sandboxed(item, target).testset
+        with_interactive_env(target; combined) do
+            sandboxed && return run_sandboxed(item, target, combined).testset
             say(item, target, 1, nothing)
-            spec = interactive_spec(item, target)
+            spec = interactive_spec(item, target; combined)
             result = run_item(spec; printing = true)
             say(item, target, 1, outcome(result))
             print_evidence(finish_here!(spec, result))
@@ -115,15 +168,46 @@ function run_interactive(ex::Expr, source::LineNumberNode)
 end
 
 # The session's project, or `nothing`: a pasted item need not come from a package,
-# and then it runs with nothing arranged.
-function interactive_target()
+# and then it runs with nothing arranged. After `activate_mono`, which activates no
+# one package, the package whose file `path` is.
+function interactive_target(path::Union{Nothing, AbstractString} = nothing)
     state = ACTIVATION[]
-    state === nothing || return state.target
+    combined = state !== nothing && state.target === nothing
+    state === nothing || combined || return state.target
     return try
-        resolve_target(())
+        combined ? (path === nothing || !isfile(path) ? nothing : target_from_dir(dirname(abspath(path)))) :
+            resolve_target(())
     catch
         nothing
     end
+end
+
+# The package a pasted item from `path` runs as one of, and whether it runs as in a
+# combined run. After `activate_mono`, the package that takes part whose directory
+# holds the item's file, or the REPL's current directory for an item with no file;
+# otherwise as `interactive_target`.
+function paste_target(path::AbstractString)
+    state = ACTIVATION[]
+    (state === nothing || state.participants === nothing) && return interactive_target(path), false
+    return member_target(state.participants, isfile(path) ? dirname(abspath(path)) : pwd()), true
+end
+
+# The package of `ps` whose directory holds `dir`, the innermost. None, or an isolated
+# one, which a shared worker never runs, is an error that says what to do instead.
+function member_target(ps::Participants, dir::AbstractString)
+    real = realpath(dir)
+    holds = [k for k in eachindex(ps.root) if within(real, ps.root[k])]
+    isempty(holds) && throw(ConfigError(string(
+        "after `Runtests.activate_mono()`, a test item runs as an item of the package whose directory holds its file, ",
+        "or the REPL's current directory, and ", real, " is in none of ", join(ps.name, ", "),
+        ": `cd` into the package's directory first, or `include` the item's file"
+    )))
+    k = holds[argmax([length(ps.root[h]) for h in holds])]
+    ps.isolated[k] && throw(ConfigError(string(
+        ps.name[k], " is isolated, and its items run in its own test environment: `Runtests.deactivate()`, then ",
+        "`Runtests.activate(", repr(ps.root[k]), ")`"
+    )))
+    return target_from_dir(ps.root[k])
 end
 
 function warn_ignored(item::RawItem, sandboxed::Bool)
@@ -141,24 +225,29 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
 end
 
 # The run's environment for the length of one item. After `activate` the session is
-# already in it, and `with_test_env` leaves it alone. For a profile in an environment
-# directory, `prof`, that environment over it, as its workers have it.
-function with_interactive_env(f, target, prof::Union{Nothing, Profile} = nothing)
+# already in it, and `with_test_env` leaves it alone. `combined`: after `activate_mono`,
+# the union environment with the shared setups, which is what a shared worker has. For
+# a profile in an environment directory, `prof`, that environment over it, as its
+# workers have it.
+function with_interactive_env(f, target, prof::Union{Nothing, Profile} = nothing; combined::Bool = false)
     target === nothing && return f()
+    combined && return in_profile_environment(f, target, prof)
     return with_test_env(target) do
-        with_load_path(joinpath(target.testdir, TESTSETUPS_DIR)) do
-            (prof === nothing || isempty(prof.environment)) && return f()
-            project = profile_project(prof, Base.active_project(), target.root)
-            current, load_path = Base.active_project(), copy(LOAD_PATH)
-            Base.set_active_project(joinpath(project, "Project.toml"))
-            copy!(LOAD_PATH, stacked_load_path(load_path, current))
-            try
-                return f()
-            finally
-                copy!(LOAD_PATH, load_path)
-                Base.set_active_project(current)
-            end
-        end
+        with_load_path(() -> in_profile_environment(f, target, prof), joinpath(target.testdir, TESTSETUPS_DIR))
+    end
+end
+
+function in_profile_environment(f, target, prof::Union{Nothing, Profile})
+    (prof === nothing || isempty(prof.environment)) && return f()
+    project = profile_project(prof, Base.active_project(), target.root)
+    current, load_path = Base.active_project(), copy(LOAD_PATH)
+    Base.set_active_project(joinpath(project, "Project.toml"))
+    copy!(LOAD_PATH, stacked_load_path(load_path, current))
+    try
+        return f()
+    finally
+        copy!(LOAD_PATH, load_path)
+        Base.set_active_project(current)
     end
 end
 
@@ -174,13 +263,14 @@ item_location(item::RawItem, target) = string(
 )
 
 # `prefix` is where its attempts keep their evidence (see `artifacts_path`), one for
-# all of them.
+# all of them. `combined`: the item runs in its package's root, as on a shared worker.
 function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UInt64 = rand(RandomDevice(), UInt64),
-                          prefix::String = interactive_artifacts_prefix())
+                          prefix::String = interactive_artifacts_prefix(); combined::Bool = false)
     project = target === nothing ? "" : something(project_name_of(target.project), "")
     return ItemSpec(
         Int32(1), item.name, item.file, item.line, item.code, item.skip, item.failfast == 1,
-        project, item.profile, Int8(attempt), false, "", seed, artifacts_path(prefix, 1, attempt)
+        project, item.profile, Int8(attempt), false, "", seed, artifacts_path(prefix, 1, attempt),
+        combined ? target.root : ""
     )
 end
 
@@ -197,7 +287,7 @@ function sandbox_worker(prof, target, redirect_fn)
     )
 end
 
-function run_sandboxed(item::RawItem, target)
+function run_sandboxed(item::RawItem, target, combined::Bool = false)
     prof = interactive_profile(item, target)
     # The limits a run holds the profile's own code to; without a project, a run's defaults.
     limits = target === nothing ? RunConfig(; workers = 0) : read_config(target.testdir)
@@ -218,7 +308,7 @@ function run_sandboxed(item::RawItem, target)
                 RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)), limits.init_timeout_s,
                 TimeoutException(limits.init_timeout_s, "the `init` expression of profile `$(prof.name)`", "", "init_timeout")
             )
-            spec = interactive_spec(item, target, attempt, seed, prefix)
+            spec = interactive_spec(item, target, attempt, seed, prefix; combined)
             fut = RuntestsWorkers.remote_run(w, spec)
             result = (
                 timeout === nothing ? fetch(fut) :

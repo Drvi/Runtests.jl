@@ -37,6 +37,7 @@ makedocs(;
             "guide/failures.md",
             "guide/repl.md",
             "guide/ci.md",
+            "guide/monorepos.md",
             "guide/coverage.md",
             "guide/measuring.md",
             "guide/editors.md",

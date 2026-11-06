@@ -1,5 +1,5 @@
 using Random: Random
-using Runtests.Private: init_run_state, write_status!, finish_run_state!, read_run_state, history,
+using Runtests.Private: init_run_state, write_status!, finish_run_state!, read_run_state, history, idle_worker_seconds, nslots,
             runstate_files, runstate_dir, prune_runstates, new_runstate_path, prepare,
             execute, plan, scan, discover, setup_modules, read_config, Filter, History,
             UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, nitems, RS_STATUS_BYTES,
@@ -1225,6 +1225,22 @@ end
         # A run state that cannot be read is an error, not a silent fallback to
         # whatever this checkout happens to say.
         @test_throws Runtests.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.runstate"))
+    end
+
+    @testset "a run state yields the idle worker-seconds of its planned slots" begin
+        dir = make_pkg("IdleSlots", "test/a_test.jl" =>
+            "@testitem \"quick\" begin\n    @test true\nend\n@testitem \"slow\" begin\n    sleep(1)\n    @test true\nend\n")
+        with_runstate_dir() do _
+            (_, run, p), _ = capture_run(() -> run_states(dir; workers = 2, monitor = false))
+            rs = read_run_state((@atomic run.runstate).path)
+            @test rs.meta["slots"] == string(nslots(p)) == "2"
+            attempts = [e for e in rs.events if e.kind === :attempt]
+            span = (rs.end_unix - rs.start_unix) - minimum(e -> e.t0, attempts)
+            idle = idle_worker_seconds(rs)
+            @test idle ≈ nslots(p) * span - sum(e -> e.t1 - e.t0, attempts) atol = 1e-3
+            # The slot that ran the quick item waited for the slow one to end.
+            @test idle > 0.5
+        end
     end
 
     @testset "a replay keeps the recorded [order], and finds each item's environment where its file is" begin

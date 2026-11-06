@@ -239,6 +239,8 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             ok, out = template_chores(pkg)
             @test ok === true
             @test occursin("$(joinpath("test", "periods_tests.jl")): expanded from $(shown_template("periods")), 4 test items", out)
+            # Each phase is said as it starts, the dependencies by name.
+            @test occursin("periods_tests_template.jl:2: loading the template's dependencies: Dates, ExpandsSetup", out)
             text = read(o, String)
             # Written as the item's module sees the values: `Day`, not `Dates.Day`.
             @test occursin("@testitem \"doubling a Day of 1\" tags=[:gen] begin\n    using Dates\n    using ExpandsSetup\n    P = Day\n    @test twice(P(1)) == P(2 * 1)\n", text)

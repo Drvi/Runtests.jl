@@ -407,8 +407,11 @@ run in sequence on one worker; all items in a chain must use the same profile an
 be in the same environment.
 
 A profile's `init` runs once per worker before its items; `test_end` runs after
-each item. Each has its own timeout, separate from the item's budget. Failures
-in `test_end` count toward the item's result.
+each attempt at an item that was not skipped. Each has its own timeout, separate
+from the item's budget. Failures in `test_end` count toward the item's result.
+Profiles whose workers start the same way, the same flags, threads, variables,
+`init`, preferences and environment, share workers: profiles that differ only in
+`test_end` share them, and each item runs the `test_end` of its own profile.
 
 The `preferences` path is relative to the config file. Its contents overlay
 `LocalPreferences.toml` in a temporary copy of the item's environment, with separate
@@ -597,10 +600,12 @@ A run hands out, in this order:
 
 The first four and the last go to whichever worker is free, and a worker that
 finishes its own stretch takes over half of the longest one left. A worker whose
-profile has nothing left restarts under the profile whose workers have the most
-left each, when that saves more than a fresh worker costs: starting, and compiling
-what the others already have. `why here` says which rule placed an item, when it
-was not file order.
+pool has nothing left restarts for another pool if that makes the pool finish
+sooner. The work left for each of the pool's workers must then be longer than its
+longest item or chain. It must also be longer than what a fresh worker costs:
+starting, and compiling what the others already have. Of those pools, the worker
+takes the one that finishes last. `why here` says which rule placed an item, when
+it was not file order.
 
 A name much longer than the rest is shortened to `r"^…"`, here and in a run's
 `RUN` and `DONE` lines: a prefix that no other item's name in the suite starts
@@ -919,6 +924,28 @@ change `Project.toml` or a manifest, and rebuilds.
 
 The items in an [environment](#environments) directory run in that one instead,
 stacked over this one.
+
+## Monorepos
+
+`Runtests.runtests_mono()` runs the test suites of the packages of a Julia workspace
+in one run, with one plan, one set of workers and one report. It needs Julia 1.12 or
+later. The root `Project.toml` lists each package and its test project under
+`[workspace]`, so that they share one manifest:
+
+```toml
+[workspace]
+projects = ["lib/A", "lib/A/test", "lib/B", "lib/B/test"]
+```
+
+Items of different packages share workers when their profiles start workers the same
+way. Each item runs in the root of its own package, under its own package's profiles,
+setups and settings. A `[monorepo]` table in the root's `test/TestItems.toml` lists
+the packages that take part (`packages`, directories or globs) and those that run
+apart (`isolated`). Before any worker starts, the run stops for an import that a
+package's own test environment cannot load, and for two setups of one name. Each
+package gets its own run state, so `runtestsf()` in a package runs its failures from
+the combined run. To run the combined suites with `Pkg.test` of the root package, its
+`test/runtests.jl` calls `Runtests.runtests_mono()`.
 
 ## Run state
 

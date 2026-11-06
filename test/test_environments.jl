@@ -399,10 +399,12 @@ end
                 @test any(l -> occursin("· profile default · environment $(joinpath("test", "qa"))", l), ups)
                 @test any(l -> occursin("· profile tuned · environment $(joinpath("test", "qa"))", l), ups)
                 @test occursin("resolving the environment of $(joinpath("test", "qa"))", out)
-                project = run.profile_projects[(:default, qa)]
+                # A profile's project is kept by the profile's index in the plan.
+                project_of(name) = run.profile_projects[findfirst(pr -> pr.name === name && pr.environment == qa, run.plan.profiles)]
+                project = project_of(:default)
                 @test !startswith(project, dir)
                 @test isfile(joinpath(project, "Manifest.toml"))
-                @test run.profile_projects[(:tuned, qa)] != project   # its preferences make it a copy of its own
+                @test project_of(:tuned) != project   # its preferences make it a copy of its own
                 @test sort(readdir(qa)) == before
             end
 

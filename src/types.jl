@@ -1,12 +1,16 @@
 const ItemIdx = Int32
 const UnitIdx = Int32
-const ProfileIdx = Int8
+const ProfileIdx = Int16
 const SlotIdx = Int16
 
 const NO_CHAIN = Symbol("")
 const DEFAULT_PROFILE = :default
 
 const USE_RUN_DEFAULT = Int32(-1)
+
+# The most pairs of a profile and an environment one package's items use: a run state
+# numbers them in a byte.
+const MAX_PACKAGE_PROFILES = Int(typemax(Int8)) - 1
 
 # The most an item's `retries` and a `timeout` can be: an item's attempts are counted
 # in an `Int8`, and its own timeout is held in an `Int32` of seconds.
@@ -45,7 +49,16 @@ struct RawItem
     # next statement: what a later run compares to tell an edited item from one that
     # only moved. 0 when there is no file to read it from, as for a pasted item.
     hash::UInt32
+    # The package whose suite holds the item, as an index into the run's packages: 1
+    # unless the run is a combined one.
+    package::Int32
 end
+
+# `it` as an item of the run's package `k`.
+with_package(it::RawItem, k::Integer) = RawItem(
+    it.name, it.file, it.line, it.tags, it.setups, it.code, it.skip, it.timeout_s, it.retries, it.failfast,
+    it.chain, it.profile, it.exclusive, it.environment, it.hash, Int32(k)
+)
 
 # A problem in a test file, located. Scanning collects all of them before failing,
 # so five broken files are five errors, not one.

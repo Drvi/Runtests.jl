@@ -36,10 +36,10 @@ function next_event(s::EditorSession; timeout = 120)
     end
 end
 # Every event up to and including the first `pred` holds for.
-function events_until(pred, s::EditorSession)
+function events_until(pred, s::EditorSession; timeout = 120)
     seen = Any[]
     while true
-        e = next_event(s)
+        e = next_event(s; timeout)
         push!(seen, e)
         pred(e) && return seen
     end
@@ -105,7 +105,9 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         )
         r = list_items(dir)
         @test r.root == dir
-        @test r.failed == String[]          # no run recorded yet
+        @test isempty(r.failed)          # no run recorded yet
+        # Each item names its package, which tells apart items of one name in a server of several.
+        @test all(it -> it.package == only(r.packages).name, r.items)
         byname = Dict(it.name => it for it in r.items)
         @test sort(collect(keys(byname))) == ["alone", "alone profiled", "chained", "first", "in qa", "profiled", "second"]
         first_ = byname["first"]
@@ -150,6 +152,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 s = open_session(dir)
                 hello = next_event(s)
                 @test hello["event"] == "hello" && hello["protocol"] == PROTOCOL_VERSION && hello["root"] == dir
+                @test hello["combined"] == false && [p["name"] for p in hello["packages"]] == ["Served"]
 
                 send(s, (; id = 1, command = "list"))
                 items = next_event(s)
@@ -161,13 +164,14 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 seen = events_until(e -> e["event"] == "run_finished", s)
                 started = only(e for e in seen if e["event"] == "run_started")
                 @test started["id"] == "r"
-                @test sort(started["items"]) == ["fails", "flaky", "passes"]
-                @test started["unknown"] == ["no such item"]
+                @test sort([k["name"] for k in started["items"]]) == ["fails", "flaky", "passes"]
+                @test all(k -> k["package"] == "Served", started["items"])
+                @test [(k["package"], k["name"]) for k in started["unknown"]] == [("Served", "no such item")]
                 @test started["workers"] == 1 && startswith(started["seed"], "0x")
                 @test all(e -> e["id"] == "r", seen)
                 finished = [e for e in seen if e["event"] == "item_finished"]
                 ends(name) = [e for e in finished if e["name"] == name]
-                @test only(ends("passes"))["state"] == "passed"
+                @test only(ends("passes"))["state"] == "passed" && only(ends("passes"))["package"] == "Served"
                 # A failure says where it is and what it was.
                 f = only(ends("fails"))
                 @test f["state"] == "failed" && f["attempts"] == 1
@@ -188,7 +192,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 @test isdir(done["logdir"])        # kept for the editor until the next run
                 # What the newest run did not pass, for an editor's "run failed".
                 send(s, (; id = 2, command = "list"))
-                @test next_event(s)["failed"] == ["fails"]
+                @test [(k["package"], k["name"]) for k in next_event(s)["failed"]] == [("Served", "fails")]
 
                 # Every mistake is answered, and the session goes on.
                 for (bad, says) in (
@@ -217,7 +221,14 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 @test last(seen)["id"] == 7 && last(seen)["state"] == "passed"
                 # A run of another item leaves the failure as it was.
                 send(s, (; id = 9, command = "list"))
-                @test next_event(s)["failed"] == ["fails"]
+                @test [(k["package"], k["name"]) for k in next_event(s)["failed"]] == [("Served", "fails")]
+                # Items as keys: this package's run, another package's are unknown.
+                send(s, (; id = 10, command = "run", items = [(; package = "Served", name = "passes"),
+                                                              (; package = "Elsewhere", name = "passes")]))
+                seen = events_until(e -> e["event"] == "run_finished", s)
+                started = only(e for e in seen if e["event"] == "run_started")
+                @test [(k["package"], k["name"]) for k in started["items"]] == [("Served", "passes")]
+                @test [(k["package"], k["name"]) for k in started["unknown"]] == [("Elsewhere", "passes")]
                 @test isdir(done["logdir"])         # the earlier run's logs stay with its run state
 
                 close_session(s)
@@ -295,13 +306,14 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             # Asked for no names: the default group, which `run_started` says.
             send(s, (; id = 1, command = "run"))
             seen = events_until(e -> e["event"] == "run_finished", s)
-            @test started(seen)["items"] == ["fast"]
+            names(e) = [k["name"] for k in e["items"]]
+            @test names(started(seen)) == ["fast"]
             recorded = last(seen)["runstate"]
             send(s, (; id = 2, command = "run", options = (; group = "all")))
-            @test sort(started(events_until(e -> e["event"] == "run_finished", s))["items"]) == ["fast", "slow"]
+            @test sort(names(started(events_until(e -> e["event"] == "run_finished", s)))) == ["fast", "slow"]
             # The run state of the first, run again: its items, not the whole suite.
             send(s, (; id = 3, command = "run", options = (; replay = recorded)))
-            @test started(events_until(e -> e["event"] == "run_finished", s))["items"] == ["fast"]
+            @test names(started(events_until(e -> e["event"] == "run_finished", s))) == ["fast"]
             close_session(s)
         end
     end
@@ -363,5 +375,62 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         @test occursin("from the item", human)
         @test occursin("ran 2 test items", human)
         @test success(proc)
+    end
+
+    @testset "a server of a workspace lists and runs the items of every package, told apart by package" begin
+        if VERSION >= v"1.12"
+            ws = realpath(mktempdir())
+            members = String[]
+            for name in ("A", "B")
+                dir = joinpath(ws, "lib", name)
+                uuid = next_uuid()
+                mkpath(joinpath(dir, "src")); mkpath(joinpath(dir, "test"))
+                write(joinpath(dir, "Project.toml"), "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n")
+                write(joinpath(dir, "src", "$name.jl"), "module $name\nend\n")
+                write(joinpath(dir, "test", "Project.toml"), """
+                    [deps]
+                    $name = "$uuid"
+                    Runtests = "632efd68-cd41-4e05-bd25-b86dc2150078"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                    [sources]
+                    $name = {path = ".."}
+                    Runtests = {path = $(repr(pkgdir(Runtests)))}
+                    """)
+                write(joinpath(dir, "test", "a_test.jl"), item("same") * item("only in $name"))
+                append!(members, ["lib/$name", "lib/$name/test"])
+            end
+            write(joinpath(ws, "Project.toml"), "[workspace]\nprojects = [" * join(repr.(members), ", ") * "]\n")
+            with_runstate_dir() do _
+                input, output = Base.BufferStream(), Base.BufferStream()
+                task = @async Runtests.serve_mono(ws; input, output)
+                events = Channel{Any}(Inf)
+                @async (for line in eachline(output); put!(events, read_json(line)); end; close(events))
+                s = EditorSession(input, output, events, task)
+                hello = next_event(s; timeout = 300)
+                @test hello["protocol"] == PROTOCOL_VERSION && hello["combined"] == true
+                @test [p["name"] for p in hello["packages"]] == ["A", "B"]
+                send(s, (; id = 1, command = "list"))
+                listing = next_event(s; timeout = 300)
+                @test sort([(it["package"], it["name"]) for it in listing["items"]]) ==
+                      [("A", "only in A"), ("A", "same"), ("B", "only in B"), ("B", "same")]
+                # A key names one of the two items of one name; a key of nothing is unknown.
+                send(s, (; id = 2, command = "run", items = [(; package = "B", name = "same"), (; package = "C", name = "x")],
+                         options = (; workers = 1)))
+                # The first run instantiates the new workspace.
+                seen = events_until(e -> e["event"] == "run_finished", s; timeout = 600)
+                started = only(e for e in seen if e["event"] == "run_started")
+                @test [(k["package"], k["name"]) for k in started["items"]] == [("B", "same")]
+                @test [(k["package"], k["name"]) for k in started["unknown"]] == [("C", "x")]
+                finished = only(e for e in seen if e["event"] == "item_finished")
+                @test (finished["package"], finished["name"], finished["state"]) == ("B", "same", "passed")
+                done = last(seen)
+                @test done["state"] == "passed" && [r["package"] for r in done["runstates"]] == ["B"]
+                # Names alone do not say which package's item.
+                send(s, (; id = 3, command = "run", names = ["same"]))
+                @test occursin("runs `items`", next_event(s)["message"])
+                close_session(s)
+            end
+        end
     end
 end

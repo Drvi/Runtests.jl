@@ -68,7 +68,7 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 
 ## TestItems.toml
 
-`test/TestItems.toml` is optional. It has these tables, and no others. A file that `config` names has the same form.
+`test/TestItems.toml` is optional. It has these tables, and no others. A file that `config` names has the same form. Only a combined run reads `[monorepo]`, from the file of the workspace root.
 
 ### [run]
 
@@ -87,6 +87,17 @@ On a run of the whole suite, each name must be an item of the suite. A run of a 
 
 Each key is the name of a group, and each value is a [tag expression](@ref tag-expressions). `all` is reserved and cannot be declared. `default` is what a run selects when nothing else selects. A name that differs from `all` or `default` only in case is an error.
 
+### [monorepo]
+
+The workspace root's file can have this table. It selects the packages of a [combined run](@ref monorepos).
+
+| Key | Default | Value |
+|:----|:--------|:------|
+| `packages` | every package of the workspace with a suite | A vector of directories or globs, relative to the workspace root, for example `["lib/*", "."]`. The packages that take part. |
+| `isolated` | `[]` | A vector of directories or globs. These packages run in their own test environment, on workers of their own. |
+
+An entry that matches no package, or names a directory outside the workspace, is an error.
+
 ### [Profiles](@id profile-keys)
 
 Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<name>`. `[profiles.default]` configures the workers of every item without a `profile`, sandboxed or not.
@@ -96,9 +107,10 @@ Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<n
 | `julia_args` | `[]` | A vector of command-line flags for `julia`, for example `["--check-bounds=yes"]`. |
 | `threads` | the `threads` of the run | The `--threads` value of the workers of the profile. |
 | `env` | `{}` | A table of environment variables for the workers, for example `{ JULIA_DEBUG = "Main" }`. |
-| `init` | none | Julia code, as a string, that runs once in each worker before its first item. |
+| `init` | none | Julia code, as a string, that runs once in each worker before its first item. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). |
 | `test_end` | none | Julia code, as a string, that runs after each item. A failure counts toward the item. |
 | `preferences` | none | A TOML file, relative to the configuration file, whose contents go over the `LocalPreferences.toml` of the environment. The file must exist. |
+| `monorepo_default` | `false` | Only in the `test/TestItems.toml` of a workspace root. `true` shares the profile with the packages of the workspace, in their own runs and in combined runs. See [Share a profile](@ref shared-profiles). |
 
 ## [Environment variables](@id environment-variables)
 

@@ -12,7 +12,9 @@ julia --project=<an environment with Runtests> -e 'using Runtests; Runtests.serv
 
 `serve` takes over the stdout of the process. After it starts, anything else written to stdout goes to stderr, from Julia or from C. Thus a stray `println` cannot get into the stream of events. `serve` returns when stdin ends or a `shutdown` command arrives. It cancels a run in progress first. One server serves one package, and runs one run at a time.
 
-The protocol version is `2`, and the `hello` event gives it. A change that can break an editor written against the protocol increases the version.
+`Runtests.serve_mono("<workspace root>")` serves the packages of a workspace, as [`runtests_mono`](@ref monorepos) runs them. Its listing holds the items of every package, and each run is a combined run. Two items of two packages can have the same name, so an item is known by its key: the name of its package and its own name.
+
+The protocol version is `3`, and the `hello` event gives it. A change that can break an editor written against the protocol increases the version.
 
 ## Commands
 
@@ -21,7 +23,7 @@ Every command is an object with a `command` field. It can have an `id` of any JS
 | Command | Fields | Answer |
 |:--------|:-------|:-------|
 | `list` | none | `items`, or `error`. |
-| `run` | `names`: exact item names. Without `names`, the run selects what a run selects when nothing else selects. `options`: an object of configuration values. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
+| `run` | `items`: item keys, each an object with `package` and `name`. `names`: exact item names, of every package, which `serve_mono` does not take. Without either, the run selects what a run selects when nothing else selects. `options`: an object of configuration values. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
 | `cancel` | none | No separate acknowledgement: the run ends with `run_finished`, `state` `cancelled`, and the original `run` ID. An `error` when nothing runs carries the `cancel` ID. |
 | `shutdown` | none | `bye`, without an ID. |
 
@@ -46,7 +48,7 @@ Other run settings come from the configuration file and environment variables, a
 
 ### Selection
 
-An editor selects files, folders or tags by sending the names of the items in them, from its last `list`. `run_started` lists the items that the run selected. The editor compares this list with what it asked for. A name that the suite does not have goes into the `unknown` field of `run_started`, and the other items still run. When none of the names exists, the answer is an `error`.
+An editor selects files, folders or tags by sending the keys of the items in them, from its last `list`. `run_started` lists the items that the run selected. The editor compares this list with what it asked for. A key that the suite does not have goes into the `unknown` field of `run_started`, and the other items still run. When none of the keys exists, the answer is an `error`.
 
 ## Events
 
@@ -54,17 +56,18 @@ Every event is an object with an `event` field. Replies carry IDs as described a
 
 ### hello
 
-The first line, before any command. Its fields are `protocol`, the `runtests` and `julia` versions, the `pid` of the server, the `root` of the package, and `config`. `config` is the file that the server reads in place of `test/TestItems.toml`, or `null`.
+The first line, before any command. Its fields are `protocol`, the `runtests` and `julia` versions, the `pid` of the server, the `root` of the package or workspace, `config`, `combined` and `packages`. `config` is the file that the server reads in place of `test/TestItems.toml`, or `null`. `combined` is `true` for `serve_mono`. `packages` holds the `name` and `root` of each package that the server serves.
 
 ### items
 
-The answer to `list`. Its fields are `root`, `testdir`, `items`, `errors` and `failed`. `failed` holds the names of the items that are failing, which are the items that `Runtests.runtestsf()` runs. The last run that ran an item to a verdict decides, whether that run came from the editor, the terminal or a replay. A run that stopped before it reached an item leaves the verdict as it was.
+The answer to `list`. Its fields are `root`, `testdir`, `packages`, `items`, `errors` and `failed`. `testdir` is `null` for `serve_mono`. `packages` holds the `name`, `root` and `testdir` of each package. `failed` holds the keys of the items that are failing, which are the items that `Runtests.runtestsf()` runs in their package. The last run that ran an item to a verdict decides, whether that run came from the editor, the terminal or a replay. A run that stopped before it reached an item leaves the verdict as it was.
 
 Each item in `items` has these fields:
 
 | Field | Meaning |
 |:------|:--------|
-| `name` | Unique across the suite. The name identifies an item everywhere in the protocol. |
+| `package` | The name of the package of the item. With `name`, its key, which identifies an item everywhere in the protocol. |
+| `name` | Unique in its package. |
 | `file`, `line` | The absolute path, and the line of the `@testitem`. |
 | `end_line` | The line before the next item in the file, or the last line of the file. These are the lines where the item is the one at the cursor. |
 | `tags`, `setups` | Strings. |
@@ -75,22 +78,22 @@ Each item in `items` has these fields:
 | `skip` | `true`, `false`, or the text of the expression that the worker evaluates. |
 | `timeout`, `retries`, `failfast` | The value of the item, or `null` for the value of the run. |
 
-`errors` holds every problem that a run refuses to start on. Examples are a file that does not parse, a name that two items use, and a value that `TestItems.toml` does not accept. Each error has a `file`, a `line` (0 when there is none) and a `message`. The items still come from every file that parses.
+`errors` holds every problem that a run refuses to start on. Examples are a file that does not parse, a name that two items use, and a value that `TestItems.toml` does not accept. For `serve_mono`, it also holds what stops a combined run: two setups of one name, and an import that the test environment of its own package cannot load. Each error has a `file`, a `line` (0 when there is none) and a `message`. The items still come from every file that parses.
 
 ### run_started
 
 | Field | Meaning |
 |:------|:--------|
-| `items` | The names that will run, in the order of the plan. |
+| `items` | The keys of the items that will run, in the order of the plan. |
 | `workers` | The number of workers, or 0 for a run in the process of the server. |
 | `seed` | The seed of the run, as `"0x…"` text. |
-| `unknown` | The names of the command that the suite does not have. |
+| `unknown` | The keys of the command that the suite does not have. |
 
 ### item_started
 
 | Field | Meaning |
 |:------|:--------|
-| `name`, `file`, `line` | The item. |
+| `package`, `name`, `file`, `line` | The item. |
 | `attempt` | The number of the attempt, from 1. |
 | `attempts` | The most attempts that the item gets. |
 | `worker` | The worker slot, from 1, or 0 for an outcome recorded before a worker ran the item, such as a broken chain. |
@@ -118,9 +121,10 @@ Its fields are these:
 
 - `state`: `passed`, `failed`, `cancelled`, `stalled` or `error`. `stalled` means that the run stopped as hung. `error` comes after an `error` event that says why.
 - `counts`: the number of items in each state.
-- `not_run`: the names of the items that never finished.
+- `not_run`: the keys of the items that never finished.
 - `elapsed`: seconds.
-- `runstate`: the run state file.
+- `runstate`: the run state file of a run of one package, or `null`.
+- `runstates`: the run state of each package, each a `package` and a `path`. A combined run writes one for each package. The `path` is `null` when the run state could not be written.
 - `logdir`: the directory of the item logs. Normally these stay beside the run state and follow its [retention rules](@ref retention). Only fallback logs in temporary storage are removed when the next run starts or the server stops.
 
 If execution fails before a run can be initialized, `run_finished` has only `state` and the run's ID, when supplied. The other fields above are absent.
@@ -143,12 +147,12 @@ The last line. The server writes it when stdin ends or after a `shutdown` comman
 
 ```text
 → {"id":1,"command":"list"}
-← {"event":"items","id":1,"root":"/pkg","testdir":"/pkg/test","items":[{"name":"adds","file":"/pkg/test/a_test.jl","line":1,"end_line":4,…}],"errors":[]}
-→ {"id":2,"command":"run","names":["adds"],"options":{"workers":1}}
-← {"event":"run_started","id":2,"items":["adds"],"workers":1,"seed":"0x0223a77cb668dc62","unknown":[]}
-← {"event":"item_started","id":2,"name":"adds","file":"/pkg/test/a_test.jl","line":1,"attempt":1,"attempts":1,"worker":1,"pid":4242}
-← {"event":"item_finished","id":2,"name":"adds",…,"state":"passed","elapsed":0.03,"compile":0.02,"note":"","log":null,"failures":[]}
-← {"event":"run_finished","id":2,"state":"passed","counts":{"passed":1,…},"not_run":[],"elapsed":2.1,"runstate":"…","logdir":"…"}
+← {"event":"items","id":1,"root":"/pkg","testdir":"/pkg/test","packages":[…],"items":[{"package":"Pkg1","name":"adds","file":"/pkg/test/a_test.jl","line":1,"end_line":4,…}],"errors":[],"failed":[]}
+→ {"id":2,"command":"run","items":[{"package":"Pkg1","name":"adds"}],"options":{"workers":1}}
+← {"event":"run_started","id":2,"items":[{"package":"Pkg1","name":"adds"}],"workers":1,"seed":"0x0223a77cb668dc62","unknown":[]}
+← {"event":"item_started","id":2,"package":"Pkg1","name":"adds","file":"/pkg/test/a_test.jl","line":1,"attempt":1,"attempts":1,"worker":1,"pid":4242}
+← {"event":"item_finished","id":2,"package":"Pkg1","name":"adds",…,"state":"passed","elapsed":0.03,"compile":0.02,"note":"","log":null,"failures":[]}
+← {"event":"run_finished","id":2,"state":"passed","counts":{"passed":1,…},"not_run":[],"elapsed":2.1,"runstate":"…","runstates":[…],"logdir":"…"}
 → {"command":"shutdown"}
 ← {"event":"bye"}
 ```

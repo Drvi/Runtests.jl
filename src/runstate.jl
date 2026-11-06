@@ -310,6 +310,14 @@ function run_meta(p::Plan)
         push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
+    # The slots the plan made, which `idle_worker_seconds` counts against. A package's
+    # part of a run of several packages has none (`package_plan`): the run's slots
+    # served every package, and its record holds only the package's own attempts.
+    nslots(p) == 0 || push!(meta, "slots" => string(nslots(p)))
+    # Where each profile that a workspace shares ran its `init`, relative to the
+    # package, which a replay finds again from wherever the package is then.
+    dirs = unique!([string(prof.name, '\t', rel_slash(prof.dir, p.root)) for prof in p.profiles if !isempty(prof.dir)])
+    isempty(dirs) || push!(meta, "profile_dirs" => join(dirs, '\n'))
     return meta
 end
 
@@ -320,13 +328,15 @@ function environment_manifest()
 end
 
 """
-    init_run_state(path, plan; dry_run=false, start=time()) -> RunStateFile
+    init_run_state(path, plan; dry_run=false, start=time(), meta=[]) -> RunStateFile
 
 Write everything that is known before the run starts, including a full status
 section of `unseen` records, so that every later write is an overwrite at a
-known offset. `start` is the moment every offset in the file counts from.
+known offset. `start` is the moment every offset in the file counts from. `meta`
+adds to what `run_meta` records.
 """
-function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, start::Float64 = time())
+function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, start::Float64 = time(),
+                        meta::Vector{Pair{String, String}} = Pair{String, String}[])
     mkpath(dirname(path))
     io = open(path, "w+")
     strings = StringTable()
@@ -336,7 +346,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
 
     profiles = IOBuffer()
     write(profiles, UInt32(length(p.profiles)))
-    for prof in p.profiles
+    for (j, prof) in enumerate(p.profiles)
         write(profiles, intern!(strings, string(prof.name)))
         write(profiles, UInt32(length(prof.julia_args)))
         for a in prof.julia_args
@@ -344,7 +354,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         end
         # As configured, empty for the run's: a replay asked for other threads gives
         # them to the profiles that take the run's.
-        write(profiles, intern!(strings, p.cfg.profiles[prof.name].threads))
+        write(profiles, intern!(strings, p.packages.cfg[p.profile_package[j]].profiles[prof.name].threads))
         write(profiles, UInt32(length(prof.env)))
         for (k, v) in prof.env
             write(profiles, intern!(strings, k))
@@ -380,8 +390,8 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         write_record(items, iref)
     end
 
+    pairs_ = [run_meta(p); meta]
     meta = IOBuffer()
-    pairs_ = run_meta(p)
     write(meta, UInt32(length(pairs_)))
     for (k, v) in pairs_
         write(meta, intern!(strings, k), intern!(strings, v))
@@ -623,6 +633,25 @@ struct RunStateRecord
 end
 
 """
+    idle_worker_seconds(rs) -> Union{Nothing, Float64}
+
+The seconds that the run's planned slots spent without a running item, from the
+start of its first attempt to its end: the slots times that span, less the time its
+attempts ran. A worker's start, a slot that waits for work and one that stopped
+early all count. `nothing` for a record without its number of slots, which a package's
+record of a run of several packages is, or without an attempt, and for one still being
+written, whose end is not known.
+"""
+function idle_worker_seconds(rs::RunStateRecord)
+    slots = tryparse(Int, get(rs.meta, "slots", ""))
+    attempts = [e for e in rs.events if e.kind === :attempt]
+    (slots === nothing || isempty(attempts) || !rs.complete || rs.end_unix <= rs.start_unix) && return nothing
+    span = (rs.end_unix - rs.start_unix) - minimum(e -> e.t0, attempts)
+    busy = sum(e -> Float64(e.t1 - e.t0), attempts)
+    return max(0.0, slots * span - busy)
+end
+
+"""
     is_live(rs; now = time()) -> Bool
 
 Whether the run that wrote `rs` is still going, as far as its file can say: it has
@@ -841,7 +870,7 @@ function read_profiles_section(io::IO, strings)
         test_end = parse_block(lookup(strings, read(io, UInt32)))
         path = lookup(strings, read(io, UInt32))
         content = lookup(strings, read(io, UInt32))
-        profiles[name] = Profile(name, args, threads, env, init, test_end, path, "")
+        profiles[name] = Profile(name, args, threads, env, init, test_end, path, "", "")
         isempty(content) || (preferences[name] = content)
     end
     return profiles, preferences

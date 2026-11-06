@@ -516,7 +516,7 @@ end
                 return parse(Int, read(file, String))
             end
             before = collections()
-            slot = Runtests.Private.Slot(Runtests.Private.SlotIdx(1), p.profiles[1], w, 0.0, 0,
+            slot = Runtests.Private.Slot(Runtests.Private.SlotIdx(1), Runtests.Private.ProfileIdx(1), w, 0.0, 0,
                                          Runtests.Private.ItemIdx(0), Int8(0), "", String[], false,
                                          Runtests.Private.ItemIdx(0))
             Runtests.Private.set_paused!(q, true)
@@ -750,7 +750,9 @@ end
         rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
         @test phase_stats(st, PHASE_TEST).starts == 4
-        @test phase_stats(st, PHASE_TEST).nprocs_at_peak <= 2   # the run and one worker
+        # One worker at a time. The whole tree can hold more, such as a process that
+        # a worker starts, which this run does not decide.
+        @test phase_stats(st, PHASE_TEST).workers_at_peak <= 1
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("4 worker starts", summary)
 

@@ -75,7 +75,7 @@ Each keyword except `skip` must be a literal. Arithmetic on numeric literals is 
 
 A retry runs on the same worker, except in three cases: the worker timed out, the worker crashed, or the item has `sandbox = true`. A chain retries from its first item. All items in a chain must use the same profile and be in the same environment. `sandbox = true` and `chain` do not go together.
 
-The items of a profile share the workers of that profile. If an item needs a new process of its own, add `sandbox = true`. The two keywords combine: `profile = :bounds sandbox = true` runs the item alone, in a new process of the `bounds` profile. Neither keyword chooses the packages of the item. The location of its file does.
+The items of a profile share the workers of that profile, and of every profile whose workers start the same way. If an item needs a new process of its own, add `sandbox = true`. The two keywords combine: `profile = :bounds sandbox = true` runs the item alone, in a new process of the `bounds` profile. Neither keyword chooses the packages of the item. The location of its file does.
 
 ## How the body runs
 

@@ -419,7 +419,7 @@ end
         @test states["default sees no preference"] === PASSED
         @test states["tuned sees it"] === PASSED
         # The tuned profile ran in a project of its own, carrying the same manifest.
-        proj = run.profile_projects[(:tuned, "")]
+        proj = run.profile_projects[findfirst(pr -> pr.name === :tuned && isempty(pr.environment), run.plan.profiles)]
         @test isfile(joinpath(proj, "Manifest.toml"))
         @test occursin("fast", read(joinpath(proj, "LocalPreferences.toml"), String))
         # Every package that manifest names is findable from where it now sits.

@@ -24,6 +24,7 @@ mutable struct AttemptArtifacts
     const dir       :: String           # "" when the attempt was given nowhere to keep evidence
     const info      :: TestItemInfo     # what `current_testitem()` says while producers run
     const full_stacktraces :: Bool      # a producer's error keeps the framework's own frames
+    const root      :: String           # where producers run, as the item did (see `ItemSpec`)
     const lock      :: ReentrantLock    # guards everything below
     const producers :: Vector{Any}
     open            :: Bool
@@ -35,7 +36,7 @@ end
 
 AttemptArtifacts(spec::ItemSpec) = AttemptArtifacts(
     spec.index, spec.attempt, spec.artifacts,
-    TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile), spec.full_stacktraces,
+    TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile), spec.full_stacktraces, spec.root,
     ReentrantLock(), Any[], true, false, Symbol("")
 )
 
@@ -200,9 +201,11 @@ function run_producers(a::AttemptArtifacts)
     t0 = time()
     failed = 0
     capture_output(artifacts_log_path(a.dir)) do
-        with(CURRENT_TESTITEM => a.info) do
-            for (k, f) in enumerate(producers)
-                failed += !run_producer(f, k, joinpath(a.dir, string("producer_", k)), a.full_stacktraces)
+        in_dir(a.root) do
+            with(CURRENT_TESTITEM => a.info) do
+                for (k, f) in enumerate(producers)
+                    failed += !run_producer(f, k, joinpath(a.dir, string("producer_", k)), a.full_stacktraces)
+                end
             end
         end
         println(stdout, "collected: ", length(producers), length(producers) == 1 ? " producer" : " producers",

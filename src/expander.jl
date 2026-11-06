@@ -246,8 +246,8 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
     # Said as each phase starts and ends, for whoever waits on a slow one: loading the
     # imports can precompile them, and the loop and the checks run the template's code.
     at = string(basename(path), ":", line)
-    imports = [string(ex) for ex in body.args if is_import(ex)]
-    progress(at, ": loading what the body imports", isempty(imports) ? "" : string(", ", join(imports, "; ")))
+    deps = imported_packages(body)
+    progress(at, ": loading the template's dependencies", isempty(deps) ? "" : string(": ", join(deps, ", ")))
     t0 = time()
     item = item_module(body, project, line)
     t1 = time()
@@ -321,6 +321,24 @@ end
 # package the body imports, by name and nothing more, so the loop says `Dates.Day`
 # where the item, after its `using Dates`, says `Day`. What the imports bring into
 # scope is the item's.
+# The packages the body's imports name, in the order written: `A` of `using A.B: c` and
+# of `import A as B`, and nothing of a relative `using .A`.
+function imported_packages(body::Expr)
+    out = String[]
+    for ex in body.args
+        is_import(ex) || continue
+        for a in ex.args
+            p = a isa Expr && a.head === :(:) ? a.args[1] : a
+            path = p isa Expr && p.head === :as ? p.args[1] : p
+            (path isa Expr && path.head === :. && !isempty(path.args) && path.args[1] isa Symbol && path.args[1] !== :.) ||
+                continue
+            name = String(path.args[1])
+            name in out || push!(out, name)
+        end
+    end
+    return out
+end
+
 function loop_module(body::Expr, project::String, line::Int)
     imports = Any[:(import Test)]
     isempty(project) || push!(imports, :(import $(Symbol(project))))

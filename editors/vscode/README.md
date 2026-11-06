@@ -21,6 +21,12 @@ It starts a Runtests server per workspace folder with a test suite (`Runtests.se
 and speaks to it over its standard streams, one JSON object per line. Everything the
 server writes for people is also in the **Runtests** output channel, runs or not.
 
+A folder that is the root of a Julia workspace of several packages, a monorepo, is
+served by `Runtests.serve_mono`: the items of every package in one tree, under a node
+for each package, and each run a combined run, as `Runtests.runtests_mono()` runs it.
+The folder is taken for one when its `Project.toml` lists workspace members other
+than its own `test`; `runtests.monorepo` says otherwise.
+
 ## Trying it
 
 It is plain JavaScript with no dependencies: nothing to build.
@@ -34,8 +40,11 @@ It is plain JavaScript with no dependencies: nothing to build.
   ln -s "$PWD/editors/vscode" ~/.vscode/extensions/runtests.runtests-0.1.0
   ```
 
-The package's test environment must have Runtests: the server runs in
-`test/Project.toml`'s environment when there is one, and the package's otherwise.
+The server runs in an environment that has Runtests. For a folder of one package, it
+is `test/Project.toml`'s environment when there is one, and the package's otherwise.
+For a workspace of several packages, it is the first of the root's `test`, the root
+and the `test` of each member that has Runtests in `[deps]`. The setting
+`runtests.environment` replaces this choice.
 
 ## Settings
 
@@ -44,8 +53,9 @@ The package's test environment must have Runtests: the server runs in
 | `runtests.julia.executable` | the `julia` that runs the server; by default the Julia extension's `julia.executablePath`, or `julia` on the `PATH` |
 | `runtests.julia.args` | arguments given to `julia` first, such as `["+1.12"]` for a juliaup channel |
 | `runtests.environment` | the environment the server runs in, relative to the folder |
+| `runtests.monorepo` | `auto`, `on` or `off`: serve the folder as a workspace of several packages; `auto` when its `Project.toml` lists members other than its `test`. The server restarts when this setting, or the folder's `Project.toml`, changes the choice |
 | `runtests.run.options` | settings sent with every run, such as `{"workers": 2}` |
-| `runtests.config` | a config file read in place of `test/TestItems.toml`, relative to the folder, for listing and every run; **Runtests: Restart Server** after changing it |
+| `runtests.config` | a config file read in place of `test/TestItems.toml`, relative to the folder, for listing and every run; **Runtests: Restart Server** after changing it. A workspace of several packages does not use it, because each package reads its own `test/TestItems.toml`. The extension then shows a warning |
 
 Everything else a run takes comes from `test/TestItems.toml`, as it does for
 `Runtests.runtests()`.

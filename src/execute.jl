@@ -15,7 +15,7 @@ using Base: SIGKILL
 # while `dying_log` is set, and the slot's again once it has joined the relay.
 mutable struct Slot
     const id::SlotIdx
-    profile::Profile
+    profile::ProfileIdx      # the profile its process starts with, by its index in the plan
     @atomic worker::Union{Nothing, RuntestsWorkers.Worker}
     started_at::Float64      # when this slot's current process came up
     worker_items::Int        # items the current process has run, for its EXIT line
@@ -45,8 +45,8 @@ end
 What the run has measured of one pool, for deciding where a slot whose own pool
 has run dry does the most good: how long the pool's workers took to be ready; the
 compile time of items that ran first on a fresh process, and of items that ran on
-one that had run others; and how long its units took, against their estimates
-where they had one.
+one that had run others; and how long its items took, against their recorded
+durations where they had one.
 """
 mutable struct PoolStats
     starts::Int
@@ -55,10 +55,10 @@ mutable struct PoolStats
     cold_compile_s::Float64
     warm::Int                    # items that ran on a process that had run others
     warm_compile_s::Float64
-    units::Int
+    items::Int
     took_s::Float64
-    estimated_s::Float64         # the estimates of the units that had one
-    estimated_took_s::Float64    # and what those units took
+    estimated_s::Float64         # the recorded durations of the items that had one
+    estimated_took_s::Float64    # and what those items took
 end
 PoolStats() = PoolStats(0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0)
 
@@ -81,8 +81,9 @@ mutable struct Queues
     const pending::Vector{Int32}     # pools no slot serves yet, in pickup order
     const claimed::BitVector         # per unit: handed out already
     const serving::Vector{Int}       # per pool: slots working for it
-    const est::Vector{Float64}       # per unit: estimated seconds, 0 for none
-    const typical::Float64           # a unit without an estimate, before the run has timed any
+    const est::Vector{Float64}       # per unit: the recorded seconds of its items
+    const unrecorded::Vector{Int32}  # per unit: its items without a recorded duration
+    const typical::Float64           # an unrecorded item, before its pool has timed any
     const stats::Vector{PoolStats}   # per pool
     const prior::ColdCost            # what a fresh worker cost in earlier runs
     cancelled::Bool
@@ -95,8 +96,9 @@ Queues(p::Plan) = Queues(
     UnitIdx[first(r) for r in p.slot_units], UnitIdx[last(r) for r in p.slot_units],
     copy(p.slot_pool), copy(p.pending), falses(length(p.units)),
     [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
-    p.units.est_s, typical_estimate(p.units.est_s), [PoolStats() for _ in p.pools], p.cold,
-    false, false
+    p.units.est_s, Int32[count(i -> p.items.est_s[i] == 0, span) for span in p.units.span],
+    typical_estimate(p.items.est_s),
+    [PoolStats() for _ in p.pools], p.cold, false, false
 )
 
 struct Claim
@@ -163,34 +165,48 @@ function claim!(q::Queues, s::Integer)
 end
 
 # The pool a slot whose own pool `k` has run dry does the most good in, or 0 for
-# none: the one whose slots have the most unclaimed work each, if that is more than
-# a fresh worker costs there. A worker that joins late starts its process and
-# compiles what the pool's others compiled long ago, so it has to take more work off
-# them than that.
+# none: of the pools that one more worker makes finish sooner, the one that finishes
+# last. Each pool is played out (`finish_time`): its unclaimed units, in the order they
+# are handed out, each to whichever of its workers is free first, its own workers free
+# now and the new one once it has started its process and compiled what the others
+# have (`cold_cost`). Units are whole, so a worker that is ready only after the others
+# have claimed the last of them makes the pool finish no sooner.
 function neediest_pool(q::Queues, k::Integer)
-    best, most = 0, 0.0
+    best, latest = 0, 0.0
     for j in eachindex(q.pools)
         j == k && continue
-        share = remaining_work(q, j) / max(q.serving[j], 1)
-        share > most && share > cold_cost(q, j) && ((best, most) = (j, share))
+        units = unclaimed_work(q, j)
+        isempty(units) && continue
+        n = q.serving[j]
+        without = n == 0 ? Inf : finish_time(units, zeros(n))
+        with = finish_time(units, [zeros(n); cold_cost(q, j)])
+        with < without && without > latest && ((best, latest) = (j, without))
     end
     return best
 end
 
-# Pool `j`'s unclaimed work, in seconds: each unit's estimate, scaled by how this
-# run's units have taken against theirs, and a unit without one at the pool's
-# average so far. A pool's units are consecutive: its head, its body, its tail.
-function remaining_work(q::Queues, j::Integer)
+# When the last of `units`, durations in seconds in the order they are handed out,
+# ends, on workers free from the times `free`, each taking the next unit as it is free.
+function finish_time(units::Vector{Float64}, free::Vector{Float64})
+    free = copy(free)
+    for d in units
+        _, w = findmin(free)
+        free[w] += d
+    end
+    return maximum(free)
+end
+
+# Pool `j`'s unclaimed units, each its estimated seconds, in the order they are handed
+# out: its head, its body, its tail, which are consecutive. A recorded duration is
+# scaled by how this run's items took against theirs. An item without one counts as
+# the pool's average item so far. Before the pool has timed any, it counts as the
+# typical recorded item, as in the plan.
+function unclaimed_work(q::Queues, j::Integer)
     st = q.stats[j]
     scale = st.estimated_s > 0 ? st.estimated_took_s / st.estimated_s : 1.0
-    unknown = st.units > 0 ? st.took_s / st.units : q.typical
+    unknown = st.items > 0 ? st.took_s / st.items : q.typical
     pool = q.pools[j]
-    total = 0.0
-    for u in first(pool.head):last(pool.tail)
-        q.claimed[u] && continue
-        total += q.est[u] > 0 ? q.est[u] * scale : unknown
-    end
-    return total
+    return Float64[q.est[u] * scale + q.unrecorded[u] * unknown for u in first(pool.head):last(pool.tail) if !q.claimed[u]]
 end
 
 # What a fresh worker in pool `j` costs before it is as fast as the pool's others:
@@ -313,6 +329,17 @@ mutable struct Run
     # Where `RUNTESTS_ARTIFACT_DIR` had the run copy its run state and logs, once it
     # has; empty otherwise.
     exported::String
+    # Per package, where its items' logs and evidence go: `logdir`, `logprefix` and
+    # `artifacts_prefix` are the first package's, the one of a standalone run. A log is
+    # named by the item's index in its package's run state.
+    const logdirs::Vector{String}
+    const logprefixes::Vector{String}
+    const artifacts_prefixes::Vector{String}
+    const local_item::Vector{ItemIdx}
+    # Per package, once the environment is active: the project its items run in, the
+    # test environment of a standalone run, the union environment of a combined one,
+    # or an isolated package's own test project.
+    const package_projects::Vector{String}
     # The name column, chosen once from every name the run will print, and each
     # item's name as it is written there (see `item_names`).
     const name_width::Int32
@@ -321,11 +348,12 @@ mutable struct Run
     const t0::Float64
     # Opened once the test environment is active, after the monitor, which writes
     # its peaks here, has started.
-    @atomic runstate::Union{Nothing, RunStateFile}
+    @atomic runstate::Union{Nothing, RunStateFile, RunStateSet}
     monitor::Union{Nothing, Monitor}
-    # Profile name -> the project directory its workers run in. Only profiles that
-    # declare preferences have one; everything else uses the test environment.
-    const profile_projects::Dict{Tuple{Symbol, String}, String}   # by `pool_key`
+    # The project directory the workers of a profile run in, by the profile's index.
+    # Only a profile that declares preferences or runs in an environment directory has
+    # one; the others use the test environment.
+    const profile_projects::Dict{ProfileIdx, String}
     @atomic ndone::Int
     # Items whose state does not pass, kept by `set_state!` for the status line,
     # which is drawn from other threads than the one the states are written on.
@@ -391,10 +419,21 @@ function execute(p::Plan, target; on_item = nothing)
     runid = string(time_ns(); base = 16)
     scratch = mktempdir(; prefix = "runtests_")
     names, column = item_names(p, name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)))
+    # A package's logs go in a directory of their own until its run state is open.
+    npkg = length(p.packages)
+    logdirs = npkg == 1 ? [scratch] : [mkpath(joinpath(scratch, string(k))) for k in 1:npkg]
+    evidence = joinpath(tempdir(), string("runtests_artifacts_", runid))
+    artifacts_prefixes = npkg == 1 ? [joinpath(evidence, "item_")] : [joinpath(evidence, string(k), "item_") for k in 1:npkg]
+    local_item = zeros(ItemIdx, nitems(p))
+    seen = zeros(Int, npkg)
+    for i in 1:nitems(p)
+        local_item[i] = (seen[p.items.package[i]] += 1)
+    end
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch,
-        joinpath(scratch, "item_"), joinpath(tempdir(), string("runtests_artifacts_", runid), "item_"), "", column, names,
-        ReentrantLock(), time(), nothing, nothing, Dict{Tuple{Symbol, String}, String}(), 0, 0, 0.0, false, Task[],
+        joinpath(scratch, "item_"), artifacts_prefixes[1], "", logdirs, [joinpath(d, "item_") for d in logdirs],
+        artifacts_prefixes, local_item, String[], column, names,
+        ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_item,
         ReentrantLock()
     )
@@ -410,7 +449,7 @@ function execute(p::Plan, target; on_item = nothing)
     for s in 1:nslots(p)
         push!(
             run.slots, Slot(
-                SlotIdx(s), p.profiles[p.pools[p.slot_pool[s]].profile],
+                SlotIdx(s), p.pools[p.slot_pool[s]].profile,
                 nothing, 0.0, 0, ItemIdx(0), Int8(0), "", String[], false, ItemIdx(0)
             )
         )
@@ -420,9 +459,11 @@ function execute(p::Plan, target; on_item = nothing)
         run.monitor = monitor
         start_monitor!(monitor)
     end
-    setup_path = joinpath(target.testdir, TESTSETUPS_DIR)
+    # The setups of each package that does not run apart, on one load path.
+    setup_paths = String[joinpath(r, "test", TESTSETUPS_DIR) for (r, isolated) in zip(p.packages.root, p.packages.isolated)
+                         if !isolated]
     return try
-        run_phases(run, p, target, setup_path)
+        run_phases(run, p, target, setup_paths)
     finally
         # Wherever the run stopped: a throw before the first item would otherwise
         # leave the monitor running and the error printed over its line.
@@ -431,22 +472,22 @@ function execute(p::Plan, target; on_item = nothing)
     end
 end
 
-function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
+function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
     return with_logger(RunLogger(current_logger(), run)) do
-        with_test_env(target, run) do
+        with_run_env(target, run) do
             # Before the run state: an environment directory that does not resolve
             # stops the run before anything has run to record.
             profile_projects!(run, p)
             # Opened once the test environment is active: its manifest is part of
-            # what the file records.
-            @atomic run.runstate = open_runstate(p, run.t0)
+            # what the file records. A run of several packages has one for each.
+            @atomic run.runstate = is_combined(p) ? open_runstate_set(p, run.t0, run.runid) : open_runstate(p, run.t0)
             keep_logs_by_runstate!(run)
             # Until the first item can start, a throw ends the run here, and its file
             # must say so: unfinished, its beats would keep it looking alive for as
             # long as this process lasts. Why it ended goes beside it.
             testing = Ref(false)
             try
-                run_testing(run, p, target, setup_path, testing)
+                run_testing(run, p, target, setup_paths, testing)
             catch e
                 if !testing[]
                     shielded() do
@@ -464,10 +505,10 @@ end
 
 # Setup, then the items. `testing` is set once the items' own `finally` is in place
 # to finish the run state.
-function run_testing(run::Run, p::Plan, target, setup_path::AbstractString, testing::Ref{Bool})
+function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, testing::Ref{Bool})
     cfg = p.cfg
     check_replayed_environment(run)
-    return with_load_path(setup_path) do
+    return with_load_path(setup_paths) do
         precompile_phase(run, p, target)
         # From the start of the run, as the monitor's setup stage is, so the
         # header and the closing block give the same figure.
@@ -517,8 +558,13 @@ function run_testing(run::Run, p::Plan, target, setup_path::AbstractString, test
                 finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
                 tidy_logs(run)
                 export_run!(run)
-                # A replay deletes no run state, the one it runs least of all.
-                isempty(p.cfg.replayed_from) && prune_runstates(p.root; names = Set(p.suite_names))
+                # A replay deletes no run state, the one it runs least of all. Each
+                # package prunes its own.
+                if isempty(p.cfg.replayed_from)
+                    for k in eachindex(p.packages.root)
+                        prune_runstates(p.packages.root[k]; names = Set(p.packages.suite_names[k]))
+                    end
+                end
                 # The exception on its way out stops the report from being
                 # made, so what the run got through is said here or nowhere.
                 interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
@@ -538,8 +584,8 @@ active afterwards. The environment is:
    `Pkg.test`, which has built an environment with the test dependencies;
 2. the active one, when it is the package's own `test/Project.toml`, because
    activating that is a deliberate choice;
-3. the package's `test/Project.toml`, when the package lists it in its
-   `[workspace]`, as `Pkg.test` does;
+3. the package's `test/Project.toml`, when it is a member of the workspace the
+   package is in, which shares its manifest, as `Pkg.test` uses it;
 4. otherwise a test environment built by `TestEnv`.
 
 The last two are cached for the session.
@@ -662,15 +708,27 @@ end
 
 mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
 
-# Whether the package lists `test/` in its own `[workspace]`, by the rule Julia's
-# loader uses to find a workspace member's manifest.
+# Whether `test/Project.toml` is a member of a workspace, and of the one the package
+# is in: the package's own, or one that lists both, as a monorepo's root does,
+# directly or through the package's own. Julia's loader finds a member's manifest by
+# following its workspace parents, so the outermost roots decide.
 function in_package_workspace(testproj, proj)
     isfile(testproj) || return false
     @static if isdefined(Base, :base_project)
-        base = Base.base_project(testproj)
-        return base !== nothing && samefile(base, proj)
+        Base.base_project(testproj) === nothing && return false
+        return samefile(outermost_workspace(testproj), outermost_workspace(proj))
     else
         return false   # workspaces came with Julia 1.12
+    end
+end
+
+# The project at the top of the workspaces that `project` is a member of, or
+# `project` itself when it is a member of none.
+function outermost_workspace(project)
+    while true
+        parent = Base.base_project(project)
+        (parent === nothing || samefile(parent, project)) && return project
+        project = parent
     end
 end
 
@@ -748,34 +806,52 @@ function open_runstate(p::Plan, start::Float64)
 end
 
 # The items' logs go beside the run state once it is open, so that they last as long
-# as it does. Without one, or without a directory there, they stay in `scratch`.
+# as it does: each package's beside its own. Without one, or without a directory
+# there, they stay in `scratch`.
 function keep_logs_by_runstate!(run::Run)
-    rsf = @atomic run.runstate
-    rsf === nothing && return nothing
-    dir = logs_dir(rsf.path)
-    try
-        mkpath(dir)
-    catch e
-        is_interrupt(e) && rethrow()
-        @warn "Runtests: could not make $(dir) for the items' logs; they go with the run" exception = e
-        return nothing
+    rs = @atomic run.runstate
+    files = rs isa RunStateSet ? rs.files : [rs]
+    for (k, rsf) in enumerate(files)
+        rsf === nothing && continue
+        dir = logs_dir(rsf.path)
+        try
+            mkpath(dir)
+        catch e
+            is_interrupt(e) && rethrow()
+            @warn "Runtests: could not make $(dir) for the items' logs; they go with the run" exception = e
+            continue
+        end
+        run.logdirs[k] = dir
+        run.logprefixes[k] = joinpath(dir, "item_")
+        # Absolute: a worker runs in the package's directory, and an item is handed it.
+        run.artifacts_prefixes[k] = abspath(run.logprefixes[k])
     end
-    run.logdir = dir
-    run.logprefix = joinpath(dir, "item_")
-    # Absolute: a worker runs in the package's directory, and an item is handed it.
-    run.artifacts_prefix = abspath(run.logprefix)
+    run.logdir, run.logprefix, run.artifacts_prefix = run.logdirs[1], run.logprefixes[1], run.artifacts_prefixes[1]
     return nothing
 end
 
-# `text` as `name` in the run's log directory; never a reason to fail the run.
+# `text` as `name` in each package's log directory; never a reason to fail the run.
 function write_run_log(run::Run, name::AbstractString, text::AbstractString)
-    try
-        write(joinpath(run.logdir, name), text)
-    catch e
-        is_interrupt(e) && rethrow()
+    for dir in run.logdirs
+        try
+            write(joinpath(dir, name), text)
+        catch e
+            is_interrupt(e) && rethrow()
+        end
     end
     return nothing
 end
+
+# Where attempt `attempt` at item `i` writes what it prints, and its failure report:
+# with its package's logs, by its index in its package's run state.
+item_log(run::Run, i::Integer, attempt::Integer) =
+    item_log_path(run.logprefixes[run.plan.items.package[i]], run.local_item[i], attempt)
+failure_log(run::Run, i::Integer, attempt::Integer) =
+    failure_path(run.logprefixes[run.plan.items.package[i]], run.local_item[i], attempt)
+
+# Whether a plan is a run of several packages, each with a run state of its own:
+# packages other than the one at its root.
+is_combined(p::Plan) = length(p.packages) > 1 || p.packages.root[1] != p.root
 
 function write_failure_report(run::Run, i::ItemIdx, attempt::Integer, testset)
     failures = collect_failures(testset)
@@ -786,7 +862,11 @@ function write_failure_report(run::Run, i::ItemIdx, attempt::Integer, testset)
             println(io)
         end
     end
-    write_run_log(run, basename(failure_path(run.logprefix, i, attempt)), strip_root(text, run.plan.root))
+    try
+        write(failure_log(run, i, attempt), strip_root(text, run.plan.root))
+    catch e
+        is_interrupt(e) && rethrow()
+    end
     return nothing
 end
 
@@ -800,14 +880,20 @@ once the run state is finished, however the run ended. Never a reason to fail it
 """
 function export_run!(run::Run)
     dir = get(ENV, "RUNTESTS_ARTIFACT_DIR", "")
-    rsf = @atomic run.runstate
-    (isempty(dir) || rsf === nothing) && return nothing
+    rs = @atomic run.runstate
+    (isempty(dir) || rs === nothing) && return nothing
     try
         dir = abspath(dir)
-        mkpath(dir)
-        cp(rsf.path, joinpath(dir, basename(rsf.path)); force = true)
-        logs = logs_dir(rsf.path)
-        isdir(logs) && cp(logs, joinpath(dir, basename(logs)); force = true)
+        # A run of several packages: each package's in a directory of its name.
+        files = rs isa RunStateSet ? collect(zip(rs.files, run.plan.packages.name)) : [(rs, "")]
+        for (rsf, sub) in files
+            rsf === nothing && continue
+            to = joinpath(dir, sub)
+            mkpath(to)
+            cp(rsf.path, joinpath(to, basename(rsf.path)); force = true)
+            logs = logs_dir(rsf.path)
+            isdir(logs) && cp(logs, joinpath(to, basename(logs)); force = true)
+        end
         run.exported = dir
     catch e
         is_interrupt(e) && rethrow()
@@ -819,15 +905,18 @@ end
 # A log an attempt left empty says nothing, and a directory of them is noise; what
 # is left is what the items printed, and the reports of those that did not pass.
 function tidy_logs(run::Run)
-    run.artifacts_prefix == abspath(run.logprefix) || remove_if_empty(dirname(run.artifacts_prefix))
-    run.logdir == run.scratch && return nothing
-    try
-        for f in readdir(run.logdir; join = true)
-            isfile(f) && filesize(f) == 0 && rm(f; force = true)
+    for k in eachindex(run.logdirs)
+        logdir, prefix, evidence = run.logdirs[k], run.logprefixes[k], run.artifacts_prefixes[k]
+        evidence == abspath(prefix) || remove_if_empty(dirname(evidence))
+        startswith(logdir, run.scratch) && continue
+        try
+            for f in readdir(logdir; join = true)
+                isfile(f) && filesize(f) == 0 && rm(f; force = true)
+            end
+            isempty(readdir(logdir)) && rm(logdir; force = true)
+        catch e
+            is_interrupt(e) && rethrow()
         end
-        isempty(readdir(run.logdir)) && rm(run.logdir; force = true)
-    catch e
-        is_interrupt(e) && rethrow()
     end
     return nothing
 end
@@ -850,6 +939,17 @@ is_plain(prof::Profile) = prof.name === DEFAULT_PROFILE && isempty(prof.environm
 # an environment other than the test environment.
 uses_profiles(p::Plan) = any(i -> p.profiles[i].name !== DEFAULT_PROFILE, p.units.profile)
 uses_environments(p::Plan) = any(i -> !isempty(p.profiles[i].environment), p.units.profile)
+
+# How a worker's UP line names profile `j`, "" for not at all. In a run of several
+# profiles, every profile is named, the default too, because a slot can move from one
+# profile's pool to another's. Otherwise every profile but the default of the run's
+# first package is named; that package is the root's when the root runs. In a run of
+# several packages, the name comes with the package that declares the profile.
+function profile_text(p::Plan, j::Integer)
+    k = p.profile_package[j]
+    (uses_profiles(p) || k != 1) || return ""
+    return string(" · profile ", p.profiles[j].name, is_combined(p) ? string(" of ", p.packages.name[k]) : "")
+end
 
 # `workers=0` is a promise about the pool, not about never starting a process.
 # Starting one anyway is the right thing and a surprising thing, so it is said out
@@ -890,6 +990,21 @@ function with_load_path(f, setup_path::AbstractString)
     end
 end
 
+with_load_path(f, setup_paths::Vector{String}) =
+    isempty(setup_paths) ? f() : with_load_path(() -> with_load_path(f, setup_paths[2:end]), setup_paths[1])
+
+# The environment a run's items resolve against, active for the length of `f`: the
+# test environment of a standalone run (`with_test_env`), the union environment of a
+# combined one (`with_union_env`). `run.package_projects` says, for each package, the
+# project its items run in.
+function with_run_env(f, target, run::Run)
+    is_combined(run.plan) && return with_union_env(f, run)
+    return with_test_env(target, run) do
+        push!(run.package_projects, something(Base.active_project(), ""))
+        f()
+    end
+end
+
 """
     profile_projects!(run, p)
 
@@ -904,31 +1019,31 @@ environment directory runs in a copy of it instead (see
 [`environment_project`](@ref)).
 """
 function profile_projects!(run::Run, p::Plan)
-    env = Base.active_project()
-    for prof in values(p.profiles)
+    for (j, prof) in enumerate(p.profiles)
+        env = run.package_projects[p.profile_package[j]]
         announce = () -> say(run, "resolving the environment of ", relpath_or_path(prof.environment, p.root))
-        dir = profile_project(prof, env, p.root, announce)
-        dir === nothing || (run.profile_projects[pool_key(prof)] = dir)
+        # An environment directory gets the package of its own suite.
+        dir = profile_project(prof, env, p.packages.root[p.profile_package[j]], announce)
+        dir === nothing || (run.profile_projects[ProfileIdx(j)] = dir)
     end
     return nothing
 end
-
-# What tells the plan's profiles apart: a declared profile runs in several
-# environments, one pool each.
-pool_key(prof::Profile) = (prof.name, prof.environment)
 
 # The project `prof`'s workers run in, or `nothing` for a profile without
 # preferences or an environment, whose workers run in the environment `env` itself.
 # For one with an environment, see `environment_project`, which `root`, the package
 # under test, and `announce` are for. Otherwise in the system's temporary files,
-# keyed by `env`'s path, and never beside `env`, which can be the package's own
-# `test/`. Rewritten on every call, so it follows the environment and the
-# preferences file.
+# keyed by `env`'s path and the preferences file, and never beside `env`, which can
+# be the package's own `test/`. The preferences file is in the key because profiles
+# of one name in two packages of a combined run share `env` and can name different
+# files. Rewritten on every call, so it follows the environment and the preferences
+# file.
 function profile_project(prof::Profile, env, root = nothing, announce = nothing)
     isempty(prof.environment) || return environment_project(prof, root, announce)
     (env === nothing || isempty(prof.preferences)) && return nothing
     root = dirname(env)
-    dir = joinpath(tempdir(), "runtests_profiles", string(crc32c(abspath(env)); base = 16, pad = 8), String(prof.name))
+    key = crc32c(string(abspath(env), '\0', abspath(prof.preferences)))
+    dir = joinpath(tempdir(), "runtests_profiles", string(key; base = 16, pad = 8), String(prof.name))
     mkpath(dir)
     copy_env_files(dir, root)
     own = joinpath(root, "LocalPreferences.toml")
@@ -1153,9 +1268,9 @@ Returns every set of cache flags the pools' workers have besides this process's,
 the julia arguments that give it, for the setups to be compiled for too.
 """
 function precompile_env(run::Run, p::Plan)
-    # Each profile's flags are asked of a process of their own, so once.
-    asked = Dict{Symbol, Union{Nothing, Base.CacheFlags}}()
-    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.name)
+    # Each set of flags is asked of a process of its own, so once.
+    asked = Dict{Vector{String}, Union{Nothing, Base.CacheFlags}}()
+    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.julia_args)
     # The flags this process runs under lead, because every pool without julia
     # arguments of its own uses them and because `test_env` switched `Pkg`'s own
     # precompilation off.
@@ -1171,14 +1286,14 @@ function precompile_env(run::Run, p::Plan)
         flags == Base.CacheFlags() || flags in last.(others) || push!(others, Cmd(prof.julia_args) => flags)
         # A profile with preferences runs in a project of its own, which `configs`
         # cannot carry; it gets a call of its own below.
-        (haskey(run.profile_projects, pool_key(prof)) || flags in last.(configs)) && continue
+        (haskey(run.profile_projects, pool.profile) || flags in last.(configs)) && continue
         push!(configs, Cmd(prof.julia_args) => flags)
         push!(names, String(prof.name))
     end
     # One call each: a project is part of a cache's identity, so two profiles with
     # different preferences are two environments, not two configurations of one.
-    for (key, dir) in run.profile_projects
-        prof = p.profiles[findfirst(q -> pool_key(q) == key, p.profiles)]
+    for (j, dir) in sort!(collect(run.profile_projects); by = first)
+        prof = p.profiles[j]
         flags = flags_of(prof)
         flags === nothing && continue
         where_ = isempty(prof.environment) ? "the test environment" :
@@ -1190,6 +1305,12 @@ function precompile_env(run::Run, p::Plan)
     # nothing when there is nothing to do.
     isempty(names) || say(run, "precompiling the test environment for ", plural(length(names), "profile"), ": ", join(names, ", "))
     precompile_configs(run, configs, Base.active_project(), join(names, ", "))
+    # An isolated package's items run in its own test project, a project of its own.
+    for k in eachindex(p.packages.name)
+        p.packages.isolated[k] || continue
+        say(run, "precompiling the test environment of ", p.packages.name[k])
+        precompile_configs(run, configs, run.package_projects[k], p.packages.name[k])
+    end
     return others
 end
 
@@ -1240,12 +1361,17 @@ not a package has a single cache file per depot, which a second set of flags wou
 write over; its workers under other flags compile it for themselves.
 """
 function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, Base.CacheFlags}} = Pair{Cmd, Base.CacheFlags}[])
-    isempty(p.setups) && return nothing
+    # An isolated package's setups are not on this process's load path: its workers
+    # compile them for themselves.
+    setups = any(p.packages.isolated) ?
+        sort!(unique!([s for i in 1:nitems(p) if !p.packages.isolated[p.items.package[i]] for s in setups_of(p.items, i)])) :
+        p.setups
+    isempty(setups) && return nothing
     # A *valid* cache is the question: a cache file left over from another checkout
     # of the same setup would be rebuilt by every worker at once, which is the whole
     # thing this avoids.
     stale = Tuple{Base.PkgId, Pair{Cmd, Base.CacheFlags}}[]
-    for name in p.setups
+    for name in setups
         pkg = Base.identify_package(String(name))
         if pkg === nothing
             throw(
@@ -1499,12 +1625,16 @@ did not.
 function stall_limit(p::Plan)
     forced = STALL_LIMIT_OVERRIDE[]
     forced === nothing || return forced
-    cfg = p.cfg
-    item = maximum(t -> t == USE_RUN_DEFAULT ? cfg.timeout_s : Int(t), p.items.timeout_s; init = cfg.timeout_s)
-    init = any(prof -> !isempty(prof.init.args), p.profiles) ? cfg.init_timeout_s : 0
-    test_end = any(prof -> !isempty(prof.test_end.args), p.profiles) ? cfg.test_end_timeout_s : 0
+    # Each limit as the item's own package sets it, the largest of them, and never
+    # less than a package's own `timeout`.
+    item = max(maximum(i -> item_timeout(p, ItemIdx(i)), 1:nitems(p)), maximum(cfg -> cfg.timeout_s, p.packages.cfg))
+    package_of(j) = p.packages.cfg[p.profile_package[j]]
+    init = maximum(j -> isempty(p.profiles[j].init.args) ? 0 : package_of(j).init_timeout_s, eachindex(p.profiles))
+    test_end = maximum(j -> isempty(p.profiles[j].test_end.args) ? 0 : package_of(j).test_end_timeout_s,
+                       eachindex(p.profiles))
+    artifacts = maximum(cfg -> cfg.artifacts_timeout_s, p.packages.cfg)
     # Summed as floats: three limits of up to 2^31 - 1 seconds each overflow a 32-bit `Int`.
-    attempt = max(Float64(item) + init + test_end, Float64(cfg.artifacts_timeout_s))
+    attempt = max(Float64(item) + init + test_end, Float64(artifacts))
     return attempt + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S
 end
 
@@ -1570,7 +1700,7 @@ function run_slot(run::Run, slot::Slot, target)
         elseif claim.kind === :rebind
             # This slot's own pool is empty and another profile still has work, so
             # the process is replaced instead of the worker cap being exceeded.
-            slot.profile = run.plan.profiles[run.plan.pools[claim.pool].profile]
+            slot.profile = run.plan.pools[claim.pool].profile
             stop_worker!(run, slot)
             continue
         end
@@ -1597,7 +1727,7 @@ end
 const WORKER_START_RETRIES = 2
 
 function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
-    prof = slot.profile
+    prof = run.plan.profiles[slot.profile]
     last_err = nothing
     for attempt in 1:(WORKER_START_RETRIES + 1)
         began = time()
@@ -1606,9 +1736,10 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                 julia_args = run.plan.cfg.coverage ?
                     [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args,
                 threads = prof.threads,
-                extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, pool_key(slot.profile), Base.active_project()), slot.profile),
-                dir = target.root,
-                project = Base.active_project(),
+                extra_env = worker_env(run.runid, slot.id, worker_project(run, slot.profile), prof;
+                                       load_path = worker_load_path(run, slot.profile)),
+                dir = worker_dir(run.plan, slot.profile),
+                project = worker_project(run, slot.profile),
                 redirect_io = stdout,
                 # Everything the worker writes: its RUN and DONE records, and under
                 # `logs=:eager` whatever its items print.
@@ -1636,9 +1767,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                     # Why this process exists: a pool worker runs whatever it is
                     # handed, a sandbox runs one unit and goes away again.
                     exclusive ? " · sandbox" : "",
-                    # In a run of several profiles, the default's too: a slot can
-                    # move from one profile's pool to another's.
-                    uses_profiles(run.plan) ? string(" · profile ", prof.name) : "",
+                    profile_text(run.plan, slot.profile),
                     uses_environments(run.plan) ? string(" · ", isempty(prof.environment) ? "test environment" :
                         string("environment ", relpath_or_path(prof.environment, run.plan.root))) : "",
                     isempty(prof.julia_args) ? "" : string(" · ", join(prof.julia_args, " "))
@@ -1714,7 +1843,9 @@ end
 # An item's RUN or DONE line, drawn from what this run knows about the item.
 item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
     slot_id, i, nitems(run.plan), run.names[i], run.name_width, attempt,
-    attempts_for(run.plan, run.plan.items.unit[i]), something(how, run.plan.locations[i])
+    attempts_for(run.plan, run.plan.items.unit[i]), something(how, run.plan.locations[i]);
+    package = is_combined(run.plan) ? run.plan.packages.name[run.plan.items.package[i]] : "",
+    package_width = maximum(textwidth, run.plan.packages.name)
 )
 
 """
@@ -1749,11 +1880,42 @@ end
 # items resolve against, and the profile's own variables. The project is stated
 # rather than inherited: a `JULIA_PROJECT` the caller happened to have set would
 # otherwise win over the test environment this run just built.
-function worker_env(run_id, slot_id, project, prof::Profile)
-    load_path = isempty(prof.environment) ? LOAD_PATH : stacked_load_path(LOAD_PATH, Base.active_project())
+function worker_env(run_id, slot_id, project, prof::Profile;
+                    load_path = isempty(prof.environment) ? LOAD_PATH : stacked_load_path(LOAD_PATH, Base.active_project()))
     env = ["RUNTESTS_RUN_ID" => string(run_id), "RUNTESTS_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(load_path, PATHSEP)]
     project === nothing || push!(env, "JULIA_PROJECT" => project)
     return append!(env, prof.env)
+end
+
+# The project the workers of profile `j` run in: the profile's own (`profile_projects!`),
+# or that of its package's items.
+worker_project(run::Run, j::Integer) =
+    get(run.profile_projects, ProfileIdx(j), run.package_projects[run.plan.profile_package[j]])
+
+# The load path of the workers of profile `j`: this process's, which holds the setups
+# of every package that shares workers; for an isolated package, with its own setups
+# in their place. In an environment directory, stacked over its package's project.
+function worker_load_path(run::Run, j::Integer)
+    p = run.plan
+    k = p.profile_package[j]
+    load_path = copy(LOAD_PATH)
+    if p.packages.isolated[k]
+        shared = Set(joinpath(r, "test", TESTSETUPS_DIR) for r in p.packages.root)
+        filter!(d -> !(d in shared), load_path)
+        own = joinpath(p.packages.root[k], "test", TESTSETUPS_DIR)
+        isdir(own) && push!(load_path, own)
+    end
+    isempty(p.profiles[j].environment) && return load_path
+    return stacked_load_path(load_path, run.package_projects[k])
+end
+
+# Where the workers of profile `j` start: where its `init` runs, for a profile with
+# one (`init_dir`), the package's root for an isolated package, and the run's root
+# otherwise.
+function worker_dir(p::Plan, j::Integer)
+    k = p.profile_package[j]
+    isempty(p.profiles[j].init.args) || return init_dir(p.profiles[j], p.packages.root[k])
+    return p.packages.isolated[k] ? p.packages.root[k] : p.root
 end
 
 # The load path of an item in an environment directory: that environment,
@@ -1779,13 +1941,15 @@ function worker_ended!(run::Run, slot::Integer, w::RuntestsWorkers.Worker)
 end
 
 function init_worker!(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
-    init = slot.profile.init
-    isempty(init.args) && return nothing
-    timeout = run.plan.cfg.init_timeout_s
-    fut = RuntestsWorkers.remote_eval(w, Expr(:block, init.args...))
+    p = run.plan
+    prof = p.profiles[slot.profile]
+    isempty(prof.init.args) && return nothing
+    # Under the `init_timeout` of the package that declares the profile.
+    timeout = p.packages.cfg[p.profile_package[slot.profile]].init_timeout_s
+    fut = RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...))
     fetch_within(
         fut, timeout,
-        TimeoutException(timeout, "the `init` expression of profile `$(slot.profile.name)`", "", "init_timeout")
+        TimeoutException(timeout, "the `init` expression of profile `$(prof.name)`", "", "init_timeout")
     )
     return nothing
 end
@@ -1958,7 +2122,7 @@ Base.showerror(io::IO, e::TimeoutException) = print(
 # `failfast` do. A chain is retried as a unit, so the most demanding member sets
 # the number of attempts.
 attempts_for(p::Plan, u::UnitIdx) = 1 + maximum(p.units.span[u]) do i
-    p.items.retries[i] == USE_RUN_DEFAULT ? p.cfg.retries : Int(p.items.retries[i])
+    p.items.retries[i] == USE_RUN_DEFAULT ? item_cfg(p, i).retries : Int(p.items.retries[i])
 end
 
 # The attempt policy, the same wherever the unit runs: on a pool worker, on a
@@ -1990,26 +2154,26 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
     return nothing
 end
 
-# What one attempt at unit `u` on `slot` measured, for the scheduler: how long the
-# unit took against its estimate, and each item's compile time, as a fresh process's
+# What one attempt at unit `u` on `slot` measured, for the scheduler: how long each
+# item took against its recorded duration, and its compile time, as a fresh process's
 # first item or a later one. Only an attempt whose items all ran and timed
 # themselves counts: an outcome the run decided took as long as it was allowed.
 function note_attempt!(run::Run, slot::Slot, u::UnitIdx)
     st = run.statuses
     span = run.plan.units.span[u]
     any(i -> st.synthetic[i] || st.state[i] === UNSEEN || st.state[i] === CANCELLED, span) && return nothing
-    took = sum(i -> Float64(st.elapsed[i]), span)
-    est = run.plan.units.est_s[u]
+    recorded = run.plan.items.est_s
     q = run.queues
     @lock q.lock begin
         ps = q.stats[q.pool[slot.id]]
-        ps.units += 1
-        ps.took_s += took
-        if est > 0
-            ps.estimated_s += est
-            ps.estimated_took_s += took
-        end
         for i in span
+            took = Float64(st.elapsed[i])
+            ps.items += 1
+            ps.took_s += took
+            if recorded[i] > 0
+                ps.estimated_s += recorded[i]
+                ps.estimated_took_s += took
+            end
             if st.seq[i] == 1
                 ps.cold += 1
                 ps.cold_compile_s += st.compile[i]
@@ -2123,7 +2287,7 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
     res = try
         r = run_item(spec)
         printline(run, item_line(run, nothing, i, attempt, outcome(r)))
-        with_test_end(r, spec, slot.profile.test_end)
+        with_test_end(r, spec, item_profile(run.plan, i).test_end)
     catch e
         if is_interrupt(e)
             (@atomic run.stalled) && record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
@@ -2140,26 +2304,28 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
     return true
 end
 
-# The item, then the profile's `test_end`: two requests to one process, each
+# The item, then its profile's `test_end`: two requests to one process, each
 # against its own limit, so a `test_end` that hangs is not reported as an item that
 # hung. Most profiles have no `test_end` and send one request.
 function dispatch(run::Run, w::RuntestsWorkers.Worker, spec::ItemSpec, timeout::Int, slot::Slot)
     fut = RuntestsWorkers.remote_run(w, spec)
     res = fetch_within(fut, timeout, TimeoutException(timeout, "test item", spec.name, timeout_setting(run.plan, spec.index)))::ItemResult
-    test_end = slot.profile.test_end
+    prof = item_profile(run.plan, spec.index)
+    test_end = prof.test_end
     (isempty(test_end.args) || res.state === SKIPPED) && return res
-    seconds = run.plan.cfg.test_end_timeout_s
+    # Under the `test_end_timeout` of the item's own package.
+    seconds = item_cfg(run.plan, spec.index).test_end_timeout_s
     endfut = RuntestsWorkers.remote_end(w, spec, test_end)
     endres = try
         fetch_within(
             endfut, seconds,
-            TimeoutException(seconds, "the `test_end` expression of profile `$(slot.profile.name)`", "", "test_end_timeout")
+            TimeoutException(seconds, "the `test_end` expression of profile `$(prof.name)`", "", "test_end_timeout")
         )::ItemResult
     catch e
         # The item ran; it is the profile's own code that did not come back. Saying
         # "the worker running this item died" here would point at the wrong code.
         (e isa TimeoutException || is_interrupt(e)) && rethrow()
-        throw(TestEndFailure(slot.profile.name, e))
+        throw(TestEndFailure(prof.name, e))
     end
     return merge_test_end(res, endres)
 end
@@ -2222,7 +2388,7 @@ function handle_dispatch_failure!(
             # `wait` below joins the task relaying this worker's output, so
             # everything the process says on its way down has been filed by the
             # time the item is reported.
-            @atomic slot.dying_log = item_log_path(run.logprefix, i, attempt)
+            @atomic slot.dying_log = item_log(run, i, attempt)
             RuntestsWorkers.terminate!(w, :timeout)
             wait(w)   # a replacement must not overlap the process it replaces
             flush_dying_log!(slot)
@@ -2274,19 +2440,29 @@ function handle_dispatch_failure!(
     end
 end
 
+# The profile of item `i`'s own unit. A pool's workers start with the configuration
+# of one of its profiles, which every profile of the pool shares; what differs between
+# them, `test_end` and the name an item sees, is the item's own.
+item_profile(p::Plan, i::Integer) = p.profiles[p.units.profile[p.items.unit[i]]]
+
 function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
     p = run.plan
     # The directory is this run's own and (item, attempt) is unique within it, so
     # nothing is there to clear first.
-    logpath = p.cfg.logs === :eager ? "" : item_log_path(run.logprefix, i, attempt)
+    logpath = p.cfg.logs === :eager ? "" : item_log(run, i, attempt)
     return ItemSpec(
         i, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i],
         p.items.code[i], p.items.skip[i],
-        p.items.failfast[i] == -1 ? p.cfg.item_failfast : p.items.failfast[i] == 1,
-        run.project_name, slot.profile.name, attempt, p.cfg.full_stacktraces, logpath,
-        item_seed(p.items.seed[i], p.items.name[i]), attempt_artifacts(run, i, attempt)
+        p.items.failfast[i] == -1 ? item_cfg(p, i).item_failfast : p.items.failfast[i] == 1,
+        is_combined(p) ? p.packages.name[p.items.package[i]] : run.project_name,
+        item_profile(p, i).name, attempt, p.cfg.full_stacktraces, logpath,
+        item_seed(p.items.seed[i], p.items.name[i]), attempt_artifacts(run, i, attempt), item_root(p, i)
     )
 end
+
+# The directory item `i` runs in: its package's root, or "" where the worker already
+# is, in the root of the run's one package.
+item_root(p::Plan, i::Integer) = (r = p.packages.root[p.items.package[i]]) == p.root ? "" : r
 
 # The run's seed and the item's name, mixed so that each item draws its own numbers
 # whatever ran before it in the same process. CRC32c rather than `hash`, which may
@@ -2294,7 +2470,7 @@ end
 item_seed(seed::UInt64, name::AbstractString) = seed ⊻ (UInt64(crc32c(name)) * 0x9e3779b97f4a7c15)
 
 item_timeout(p::Plan, i::ItemIdx) =
-    p.items.timeout_s[i] == USE_RUN_DEFAULT ? p.cfg.timeout_s : Int(p.items.timeout_s[i])
+    p.items.timeout_s[i] == USE_RUN_DEFAULT ? item_cfg(p, i).timeout_s : Int(p.items.timeout_s[i])
 
 timeout_setting(p::Plan, i::Integer) =
     p.items.timeout_s[i] == USE_RUN_DEFAULT ? "the run's timeout" : string("its own timeout=", p.items.timeout_s[i])
@@ -2366,7 +2542,9 @@ What a function given as `runtests(on_item = f)` is called with, in this process
 once as an attempt at a test item starts, `kind = :started`, and once as it ends,
 `kind = :finished`. A retry is another attempt, with a call of each.
 
-It says which item it is (`name`, `file`, `line`, `attempt`), where it ran (`worker`,
+It says which item it is (`name`, `file`, `line`, `attempt`, and the `package` whose
+suite holds it, with its `root`, which tell apart two items of one name in a run of
+several packages), where it ran (`worker`,
 numbered as the run's lines number them, `w1`, and `pid`, its process), when it
 started or ended (`time`, as `time()` gives it), and how it went (`state`: `:running`
 as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped`,
@@ -2405,6 +2583,8 @@ struct ItemEvent
     allocated::Int64
     allocations::Int64
     maxrss::Int64
+    package::String
+    root::String
 end
 
 # The caller's `on_item` with one attempt's event, which is built only when there is
@@ -2419,7 +2599,8 @@ function tell_on_item(
     event = ItemEvent(
         kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, run.statuses.pid[i],
         at, Symbol(state_name(state)), measured, elapsed, stats.cpu_ns / 1.0e9, stats.compile_ns / 1.0e9,
-        stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss
+        stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss,
+        p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]]
     )
     @lock run.on_item_lock begin
         # Read again: a call another task made while this one waited may have failed.
@@ -2530,7 +2711,7 @@ function run_in_process(run::Run, target)
         is_cancelled(run.queues) && break
         # A unit that asked for a process gets one here too — `run_unit_once!`
         # decides which do — started and stopped around it.
-        slot.profile = p.profiles[p.units.profile[u]]
+        slot.profile = p.units.profile[u]
         try
             run_unit!(run, slot, u, target)
         finally

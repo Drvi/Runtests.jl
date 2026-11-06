@@ -8,6 +8,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { RuntestsServer, PROTOCOL } = require('../src/server');
+const { keyOf } = require('../src/model');
+
+// The served package's items, as a run asks for them.
+const keys = names => names.map(n => keyOf('Served', n));
 
 const REPO = path.resolve(__dirname, '..', '..', '..');
 const julia = process.env.RUNTESTS_TEST_JULIA ?? 'julia';
@@ -59,6 +63,7 @@ after(async () => {
 test('the listing holds every item, where it is', async () => {
     const listing = await server.list();
     assert.deepEqual(listing.items.map(it => it.name), ['passes', 'fails', 'slow 1', 'slow 2']);
+    assert.ok(listing.items.every(it => it.package === 'Served'));
     assert.deepEqual(listing.errors, []);
     const fails = listing.items[1];
     assert.equal(path.basename(fails.file), 'a_test.jl');
@@ -68,7 +73,7 @@ test('the listing holds every item, where it is', async () => {
 
 test('a run reports each item as it goes, a failure where it is', { timeout: 240_000 }, async () => {
     const events = [];
-    const end = await server.run(['passes', 'fails'], { workers: 1 }, ev => events.push(ev));
+    const end = await server.run(keys(['passes', 'fails']), { workers: 1 }, ev => events.push(ev));
     assert.equal(end.event, 'run_finished');
     assert.equal(end.state, 'failed');
     const kinds = events.map(e => e.event);
@@ -81,18 +86,18 @@ test('a run reports each item as it goes, a failure where it is', { timeout: 240
     assert.equal(failure.line, 6);
     assert.match(failure.message, /x == 2/);
     // What an editor's "run failed" runs next.
-    assert.deepEqual((await server.list()).failed, ['fails']);
+    assert.deepEqual((await server.list()).failed, [{ package: 'Served', name: 'fails' }]);
 });
 
 test('a run that cannot start ends with its error', { timeout: 120_000 }, async () => {
-    const end = await server.run(['no such item'], {}, () => {});
+    const end = await server.run(keys(['no such item']), {}, () => {});
     assert.equal(end.event, 'error');
     assert.match(end.message, /no test items matched/);
 });
 
 test('a cancel stops a run at once', { timeout: 240_000 }, async () => {
     let cancelledAt = null;
-    const end = await server.run(['slow 1', 'slow 2'], { workers: 2 }, ev => {
+    const end = await server.run(keys(['slow 1', 'slow 2']), { workers: 2 }, ev => {
         if (ev.event === 'item_started' && cancelledAt === null) {
             cancelledAt = Date.now();
             server.cancel();
@@ -107,7 +112,7 @@ test('a cancel while the server starts stops the run it waits for', { timeout: 2
     const starting = serve();
     try {
         const events = [];
-        const run = starting.run(['passes'], { workers: 1 }, ev => events.push(ev.event));
+        const run = starting.run(keys(['passes']), { workers: 1 }, ev => events.push(ev.event));
         starting.cancel();
         const end = await run;
         assert.equal(end.event, 'run_finished');
@@ -116,6 +121,22 @@ test('a cancel while the server starts stops the run it waits for', { timeout: 2
     } finally {
         await starting.stop();
     }
+});
+
+test('a server of another protocol gets no command, and says why', async () => {
+    // A server that says hello in protocol 2, and writes down whatever it is sent.
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'runtests-protocol-'));
+    const received = path.join(fake, 'received');
+    fs.writeFileSync(path.join(fake, 'server.js'),
+        `console.log(JSON.stringify({ event: 'hello', protocol: 2 }));\n` +
+        `process.stdin.on('data', d => require('node:fs').appendFileSync(${JSON.stringify(received)}, d));\n`);
+    const old = new RuntestsServer({ julia: process.execPath, juliaArgs: [path.join(fake, 'server.js')], environment: fake, root: fake });
+    await assert.rejects(old.list(), /editor protocol 2, and this extension speaks protocol 3/);
+    const end = await old.run(keys(['passes']), {}, () => assert.fail('no event of a run'));
+    assert.equal(end.event, 'error');
+    assert.match(end.message, /editor protocol 2/);
+    assert.equal(fs.existsSync(received), false);
+    fs.rmSync(fake, { recursive: true, force: true });
 });
 
 test('a julia that cannot be started is said, and tried again next time', async () => {

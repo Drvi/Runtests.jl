@@ -28,13 +28,34 @@ struct Profile
     # place of the test environment, or empty. Never declared: a plan gives each pool
     # the environment of its items' directory (see `in_environment`).
     environment::String
+    # The absolute path of the directory its `init` runs in: the workspace root for a
+    # profile that a workspace shares with its packages (see `SharedProfiles`), or
+    # empty for the root of the package whose configuration holds it.
+    dir::String
 end
 
 Profile(
     name::Symbol; julia_args = String[], threads = "2,1", env = Pair{String, String}[],
-    init = Expr(:block), test_end = Expr(:block), preferences = "", environment = ""
+    init = Expr(:block), test_end = Expr(:block), preferences = "", environment = "", dir = ""
 ) =
-    Profile(name, julia_args, threads, env, init, test_end, preferences, environment)
+    Profile(name, julia_args, threads, env, init, test_end, preferences, environment, dir)
+
+"""
+    SharedProfiles
+
+The profiles a workspace shares with its packages: those that the `test/TestItems.toml`
+of the workspace root marks `monorepo_default = true`, by name, each with the workspace
+root as the directory its `init` runs in. `path` is that file, empty for a package in
+no workspace. A package takes a shared profile that it does not declare, and one that
+it declares with the same `init` and `test_end`, as code, runs its `init` where the
+shared one does, so that the workers of both are alike (`share_profiles!`).
+"""
+struct SharedProfiles
+    path::String
+    profiles::Dict{Symbol, Profile}
+end
+
+const NO_SHARED_PROFILES = SharedProfiles("", Dict{Symbol, Profile}())
 
 Base.@kwdef struct RunConfig
     workers::Int
@@ -114,8 +135,8 @@ function unknown_keyword(k::Symbol)
 end
 
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
-const TOP_KEYS = (:run, :order, :profiles, :groups)
+const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :monorepo_default)
+const TOP_KEYS = (:run, :order, :profiles, :groups, :monorepo)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
 # The group a run selects when nothing else selects, the whole suite unless declared,
@@ -133,7 +154,8 @@ directory; named, it has to exist, where `test/TestItems.toml` may be absent.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
-    return build_config(path, toml; config_file = config === nothing ? "" : path, kwargs...)
+    return build_config(path, toml; config_file = config === nothing ? "" : path,
+                        shared = package_shared_profiles(dirname(abspath(testdir))), kwargs...)
 end
 
 """
@@ -223,7 +245,8 @@ function env_setting(key::Symbol, name::String, text::String)
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
 
-function build_config(path, toml; nunits = 0, config_file::AbstractString = "", kwargs...)
+function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
+                      shared::Union{Nothing, SharedProfiles} = nothing, kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
     end
@@ -308,7 +331,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml),
+        profiles = read_profiles(path, toml; shared),
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
@@ -319,10 +342,11 @@ end
 
 # What `--threads` takes: default threads, `auto` or at least one, then optionally
 # interactive ones, `auto` or any number. Checked here, or the first worker dies of it.
-function threads_spec(what, x, err = ConfigError)
+# `where_` says where the setting is, after its name.
+function threads_spec(what, x, err = ConfigError; where_ = "")
     s = x isa Integer ? string(x) : x
     (s isa AbstractString && occursin(r"^(auto|[1-9][0-9]*)(,(auto|[0-9]+))?$", s)) || throw(err(
-        "`$what` must be what `--threads` takes (\"4\", \"4,1\", \"auto\"), got $(repr(x))"
+        "`$what`$where_ must be what `--threads` takes (\"4\", \"4,1\", \"auto\"), got $(repr(x))"
     ))
     return String(s)
 end
@@ -333,53 +357,153 @@ end
 default_logs(workers::Integer, interactive::Bool = isinteractive()) =
     interactive && workers <= 1 ? :eager : :issues
 
-function read_profiles(path, toml)
+# The profiles of the configuration file `path`, `default` always among them, with
+# those that the package's workspace shares (`share_profiles!`). `shared` is `nothing`
+# where the workspace is not known, as before Julia 1.12.
+function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = nothing)
     profiles = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
-    # Numbered in a `ProfileIdx`, `default` among them.
-    length(tbl) < typemax(ProfileIdx) ||
-        throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $(typemax(ProfileIdx) - 1) fit"))
+    # Numbered in a byte in a run state, `default` among them.
+    length(tbl) <= MAX_PACKAGE_PROFILES ||
+        throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $MAX_PACKAGE_PROFILES fit"))
     for name in keys(tbl)
-        label = "profiles.$name"
-        given = tbl[name]
-        given isa AbstractDict && haskey(given, "environment") && throw(ConfigError(
-            "`environment` of [$label] in $(relpath_or_path(path)): a profile has no environment. The test items in " *
-                "a directory under `test/` with a Project.toml of its own run in that environment, under any " *
-                "profile; remove the key, and give those items `profile = :$name` where they need this profile"
-        ))
-        p = section(path, tbl, name, PROFILE_KEYS, label)
-        args = string_list(path, p, "julia_args", label)
-        vars = get(Dict{String, Any}, p, "env")
-        (vars isa AbstractDict && all(v -> v isa Union{AbstractString, Real}, values(vars))) || throw(ConfigError(
-            "`env` of [$label] in $(relpath_or_path(path)) must be a table of variables, as in " *
-                "`env = { NAME = \"value\" }`, got $(repr(vars))"
-        ))
-        env = Pair{String, String}[string(k) => string(v) for (k, v) in vars]
-        sort!(env; by = first)
-        profiles[Symbol(name)] = Profile(
-            Symbol(name), args,
-            haskey(p, "threads") ? threads_spec("threads of [$label]", p["threads"]) : "", env,
-            parse_expr(path, name, "init", string_setting(path, p, "init", label)),
-            parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
-            profile_preferences(path, name, get(p, "preferences", "")), ""
-        )
+        prof, shares = parse_profile(path, tbl, name)
+        (shares && shared !== nothing && !same_file(path, shared.path)) && throw(ConfigError(string(
+            "`monorepo_default` of [profiles.", name, "] in ", relpath_or_path(path), ": only the test/TestItems.toml ",
+            "of a workspace's root shares a profile with the packages of the workspace",
+            isempty(shared.path) ? ", and this package is in no workspace" :
+                string(", here ", relpath_or_path(shared.path), ". Move the profile there")
+        )))
+        profiles[prof.name] = prof
     end
+    shared === nothing || share_profiles!(profiles, shared)
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = ""))
     return profiles
 end
 
+# Profile `name` of the `[profiles]` table `tbl` of the configuration file `path`, and
+# whether it says `monorepo_default = true`.
+function parse_profile(path, tbl::AbstractDict, name::AbstractString)
+    label = "profiles.$name"
+    given = tbl[name]
+    given isa AbstractDict && haskey(given, "environment") && throw(ConfigError(
+        "`environment` of [$label] in $(relpath_or_path(path)): a profile has no environment. The test items in " *
+            "a directory under `test/` with a Project.toml of its own run in that environment, under any " *
+            "profile; remove the key, and give those items `profile = :$name` where they need this profile"
+    ))
+    p = section(path, tbl, name, PROFILE_KEYS, label)
+    args = string_list(path, p, "julia_args", label)
+    vars = get(Dict{String, Any}, p, "env")
+    (vars isa AbstractDict && all(v -> v isa Union{AbstractString, Real}, values(vars))) || throw(ConfigError(
+        "`env` of [$label] in $(relpath_or_path(path)) must be a table of variables, as in " *
+            "`env = { NAME = \"value\" }`, got $(repr(vars))"
+    ))
+    env = Pair{String, String}[string(k) => string(v) for (k, v) in vars]
+    sort!(env; by = first)
+    shares = get(p, "monorepo_default", false)
+    shares isa Bool || throw(ConfigError(
+        "`monorepo_default` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(shares))"
+    ))
+    prof = Profile(
+        Symbol(name), args,
+        haskey(p, "threads") ? threads_spec("threads", p["threads"]; where_ = " of [$label] in $(relpath_or_path(path))") : "",
+        env,
+        parse_expr(path, name, "init", string_setting(path, p, "init", label)),
+        parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
+        profile_preferences(path, name, get(p, "preferences", "")), "", ""
+    )
+    return prof, shares
+end
+
+same_file(a::AbstractString, b::AbstractString) = !isempty(b) && isfile(a) && isfile(b) && samefile(a, b)
+
+# A package's profiles with those its workspace shares: a shared profile that the
+# package does not declare is its own too, and one that it declares with the same
+# `init` and `test_end`, as code, runs that code where the shared one runs it. One
+# with another `init` or `test_end` stays the package's alone.
+function share_profiles!(profiles::Dict{Symbol, Profile}, shared::SharedProfiles)
+    for (name, s) in shared.profiles
+        own = get(profiles, name, nothing)
+        if own === nothing
+            profiles[name] = s
+        elseif same_code(own.init, s.init) && same_code(own.test_end, s.test_end)
+            profiles[name] = Profile(own.name, own.julia_args, own.threads, own.env, s.init, s.test_end,
+                                     own.preferences, own.environment, s.dir)
+        end
+    end
+    return profiles
+end
+
+# The directory the `init` of `prof` runs in, for a package whose root is `root`.
+init_dir(prof::Profile, root::AbstractString) = isempty(prof.dir) ? String(root) : prof.dir
+
+# Whether two expressions are the same code, wherever and however each was written.
+same_code(a::Expr, b::Expr) = Base.remove_linenums!(deepcopy(a)) == Base.remove_linenums!(deepcopy(b))
+
+"""
+    shared_profiles(path, toml, workspace) -> SharedProfiles
+
+The profiles that the configuration file `path` of the root of `workspace` marks
+`monorepo_default = true`, with `workspace` as the directory their `init` runs in. Only
+those are read: the rest of the file is the root's own, which its own runs check.
+"""
+function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
+    out = Dict{Symbol, Profile}()
+    tbl = get(Dict{String, Any}, toml, "profiles")
+    tbl isa AbstractDict || return SharedProfiles(String(path), out)
+    for (name, given) in tbl
+        (given isa AbstractDict && get(given, "monorepo_default", false) === true) || continue
+        prof, _ = parse_profile(path, tbl, name)
+        out[prof.name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end,
+                                 prof.preferences, prof.environment, String(workspace))
+    end
+    return SharedProfiles(String(path), out)
+end
+
+# The profiles that the workspace of the package at `root` shares with its packages:
+# none for a package in no workspace, and `nothing` before Julia 1.12, whose packages
+# are in none.
+function package_shared_profiles(root::AbstractString)
+    @static if isdefined(Base, :base_project)
+        project = project_file(root)
+        project === nothing && return NO_SHARED_PROFILES
+        outer = outermost_workspace(project)
+        haskey(parse_project(outer), "workspace") || return NO_SHARED_PROFILES
+        workspace = realpath(dirname(outer))
+        # As TOML only: what else the file holds is the root's to check.
+        path = joinpath(workspace, "test", "TestItems.toml")
+        isfile(path) || return SharedProfiles(path, Dict{Symbol, Profile}())
+        toml = try
+            TOML.parsefile(path)
+        catch e
+            throw(ConfigError("could not parse $(relpath_or_path(path)), which holds the profiles the workspace " *
+                              "shares: $(sprint(showerror, e))"))
+        end
+        return shared_profiles(path, toml, workspace)
+    else
+        return nothing
+    end
+end
+
 # The profile as its workers start: with its own `--threads`, or the run's when it
 # sets none.
 run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
-    Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment) :
+    Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment,
+            prof.dir) :
     prof
+
+# What a worker gets when it starts, and so what makes the workers of two profiles
+# interchangeable: everything but the name and `test_end`, which runs after each item.
+start_configuration(prof::Profile) =
+    (prof.julia_args, prof.threads, prof.env, prof.init, prof.preferences, prof.environment)
 
 # The profile as its workers start in the environment of the directory `environment`,
 # or in the test environment when it is empty.
 in_environment(prof::Profile, environment::AbstractString) =
-    Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, prof.preferences, String(environment))
+    Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, prof.preferences,
+            String(environment), prof.dir)
 
 """
     read_groups(path, toml) -> Dict{String, TagExpr}

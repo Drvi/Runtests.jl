@@ -192,7 +192,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
         @testset "the directory given is the workspace root" begin
             ws = make_workspace("A" => ["test/a_test.jl" => one_item("a")])
             err = try find_participants(joinpath(ws, "lib", "A")); nothing catch e; e end
-            @test err isa ArgumentError && occursin("is a member of the workspace at $ws", slashed(err.msg))
+            @test err isa ArgumentError && occursin(slashed("is a member of the workspace at $ws"), slashed(err.msg))
             # Without one, the workspace of the active project, a test project's too.
             active = Base.active_project()
             try
@@ -218,7 +218,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             rel = replace(relpath(beside, ws), '\\' => '/')
             ws = make_workspace("A" => ["test/a_test.jl" => one_item("a")]; members = [rel, "$rel/test"])
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("lists $(repr(rel)), which is outside the workspace at $ws", slashed(err.msg))
+            @test err isa ConfigError && occursin(slashed("lists $(repr(rel)), which is outside the workspace at $ws"), slashed(err.msg))
         end
 
         @testset "a package whose test project is not in the workspace stops the run, naming both fixes" begin
@@ -309,7 +309,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         (1, "must be package names or directories"),
                     )
                     err = try find_participants(ws; packages); nothing catch e; e end
-                    @test err isa ArgumentError && occursin(says, slashed(err.msg))
+                    @test err isa ArgumentError && occursin(slashed(says), slashed(err.msg))
                 end
             end
         end

@@ -48,6 +48,8 @@ end
 
 `init` runs once in each worker of the profile, before the first item. `test_end` runs after each attempt at an item that was not skipped, a failed attempt before its retry too. Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
 
+`init` runs at the top level of `Main` of the worker. Under `workers = 0`, the `init` of the default profile runs in `Main` of the process that calls `runtests`, and the run warns about it. Items run in modules of their own, and do not see what `init` defines or imports. Thus `init = "using Plots"` loads Plots before the first item, and an item that uses Plots must still import it. `test_end` runs in a new module of its own, with `Test` and the package in scope. It does not see the variables of the item. [Where code runs](@ref where-code-runs) gives the details.
+
 ## Preferences
 
 `preferences` names a TOML file, relative to the configuration file. The file must exist. Its contents go over the `LocalPreferences.toml` of a temporary copy of the environment of the item. Runtests precompiles separately for the preferences of each profile.

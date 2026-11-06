@@ -117,6 +117,28 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
+    @testset "an included test file runs each of its items, as a pasted item runs" begin
+        with_activated(DEPS) do _
+            file = joinpath(mktempdir(), "included_tests.jl")
+            write(file, """
+            @testitem "included first" begin
+                @test TestDeps.pick([3, 4]) == 3
+            end
+            @testitem "included second" begin
+                total = 0
+                for i in 1:3
+                    total += i
+                end
+                @test total == 6 && @isdefined(Test)
+            end
+            """)
+            ts, out = capture_run(() -> include(file))
+            @test state_of(ts) === PASSED
+            @test occursin("included first", out) && occursin("included second", out)
+            @test count("· DONE", out) == 2
+        end
+    end
+
     @testset "skip is honoured, literally and as an expression" begin
         with_activated(DEPS) do _
             static, _ = capture_run() do

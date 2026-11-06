@@ -69,7 +69,7 @@ Keywords come between the name and `begin`. The [syntax reference](@ref testitem
 
 Each keyword except `skip` must be a literal. Arithmetic on numeric literals is also a literal, for example `timeout = 5*60`. An incorrect value is an error. For example, `timeout = true` is not one second.
 
-`skip` can be any expression. The worker evaluates it before the body, with `Test` and the package in scope, but before the imports of the body. It must give a `Bool`. An exception or a value of another type is an error of the item.
+`skip` can be any expression. The worker evaluates it before the body, in a module of its own, with `Test` and the package in scope. The imports of the body are not in scope yet, and the body does not see what `skip` defines. It must give a `Bool`. An exception or a value of another type is an error of the item.
 
 ### Retries, chains and sandboxes
 
@@ -80,6 +80,8 @@ The items of a profile share the workers of that profile, and of every profile w
 ## How the body runs
 
 The body of an item runs at the top level of a new module, with the soft scope of the REPL. Thus `x = 1` followed by a loop that changes `x` works as it does at the prompt. As in a script, the variables of the body are untyped globals.
+
+On a worker, the body runs in the root of its package. Under `workers = 0`, it runs in the current directory of the process that calls `runtests`, which is `test/` under `Pkg.test`. To read a file next to the test file, build its path from `@__DIR__`, the directory of the test file. [Where code runs](@ref where-code-runs) gives the module and the directory of each piece of code.
 
 !!! warning
     Put code whose speed or allocations a test measures inside a function or a `let` block. In the body, the measurement includes the access to the untyped globals.
@@ -97,7 +99,7 @@ end
 
 When the item ends, the run releases what its nonconstant globals refer to. An item that registers [failure-artifact producers](@ref evidence) retains the values they need through `test_end` and artifact collection. A `const` keeps its value for as long as the worker runs.
 
-## Items on one worker
+## [Items on one worker](@id items-on-one-worker)
 
 A worker runs one item at a time, and runs many items one after the other. Later items on that worker can see changes to `ENV`, the global logger and loaded packages. A working-directory change can persist when an item runs directly in the worker's directory. In a [combined run](@ref monorepos), an item of a member package below the workspace root temporarily enters that package's root and restores the worker's directory afterward; a root-package item can leave it changed. Restore process state that an item changes, with `withenv` or `try` and `finally`. If an item cannot restore it, give the item `sandbox = true`.
 

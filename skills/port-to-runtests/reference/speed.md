@@ -2,15 +2,13 @@
 
 Only after parity holds (SKILL.md, step 8), and only when the user wants it.
 
-A run takes about as long as the larger of two figures: its longest item, and its
-total item time divided by the number of workers. Startup comes on top: the test
-environment, precompiling setups, and starting workers. Runtests already starts the
-longest items first. Splitting pays only when one item is longer than a worker's
-share of the total.
+A long item or chain can limit its pool's completion, but worker startup, compilation,
+recent failures, explicit order and other pools also affect the run. Measure the
+items and pool that hold up the actual run before predicting whether a split helps.
 
-Measure from the second run on. The first run has no recorded durations, so it
-schedules blind: two ported suites took 54 s and 60 s on their first runs, and 33 s
-on later ones.
+If no history exists, the first run uses typical duration estimates and may schedule
+differently. Compare repeated runs under matching conditions; report cold and warm
+times separately.
 
 Each item's time is on its `DONE` line (`PASS · 12.4s (98% compile)`), and in the run
 state whose path the run prints at the end:
@@ -24,14 +22,13 @@ for (item, st) in first(rows, 10)
 end
 ```
 
-In many Julia suites most of an item's time is compilation. That decides where a
-split pays:
+When compilation dominates an item's time, use that evidence to choose a split:
 
-- Split along what compiles separately: element types, input types, configurations
-  that take different code paths. Each part then compiles only its own code.
-- Do not split along what shares compiled code, such as values of one type, or the
-  same functions called with other inputs. Every part would compile the same code,
-  and the run gets slower.
+- Try splitting along code that compiles separately: element types, input types or
+  configurations that take different code paths. Measure whether the parts finish
+  sooner together.
+- Splitting values that share compiled code may repeat compilation and increase
+  total work. Keep them together unless a measurement shows a benefit.
 - A worker keeps what it compiled for the items it runs later. That is why Runtests
   runs neighbouring items of a file on the same worker.
 
@@ -57,6 +54,6 @@ Ways to split:
 - A long item with sections becomes an item per section. Code the sections share
   moves into a setup, or is repeated in each section if it is cheap.
 
-After splitting, check parity again, and compare at least two runs on each side,
-from the second run on. Keep a split only if the run got faster, or if the user wants
+After splitting, check parity again and compare repeated runs under matching
+conditions. Keep a split when measured run time improves or when the user wants
 failures to name their case.

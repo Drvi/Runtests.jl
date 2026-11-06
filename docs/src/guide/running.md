@@ -86,6 +86,8 @@ The `retries` setting controls additional attempts within one run. [Configure ru
 
 `workers = 0` runs the items in the process that calls `runtests`, one after the other. An item that needs a process of its own still gets one. These are items with `sandbox = true`, items that run under a profile other than `default`, and items in an environment directory. The run starts a process for each such item or chain, stops it afterwards, and lists these items. A chain shares that process through its members and retries unless the process is lost.
 
+The items in this process run in its current directory, which is `test/` under `Pkg.test`. The `init` of the default profile runs once in `Main` of this process, before the first item, and the run warns about it. The items that get a process of their own run in the root of the package. [Where code runs](@ref where-code-runs) gives the details.
+
 Items that run in the caller's process, their profile hooks and their artifact producers have no enforceable timeout: there is no separate process to stop. Items that get a worker keep their timeouts. Coverage needs workers, so `workers = 0` with `coverage = true` is an error.
 
 ## What a run returns

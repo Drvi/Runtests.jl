@@ -33,6 +33,8 @@ Commit the expansion. An installed package needs it to run `Pkg.test()`. When th
 
 `chores` runs the loops in a separate process, with the test environment and the setups available. The loop sees `Test`, the package under test, and the packages that the body imports, by the name of the module only. In the example, the loop writes `Dates.Day`. The item writes `Day`, because its body has `using Dates`.
 
+The loop runs in a module named `Template`, in the current directory of the process that calls `chores`. To read a file in the loop, build its path from `@__DIR__`, the directory of the template.
+
 The loop does not see the names that `using Dates` exports. Put a list that several templates share in a [setup](setups.md), and refer to it by a qualified name, such as `MySetups.PERIODS`. The body must import that setup.
 
 ## Interpolation

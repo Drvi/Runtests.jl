@@ -729,6 +729,79 @@ end
                 @test whys(copied)["c"] == "new"
             end
         end
+
+        @testset "pruning never changes what the runs say about an item the suite has" begin
+            # Random histories: runs of random sets of items, with random outcomes,
+            # durations and seeds; runs of the whole suite, some stopped early; runs of
+            # another machine; an old run still going; and an edit of two items halfway.
+            # `e` runs seldom and `f` only in the first runs, so old runs hold their facts.
+            # Whatever pruning deletes, each item of the suite keeps its latest verdict
+            # and when, the seed of a failure, its newest duration and source hash, and
+            # whether the newest run to select it stopped before it.
+            P = Runtests.Private
+            names = ["a", "b", "c", "d", "e", "f"]
+            source(edited) = join(("@testitem \"$n\" begin\n    @test $(edited && n in ("a", "b") ? "1 + 1 == 2" : "true")\nend\n"
+                                   for n in names))
+            outcomes = (PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, P.CANCELLED)
+            rate(name, n) = name == "f" ? (n <= 3 ? 0.9 : 0.0) : name == "e" ? 0.1 : 0.4
+            pkg = make_pkg("Facts", "test/t_test.jl" => source(false))
+            # What a run, or `runtestsf`, reads of the items of `suite`.
+            function observed(suite)
+                h = history(pkg)
+                return (facts = P.kept_facts(P.item_facts(P.project_runs(pkg)), suite),
+                        failing = Dict(n => f.seed for (n, f) in P.failing_facts(pkg; names = suite)),
+                        seconds = filter(((n, _),) -> n in suite, h.seconds),
+                        hashes = filter(((n, _),) -> n in suite, h.hashes),
+                        urgent = intersect(Set(keys(h.failed)), suite),
+                        stopped = intersect(h.cancelled, suite),
+                        known = intersect(h.known, suite))
+            end
+            for trial in 1:8
+                rng = Random.Xoshiro(trial)
+                write(joinpath(pkg, "test", "t_test.jl"), source(false))
+                with_runstate_dir() do dir
+                    withenv("RUNTESTS_HOST" => "here") do
+                        nruns = keep + rand(rng, 4:16)
+                        elsewhere = String[]
+                        live = nothing
+                        for n in 1:nruns
+                            n == nruns ÷ 2 && write(joinpath(pkg, "test", "t_test.jl"), source(true))
+                            whole = rand(rng) < 0.25
+                            chosen = filter(x -> rand(rng) < rate(x, n), names)
+                            isempty(chosen) && push!(chosen, rand(rng, names))
+                            p, _ = prepare((pkg,); name = whole ? nothing : Set(chosen), seed = rand(rng, UInt64),
+                                           announce = false)
+                            other = rand(rng) < 0.15
+                            path = record_in(dir, string(1_000_000 + n, "-1"))
+                            rsf = withenv(() -> init_run_state(path, p), "RUNTESTS_HOST" => other ? "elsewhere" : "here")
+                            other && push!(elsewhere, path)
+                            for i in 1:nitems(p)
+                                p.items.name[i] in chosen || continue
+                                write_status!(rsf, i, rand(rng, outcomes), 1, 1; elapsed = Float64(rand(rng, 1:9)))
+                            end
+                            if n == 3 && !other
+                                live = (path, rsf)
+                            else
+                                finish_run_state!(rsf; cancelled = whole && rand(rng) < 0.5)
+                            end
+                        end
+                        suite = Set(filter(_ -> rand(rng) < 0.75, names))
+                        ours = [f for (f, rs) in P.project_runs(pkg) if P.recorded_here(rs)]
+                        before, files = observed(suite), runstate_files(pkg)
+                        prune_runstates(pkg; names = suite)
+                        left = runstate_files(pkg)
+                        @test observed(suite) == before
+                        # Only this machine's runs beyond its newest go, and never one still going.
+                        @test issubset(setdiff(files, left), ours[1:max(0, end - keep)])
+                        @test issubset(elsewhere, left)
+                        live === nothing || @test first(live) in left
+                        # What it keeps beyond those holds a fact: a second pass deletes nothing.
+                        @test isempty(P.prunable_runstates(pkg; names = suite))
+                        live === nothing || finish_run_state!(last(live))
+                    end
+                end
+            end
+        end
     end
 
     @testset "a run keeps its items' logs beside its run state, for as long as the run state" begin
@@ -773,6 +846,31 @@ end
             end
             prune_runstates(pkg; names = Set(p.items.name))
             @test !isfile(path) && !isdir(logs)
+        end
+    end
+
+    @testset "an item's log and failure report are in its run's directory, in this process, on a worker and in a sandbox" begin
+        pkg = make_pkg("LogsEverywhere", "test/t_test.jl" => """
+            @testitem "fails here" begin
+                println("printed here")
+                @test 1 == 2
+            end
+            @testitem "fails alone" sandbox=true begin
+                println("printed alone")
+                @test 1 == 3
+            end
+            """)
+        for workers in (0, 1)
+            with_runstate_dir() do _
+                (_, run, p), _ = capture_run(() -> run_states(pkg; workers, logs = :issues, monitor = false))
+                dir = Runtests.Private.rundata_dir(run.runstate.path)
+                for (name, printed, expression) in (("fails here", "printed here", "1 == 2"),
+                                                    ("fails alone", "printed alone", "1 == 3"))
+                    i = findfirst(==(name), p.items.name)
+                    @test occursin(printed, read(joinpath(dir, "item_$(i)_1.log"), String))
+                    @test occursin(expression, read(joinpath(dir, "item_$(i)_1.failure.txt"), String))
+                end
+            end
         end
     end
 

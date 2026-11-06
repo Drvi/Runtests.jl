@@ -104,6 +104,14 @@ end)
             # This machine's newest twenty stay, however old the others are.
             @test prunable_runstates(dir; names = Set(["one"])) == recorded[3:4]
             @test prunable_runstates(dir) == recorded[3:4]
+            # Chores says how many run states other machines recorded, and their size,
+            # and deletes none of them.
+            _, out = chores_out(dir; dry_run = true)
+            @test occursin(r"run states of other machines: 1 from 1 machine, \d+[KMG], which this machine never deletes", out)
+            done, out = chores_out(dir)
+            @test done === true
+            @test runstate_files(dir) == [recorded[1:2]; recorded[5:end]]
+            @test occursin("run states of other machines: 1 from 1 machine", out)
         end
     end
 

@@ -328,6 +328,40 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         end
     end
 
+    @testset "the loop runs in a module of its own, in the caller's directory, and `@__DIR__` is the template's" begin
+        # Where the loop runs, as the code in a `$(...)` of its keywords sees it: for one
+        # package's `chores`, and for each package of `chores_mono`.
+        template(notes) = """
+            @testtemplate "where \$n" skip = \$(begin write(joinpath($(repr(notes)), string(getpid(), "-", time_ns())), string(@__MODULE__, "\\n", pwd(), "\\n", @__DIR__)); false end) for n in 1:1
+                @test true
+            end
+            """
+        seen(notes) = [split(read(f, String), '\n') for f in readdir(notes; join = true)]
+        elsewhere = mktempdir()
+        notes = mktempdir()
+        pkg = make_pkg("LoopWhere", "test/other_test.jl" => PLAIN_ITEM,
+                       "test/testtemplates/where_tests_template.jl" => template(notes))
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            ok, _ = cd(() -> template_chores(pkg), elsewhere)
+            @test ok === true
+            module_name, dir, file_dir = only(seen(notes))
+            @test module_name == "Main.Template"
+            @test samefile(dir, elsewhere)
+            @test samefile(file_dir, joinpath(pkg, "test", "testtemplates"))
+        end
+        if VERSION >= v"1.12"
+            notes = mktempdir()
+            ws = e2e_workspace("A" => ["test/other_test.jl" => PLAIN_ITEM,
+                                       "test/testtemplates/where_tests_template.jl" => template(notes)])
+            ok, _ = with_runstate_dir(_ -> cd(() -> capture_run(() -> Runtests.chores_mono(ws)), elsewhere))
+            @test ok === true
+            module_name, dir, file_dir = only(seen(notes))
+            @test module_name == "Main.Template"
+            @test samefile(dir, elsewhere)
+            @test samefile(file_dir, joinpath(ws, "lib", "A", "test", "testtemplates"))
+        end
+    end
+
     @testset "chores leaves a template it cannot expand to a person and writes nothing for it" begin
         templates = [
             "throws" => "@testtemplate \"x \$T\" for T in error(\"no list today\")\n    @test true\nend\n",

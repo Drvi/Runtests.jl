@@ -306,13 +306,36 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
     stale = prunable_runstates(target.root; names)
     if isempty(stale)
         println(io, ", none to delete")
-        return 0
+    else
+        # Another process may be reading one, or have deleted it, already.
+        fix && foreach(remove_runstate, stale)
+        println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete", ": beyond the newest ",
+                KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not")
     end
-    # Another process may be reading one, or have deleted it, already.
-    fix && foreach(remove_runstate, stale)
-    println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete", ": beyond the newest ",
-            KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not")
+    print_other_machines(io, target.root)
     return length(stale)
+end
+
+# The project's run states that other machines recorded, which no deletion on this
+# machine touches: how many, from how many machines, and what their directories hold.
+function print_other_machines(io::IO, root::AbstractString)
+    others = [(get(rs.meta, "host", ""), f) for (f, rs) in project_runs(root) if !recorded_here(rs)]
+    isempty(others) && return nothing
+    machines = length(unique(first.(others)))
+    bytes = sum(((_, f),) -> dir_bytes(rundata_dir(f)), others)
+    println(io, "run states of other machines: ", length(others), " from ", plural(machines, "machine"), ", ",
+            fmt_bytes(bytes), ", which this machine never deletes")
+    return nothing
+end
+
+# The bytes of the files under `dir`, as far as they can be read: another process
+# may delete them meanwhile.
+function dir_bytes(dir::AbstractString)
+    total = 0
+    for (root, _, files) in walkdir(dir; onerror = _ -> nothing), f in files
+        total += filesize(joinpath(root, f))
+    end
+    return total
 end
 
 # Deletes, under `fix`, the run states of checkouts that are gone; their number. Only

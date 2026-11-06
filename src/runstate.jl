@@ -1112,7 +1112,9 @@ of_project(rs::RunStateRecord, project::AbstractString) = get(rs.meta, "project_
 The run states that pruning deletes, oldest first, at the end of a run and in
 `chores` alike: of those this machine recorded for this project, beyond the newest
 `keep`, each whose deletion changes no fact of an item of `names`, the suite's items
-(see [`removable_runs`](@ref)). One recorded elsewhere, a CI artifact downloaded
+(see [`removable_runs`](@ref)). That is the invariant of every deletion here: what
+the run states say about each item of the suite (`kept_facts`) is the same after it
+as before, so a run state that holds such a newest fact is never among these. One recorded elsewhere, a CI artifact downloaded
 into the directory say, one of another project, and one that cannot be read are
 never among them: nothing shows they are ours. Nor is one still being written
 (`is_live`), by a run that started long before the newest `keep`.

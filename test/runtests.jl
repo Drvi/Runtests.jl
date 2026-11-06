@@ -50,6 +50,7 @@ const TEST_FILES = [
     "test_pkgtest.jl",
     "test_testenv.jl",
     "test_monorepo.jl",
+    "test_where_code_runs.jl",
     "test_output.jl",
     "test_shared_runstates.jl",
     "test_templates.jl",

@@ -95,7 +95,7 @@ const MATRIX_STATES = Dict(
 # session as well.
 const MATRIX_WORKERS = unique((0, 1, max(2, Threads.nthreads())))
 const MATRIX_THREADS = ("1", "2,1")
-const MATRIX_LOGS = (:eager, :issues, :batched)
+const MATRIX_LOGS = (:eager, :issues, :batched, :quiet)
 
 # `Test` prints an absolute path; the run's own lines print one relative to the
 # project. Both end the same way.
@@ -246,9 +246,20 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
             end
 
             @testset "what an item printed is shown when the mode says so" begin
-                # A failing item's output is always worth seeing.
-                @test occursin("stdout from matrix fails", out)
-                @test occursin("warning from matrix errors", out)
+                if logs === :quiet
+                    # Nothing that an item printed, only the failures: what the items
+                    # printed stays in the run's logs.
+                    @test !occursin("stdout from matrix fails", out)
+                    @test !occursin("warning from matrix errors", out)
+                    @test !occursin("Captured logs", out)
+                    @test occursin("Test Failed at " * MATRIX_FILE, out)
+                    i = findfirst(==("matrix fails"), run.plan.items.name)
+                    @test occursin("stdout from matrix fails", read(Runtests.Private.item_log(run, i, 1), String))
+                else
+                    # A failing item's output is always worth seeing.
+                    @test occursin("stdout from matrix fails", out)
+                    @test occursin("warning from matrix errors", out)
+                end
                 if logs === :issues
                     # Only the items with something wrong say what they printed.
                     @test !occursin("stdout from matrix passes", out)
@@ -260,7 +271,7 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                     @test occursin("stdout from matrix passes", out)
                     @test occursin("info from matrix passes", out)
                     @test occursin("┌ Captured logs", out)
-                else
+                elseif logs === :eager
                     # Relayed as it happened, so there is nothing to print after.
                     @test occursin("stdout from matrix passes", out)
                     @test occursin("info from matrix passes", out)

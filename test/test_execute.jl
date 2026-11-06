@@ -738,3 +738,132 @@ end
         end
     end
 end
+
+# What a run returns, what it allows alongside it, and what an item draws, in the
+# other ways a suite runs: in this process, and across the packages of a workspace.
+@testset "a run in this process and a combined run behave as one on workers" begin
+    outside(f) = Runtests.Private.without_enclosing_testset() do
+        try
+            f()
+        catch e
+            e
+        end
+    end
+    passing(name) = "@testitem $(repr(name)) begin\n    @test true\nend\n"
+    failing(name) = "@testitem $(repr(name)) begin\n    @test 1 == 2\nend\n"
+    combined = VERSION >= v"1.12"
+
+    @testset "a run returns a RunTestSet, and throws outside a testset when an item did not pass" begin
+        with_runstate_dir() do _
+            ts, _ = capture_run(() -> outside(() -> Runtests.runtests(BASICPKG; workers = 0, logs = :issues, monitor = false)))
+            @test ts isa Runtests.RunTestSet
+            err, _ = capture_run(() -> outside(() -> Runtests.runtests(FAULTY; workers = 0, tags = :fail, logs = :issues,
+                                                                       monitor = false)))
+            @test err isa Test.TestSetException
+            if combined
+                ws = e2e_workspace("A" => ["test/a_test.jl" => passing("a")], "B" => ["test/b_test.jl" => failing("b")])
+                ts, _ = capture_run(() -> outside(() -> Runtests.runtests_mono(ws; packages = ["A"], workers = 1,
+                                                                                logs = :issues, monitor = false)))
+                @test ts isa Runtests.RunTestSet
+                err, _ = capture_run(() -> outside(() -> Runtests.runtests_mono(ws; workers = 1, logs = :issues,
+                                                                                 monitor = false)))
+                @test err isa Test.TestSetException
+            end
+        end
+    end
+
+    @testset "failfast stops a run in this process before the items after the failure" begin
+        dir = make_pkg("FailfastHere", "test/t_test.jl" => failing("first fails") * passing("never starts"))
+        with_runstate_dir() do _
+            (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, failfast = true, logs = :issues,
+                                                             monitor = false))
+            @test states["first fails"] === FAILED
+            @test states["never starts"] in (UNSEEN, CANCELLED)
+        end
+    end
+
+    @testset "under workers = 0 a chain runs in order, in this process or in one process of its own" begin
+        with_journal() do jdir
+            dir = make_pkg("ChainsHere",
+                "test/TestItems.toml" => "[profiles.named]\nenv = { CHAIN_PROFILE = \"1\" }\n",
+                "test/t_test.jl" => join([journal_item("here one"; opts = "chain=:here"),
+                                          journal_item("here two"; opts = "chain=:here"),
+                                          journal_item("apart one"; opts = "chain=:apart profile=:named"),
+                                          journal_item("apart two"; opts = "chain=:apart profile=:named")]))
+            with_runstate_dir() do _
+                (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+                @test all(==(PASSED), values(states))
+            end
+            rows = journal(jdir)
+            pid(name) = only(r.pid for r in rows if r.name == name)
+            order(a, b) = [r.name for r in rows if r.name in (a, b)]
+            @test pid("here one") == pid("here two") == getpid()
+            @test order("here one", "here two") == ["here one", "here two"]
+            @test pid("apart one") == pid("apart two") != getpid()
+            @test order("apart one", "apart two") == ["apart one", "apart two"]
+        end
+    end
+
+    if combined
+        @testset "a combined run holds the process as a run does, against either kind of call" begin
+            ws = e2e_workspace("A" => ["test/a_test.jl" => "@testitem \"waits\" begin\n    sleep(5)\n    @test true\nend\n"])
+            pkg = make_pkg("BusyOther", "test/b_test.jl" => passing("b"))
+            with_runstate_dir() do _
+                # The run's output is captured while it runs, this task's included: what
+                # this task finds is tested once the run is over.
+                running = Threads.@spawn capture_run(() -> outside(() -> Runtests.runtests_mono(ws; workers = 1,
+                                                                                                 logs = :issues,
+                                                                                                 monitor = false)))
+                started = timedwait(() -> Runtests.Private.RUN_ACTIVE[], 120.0)
+                errs = [outside(() -> Runtests.runtests(pkg; workers = 1)), outside(() -> Runtests.runtests_mono(ws)),
+                        outside(() -> Runtests.chores_mono(ws; dry_run = true))]
+                ts, _ = fetch(running)
+                @test started === :ok
+                for err in errs
+                    @test err isa ConfigError && occursin("already at work in this process", err.msg)
+                end
+                @test ts isa Runtests.RunTestSet
+                @test !Runtests.Private.RUN_ACTIVE[]
+            end
+        end
+
+        @testset "every item draws from the run's seed, whatever ran before it, across packages too" begin
+            with_journal() do jdir
+                draw(name) = "@testitem $(repr(name)) begin\n" *
+                             "    write(joinpath(ENV[\"RUNTESTS_JOURNAL\"], $(repr(name)) * \"-\" * string(time_ns())), " *
+                             "string(rand(UInt64)))\nend\n"
+                ws = e2e_workspace("A" => ["test/a_test.jl" => draw("a one") * draw("a two")],
+                                   "B" => ["test/b_test.jl" => draw("b one")])
+                with_runstate_dir() do _
+                    capture_run(() -> run_mono(ws; workers = 1, seed = 7, logs = :issues, monitor = false))
+                    capture_run(() -> run_mono(ws; workers = 2, seed = 7, name = "a two", logs = :issues, monitor = false))
+                end
+                draws(prefix) = [read(f, String) for f in readdir(jdir; join = true) if startswith(basename(f), prefix)]
+                @test length(draws("a two-")) == 2 && allequal(draws("a two-"))
+                @test only(draws("a one-")) != first(draws("a two-"))
+            end
+        end
+
+        @testset "a retry runs on the same worker, and its package's run state counts both attempts" begin
+            flaky = """
+            @testitem "flaky" retries=1 begin
+                marker = joinpath(ENV["RUNTESTS_JOURNAL"], "flaky")
+                again = isfile(marker)
+                touch(marker)
+                @test again
+            end
+            """
+            ws = e2e_workspace("A" => ["test/a_test.jl" => flaky], "B" => ["test/b_test.jl" => passing("b")])
+            with_journal() do _
+                with_runstate_dir() do _
+                    (states, run, p), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+                    @test states[("A", "flaky")] === PASSED && states[("B", "b")] === PASSED
+                    @test occursin("retrying on the same worker (retry 1 of 1)", out)
+                    a = Runtests.Private.read_run_state(run.runstate.files[findfirst(==("A"), p.packages.name)].path)
+                    st = a.statuses[findfirst(it -> it.name == "flaky", a.items)]
+                    @test st.state === PASSED && st.attempt == 2
+                end
+            end
+        end
+    end
+end

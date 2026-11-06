@@ -257,3 +257,43 @@ end
         end
     end
 end
+
+@testset "a timeout holds where there is a process to stop" begin
+    # In the calling process (`workers = 0`) nothing can stop an item, so one runs past
+    # its timeout and keeps its own verdict. A sandboxed item gets a worker of its own
+    # even there, and its timeout holds.
+    dir = make_pkg("TimeoutHere", "test/t_test.jl" => """
+    @testitem "overruns here" timeout=1 begin
+        sleep(2.5)
+        @test true
+    end
+    @testitem "overruns alone" timeout=1 sandbox=true begin
+        sleep(60)
+        @test true
+    end
+    """)
+    with_runstate_dir() do _
+        (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+        @test states["overruns here"] === PASSED
+        @test states["overruns alone"] === TIMEDOUT
+    end
+
+    if VERSION >= v"1.12"
+        # In a combined run, the item of one package is stopped on its worker, the items
+        # of every package run on, and only that package's run state has the verdict.
+        ws = e2e_workspace(
+            "A" => ["test/a_test.jl" => "@testitem \"overruns\" timeout=2 begin\n    sleep(60)\n    @test true\nend\n" *
+                                        "@testitem \"a passes\" begin\n    @test true\nend\n"],
+            "B" => ["test/b_test.jl" => "@testitem \"b passes\" begin\n    @test true\nend\n"])
+        with_runstate_dir() do _
+            (states, run, p), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+            @test states == Dict(("A", "overruns") => TIMEDOUT, ("A", "a passes") => PASSED, ("B", "b passes") => PASSED)
+            @test occursin("· KILL", out)
+            record(name) = Runtests.Private.read_run_state(run.runstate.files[findfirst(==(name), p.packages.name)].path)
+            a, b = record("A"), record("B")
+            @test a.statuses[findfirst(it -> it.name == "overruns", a.items)].state === TIMEDOUT
+            @test [it.name for it in b.items] == ["b passes"]
+            @test all(st -> st.state === PASSED, b.statuses)
+        end
+    end
+end

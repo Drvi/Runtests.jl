@@ -1,8 +1,9 @@
 # Shared machinery for the tests that run a whole suite: building a throwaway
 # package, running it, and reading back what happened and what was printed.
 
-using Runtests.Private: prepare, execute, exclusively, report, nitems
+using Runtests.Private: prepare, execute, exclusively, report, nitems, prepare_mono, Target
 using Runtests: RuntestsWorkers
+using TOML: TOML
 
 # Fixture packages are written to a tempdir rather than checked in when their
 # content is the thing under test: a profile, a broken layout, an item that has to
@@ -15,11 +16,6 @@ function next_uuid()
     return string("1a2b3c4d-0000-4000-8000-", lpad(PKG_SERIAL[], 12, '0'))
 end
 
-"""
-    make_pkg(name, "test/a_test.jl" => content, ...) -> dir
-
-A package directory holding `name`, plus the given files written relative to it.
-"""
 # The record of run `stem` in the run state directory `dir`, as a run writes it: in a
 # directory of the run's own.
 record_in(dir::AbstractString, stem::AbstractString) = joinpath(dir, stem * ".rundata", "run.runstate")
@@ -28,6 +24,11 @@ record_in(dir::AbstractString, stem::AbstractString) = joinpath(dir, stem * ".ru
 records_in(dir::AbstractString) =
     sort!(filter!(isfile, [joinpath(dir, d, "run.runstate") for d in readdir(dir) if endswith(d, ".rundata")]))
 
+"""
+    make_pkg(name, "test/a_test.jl" => content, ...) -> dir
+
+A package directory holding `name`, plus the given files written relative to it.
+"""
 function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractString}...)
     dir = mktempdir()
     write(joinpath(dir, "Project.toml"),
@@ -41,6 +42,103 @@ function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractS
         write(path, content)
     end
     return dir
+end
+
+# A package `name` in `dir`: its source, a test project that depends on it, on Test
+# and on `deps`, and `files`, relative to `dir`.
+function write_package(dir::AbstractString, name::AbstractString, files; uuid = next_uuid(), test_project = true,
+                       deps = String[])
+    mkpath(joinpath(dir, "src"))
+    write(joinpath(dir, "Project.toml"), "name = $(repr(name))\nuuid = $(repr(uuid))\nversion = \"0.1.0\"\n")
+    write(joinpath(dir, "src", name * ".jl"), "module $name\nend\n")
+    mkpath(joinpath(dir, "test"))
+    test_project && write(joinpath(dir, "test", "Project.toml"),
+        "[deps]\n$name = $(repr(uuid))\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n" *
+        join("$d = $(repr(next_uuid()))\n" for d in deps) * "\n[sources]\n$name = {path = \"..\"}\n")
+    for (rel, content) in files
+        path = joinpath(dir, rel)
+        mkpath(dirname(path))
+        write(path, content)
+    end
+    return dir
+end
+
+toml_list(v) = string("[", join(repr.(v), ", "), "]")
+
+"""
+    make_workspace(packages...; root, layout, outside, members) -> workspace root
+
+A workspace in a fresh directory. Each of `packages`, a name and its files, is a
+package under `lib/`. The root is the package `Root` with `root` as its files, or no
+package when `root === nothing`. With `layout = :flat`, the root's `[workspace]`
+lists each package and its test project; with `:nested`, it lists each package, and
+the package's own `[workspace]` lists its test project. A package in `outside` keeps
+its test project out of the workspace. `members` are more directories to list.
+"""
+function make_workspace(packages::Pair{String}...; root = (), layout = :flat, outside = String[], members = String[],
+                        deps = Dict{String, Vector{String}}())
+    ws = realpath(mktempdir())
+    listed = String[]
+    for (name, files) in packages
+        dir = write_package(joinpath(ws, "lib", name), name, files; deps = get(deps, name, String[]))
+        push!(listed, "lib/$name")
+        name in outside && continue
+        if layout === :flat
+            push!(listed, "lib/$name/test")
+        else
+            open(io -> print(io, "\n[workspace]\nprojects = [\"test\"]\n"), joinpath(dir, "Project.toml"), "a")
+        end
+    end
+    if root === nothing
+        write(joinpath(ws, "Project.toml"), "")
+    else
+        write_package(ws, "Root", root)
+        push!(listed, "test")
+    end
+    append!(listed, members)
+    open(io -> print(io, "\n[workspace]\nprojects = $(toml_list(listed))\n"), joinpath(ws, "Project.toml"), "a")
+    return ws
+end
+
+# Runtests in each package's test project, by path, as a workspace that runs
+# `runtests_mono` has it; `"."` is the root package's.
+function with_runtests_dep!(ws, names)
+    for name in names
+        path = joinpath(ws, name == "." ? "" : joinpath("lib", name), "test", "Project.toml")
+        t = TOML.parsefile(path)
+        t["deps"]["Runtests"] = "632efd68-cd41-4e05-bd25-b86dc2150078"
+        get!(Dict{String, Any}, t, "sources")["Runtests"] = Dict("path" => pkgdir(Runtests))
+        open(io -> TOML.print(io, t), path, "w")
+    end
+    return ws
+end
+
+# A workspace that runs `runtests_mono`: `make_workspace`'s, with Runtests in every
+# test project, and the packages in `isolated` listed as isolated.
+function e2e_workspace(packages::Pair{String}...; isolated = String[], root = nothing, kwargs...)
+    ws = make_workspace(packages...; root, kwargs...)
+    with_runtests_dep!(ws, [collect(String, first.(packages)); root === nothing ? String[] : ["."]])
+    mkpath(joinpath(ws, "test"))
+    isempty(isolated) || open(io -> print(io, "\n[monorepo]\nisolated = ", toml_list(isolated), "\n"),
+                              joinpath(ws, "test", "TestItems.toml"), "a")
+    return ws
+end
+
+# A combined run of the workspace at `ws`: each item's state by package and name, the
+# run, and the plan.
+function run_mono(ws; on_item = nothing, kwargs...)
+    return exclusively() do
+        r = prepare_mono((ws,); announce = false, kwargs...)
+        p = r.plan
+        run = execute(p, Target(p.root, joinpath(p.root, "Project.toml"), joinpath(p.root, "test"), String[], Int32(0));
+                      on_item)
+        try
+            states = Dict((p.packages.name[p.items.package[i]], p.items.name[i]) => run.statuses.state[i] for i in 1:nitems(p))
+            return states, run, p
+        finally
+            rm(run.scratch; force = true, recursive = true)
+        end
+    end
 end
 
 # A `--check-bounds` setting other than this process's, for a profile whose julia

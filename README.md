@@ -202,9 +202,10 @@ work without the test environment having to declare `Test` itself.
 
 Every keyword except `skip` must be a literal; arithmetic on numeric literals,
 such as `timeout=5*60`, is also accepted. Invalid values are rejected:
-`timeout=true` is not one second. `skip` runs before the body's imports, with
-`Test` and the package in scope. It must return a `Bool`; an exception or any other
-result is reported as an item error.
+`timeout=true` is not one second. `skip` runs before the body's imports, in a
+module of its own, with `Test` and the package in scope. The body does not see what
+it defines. It must return a `Bool`; an exception or any other result is reported
+as an item error.
 
 A retry uses the same worker unless the worker timed out or crashed, or the item
 uses `sandbox=true`. A chain retries from its first item. The items of a profile
@@ -217,7 +218,10 @@ An item's body runs at the top level of a fresh module, with the REPL's soft sco
 script, its variables are untyped globals, so code whose speed or allocations a
 test measures belongs inside a function or a `let`. When the item ends, what its
 globals refer to is let go, so a large fixture does not stay in the worker; a
-`const` keeps its value for as long as the worker lives.
+`const` keeps its value for as long as the worker lives. On a worker, the body runs
+in its package's root. Under `workers=0` it runs in the caller's current directory,
+which is `test/` under `Pkg.test`, so build file paths from `@__DIR__`, the test
+file's directory.
 
 ### Test setups
 
@@ -281,9 +285,11 @@ Edit the template and rerun `Runtests.chores()` when the cases change.
 #### Scope and interpolation
 
 Expansion runs in a separate process with the test environment and setups
-available. The loop sees `Test`, the package under test, and packages imported by
-the body **by module name only**. In this example, the loop uses `Dates.Day`;
-the item can use `Day` after `using Dates`. Shared lists belong in a setup module,
+available, in the current directory of the process that calls `chores`. Build file
+paths in the loop from `@__DIR__`, the template's directory. The loop sees `Test`,
+the package under test, and packages imported by the body **by module name only**.
+In this example, the loop uses `Dates.Day`; the item can use `Day` after
+`using Dates`. Shared lists belong in a setup module,
 referenced by a qualified name such as `MySetups.PERIODS`.
 
 | Location | Meaning |
@@ -410,6 +416,9 @@ be in the same environment.
 A profile's `init` runs once per worker before its items; `test_end` runs after
 each attempt at an item that was not skipped. Each has its own timeout, separate
 from the item's budget. Failures in `test_end` count toward the item's result.
+`init` runs at the top level of the worker's `Main`, which items do not see: it can
+load a package before the first item, but an item that uses the package still
+imports it. `test_end` runs in a module of its own, without the item's variables.
 Profiles whose workers start the same way, the same flags, threads, variables,
 `init`, preferences and environment, share workers: profiles that differ only in
 `test_end` share them, and each item runs the `test_end` of its own profile.
@@ -1012,21 +1021,28 @@ Runs are ordered by their recorded start time, regardless of filename or when a
 record was downloaded. Each item's latest completed verdict determines whether
 it is failing, and its latest recorded duration informs scheduling.
 
-Runtests keeps this machine's newest 20 records. It keeps an older record while
-its deletion would change what the records say about an item the suite has: its
-latest verdict and when it was recorded, the seed of a failure, its newest duration
-and source hash, or whether the newest run that selected it stopped before it. An
-item the suite no longer has stays on record, for a branch that still has it, and
-keeps no record beyond the newest 20. A record's directory, with its logs, is
-deleted with it, and only with it. Records of a deleted project are removed 30 days after its newest run,
+Runtests keeps this machine's newest 20 records, and every run still in progress.
+It never deletes an older record that holds the newest fact about an item the suite
+has: its latest verdict and when it was recorded, the seed of a failure, its newest
+duration and source hash, or whether the newest run that selected it stopped before
+it. Each item holds back at most four records, so what a project keeps is bounded
+by the size of its suite. An item the suite no longer has stays on record, for a
+branch that still has it, and keeps no record beyond the newest 20. A record's
+directory, with its logs, is deleted with it, and only with it.
+
+A checkout is one copy of a project on disk. Its records are in a directory of
+their own, named for a hash of its path. `Runtests.chores()` deletes this machine's
+records of a checkout whose path no longer exists 30 days after its newest run,
 unless its parent directory is missing or empty, as with an unmounted drive. A
-project in the system's temporary files has no such wait. A run looks for deleted
-projects at most once a day.
+checkout in the system's temporary files has no such wait. A run does not look for
+deleted checkouts.
 
 The machine identity is `RUNTESTS_HOST` when it is set. Otherwise it is the name
 macOS gives the machine, which stays the same when the hostname follows the
 network, and the hostname elsewhere. Records from other machines are never changed
-or deleted. Replay performs no pruning and never deletes the supplied record.
+or deleted. `Runtests.chores()` reports how many the project has, from how many
+machines, and their size. Replay performs no pruning and never deletes the supplied
+record.
 
 Runtests reads only records in its own format. A run warns once about records of
 another version of Runtests, and leaves them alone.

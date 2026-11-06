@@ -1,6 +1,6 @@
 # [Syntax](@id syntax)
 
-This page gives the exact syntax of test files, test items, test templates and tag expressions. [Write test items](@ref writing) and [Generate test items from a template](@ref templates) explain how to use them.
+This page gives the exact syntax of test files, test items, test templates and tag expressions. It also tells [where each piece of code runs](@ref where-code-runs). [Write test items](@ref writing) and [Generate test items from a template](@ref templates) explain how to use them.
 
 ## File names
 
@@ -46,7 +46,7 @@ The name is a string literal that is not blank. It must be unique across the sui
 
 Each value except the value of `skip` must be a literal. Arithmetic on numeric literals is a literal too, for example `timeout = 5*60`. `sandbox = true` and `chain` cannot go together. `sandbox = true` and `profile` combine. All items of one chain must use the same profile and be in the same environment. `sandbox = :name` is an error that tells you to write `profile = :name`.
 
-The `skip` expression runs on the worker, with `Test` and the package in scope, before the imports of the body. An exception in it, or a value that is not a `Bool`, is an error of the item.
+The `skip` expression runs on the worker, in a module of its own, with `Test` and the package in scope, before the imports of the body. An exception in it, or a value that is not a `Bool`, is an error of the item.
 
 ### The body
 
@@ -98,3 +98,32 @@ tag         = one or more characters that are not white space, "!", "&", "|", ":
 | `"a && b \|\| c"` | The items with `a` and `b`, or with `c`. |
 
 The `tags` keyword also takes a symbol, which selects the items with that tag. A vector of symbols selects the items with all of its tags. An expression that names a tag that no item of the suite carries is an error.
+
+## [Where code runs](@id where-code-runs)
+
+The process that calls `runtests` or `chores` parses test files and templates, and does not evaluate them. Their code, and the code of a profile, runs in these places:
+
+| Code | Process | When | Module | Names in scope |
+|:-----|:--------|:-----|:-------|:---------------|
+| `init` of a profile | Each worker of the profile, and under `workers = 0` the process that calls `runtests` for the default profile | Once, before the first item of the process | `Main` of the process | The names in `Main` |
+| `skip` of an item | The process of the item | Before the body | A new module | `Test` and the package |
+| Body of an item | The process of the item | After `skip` | A new module, with the soft scope of the REPL | `Test`, the package and the imports of the body |
+| `test_end` of a profile | The process of the item | After each attempt that was not skipped | A new module | `Test` and the package |
+| Producer of `Runtests.on_failure` | The process of the item | After the verdict of an attempt that failed | The module of the item | The names of the item, with their values at that time |
+| Loop of a template, and each `$(...)` in its keywords | A process that `chores` starts, with the test environment | Once for each iteration | A module named `Template` | `Test`, the package and the packages that the body imports, by module name only |
+
+Each piece of code can import any package of the environment of its process. On a worker, that is the test environment, or the environment directory of the item over the test environment. Thus `init` and `test_end` can import every test dependency. An `init` that imports a package of one environment directory fails on the workers of the other environments of its profile.
+
+Names do not pass from one piece of code to another, but the process stays the same. A package that one piece loads stays loaded for the next, and a method that one piece adds to a function stays added. [Items on one worker](@ref items-on-one-worker) describes this.
+
+Each new module is a module in `Main`, but it does not see the names in `Main`. Thus an item does not see what `init` defines or imports. An item can reach a value that `init` defines as `Main.name`. An `init` such as `using Plots` loads the package before the first item, but does not put it in the scope of the items. An item that uses the package must import it.
+
+`skip`, the body and `test_end` do not share names. The body does not see what `skip` defines, and `test_end` does not see the variables of the body. `skip` and the body both start from the seed of the item, so the first `rand()` gives the same value in each. What `skip` prints goes to the log of the item.
+
+### The working directory
+
+On a worker, the code of an item runs in the root of its package. This is true for `skip`, the body, the `test_end` of the profile and the producers. `init` runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles).
+
+Under `workers = 0`, an item runs in the process that calls `runtests`, in the current directory of that process. Under `Pkg.test`, that directory is `test/`. The `init` of the default profile runs there too, once, in `Main` of that process, and the run warns about it. Some items need a process of their own, for a sandbox, a profile or an environment directory. Such an item still runs on a worker, in the root of its package.
+
+The loop of a template runs in the current directory of the process that calls `chores`. To read a file, build its path from `@__DIR__`. In the body of an item and in a template, `@__DIR__` is the directory of the file that holds the code, in every process.

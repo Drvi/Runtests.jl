@@ -4,7 +4,7 @@ This page tells you how to convert a suite that uses `Test.jl` testsets, ReTestI
 
 ## The port, step by step
 
-A port rewrites the suite as test items, and changes no test. It then shows that the ported suite runs the same tests, with the same outcomes, as the original. The Runtests repository has a [guide for coding agents](https://github.com/Drvi/Runtests.jl/blob/main/skills/port-to-runtests/SKILL.md) that does a port in this way. A person can follow it too. Its steps are:
+A port rewrites the suite as test items while preserving what each test checks. It then compares the ported suite's checks and outcomes with the original under comparable conditions. The Runtests repository has a [guide for coding agents](https://github.com/Drvi/Runtests.jl/blob/main/skills/port-to-runtests/SKILL.md) that does a port in this way. A person can follow it too. Its steps are:
 
 1. Make an environment outside the repository that has Runtests.
 2. Record what the suite does now: run it as CI does, and count each test and each outcome.
@@ -14,8 +14,6 @@ A port rewrites the suite as test items, and changes no test. It then shows that
 6. Put shared helpers in `test/testsetups/` and source or package fixtures in `test/testfixtures/`. Port the tests of a nested environment in place: they run in that environment. Check each remaining Julia file against the [test-directory rules](writing.md); do not hide tests to make discovery pass.
 7. Run `Runtests.chores()`, then the suite.
 8. Show that the numbers of passed, failed, errored and broken tests did not change.
-
-Before you run Runtests on a copy of a package, set `RUNTESTS_RUNSTATE_DIR` to a scratch directory. A copy has the identity of the package. Without the variable, the runs of the copy go into the run history of the package.
 
 ## The conversion scripts
 
@@ -48,15 +46,15 @@ A test item runs in a different way from a testset. These differences can change
 | Topic | In a testset | In a test item |
 |:------|:-------------|:---------------|
 | Scope | The body is a local scope, with typed local variables. | The body runs at the top level of a module, with soft scope, and its variables are untyped globals. Put code that measures speed or allocations in a `let` block or a function. |
-| Main | Every file ran in `Main`, in one process, in order. Each file saw what earlier files defined. | Each item has its own module, on one of several workers, in any order. Import what each item uses, in the item or in a setup. |
-| State | A variable, file or value that one testset left reached the testsets after it. | Items share only setups and the process of their worker. Make each item build what it needs, or put dependent items in one `chain`. |
-| Process | Changes to `ENV`, the logger, the working directory or the loaded packages lasted until the suite ended. | Items on a worker run one after the other, and see what earlier items changed. Restore changes, or use `sandbox = true`. |
-| Printed types | Types printed without their module, where `Main` imported it. | `Main` imports nothing, so messages print types with their module, for example `FixedPointDecimals.FixedDecimal{Int64, 100}`. |
+| Main | In a plain include-based suite, files ran in `Main` in order and could see earlier definitions. SafeTestsets may already isolate them. | Each item has its own module, on one of several workers, in any order. Import what each item uses, in the item or in a setup. |
+| State | A variable, file or value that one testset left could reach the next. | Each item has a fresh module, so build its own values or use a setup. A `chain` keeps items in order on one worker for intentional process or file state; it does not share item variables. |
+| Process | In a plain include-based suite, changes to `ENV`, the logger, the working directory or the loaded packages lasted until the suite ended. | Items on a worker run one after the other, and see what earlier items changed. Restore changes, or use `sandbox = true`. |
+| Printed types | Types printed without their module, where `Main` imported it. | `Main` imports nothing, unless the `init` of a profile imports a package there. Thus messages print types with their module, for example `FixedPointDecimals.FixedDecimal{Int64, 100}`. |
 | Random numbers | A `Random.seed!` in `runtests.jl` decided every draw. | Each item draws from the seed of the run combined with its name. An item that expects values from a fixed seed calls `Random.seed!` itself. |
-| Threads | The process had the threads that `julia` started with, usually 1. | Workers start with `--threads=2,1`. Set `threads` under `[run]`, or use a profile. |
+| Threads | The process had the threads that `julia` started with; record the count. | Workers use `--threads=2,1` by default. Set `threads` under `[run]`, or use a profile. |
 | Setup code | Helper code at the top of a file ran when the file was included. | Top-level setup code runs when its precompile cache is built or rebuilt. Per-process initialization belongs in `__init__`. All items on a worker share the globals of the setup. See [test setups](setups.md). |
 | Paths | `@__DIR__` named the helper's directory. | Moving a helper into a setup changes its directory. Check its paths against the [setup path rules](@ref setup-paths). In an item, `@__DIR__` and `include` are relative to the test file. |
-| Parallel runs | Testsets ran one at a time. | Items run at the same time. A path that two items can write to becomes a `mktempdir()`. |
+| Parallel runs | Plain include-based Test.jl testsets ran one at a time. | Items can overlap. Give independent items separate temporary paths; preserve intentional shared paths with explicit ordering. |
 | Crashes | An `exit()` or a crash ended the suite. | It ends only that worker. The item counts as an error, and the run continues. |
 
 ## Rules for a port

@@ -16,8 +16,8 @@ Runtests.chores()                # do the changes, and report what remains
 1. It converts the [setups](setups.md) into packages, and adds the packages that they started to import.
 2. It expands the [templates](templates.md), and deletes the expansions whose templates are gone.
 3. It reads the test items and `test/TestItems.toml`, and reports each problem that stops a run. Examples are a syntax error, a name that two items use and an incorrect value. Other examples are an `[order]` entry that names no item, an unknown profile, and a group with a tag that no item carries.
-4. It deletes the run states that a run deletes when it prunes, by the same [retention rules](@ref retention), together with the directories of their runs.
-5. If the project keeps its run states in the default location, it deletes the run states of checkouts that no longer exist, with their directories.
+4. It deletes the run states that a run deletes when it prunes, by the same [retention rules](@ref retention), together with the directories of their runs. If other machines recorded run states of the project, it reports how many, from how many machines, and their size.
+5. If the project keeps its run states in the default location, it deletes the run states of [deleted checkouts](@ref deleted-checkouts), with their directories.
 
 `chores` never changes a test item, a configuration file or an expansion that a person edited. It never deletes a run state of another machine, for example of CI, or a run state that this version of Runtests cannot read.
 

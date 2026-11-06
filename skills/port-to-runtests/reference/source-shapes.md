@@ -1,10 +1,9 @@
 # Suite shapes and how each ports
 
-Most suites are plain Test.jl. Either `runtests.jl` includes files of top-level
-testsets, or it holds the testsets itself. Some wrap each file in `@safetestset`.
-Some switch on `GROUP` or `ARGS`, and many also run Aqua or JET. Hardly any are
-already made of items. Very few files are already named `*_test.jl`, so expect to
-rename every file.
+Inspect `test/runtests.jl` and the files it runs before converting. A plain Test.jl
+suite may include files of top-level testsets or hold the testsets itself. Other
+suites wrap files in `@safetestset`, switch on `GROUP` or `ARGS`, run Aqua or JET,
+or already use test items. The file names determine which ones need renaming.
 
 ## Testsets in files that runtests.jl includes
 
@@ -26,10 +25,11 @@ load.
 ## Testsets in runtests.jl itself
 
 The converter ports them into a file named for the package and lists the move as
-`moved runtests.jl -> my_pkg_tests.jl`. Make that move with `git mv` first, so that
-the tests' history follows them, then copy in the ported file and the new
-`runtests.jl`. Code that ran but held no tests, such as a loop calling `Pkg.test`, is
-dropped and listed; port it by hand (see "Downstream tests" below).
+`moved runtests.jl -> my_pkg_tests.jl`. Apply the reviewed file move and the new
+`runtests.jl`, then check the diff. Git detects renames by content similarity;
+`git mv` is not needed and stages the move. Code that ran but held no tests, such as
+a loop calling `Pkg.test`, is dropped and listed; preserve it by hand (see
+"Downstream tests" below).
 
 ## SafeTestsets
 
@@ -128,8 +128,9 @@ one to one, ask the user.
 ## Downstream tests
 
 A loop such as `for pkg in ["CodecZlib", "CodecXz"]; Pkg.test(pkg); end` runs other
-packages' suites against this one. Ask the user whether these stay. If they do, they
-become one item tagged `:downstream`, with the loop as it was:
+packages' suites against this one. Preserve it when it ran in the baseline. It can
+stay after `runtests()` in `test/runtests.jl`, retaining its original order, or
+become one item tagged `:downstream` when independent scheduling is appropriate:
 
 ```julia
 # test/downstream_tests.jl
@@ -176,12 +177,14 @@ The items carry over. What changes around them:
 | `default_imports = false`, `_id = …` | remove: `Test` and the package are always imported |
 | items in `src/`; files named `*-test.jl` | move them into test files under `test/`, named `*_test.jl` or `*_tests.jl` |
 
-A `@testsetup` ran once in each worker. A setup module is precompiled, so its
-top-level code runs once per machine, at precompilation: SKILL.md, step 4, item 3 applies. Test
-files hold only `@testitem`s, so move every `@testsetup` out of them.
+A `@testsetup` ran once in each worker. A setup module's top-level code runs when
+its precompile cache is built or rebuilt, and its `__init__` runs when it loads:
+SKILL.md, step 4, item 3 applies. Test files hold only `@testitem`s, so move every
+`@testsetup` out of them.
 
-`scripts/port_retestitems.jl` makes the changes in this table that are the same in
-every suite: the setups, `setup = [...]`, a quoted `skip`, `default_imports` and `_id`.
+`scripts/port_retestitems.jl` makes the changes in this table for files it scans:
+the setups, `setup = [...]`, a quoted `skip`, `default_imports` and `_id`. It skips
+nested environment directories, whose suites need a separate pass.
 A setup moves from the directory of its old file to `testsetups/`, so the script also
 rewrites each `@__DIR__` in it to name the old directory.
 

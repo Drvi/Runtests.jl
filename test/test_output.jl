@@ -296,7 +296,7 @@ using Runtests: RuntestsWorkers
         @test !occursin("Captured logs", text)
         @test !occursin("some output before the failure", text)
         @test !occursin("something looked wrong", text)
-        logs = [joinpath(d, f) for (d, _, fs) in walkdir(runs) for f in fs if endswith(d, ".logs")]
+        logs = [joinpath(d, f) for (d, _, fs) in walkdir(runs) for f in fs if endswith(d, ".rundata") && endswith(f, ".log")]
         @test any(f -> occursin("some output before the failure", read(f, String)), logs)
     end
 

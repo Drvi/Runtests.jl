@@ -33,7 +33,7 @@ end
             @test states["kills its worker"] === ERRORED
             @test occursin("died while running \"kills its worker\": exited with code 7", out)
             @test occursin("the worker running this item died: exited with code 7", out)
-            rs = read_run_state(only(filter(endswith(".runstate"), readdir(dir; join=true))))
+            rs = read_run_state(only(records_in(dir)))
             down = only(e for e in rs.events if e.kind === :worker_down)
             @test down.ended_by in (:connection_lost, :process_exit)
             @test (down.exitcode, down.signal) == (7, 0)

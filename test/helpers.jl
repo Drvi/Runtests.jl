@@ -20,6 +20,14 @@ end
 
 A package directory holding `name`, plus the given files written relative to it.
 """
+# The record of run `stem` in the run state directory `dir`, as a run writes it: in a
+# directory of the run's own.
+record_in(dir::AbstractString, stem::AbstractString) = joinpath(dir, stem * ".rundata", "run.runstate")
+
+# The records in the run state directory `dir`, oldest first.
+records_in(dir::AbstractString) =
+    sort!(filter!(isfile, [joinpath(dir, d, "run.runstate") for d in readdir(dir) if endswith(d, ".rundata")]))
+
 function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractString}...)
     dir = mktempdir()
     write(joinpath(dir, "Project.toml"),

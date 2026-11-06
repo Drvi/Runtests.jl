@@ -86,10 +86,10 @@ The import check reads the code as it is written. It does not see an import that
 
 A combined run writes one run state for each package, in the run state directory of that package. Each run state holds only the items of its package. Thus `runtestsf()` in a package runs the failures of that package from the combined run, and the next run of the package plans with the durations of the combined run.
 
-The closing block gives one line for each package: its items, those that did not pass, and the path of its run state. To replay a combined run, give the path of the run state of any of its packages:
+The closing block gives one line for each package: its items, those that did not pass, and the directory of its run. To replay a combined run, give the directory of the run of any of its packages:
 
 ```julia
-Runtests.runtests_mono(; replay = "/path/to/a.runstate")
+Runtests.runtests_mono(; replay = "/path/to/the.rundata")
 ```
 
 The replay finds the run states of the other packages of the run. It runs their items again with their configuration and seeds. When the run state of a package is gone, the replay runs the other packages and says that it is a partial replay.

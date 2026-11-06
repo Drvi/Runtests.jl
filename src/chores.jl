@@ -22,9 +22,8 @@ Look after a package's suite: do what needs no person, then say what does.
   expansions' stamps instead and runs nothing. An expansion edited by hand, and a
   test file in a template's way that `chores` did not write, are left to a person.
 - run states: this machine's are pruned as a run prunes them, the same ones and no
-  others (see `prunable_runstates`), with their logs; and those of a format
-  older than any this version reads are deleted. One recorded elsewhere, a CI
-  artifact say, and one that cannot be read otherwise are never deleted.
+  others (see `prunable_runstates`), with their logs. One recorded elsewhere, a CI
+  artifact say, and one that cannot be read are never deleted.
 - checkouts that are gone: when the project keeps its run states in the default
   location, the run states there of every checkout that no longer exists, as
   `sweep_runstate_dirs` finds them, the directories that held them with them.
@@ -295,8 +294,7 @@ function chore_setups!(io::IO, target, fix::Bool)
     return (length(pending), 0)
 end
 
-# Deletes, under `fix`, the run states pruning would, and those of an older format;
-# their number.
+# Deletes, under `fix`, the run states pruning would; their number.
 function chore_runstates!(io::IO, target, fix::Bool, names)
     files = runstate_files(target.root)
     print(io, "run states: ")
@@ -304,23 +302,15 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
     print(io, length(files), " in ")
     printstyled(io, relpath_or_path(runstate_dir(target.root)); color = :light_black)
     stale = prunable_runstates(target.root; names)
-    old = old_format_runstates(target.root)
-    if isempty(stale) && isempty(old)
+    if isempty(stale)
         println(io, ", none to delete")
         return 0
     end
     # Another process may be reading one, or have deleted it, already.
-    fix && foreach(remove_runstate, [stale; old])
-    said = String[]
-    isempty(stale) || push!(said, string(
-        length(stale), " of this machine's ", fix ? "deleted" : "to delete",
-        ": beyond the newest ", KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not"
-    ))
-    isempty(old) || push!(said, string(
-        length(old), " of an older format, which this version of Runtests does not read, ", fix ? "deleted" : "to delete"
-    ))
-    println(io, ", ", join(said, "; "))
-    return length(stale) + length(old)
+    fix && foreach(remove_runstate, stale)
+    println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete", ": beyond the newest ",
+            KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not")
+    return length(stale)
 end
 
 # Deletes, under `fix`, the run states of checkouts that are gone; their number. Only

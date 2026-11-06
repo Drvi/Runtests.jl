@@ -5,8 +5,8 @@ name: CI ergonomics
 # with the README's recipe for CI: `julia-runtest`, the run-state cache, and
 # `RUNTESTS_ARTIFACT_DIR` uploaded as an artifact. Then it starts over from what it
 # saved, as the next job or a person would: the artifact downloaded and the cache
-# restored, and checks the run state, the logs, each failed attempt's evidence, the
-# cache, and the failing items run again from the download.
+# restored, and checks the run's directory, its run state and its logs, each failed
+# attempt's evidence, the cache, and the failing items run again from the download.
 
 on:
   push:
@@ -36,13 +36,13 @@ jobs:
           version: '1'
       - uses: julia-actions/cache@v2
       # Every cache step names the same path: a cache is found by its key and by its paths,
-      # and a restore that names other paths misses it. The run states are named rather
-      # than their directory less the logs: the cache archives a directory it is given
+      # and a restore that names other paths misses it. Each run's record is named, rather
+      # than its directory less the logs: the cache archives a directory it is given
       # whole, whatever an exclusion says.
       - name: Restore the run states of earlier runs
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/runtests/*.runstate
+          path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fakeci-runstates-
       - name: Run the fake suite, whose tests fail on purpose
@@ -66,7 +66,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/runtests/*.runstate
+          path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload this run's run state, logs and evidence
         if: ${{ !cancelled() }}
@@ -89,7 +89,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/runtests/*.runstate
+          path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
           fail-on-cache-miss: true
       - name: Instantiate the fake suite's test environment

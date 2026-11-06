@@ -14,10 +14,10 @@ Runtests.chores()                # do the changes, and report what remains
 1. It converts the [setups](setups.md) into packages, and adds the packages that they started to import.
 2. It expands the [templates](templates.md), and deletes the expansions whose templates are gone.
 3. It reads the test items and `test/TestItems.toml`, and reports each problem that stops a run. Examples are a syntax error, a name that two items use and an incorrect value. Other examples are an `[order]` entry that names no item, an unknown profile, and a group with a tag that no item carries.
-4. It deletes the run states that a run deletes when it prunes, by the same [retention rules](@ref retention), together with their logs. In the default per-project directory, it also deletes records whose format is older than any this version reads. It preserves newer formats and skips old-format deletion when `RUNTESTS_RUNSTATE_DIR` is set.
+4. It deletes the run states that a run deletes when it prunes, by the same [retention rules](@ref retention), together with the directories of their runs.
 5. If the project keeps its run states in the default location, it deletes the run states of checkouts that no longer exist, with their directories.
 
-`chores` never changes a test item, a configuration file or an expansion that a person edited. Normal retention preserves readable run states from other machines, for example CI. Old-format cleanup cannot use that host information; it removes obsolete records in the default per-project directory regardless of their origin.
+`chores` never changes a test item, a configuration file or an expansion that a person edited. It never deletes a run state of another machine, for example of CI, or a run state that this version of Runtests cannot read.
 
 A package without test files has nothing to read in step 3. An example is a fixture package in the `test/testfixtures/` of another package.
 
@@ -54,6 +54,7 @@ Runtests.chores(config = ["ci.toml", "nightly.toml"])
 │ test items: 3 in 1 file, all valid
 │ config: none
 │ run states: 5 in ~/.julia/runtests/runs/Geometry-…, none to delete
+│ checkouts that are gone: none with run states to delete
 └ done: 1
 ```
 

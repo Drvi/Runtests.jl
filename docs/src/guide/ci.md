@@ -48,12 +48,14 @@ steps:
 
 Runtests plans each run from the run states of earlier runs. On CI, each job starts on a new machine, so the job must restore the run states of earlier jobs. Cache the run states between jobs. Upload the run states and logs of each job as an artifact.
 
+Each run keeps its run state and its logs in a directory of its own, `<run>.rundata`. The run state is the file `run.runstate` in that directory.
+
 This example is for a matrix with `os`, `version` and `group`:
 
 ```yaml
 - uses: actions/cache/restore@v4
   with:
-    path: ${{ runner.temp }}/runtests/*.runstate
+    path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
     restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
@@ -65,7 +67,7 @@ This example is for a matrix with `os`, `version` and `group`:
 - uses: actions/cache/save@v4
   if: always()
   with:
-    path: ${{ runner.temp }}/runtests/*.runstate
+    path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
@@ -76,22 +78,22 @@ This example is for a matrix with `os`, `version` and `group`:
 
 The example uses these variables:
 
-- `RUNTESTS_RUNSTATE_DIR` is the directory of the run states.
+- `RUNTESTS_RUNSTATE_DIR` is the directory that holds the directories of the runs.
 - `RUNTESTS_HOST` is the name of the machine in the run states.
-- `RUNTESTS_ARTIFACT_DIR` is a directory into which each run copies its run state and its logs when it ends. The run also copies them after a failure or an interrupt.
+- `RUNTESTS_ARTIFACT_DIR` is a directory into which each run copies its own directory when it ends. The run also copies it after a failure or an interrupt.
 
 ### The cache
 
 The cache holds the run states and not the logs, because the next job plans from the run states only. Use these rules for the cache:
 
-- Name the run states with `*.runstate` in `path`.
+- Name the run states with `*.rundata/run.runstate` in `path`. The cache then holds each run's directory with the run state only.
 - Give the restore step and the save step the same `path`. The cache finds an entry by its key and by its paths. A restore with other paths does not find the entry.
 - Use a unique key for each run, and `restore-keys` to get the most recent cache.
 - Save the cache also when the tests fail, with `if: always()`. Then the next job sees those failures.
 - Put each dimension of the matrix in the key. Two jobs of one workflow run with the same key both save, and the cache keeps only one of them.
 
 !!! warning
-    Do not exclude the logs with a pattern such as `!**/*.logs` in `path`. The cache archives a directory as a whole, and the exclusion has no effect.
+    Do not name the directories, `*.rundata`, in `path` with a pattern such as `!**/*.log` to exclude the logs. The cache archives a directory as a whole, and the exclusion has no effect.
 
 In a monorepo, each job can test one package with the `project` input of `julia-runtest`. Then add the package to the key and to the name of the artifact, as the example adds the group.
 
@@ -101,13 +103,13 @@ A stable `RUNTESTS_HOST` makes the restored run states part of the normal [reten
 
 ### [The artifact](@id ci-artifact)
 
-The artifact holds the run states, logs and [failure evidence](@ref evidence) of this job, and none of the history. On your machine, run the failures of a downloaded run state:
+The artifact holds the directory of this job's run: its run state, its logs and its [failure evidence](@ref evidence). It holds none of the history. On your machine, run the failures of a downloaded run again:
 
 ```julia
-Runtests.runtestsf(replay = "path/to/the.runstate")
+Runtests.runtestsf(replay = "path/to/the.rundata")
 ```
 
-When items fail, the closing block of the run prints this command with the name of the copied run state.
+When items fail, the closing block of the run prints this command with the name of the copied directory.
 
 `if: failure()` uploads nothing when a retry passes. To also keep the evidence of a failed attempt that a later attempt repaired, use `if: always()`.
 

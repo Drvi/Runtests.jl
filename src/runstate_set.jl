@@ -148,7 +148,7 @@ function open_runstate_set(p::Plan, start::Float64, runid::AbstractString)
             init_run_state(path, plans[k]; start, meta)
         catch e
             is_interrupt(e) && rethrow()
-            path === nothing || rm(path; force = true)
+            path === nothing || remove_runstate(path)
             @warn "Runtests: could not open a run state file for $(p.packages.name[k]); continuing without one" exception = e
             nothing
         end

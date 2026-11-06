@@ -1,14 +1,15 @@
 # Checks what a CI run of the fake suite, `test/testfixtures/FakeCI.jl`, left for a person
 # to download, and that it works the way the README says it does:
 #
-# - the artifact `RUNTESTS_ARTIFACT_DIR` filled: one run state and its logs, nothing else;
+# - the artifact `RUNTESTS_ARTIFACT_DIR` filled: the run's directory, which holds its run
+#   state and its logs, and nothing else;
 # - the run state: every item, its verdict and its attempts;
 # - the logs: what failing items printed, and the failure report of each failed attempt;
 # - the evidence of each failed attempt, `Runtests.artifacts_dir()` and `Runtests.on_failure`,
 #   a retry's failed attempt among them, with collection errors and timeouts reported beside
 #   it in paths that hold wherever the bundle is unpacked;
 # - the run-state cache for the next job, which leaves the logs out;
-# - the failing items run again from the downloaded run state, `Runtests.runtestsf(replay =
+# - the failing items run again from the downloaded run's directory, `Runtests.runtestsf(replay =
 #   ...)`, with the same verdicts and the random numbers they drew on CI.
 #
 #     julia --project=test/testfixtures/FakeCI.jl/test .github/scripts/verify_fake_run.jl <artifact> <run states>
@@ -71,7 +72,9 @@ isdir(ARTIFACT) || error("no artifact directory at $(repr(ARTIFACT)); give it as
 # A missing run-state directory is what a cache that was not restored leaves, which the
 # checks of the cache report; the rest is checked all the same.
 
-logs_of(runstate) = string(chopsuffix(runstate, ".runstate"), ".logs")
+# The runs' directories, `<run>.rundata`, in `dir`: each holds the run's record,
+# `run.runstate`, and its logs.
+runs_in(dir) = filter(endswith(".rundata"), readdir(dir; join = true))
 read_or_empty(path) = isfile(path) ? read(path, String) : ""
 # Files compared as text, whatever line endings the runner wrote them with.
 text(path) = replace(read_or_empty(path), "\r\n" => "\n")
@@ -79,11 +82,11 @@ text(path) = replace(read_or_empty(path), "\r\n" => "\n")
 # Everything a record says of each item, by name.
 items_of(rs) = Dict(it.name => (k, string(st.state), Int(st.attempt)) for (k, (it, st)) in enumerate(zip(rs.items, rs.statuses)))
 
-const RUNSTATE = let found = filter(endswith(".runstate"), readdir(ARTIFACT; join = true))
-    length(found) == 1 || error("the artifact holds $(length(found)) run states, where it should hold one: $(readdir(ARTIFACT))")
+const RUNDATA = let found = runs_in(ARTIFACT)
+    length(found) == 1 || error("the artifact holds $(length(found)) runs, where it should hold one: $(readdir(ARTIFACT))")
     only(found)
 end
-const LOGS = logs_of(RUNSTATE)
+const RUNSTATE = joinpath(RUNDATA, "run.runstate")
 const RECORD = Runtests.read_run_state(RUNSTATE)
 RECORD === nothing && error("$(RUNSTATE) does not read as a run state")
 const ITEMS = items_of(RECORD)
@@ -93,7 +96,7 @@ const ITEMS = items_of(RECORD)
 const REPLAYED = mktempdir()
 const REPLAY_ERROR = withenv("RUNTESTS_RUNSTATE_DIR" => REPLAYED, "RUNTESTS_ARTIFACT_DIR" => nothing) do
     try
-        Runtests.runtestsf(FAKECI; replay = RUNSTATE)
+        Runtests.runtestsf(FAKECI; replay = RUNDATA)
         nothing
     catch e
         e
@@ -107,16 +110,16 @@ isempty(summary) || open(summary, "a") do io
     println(io, "### FakeCI run on ", get(RECORD.meta, "host", "?"), "\n")
     println(io, "| item | verdict | attempt | evidence |\n|:--|:--|:--|:--|")
     for (name, (k, state, attempt)) in sort!(collect(ITEMS); by = x -> first(last(x)))
-        kept = [a for a in 1:attempt if isdir(joinpath(LOGS, "item_$(k)_$(a).artifacts"))]
+        kept = [a for a in 1:attempt if isdir(joinpath(RUNDATA, "item_$(k)_$(a).artifacts"))]
         println(io, "| ", name, " | ", state, " | ", attempt, " | ",
                 isempty(kept) ? "" : join(("item_$(k)_$(a).artifacts" for a in kept), ", "), " |")
     end
 end
 
 @testset "a CI run of FakeCI" begin
-    @testset "the artifact holds the run state and its logs, and nothing else" begin
-        @test sort(readdir(ARTIFACT)) == sort([basename(RUNSTATE), basename(LOGS)])
-        @test isdir(LOGS)
+    @testset "the artifact holds the run's directory, and nothing else" begin
+        @test readdir(ARTIFACT) == [basename(RUNDATA)]
+        @test isfile(RUNSTATE)
     end
 
     @testset "the run state records every item, its verdict and its attempt" begin
@@ -129,21 +132,21 @@ end
     @testset "the logs hold what failed and what failing items printed" begin
         for ((name, attempt), says) in FAILURES
             k = first(ITEMS[name])
-            @test occursin(says, text(joinpath(LOGS, "item_$(k)_$(attempt).failure.txt")))
+            @test occursin(says, text(joinpath(RUNDATA, "item_$(k)_$(attempt).failure.txt")))
         end
         k = first(ITEMS["fails an assertion"])
-        @test occursin("printed by the failing item", text(joinpath(LOGS, "item_$(k)_1.log")))
+        @test occursin("printed by the failing item", text(joinpath(RUNDATA, "item_$(k)_1.log")))
         # An attempt that passed reports no failure.
         k = first(ITEMS["passes on a retry"])
-        @test !isfile(joinpath(LOGS, "item_$(k)_2.failure.txt"))
+        @test !isfile(joinpath(RUNDATA, "item_$(k)_2.failure.txt"))
     end
 
     @testset "each failed attempt keeps its evidence, and only those do" begin
-        kept = Set(n for n in readdir(LOGS) if endswith(n, ".artifacts"))
+        kept = Set(n for n in readdir(RUNDATA) if endswith(n, ".artifacts"))
         expected = Set(string("item_", first(ITEMS[name]), "_", attempt, ".artifacts") for (name, attempt) in keys(EVIDENCE))
         @test kept == expected
         for ((name, attempt), (; files, log)) in EVIDENCE
-            dir = joinpath(LOGS, string("item_", first(ITEMS[name]), "_", attempt, ".artifacts"))
+            dir = joinpath(RUNDATA, string("item_", first(ITEMS[name]), "_", attempt, ".artifacts"))
             for (file, content) in files
                 @test isfile(joinpath(dir, file))
                 content === nothing || @test text(joinpath(dir, file)) == content
@@ -154,35 +157,36 @@ end
             end
             # Paths there are the bundle's own, so the log reads the same wherever it is
             # unpacked.
-            @test !occursin(".logs", said)
+            @test !occursin(".rundata", said)
         end
         # A producer's error is shown down to the producer, without Runtests' own frames.
         k = first(ITEMS["producers that misbehave"])
-        @test !occursin("run_producer", text(joinpath(LOGS, "item_$(k)_1.artifacts.log")))
+        @test !occursin("run_producer", text(joinpath(RUNDATA, "item_$(k)_1.artifacts.log")))
         # A producer runs for a failed attempt that finished, and for nothing else.
-        @test !any(f -> f == "never.txt", (f for (_, _, fs) in walkdir(LOGS) for f in fs))
-        @test !isfile(joinpath(LOGS, string("item_", first(ITEMS["passes on a retry"]), "_2.artifacts.log")))
+        @test !any(f -> f == "never.txt", (f for (_, _, fs) in walkdir(RUNDATA) for f in fs))
+        @test !isfile(joinpath(RUNDATA, string("item_", first(ITEMS["passes on a retry"]), "_2.artifacts.log")))
     end
 
     @testset "the record, read where it was downloaded, says where the evidence is" begin
         shown = sprint(show, MIME("text/plain"), RECORD)
         k = first(ITEMS["fails an assertion"])
-        @test occursin(joinpath(LOGS, "item_$(k)_1.artifacts"), shown)
-        @test occursin("Runtests.runtestsf(replay = ", shown)
+        @test occursin(joinpath(RUNDATA, "item_$(k)_1.artifacts"), shown)
+        @test occursin("Runtests.runtestsf(replay = $(repr(RUNDATA)))", shown)
     end
 
     @testset "the cache for the next job holds the run state and leaves the logs out" begin
         @test isdir(RUNSTATES)
         if isdir(RUNSTATES)
-            @test basename(RUNSTATE) in readdir(RUNSTATES)
-            @test !any(endswith(".logs"), (d for (_, ds, _) in walkdir(RUNSTATES) for d in ds))
-            @test Runtests.read_run_state(joinpath(RUNSTATES, basename(RUNSTATE))) !== nothing
+            @test basename(RUNDATA) in readdir(RUNSTATES)
+            # Each run's directory holds its record, and none of its logs.
+            @test all(d -> readdir(d) == ["run.runstate"], runs_in(RUNSTATES))
+            @test Runtests.read_run_state(joinpath(RUNSTATES, basename(RUNDATA))) !== nothing
         end
     end
 
     @testset "the failing items run again from the record, as they ran on CI" begin
         @test REPLAY_ERROR !== nothing   # they fail again
-        found = filter(endswith(".runstate"), readdir(REPLAYED; join = true))
+        found = runs_in(REPLAYED)
         @test length(found) == 1
         replay = Runtests.read_run_state(only(found))
         again = items_of(replay)
@@ -192,8 +196,8 @@ end
             @test again[name][2] == ITEMS[name][2]
         end
         # With the seed it failed with: the number it drew is the one it drew on CI.
-        drawn(logs, k) = text(joinpath(logs, "item_$(k)_1.artifacts", "files", "drawn.txt"))
-        @test drawn(logs_of(only(found)), first(again["fails an assertion"])) ==
-              drawn(LOGS, first(ITEMS["fails an assertion"]))
+        drawn(run, k) = text(joinpath(run, "item_$(k)_1.artifacts", "files", "drawn.txt"))
+        @test drawn(only(found), first(again["fails an assertion"])) ==
+              drawn(RUNDATA, first(ITEMS["fails an assertion"]))
     end
 end

@@ -34,7 +34,7 @@ using TOML: TOML
 # The worker side: the protocol and the item runner, which a worker process calls.
 using ..RuntestsWorkers: RuntestsWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
-    current_testitem, in_testitem, in_test_run, run_item,
+    current_testitem, run_item,
     with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded, RECORD_MARK,
     OncePerProcess, on_failure, artifacts_dir, ARTIFACT_FILES, ARTIFACT_PRODUCERS, artifacts_log_path
 
@@ -280,7 +280,7 @@ function read_replay(path::String, target; announce::Bool = true)
     id == here || throw(ConfigError("$path records a run of project $(repr(id)), not of this one ($(repr(here)))"))
     m(k) = get(rs.meta, k, "")
     announce && println(
-        stdout, label_prefix(), "replaying ", basename(path), ": ", plural(length(rs.items), "test item"),
+        stdout, label_prefix(), "replaying ", basename(run_location(rs.path)), ": ", plural(length(rs.items), "test item"),
         " · seed ", m("seed"), " · recorded with julia ", m("julia"), " on ", m("machine"),
         isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
     )
@@ -705,7 +705,7 @@ const PRECOMPILE_SIGNATURES = (
 
         # The run state, written before the first item starts and read by the run
         # after this one.
-        statepath = joinpath(dir, "precompile.runstate")
+        statepath = joinpath(dir, string("precompile", RUNDATA_EXT), RUNSTATE_FILE)
         rsf = init_run_state(statepath, p)
         write_status!(rsf, 1, RUNNING, 1, 1)
         write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1, compile = 0.05)
@@ -753,7 +753,7 @@ end # module Private
 
 using Test
 using .Private: @testitem, @testtemplate, runtests, runtestsf, runtests_mono, chores_mono, activate_mono, current_testitem,
-    in_testitem, in_test_run, serve_mono,
+    serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 
@@ -767,7 +767,7 @@ for name in names(Test)
     startswith(string(name), "@") && @eval export $name
 end
 
-public activate_mono, serve_mono, current_testitem, in_testitem, in_test_run, on_failure, artifacts_dir,
+public activate_mono, serve_mono, current_testitem, on_failure, artifacts_dir,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
 

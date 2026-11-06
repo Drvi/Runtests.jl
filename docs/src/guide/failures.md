@@ -11,7 +11,7 @@ An item that did not pass gets a block with its results right after its `DONE` l
 ┌ [1/1] FAIL "fails"
 │ Test Failed at test/faults_test.jl:6
 │   Expression: 1 == 2
-│ No captured logs
+│ [ No captured logs
 └ @ test/faults_test.jl:5 on worker 1
 ```
 
@@ -19,7 +19,7 @@ The block holds the failed tests, the captured output of the item, and the path 
 
 ## Read the logs
 
-Except under `logs = :eager`, each run keeps what each item printed in a directory next to its run state. The directory has the name of the run state, with `.logs` in place of `.runstate`. The closing block names it when files were kept. The directory also holds the failure report of each attempt that did not pass. [The files reference](@ref run-state-files) shows the names of the files.
+Except under `logs = :eager`, each run keeps what each item printed in the directory of the run, `<run>.rundata`, next to its run state. The closing block names the directory on its `run state` line. The directory also holds the failure report of each attempt that did not pass. [The files reference](@ref run-state-files) shows the names of the files.
 
 With `logs = :eager`, use the terminal or CI job log to read the item's output; Runtests does not retain an item log of that output. Failure reports and [artifact evidence](@ref evidence) are still kept. Producers' output is captured in their `.artifacts.log` even in this mode. [The configuration reference](@ref run-keys) lists all logging modes.
 
@@ -29,12 +29,12 @@ With `logs = :eager`, use the terminal or CI job log to read the item's output; 
 
 ## Replay a recorded run
 
-A run state records a run: its items, configuration, profiles, `[order]` and seeds. To run the same items again, give the run state as `replay`:
+A run state records a run: its items, configuration, profiles, `[order]` and seeds. To run the same items again, give the directory of the run as `replay`. The `run.runstate` file in it also works.
 
 ```julia
-Runtests.read_run_state("run.runstate")     # read the record
-Runtests.runtests(replay = "run.runstate")  # run its items again
-Runtests.runtestsf(replay = "run.runstate") # run its failures again
+Runtests.read_run_state("path/to/the.rundata")     # read the record
+Runtests.runtests(replay = "path/to/the.rundata")  # run its items again
+Runtests.runtestsf(replay = "path/to/the.rundata") # run its failures again
 ```
 
 A replay does these things:
@@ -123,7 +123,7 @@ A worker lost during collection also loses a chain's process state. The remainin
 
 ### Where the evidence goes
 
-Each attempt keeps its evidence next to its log, in the logs directory of the run. A retry gets a directory of its own. Thus a failed attempt keeps its evidence when a later attempt passes. The report of the failure and the closing block of the run print the path. [The files reference](@ref run-state-files) shows the layout.
+Each attempt keeps its evidence next to its log, in the directory of the run. A retry gets a directory of its own. Thus a failed attempt keeps its evidence when a later attempt passes. The report of the failure and the closing block of the run print the path. [The files reference](@ref run-state-files) shows the layout.
 
 The evidence is deleted with the run state. `RUNTESTS_ARTIFACT_DIR` copies it with the logs; [Run on CI](@ref ci-artifact) explains how to upload it, including evidence from failed attempts whose retries passed. A pasted item keeps its evidence in a new directory in the temporary files of the system. So does an item that you step into with `Runtests.debug`. The REPL prints its path. Delete the directory when you no longer need it.
 

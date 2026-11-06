@@ -4,11 +4,11 @@ This page lists the files that Runtests reads and writes outside `test/`. [Synta
 
 ## [Run state files](@id run-state-files)
 
-Each run writes a run state file and a directory of logs, next to each other, in the run state directory:
+Each run keeps its run state and its logs in a directory of its own, `<run>.rundata`, in the run state directory:
 
 ```text
-<run>.runstate
-<run>.logs/
+<run>.rundata/
+  run.runstate              # the record of the run
   item_7_1.log
   item_7_1.failure.txt
   item_7_1.artifacts/
@@ -18,26 +18,27 @@ Each run writes a run state file and a directory of logs, next to each other, in
   item_7_1.artifacts.log    # what the producers printed, their errors, and their times
 ```
 
-The name `<run>` is the start time of the run in microseconds and the ID of its process, for example `1790247276123456-96211`. The names in the logs directory are `item_<i>_<attempt>`, where `<i>` is the number of the item and `<attempt>` is the attempt.
+The name `<run>` is the start time of the run in microseconds and the ID of its process, for example `1790247276123456-96211`. If a directory with that name exists, the run adds `_2`, `_3` and so on to the name. The names of the logs are `item_<i>_<attempt>`, where `<i>` is the number of the item and `<attempt>` is the attempt.
 
 | File | Contents |
 |:-----|:---------|
-| `<run>.runstate` | The binary record of the run. `Runtests.read_run_state` reads it. |
+| `run.runstate` | The binary record of the run. `Runtests.read_run_state` reads it, or the directory of the run. |
 | `item_<i>_<a>.log` | Captured output of the attempt. `logs = :eager` streams this output without saving a per-item log. |
 | `item_<i>_<a>.failure.txt` | The failure report of an attempt that did not pass. |
 | `item_<i>_<a>.artifacts/files/` | The outputs that the item wrote to `Runtests.artifacts_dir()`. |
 | `item_<i>_<a>.artifacts/producer_<k>/` | The files that the producer `k` wrote. |
 | `item_<i>_<a>.artifacts.log` | What the producers printed, their errors and their times. |
+| `setup.log` | The error that stopped a run before its first item. |
 
-Runtests deletes an empty log file at the end of the run, and the logs directory when it is empty. The logs directory is deleted with its run state. Starting another editor run or stopping the server does not remove these persistent logs; see [Run states and history](@ref history).
+Runtests deletes an empty log file at the end of the run. When Runtests deletes a run state, it deletes the directory of the run with it. Another editor run does not remove the logs, and neither does stopping the server. [Run states and history](@ref history) tells which run states Runtests keeps.
 
 ## The run state directory
 
-By default, the run state directory is `runtests/runs/<project>-<hash>/` in the first Julia depot, for example `~/.julia/runtests/runs/MyPackage-8db4f545/`. `<project>` is the name of the project, and `<hash>` is a hash of the path of the project. Thus each checkout has its own directory. `RUNTESTS_RUNSTATE_DIR` names another directory, which several projects can share. [Run states and history](@ref history) explains which run states Runtests keeps.
+By default, the run state directory is `runtests/runs/<project>-<hash>/` in the first Julia depot, for example `~/.julia/runtests/runs/MyPackage-8db4f545/`. `<project>` is the name of the project, and `<hash>` is a hash of the path of the project. Thus each checkout has its own directory. `RUNTESTS_RUNSTATE_DIR` names another directory, which several projects can share. Several processes can use one run state directory at the same time. Each run makes a new directory for itself, and no two runs get the same directory. [Run states and history](@ref history) explains which run states Runtests keeps.
 
 ## The artifact directory
 
-When `RUNTESTS_ARTIFACT_DIR` is set, each run copies its run state and its logs directory into that directory when it ends. It also does this after a failure or an interrupt. The closing block names the directory on the `copied to` line.
+When `RUNTESTS_ARTIFACT_DIR` is set, each run copies its directory, `<run>.rundata`, into that directory when it ends. It also does this after a failure or an interrupt. A run of several packages copies the directory of each package into a directory with the name of the package. The closing block names the artifact directory on the `copied to` line.
 
 ## Files in the package
 

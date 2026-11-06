@@ -27,20 +27,18 @@
 # stored compressed and inflated only when asked for (`recorded_manifest`): the
 # reads that plan every run pay nothing for it.
 #
-# Beside the file, a directory of the same name ending in `.logs` (`logs_dir`) holds
-# what the items printed, `item_<index>_<attempt>.log`, the failure report of each
-# attempt that did not pass, `item_<index>_<attempt>.failure.txt`, and `setup.log`
-# for a run that ended before its first item. It is made with the file and deleted
-# only with it.
+# The file is `run.runstate` in a directory of the run's own, `<run>.rundata`
+# (`new_runstate_path`), which also holds what the items printed,
+# `item_<index>_<attempt>.log`, the failure report of each attempt that did not pass,
+# `item_<index>_<attempt>.failure.txt`, what each attempt kept (`artifacts.jl`), and
+# `setup.log` for a run that ended before its first item. The directory is made with
+# the file and deleted only with it.
 
 using CRC32c: crc32c
 using Zlib_jll: libz
 
 const RS_MAGIC = 0x544e5552   # "RUNT" on disk
 const RS_VERSION = UInt32(8)
-# Every version this one reads. A new version keeps a reader for the one before it:
-# a run state the reader passes over is history lost to the next run.
-const RS_READABLE = (UInt32(7), UInt32(8))
 # 40 bytes of counts and times, then nine section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
@@ -145,14 +143,6 @@ struct ItemRecord
     seed::UInt64   # the seed the item's numbers came from, mixed with its name
 end
 @assert sizeof(ItemRecord) == 32
-
-# An item as version 7 stored it: no source hash, and the run's seed for every item.
-struct ItemRecord7
-    name::UInt32
-    file::UInt32
-    line::UInt32
-    unit::UInt32
-end
 
 # Sixteen bytes, two of them padding after `exclusive`: the compiler's layout, so
 # it cannot drift from the struct.
@@ -679,11 +669,13 @@ end
 """
     read_run_state(path) -> Union{Nothing,RunStateRecord}
 
-Read a run state file. Never throws: a file that is truncated, from a crashed
-run, or written by a different version comes back as much as can be read (or
-`nothing`), because a broken record of an old run must not stop a new one.
+Read a run state: a run's directory, `<run>.rundata`, or the `run.runstate` file in
+it. Never throws: a file that is truncated, from a crashed run, or written by a
+different version comes back as much as can be read (or `nothing`), because a broken
+record of an old run must not stop a new one.
 """
 function read_run_state(path::AbstractString)
+    path = record_path(path)
     bytes = try
         read(path)
     catch
@@ -695,7 +687,7 @@ function read_run_state(path::AbstractString)
     total = length(bytes)
     try
         h = read_record(io, Header)
-        (h.magic == RS_MAGIC && h.version in RS_READABLE) || return nothing
+        (h.magic == RS_MAGIC && h.version == RS_VERSION) || return nothing
         n_items = bounded(h.n_items, total)
 
         seek(io, Int(h.off_strings))
@@ -723,15 +715,8 @@ function read_run_state(path::AbstractString)
         seek(io, Int(h.off_items))
         run_seed = something(tryparse(UInt64, get(meta, "seed", "")), UInt64(0))
         items = map(1:min(bounded(read(io, UInt32), total), n_items)) do _
-            if h.version == 7
-                r7 = read_record(io, ItemRecord7)
-                RunStateItem(lookup(strings, r7.name), lookup(strings, r7.file), Int32(r7.line), Int32(r7.unit),
-                             UInt32(0), run_seed)
-            else
-                r = read_record(io, ItemRecord)
-                RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit),
-                             r.hash, r.seed)
-            end
+            r = read_record(io, ItemRecord)
+            RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit), r.hash, r.seed)
         end
 
         # Kept as stored: inflating it is for whoever asks for it.
@@ -934,7 +919,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     # Paired by `zip`: a damaged file can hold fewer items than statuses.
     bad = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if is_non_pass(st.state) || st.state === RUNNING]
     isempty(bad) || println(io, "  not passed:")
-    prefix = joinpath(logs_dir(rs.path), "item_")
+    prefix = joinpath(rundata_dir(rs.path), "item_")
     for (it, st) in bad
         println(io, "    ", rpad(repr(it.name), 30), " ", rpad(string(st.state), 12), " attempt ", st.attempt,
             " · worker ", st.slot, " (pid ", st.pid, ") · ", fmt_seconds(st.elapsed), " · ", it.file, ":", it.line)
@@ -953,9 +938,9 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
         println(io, "    worker ", d.slot, " pid ", d.pid, " at ", fmt_seconds(d.t0), ": ", worker_end_text(d.ended_by),
             " (", how, ") · had run ", length(ran), isempty(ran) ? "" : string(": ", join(repr.(last(ran, 5)), ", "), length(ran) > 5 ? ", …" : ""))
     end
-    print(io, "  run it again with Runtests.runtests(replay = ", repr(rs.path), ")")
+    print(io, "  run it again with Runtests.runtests(replay = ", repr(run_location(rs.path)), ")")
     any(((it, st),) -> is_non_pass(st.state) && st.state !== CANCELLED, zip(rs.items, rs.statuses)) &&
-        print(io, ", or its failing items with Runtests.runtestsf(replay = ", repr(rs.path), ")")
+        print(io, ", or its failing items with Runtests.runtestsf(replay = ", repr(run_location(rs.path)), ")")
 end
 
 ### Where run states live ##################################################
@@ -1045,13 +1030,27 @@ runstate_root() = joinpath(first(DEPOT_PATH), "runtests", "runs")
 # tells `sweep_runstate_dirs` whether the project is still there.
 const PROJECT_MARK = "project"
 
-# Named for the microsecond the run started, in 16 digits (enough until the year
-# 2286), so that names sort oldest first: one process starts its runs one after
-# another, milliseconds apart at the least, so its names never tie. The pid tells
-# apart processes that start in the same microsecond, which leaves nothing to
-# order. The wall clock, not `time_ns`, which restarts with the machine. A file
-# already there, a run state downloaded from CI say, is never written over: the new
-# name takes a suffix instead.
+# A run keeps what it records in a directory of its own, `<run>.rundata`: the record,
+# `RUNSTATE_FILE`, and beside it what its items left, every name of which starts with
+# `item_`, and `setup.log` for a run that ended before its first item. No two of these
+# names can be the same.
+const RUNDATA_EXT = ".rundata"
+const RUNSTATE_FILE = "run.runstate"
+
+# The record of the run whose directory, or record, `path` is.
+record_path(path::AbstractString) = isdir(path) ? joinpath(path, RUNSTATE_FILE) : String(path)
+
+# How the run whose record is `path` is named, to replay it say: by its directory,
+# `<run>.rundata`, or for a record kept elsewhere, a copy say, by the record's own path.
+run_location(path::AbstractString) = endswith(dirname(path), RUNDATA_EXT) ? dirname(path) : String(path)
+
+# The path of a new run's record, in a new directory of its own. Named for the
+# microsecond the run started, in 16 digits (enough until the year 2286), so that names
+# sort oldest first: one process starts its runs one after another, milliseconds apart
+# at the least, so its names never tie. The pid tells apart processes that start in
+# the same microsecond, which leaves nothing to order. The wall clock, not `time_ns`,
+# which restarts with the machine. A directory already there, one downloaded from CI
+# say, is never written into: the new name takes a suffix instead.
 function new_runstate_path(root::AbstractString; start_us::Integer = wall_microseconds())
     dir = runstate_dir(root)
     mkpath(dir)
@@ -1064,33 +1063,35 @@ function new_runstate_path(root::AbstractString; start_us::Integer = wall_micros
     stem = string(lpad(start_us, 16, '0'), "-", getpid())
     n = 1
     while true
-        path = joinpath(dir, n == 1 ? stem * ".runstate" : string(stem, "_", n, ".runstate"))
-        # Created, not checked for: two processes that name a file the same, in
+        rundata = joinpath(dir, n == 1 ? stem * RUNDATA_EXT : string(stem, "_", n, RUNDATA_EXT))
+        # Made, not checked for: two processes that name a directory the same, in
         # containers sharing the directory say, get one each.
         claimed = try
-            close(Base.Filesystem.open(path, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_EXCL | Base.Filesystem.JL_O_WRONLY, 0o644))
+            mkdir(rundata)
             true
         catch e
             (e isa Base.IOError && e.code == Base.UV_EEXIST) || rethrow()
             false
         end
-        claimed && return path
+        claimed && return joinpath(rundata, RUNSTATE_FILE)
         n += 1
     end
 end
 
 wall_microseconds() = (tv = Libc.TimeVal(); tv.sec * 1_000_000 + tv.usec)
 
+# The records of the runs in the run state directory of `root`, oldest first: one in
+# each `<run>.rundata` directory, which a run that is starting may not have written yet.
 function runstate_files(root::AbstractString)
     dir = runstate_dir(root)
     # Another process can delete the directory between any two calls.
     files = try
-        filter!(endswith(".runstate"), readdir(dir; join = true))
+        [joinpath(dir, d, RUNSTATE_FILE) for d in readdir(dir) if endswith(d, RUNDATA_EXT)]
     catch e
         e isa Base.IOError || rethrow()
         return String[]
     end
-    return sort!(files)   # names start with a unix timestamp, so this is oldest-first
+    return sort!(filter!(isfile, files))   # names start with a unix timestamp, so this is oldest-first
 end
 
 const KEEP_RUNS = 20
@@ -1142,15 +1143,16 @@ function warn_unnamed_ci_host(dir::AbstractString)
     return nothing
 end
 
-# The directory of a run state's logs.
-logs_dir(path::AbstractString) = string(chopsuffix(path, ".runstate"), ".logs")
+# The directory of the run whose record is `path`, `<run>.rundata`, which also holds its
+# logs.
+rundata_dir(path::AbstractString) = dirname(path)
 
-# A run state and its logs, which go together. Another process may be reading them,
-# or have deleted them already.
+# A run's directory, its record and its logs together; nothing but a run's directory.
+# Another process may be reading them, or have deleted them already.
 function remove_runstate(path::AbstractString)
+    (basename(path) == RUNSTATE_FILE && endswith(dirname(path), RUNDATA_EXT)) || return nothing
     try
-        rm(path; force = true)
-        rm(logs_dir(path); force = true, recursive = true)
+        rm(dirname(path); force = true, recursive = true)
     catch e
         is_interrupt(e) && rethrow()
     end
@@ -1163,17 +1165,17 @@ end
 function project_runs(root::AbstractString)
     project = project_id(root)
     runs = Pair{String, RunStateRecord}[]
-    others = Dict{UInt32, Int}()   # format => how many files of a format this version does not read
+    others = 0   # files of a format this version does not read
     for f in runstate_files(root)
         rs = read_run_state(f)
         if rs === nothing
             v = runstate_version(f)
-            v === nothing || v in RS_READABLE || (others[v] = get(others, v, 0) + 1)
+            v === nothing || v == RS_VERSION || (others += 1)
             continue
         end
         of_project(rs, project) && push!(runs, f => rs)
     end
-    isempty(others) || warn_other_formats(runstate_dir(root), others)
+    others == 0 || warn_other_formats(runstate_dir(root), others)
     return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
 end
 
@@ -1199,34 +1201,14 @@ end
 const WARNED_FORMATS = Set{String}()
 const WARNED_FORMATS_LOCK = ReentrantLock()
 
-# A run state this version does not read is history the run goes without, which is
-# said rather than left to be found out.
-function warn_other_formats(dir::AbstractString, others::Dict{UInt32, Int})
+# A run state this version does not read, another version's, is history the run goes
+# without, which is said rather than left to be found out.
+function warn_other_formats(dir::AbstractString, others::Integer)
     first_time = @lock WARNED_FORMATS_LOCK (dir in WARNED_FORMATS ? false : (push!(WARNED_FORMATS, dir); true))
     first_time || return nothing
-    older = sum((n for (v, n) in others if v < first(RS_READABLE)); init = 0)
-    newer = sum((n for (v, n) in others if v > last(RS_READABLE)); init = 0)
-    what = String[]
-    older > 0 && push!(what, string(plural(older, "run state"), " of an older format, which `Runtests.chores()` deletes"))
-    newer > 0 && push!(what, string(plural(newer, "run state"), " written by a newer version of Runtests"))
-    @warn "Runtests: $(relpath_or_path(dir)) holds $(join(what, " and ")); this version does not read them, " *
-        "so the durations and failures they recorded are not used"
+    @warn "Runtests: $(relpath_or_path(dir)) holds $(plural(others, "run state")) of another version of Runtests; " *
+        "this version does not read them, so the durations and failures they recorded are not used"
     return nothing
-end
-
-"""
-    old_format_runstates(root) -> Vector{String}
-
-The run states in the project's own directory of a format older than any this
-version reads, which no later version reads either. Empty for a directory that
-`RUNTESTS_RUNSTATE_DIR` names, which can hold other projects' files.
-"""
-function old_format_runstates(root::AbstractString)
-    isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", "")) || return String[]
-    return filter(runstate_files(root)) do f
-        v = runstate_version(f)
-        v !== nothing && v < first(RS_READABLE)
-    end
 end
 
 # `project_runs`, with `base` among them, when there is one, wherever its file is:
@@ -1434,15 +1416,13 @@ function gone_checkout(dir::AbstractString, temp::AbstractString, parents::Paren
         in_temp = startswith(project, joinpath(temp, ""))
         in_temp || reachable!(parents, dirname(project)) || return nothing
         entries = readdir(dir)
-        files = [joinpath(dir, f) for f in entries if endswith(f, ".runstate")]
+        files = filter!(isfile, [joinpath(dir, d, RUNSTATE_FILE) for d in entries if endswith(d, RUNDATA_EXT)])
         in_temp || time() - maximum(mtime, files; init = 0.0) >= SWEEP_GRACE_S || return nothing
         deleted = filter(files) do f
             rs = read_run_state(f)
-            rs === nothing ? something(runstate_version(f), typemax(UInt32)) < first(RS_READABLE) :
-                recorded_here(rs) && !is_live(rs)
+            rs !== nothing && recorded_here(rs) && !is_live(rs)
         end
-        going = Set(basename(f) for f in deleted)
-        union!(going, (basename(logs_dir(f)) for f in deleted))
+        going = Set(basename(dirname(f)) for f in deleted)
         whole = all(f -> f == PROJECT_MARK || is_folder_metadata(f) || f in going, entries)
         return GoneCheckout(String(dir), project, deleted, whole)
     catch e

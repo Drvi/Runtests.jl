@@ -255,7 +255,7 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                     @test !occursin("info from matrix passes", out)
                     @test occursin("┌ Captured logs", out)
                     # A failure that printed nothing says that, rather than nothing.
-                    @test occursin("No captured logs", out)
+                    @test occursin("[ No captured logs", out)
                 elseif logs === :batched
                     @test occursin("stdout from matrix passes", out)
                     @test occursin("info from matrix passes", out)

@@ -9,7 +9,7 @@ declared(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n
 function recorded_runs(dir, pkg, n; after = 0, ran = nothing, failed = String[])
     p, _ = prepare((pkg,); announce = false)
     return map(1:n) do i
-        path = joinpath(dir, string(1_000_000 + after + i, "-1.runstate"))
+        path = record_in(dir, string(1_000_000 + after + i, "-1"))
         rsf = init_run_state(path, p)
         for k in 1:nitems(p)
             name = p.items.name[k]
@@ -117,7 +117,7 @@ end)
             renamed = recorded_runs(runs, dir, 2)
             write(file, declared("one"))
             p, _ = prepare((dir,); announce = false)
-            stopped = joinpath(runs, "1000003-1.runstate")
+            stopped = record_in(runs, "1000003-1")
             finish_run_state!(init_run_state(stopped, p); cancelled = true)
             useful = recorded_runs(runs, dir, 3; after = 3)
             # Among the newest twenty they stay, whatever they hold: another branch

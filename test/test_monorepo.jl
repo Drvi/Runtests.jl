@@ -2,7 +2,7 @@ using Runtests.Private: find_participants, import_problems, union_environment, p
     ScanFailure, Filter, RawItem, Profile, History, Packages, scan, walk_test_dir, setup_modules, config_toml,
     read_profiles, read_config, with_package, item_cfg, start_configuration, auto_workers, plan, nitems,
     exclusively, execute, Target, read_run_state, PASSED, FAILED, ERRORED, TIMEDOUT, history, failing_items,
-    failure_log, attempt_artifacts, logs_dir, runstate_dir, idle_worker_seconds
+    failure_log, attempt_artifacts, rundata_dir, runstate_dir, idle_worker_seconds
 using Pkg: Pkg
 using TOML: TOML
 
@@ -128,14 +128,18 @@ function scan_participants(ps)
     end
     return items, owner, profiles, setups, configs
 end
-root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
+# A path or a message as it reads with `/` between directories, which Windows writes
+# as `\`.
+slashed(s::AbstractString) = replace(s, '\\' => '/')
+
+root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
 
 @testset "combined runs" begin
     @testset "a combined run needs Julia 1.12, which has workspaces" begin
         ws = make_workspace("A" => ["test/a_test.jl" => one_item("a")])
         if VERSION < v"1.12"
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ErrorException && occursin("Julia 1.12 or later", err.msg)
+            @test err isa ErrorException && occursin("Julia 1.12 or later", slashed(err.msg))
         else
             @test names_of(find_participants(ws)) == ["A"]
         end
@@ -188,7 +192,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
         @testset "the directory given is the workspace root" begin
             ws = make_workspace("A" => ["test/a_test.jl" => one_item("a")])
             err = try find_participants(joinpath(ws, "lib", "A")); nothing catch e; e end
-            @test err isa ArgumentError && occursin("is a member of the workspace at $ws", err.msg)
+            @test err isa ArgumentError && occursin("is a member of the workspace at $ws", slashed(err.msg))
             # Without one, the workspace of the active project, a test project's too.
             active = Base.active_project()
             try
@@ -199,7 +203,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             end
             plain = make_pkg("NoWorkspace", "test/a_test.jl" => one_item("a"))
             err = try find_participants(plain); nothing catch e; e end
-            @test err isa ConfigError && occursin("declares no workspace", err.msg) && occursin("[workspace]", err.msg)
+            @test err isa ConfigError && occursin("declares no workspace", slashed(err.msg)) && occursin("[workspace]", slashed(err.msg))
         end
 
         @testset "the members of a workspace are under its root, and the root takes part once" begin
@@ -214,7 +218,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             rel = replace(relpath(beside, ws), '\\' => '/')
             ws = make_workspace("A" => ["test/a_test.jl" => one_item("a")]; members = [rel, "$rel/test"])
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("lists $(repr(rel)), which is outside the workspace at $ws", err.msg)
+            @test err isa ConfigError && occursin("lists $(repr(rel)), which is outside the workspace at $ws", slashed(err.msg))
         end
 
         @testset "a package whose test project is not in the workspace stops the run, naming both fixes" begin
@@ -222,12 +226,12 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                                 outside = ["B"])
             err = try find_participants(ws); nothing catch e; e end
             @test err isa ConfigError
-            @test occursin("lib/B", err.msg) && !occursin("lib/A", err.msg)
-            @test occursin("projects` of [workspace]", err.msg) && occursin("`packages` of [monorepo]", err.msg)
+            @test occursin("lib/B", slashed(err.msg)) && !occursin("lib/A", slashed(err.msg))
+            @test occursin("projects` of [workspace]", slashed(err.msg)) && occursin("`packages` of [monorepo]", slashed(err.msg))
             # Tests with [extras] and [targets] have no test project at all.
             rm(joinpath(ws, "lib", "B", "test", "Project.toml"))
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("lib/B (it has none: its tests use [extras] and [targets])", err.msg)
+            @test err isa ConfigError && occursin("lib/B (it has none: its tests use [extras] and [targets])", slashed(err.msg))
             # Left out by [monorepo], it is no error.
             write(joinpath(ws, "test", "TestItems.toml"), "[monorepo]\npackages = [\"lib/A\"]\n")
             ps = find_participants(ws)
@@ -276,14 +280,14 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 )
                 listing(entries...; isolated)
                 err = try find_participants(ws); nothing catch e; e end
-                @test err isa ConfigError && occursin(says, err.msg)
+                @test err isa ConfigError && occursin(says, slashed(err.msg))
             end
             write(config, "[monorepo]\npackages = \"lib/A\"\n")
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("must be a list of strings", err.msg)
+            @test err isa ConfigError && occursin("must be a list of strings", slashed(err.msg))
             write(config, "[monorepo]\npackage = [\"lib/A\"]\n")
             err = try find_participants(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("unknown key `package` in [monorepo]", err.msg)
+            @test err isa ConfigError && occursin("unknown key `package` in [monorepo]", slashed(err.msg))
         end
 
         @testset "the keyword `packages` narrows the participants, by name or directory" begin
@@ -305,7 +309,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                         (1, "must be package names or directories"),
                     )
                     err = try find_participants(ws; packages); nothing catch e; e end
-                    @test err isa ArgumentError && occursin(says, err.msg)
+                    @test err isa ArgumentError && occursin(says, slashed(err.msg))
                 end
             end
         end
@@ -349,7 +353,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             ps = find_participants(ws)
             @test names_of(ps) == ["A", "B", "C"] && ps.isolated == [false, false, true]
             problems = import_problems(ps, scan_participants(ps)...)
-            found = sort!([(relpath(e.file, ws), Int(e.line), e.msg) for e in problems])
+            found = sort!([(slashed(relpath(e.file, ws)), Int(e.line), slashed(e.msg)) for e in problems])
             forms_at = [(f, findfirst(==("    $f"), split(read(joinpath(ws, "lib/A/test/forms_test.jl"), String), '\n')))
                         for f in forms]
             declared = "which is not in [deps] of A's test project, lib/A/test/Project.toml, so A's own run cannot load it"
@@ -420,7 +424,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             config = joinpath(ws, "test", "TestItems.toml")
             mkpath(dirname(config))
             fails(says) = (err = try union_environment(find_participants(ws), mktempdir()); nothing catch e; e end;
-                           err isa ConfigError && occursin(says, err.msg))
+                           err isa ConfigError && occursin(says, slashed(err.msg)))
             # The same name for two packages, said with both declarations; an isolated
             # participant is not in the union, so its declaration is no conflict.
             @test fails(r"Dup is two packages in it: \S+ in lib/A/test/Project.toml, and \S+ in lib/B/test/Project.toml")
@@ -469,14 +473,14 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             own = joinpath(ws, "lib", "OwnInit", "test", "TestItems.toml")
             write(own, "[profiles.default]\nmonorepo_default = true\n")
             for err in (try mono(ws); nothing catch e; e end, try read_config(dirname(own)); nothing catch e; e end)
-                @test err isa ConfigError && occursin("only the test/TestItems.toml of a workspace's root shares", err.msg)
+                @test err isa ConfigError && occursin("only the test/TestItems.toml of a workspace's root shares", slashed(err.msg))
             end
             write(joinpath(ws, "test", "TestItems.toml"), replace(shared, "= true" => "= \"yes\""))
             err = try read_config(joinpath(ws, "test")); nothing catch e; e end
-            @test err isa ConfigError && occursin("must be true or false, got \"yes\"", err.msg)
+            @test err isa ConfigError && occursin("must be true or false, got \"yes\"", slashed(err.msg))
             lone = make_pkg("Lone", "test/TestItems.toml" => "[profiles.default]\nmonorepo_default = true\n")
             err = try read_config(joinpath(lone, "test")); nothing catch e; e end
-            @test err isa ConfigError && occursin("this package is in no workspace", err.msg)
+            @test err isa ConfigError && occursin("this package is in no workspace", slashed(err.msg))
         end
 
         @testset "a package's own runs read only the profiles that the workspace root shares" begin
@@ -489,7 +493,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             # One that it shares is checked as the root's own runs check it, and its file named.
             write(config, "[profiles.default]\nmonorepo_default = true\nthreads = \"nonsense\"\n")
             err = try read_config(joinpath(ws, "lib", "A", "test")); nothing catch e; e end
-            @test err isa ConfigError && occursin(r"`threads` of \[profiles\.default\] in \S*TestItems\.toml must be", err.msg)
+            @test err isa ConfigError && occursin(r"`threads` of \[profiles\.default\] in \S*TestItems\.toml must be", slashed(err.msg))
         end
 
         @testset "two packages of one name do not take part together" begin
@@ -499,7 +503,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             says = "2 packages that take part are Dup: lib/Dup and tools/Dup"
             for err in (try find_participants(ws); nothing catch e; e end, try mono(ws; item_keys = [("Dup", "same")]); nothing catch e; e end,
                         try Runtests.Private.list_items_mono(ws); nothing catch e; e end)
-                @test err isa ConfigError && occursin(says, err.msg)
+                @test err isa ConfigError && occursin(says, slashed(err.msg))
             end
             # Taking part one at a time, each is itself.
             @test root_rel(find_participants(ws; packages = ["tools/Dup"])) == ["tools/Dup"]
@@ -610,7 +614,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 @test all(i -> item_cfg(mono(ws; timeout = 10).plan, i).timeout_s == 10, 1:3)
             end
             err = try mono(ws; config = "x.toml"); nothing catch e; e end
-            @test err isa ArgumentError && occursin("reads each package's own", err.msg)
+            @test err isa ArgumentError && occursin("reads each package's own", slashed(err.msg))
             # `workers = "auto"` counts the most threads any package's workers start with.
             rm(joinpath(ws, "test", "TestItems.toml"))
             write(joinpath(ws, "lib", "B", "test", "TestItems.toml"), "[profiles.wide]\nthreads = \"8\"\n")
@@ -642,11 +646,11 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 @test selected(mono(ws; name = "a3")) == ["A:a3"]
             end
             err = try mono(ws; group = "nope"); nothing catch e; e end
-            @test err isa ArgumentError && occursin("no package of the combined run declares", err.msg)
+            @test err isa ArgumentError && occursin("no package of the combined run declares", slashed(err.msg))
             # A tag has to be in one of the suites.
             @test selected(mono(ws; tags = [:onlyb])) == ["B:b1"]
             err = try mono(ws; tags = [:nowhere]); nothing catch e; e end
-            @test err isa ArgumentError && occursin("no test item has the tag `nowhere`", err.msg)
+            @test err isa ArgumentError && occursin("no test item has the tag `nowhere`", slashed(err.msg))
             # `packages` narrows the participants; paths select within the package they
             # are in, a line one item.
             @test selected(mono(ws; packages = ["B"])) == ["B:b1", "B:b2"]
@@ -654,7 +658,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             @test selected(prepare_mono((a, b); announce = false, group = "all")) == ["A:a1", "A:a2", "A:a3", "B:b1", "B:b2"]
             @test selected(prepare_mono(("$a:5",); announce = false)) == ["A:a2"]
             err = try prepare_mono((joinpath(ws, "lib/Skipped/test/s_test.jl"),); announce = false); nothing catch e; e end
-            @test err isa ArgumentError && occursin("is in lib/Skipped, which does not take part", err.msg)
+            @test err isa ArgumentError && occursin("is in lib/Skipped, which does not take part", slashed(err.msg))
             err = try mono(ws; name = "zzz"); nothing catch e; e end
             @test err isa NoTestsError
             # Keys, as an editor asks: a package that no key names is not read, and a key
@@ -669,7 +673,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                                 "B" => ["test/b_test.jl" => item_text("b"), "test/testsetups/Common.jl" => "module Common end\n"];
                                 root = nothing)
             err = try mono(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("`Common` in lib/A/test/testsetups and in lib/B/test/testsetups", err.msg)
+            @test err isa ConfigError && occursin("`Common` in lib/A/test/testsetups and in lib/B/test/testsetups", slashed(err.msg))
             # B selected away gives no item and shares no worker or load path with A,
             # whichever way the selection is made.
             write(joinpath(ws, "lib", "A", "test", "a_test.jl"), item_text("a"; opts = "tags=[:fast]"))
@@ -691,13 +695,13 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                                 "B" => ["test/b_test.jl" => item_text("b")];
                                 root = nothing, deps = Dict("B" => ["X"]))
             err = try mono(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("`X` in lib/A/test/testsetups, which lib/B/test/Project.toml declares", err.msg)
+            @test err isa ConfigError && occursin("`X` in lib/A/test/testsetups, which lib/B/test/Project.toml declares", slashed(err.msg))
             # The same for another package itself, and none once either side is isolated.
             mv(joinpath(ws, "lib", "A", "test", "testsetups", "X.jl"), joinpath(ws, "lib", "A", "test", "testsetups", "B.jl"))
             write(joinpath(ws, "lib", "A", "test", "testsetups", "B.jl"), "module B end\n")
             write(joinpath(ws, "lib", "A", "test", "a_test.jl"), item_text("a"))
             err = try mono(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("`B` in lib/A/test/testsetups, which lib/B/Project.toml declares", err.msg)
+            @test err isa ConfigError && occursin("`B` in lib/A/test/testsetups, which lib/B/Project.toml declares", slashed(err.msg))
             mkpath(joinpath(ws, "test"))
             for isolated in ("lib/A", "lib/B")
                 write(joinpath(ws, "test", "TestItems.toml"), "[monorepo]\nisolated = [$(repr(isolated))]\n")
@@ -774,7 +778,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             log = tempname()
             records(name) = """
                 @testitem $(repr(name)) begin
-                    open(io -> println(io, Main.SHARED_INIT, ' ', getpid()), $(repr(log)), "a")
+                    open(io -> println(io, Main.SHARED_INIT, '\t', getpid()), $(repr(log)), "a")
                 end
                 """
             shared = "[profiles.default]\nmonorepo_default = true\ninit = \"global SHARED_INIT = pwd()\"\n"
@@ -782,23 +786,25 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                                "Copies" => ["test/b_test.jl" => records("b"),
                                             "test/TestItems.toml" => "[profiles.default]\ninit = \"global SHARED_INIT = pwd()\"\n"];
                                root = ["test/r_test.jl" => records("r"), "test/TestItems.toml" => shared])
-            lines() = [split(l, ' ') for l in readlines(log)]
+            lines() = [split(l, '\t') for l in readlines(log)]
+            # The same directory, however a system spells it: Windows has short names too.
+            in_ws(l) = samefile(l[1], ws) || (println("init ran in ", l[1], ", not ", ws); false)
             with_runstate_dir() do _
                 states, run, p = run_mono(ws; workers = 2, logs = :issues, monitor = false)
                 @test all(==(PASSED), values(states)) && length(states) == 3
                 @test length(p.pools) == 1
-                @test all(l -> l[1] == ws, lines())
+                @test all(in_ws, lines())
                 # Each package's run state says where the `init` ran, for a replay to run it there.
                 records_ = [read_run_state(f.path) for f in run.runstate.files]
                 @test [rs.meta["profile_dirs"] for rs in records_] == ["default\t.", "default\t../..", "default\t../.."]
                 member = joinpath(ws, "lib", "Inherits")
                 replayed = Runtests.Private.replayed_config(read_config(joinpath(member, "test")), records_[2], member)
-                @test replayed.profiles[:default].dir == ws
+                @test samefile(replayed.profiles[:default].dir, ws)
                 # A package's own run runs the shared `init` where the combined run did.
                 rm(log)
                 states, _, _ = run_states(member; workers = 1, logs = :issues, monitor = false)
                 @test states == Dict("a" => PASSED)
-                @test only(lines())[1] == ws
+                @test in_ws(only(lines()))
             end
         end
 
@@ -843,9 +849,10 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                                          "RUNTESTS_ARTIFACT_DIR" => artifacts)
                 @test states == Dict(("A", "a") => PASSED, ("B", "b") => PASSED)
                 @test run.exported == artifacts
+                # Each package's run directory, under the package's name.
                 for (k, name) in enumerate(["A", "B"])
                     path = run.runstate.files[k].path
-                    @test read(joinpath(artifacts, name, basename(path))) == read(path)
+                    @test read(joinpath(artifacts, name, basename(rundata_dir(path)), basename(path))) == read(path)
                 end
                 # A file where the directory must go: a warning, and the items keep their verdicts.
                 blocked = joinpath(mktempdir(), "file")
@@ -991,7 +998,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 @test !any(rs -> any(s -> s.state === PASSED, rs.statuses), records)
                 # The failure report is with A's logs, by the item's index in A's run state.
                 report = failure_log(run, item_of(p, "A", "same"), 1)
-                @test isfile(report) && dirname(report) == logs_dir(run.runstate.files[1].path)
+                @test isfile(report) && dirname(report) == rundata_dir(run.runstate.files[1].path)
                 # A's runs find A's failure; B's, with an item of that name, none.
                 @test failing_items(joinpath(ws, "lib", "A")) == ["same"]
                 @test isempty(failing_items(joinpath(ws, "lib", "B")))
@@ -1027,9 +1034,9 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 "B" => ["test/b_test.jl" => item_text("b")],
             )
             err = try Runtests.runtests_mono(ws; workers = 0, monitor = false); nothing catch e; e end
-            @test err isa ArgumentError && occursin("give it one worker or more", err.msg)
+            @test err isa ArgumentError && occursin("give it one worker or more", slashed(err.msg))
             err = try mono(ws; coverage = true, workers = 0); nothing catch e; e end
-            @test err isa ArgumentError && occursin("`coverage` is counted by worker processes", err.msg)
+            @test err isa ArgumentError && occursin("`coverage` is counted by worker processes", slashed(err.msg))
             with_runstate_dir() do dir
                 value, out = capture_run(() -> Runtests.runtests_mono(ws; dry_run = true))
                 @test value === nothing && occursin("dry run", out)
@@ -1126,7 +1133,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 @test selected(r.plan) == [("A", "a1"), ("A", "qa1")]
                 @test any(==("partial replay: no run state of B is left from the replayed run"), r.plan.notes)
                 err = try mono(ws; replay = a_record, packages = ["B"]); nothing catch e; e end
-                @test err isa ConfigError && occursin("has a run state of the run", err.msg)
+                @test err isa ConfigError && occursin("has a run state of the run", slashed(err.msg))
                 # A run state of one package is replayed by its own `runtests`.
                 single = read_run_state(a_record)
                 err = try Runtests.Private.replay_records(a_record, find_participants(ws)); nothing catch e; e end
@@ -1135,7 +1142,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 broken = Runtests.Private.RunStateRecord((f === :meta ? merge(single.meta, Dict("environments" => "")) :
                                                           getfield(single, f) for f in fieldnames(Runtests.Private.RunStateRecord))...)
                 err = try Runtests.Private.check_replayed_environments(RawItem[], [broken], [joinpath(ws, "lib", "A")]); nothing catch e; e end
-                @test err isa ConfigError && occursin("records 1 environment directory for 2 test items", err.msg)
+                @test err isa ConfigError && occursin("records 1 environment directory for 2 test items", slashed(err.msg))
             end
         end
 
@@ -1208,7 +1215,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
                 for (dir, says) in ((ws, "is in none of A, C: `cd` into the package's directory"),
                                     (joinpath(ws, "lib", "C"), "C is isolated"))
                     err = try pasted(dir); nothing catch e; e end
-                    @test err isa ConfigError && occursin(says, err.msg)
+                    @test err isa ConfigError && occursin(says, slashed(err.msg))
                 end
                 redirect_stdout(Runtests.deactivate, devnull)
                 @test Base.active_project() == project && LOAD_PATH == load_path && !isdir(dirname(active))
@@ -1220,13 +1227,13 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             ws = make_workspace("A" => ["test/a_test.jl" => item_text("a"), "test/testsetups/Common.jl" => "module Common end\n"],
                                 "B" => ["test/b_test.jl" => item_text("b"), "test/testsetups/Common.jl" => "module Common end\n"])
             err = try Runtests.activate_mono(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("`Common` in lib/A/test/testsetups and in lib/B/test/testsetups", err.msg)
+            @test err isa ConfigError && occursin("`Common` in lib/A/test/testsetups and in lib/B/test/testsetups", slashed(err.msg))
             @test Base.active_project() == project && LOAD_PATH == load_path && !Runtests.is_activated()
             # So does a setup that a package of the union environment would shadow.
             ws = make_workspace("A" => ["test/a_test.jl" => item_text("a"), "test/testsetups/X.jl" => "module X end\n"],
                                 "B" => ["test/b_test.jl" => item_text("b")]; deps = Dict("B" => ["X"]))
             err = try Runtests.activate_mono(ws); nothing catch e; e end
-            @test err isa ConfigError && occursin("`X` in lib/A/test/testsetups, which lib/B/test/Project.toml declares", err.msg)
+            @test err isa ConfigError && occursin("`X` in lib/A/test/testsetups, which lib/B/test/Project.toml declares", slashed(err.msg))
             @test Base.active_project() == project && LOAD_PATH == load_path && !Runtests.is_activated()
         end
 
@@ -1285,7 +1292,7 @@ root_rel(ps) = [relpath(r, ps.workspace) for r in ps.root]
             )
             # The clash is in the last packages, and no package's chores ran: A's setup is still a module.
             err = with_runstate_dir(_ -> try Runtests.chores_mono(ws); nothing catch e; e end)
-            @test err isa ConfigError && occursin("`Common` in lib/C/test/testsetups and in lib/D/test/testsetups", err.msg)
+            @test err isa ConfigError && occursin("`Common` in lib/C/test/testsetups and in lib/D/test/testsetups", slashed(err.msg))
             @test isfile(joinpath(ws, "lib", "A", "test", "testsetups", "ASetup.jl"))
             rm(joinpath(ws, "lib", "D", "test", "testsetups"); recursive = true)
             # A setup that imports another package's test dependency, and a launcher that

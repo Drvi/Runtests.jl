@@ -71,9 +71,7 @@ end
     info = Runtests.current_testitem()
     @test info !== nothing
     @test info.name == "knows it is in a test item"
-    @test Runtests.in_testitem()
-    @test Runtests.in_test_run()
-    @test fetch(Threads.@spawn Runtests.in_testitem())   # spawned tasks inherit the scope
+    @test fetch(Threads.@spawn Runtests.current_testitem()) == info   # spawned tasks inherit the scope
 end
 
 @testitem "survives two dead workers" tags=[:abort] retries=2 begin

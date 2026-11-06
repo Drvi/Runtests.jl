@@ -7,8 +7,7 @@ of Runtests, which takes it little longer than this part alone, because Runtests
 loads `Pkg` only when it builds an environment, which a worker never does.
 
 Test code reaches this package through Runtests: `Runtests.current_testitem()`,
-`Runtests.in_testitem()`, `Runtests.in_test_run()`, `Runtests.on_failure()` and
-`Runtests.artifacts_dir()` are defined here.
+`Runtests.on_failure()` and `Runtests.artifacts_dir()` are defined here.
 """
 module RuntestsWorkers
 

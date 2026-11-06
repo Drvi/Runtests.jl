@@ -123,9 +123,9 @@ Its fields are these:
 - `counts`: the number of items in each state.
 - `not_run`: the keys of the items that never finished.
 - `elapsed`: seconds.
-- `runstate`: the run state file of a run of one package, or `null`.
-- `runstates`: the run state of each package, each a `package` and a `path`. A combined run writes one for each package. The `path` is `null` when the run state could not be written.
-- `logdir`: the directory of the item logs. Normally these stay beside the run state and follow its [retention rules](@ref retention). Only fallback logs in temporary storage are removed when the next run starts or the server stops.
+- `runstate`: the run state file of a run of one package, `<run>.rundata/run.runstate`, or `null`.
+- `runstates`: the run state file of each package, each a `package` and a `path`. A combined run writes one for each package. The `path` is `null` for a package whose run state the run failed to write.
+- `logdir`: the directory of the item logs. Normally this is the directory of the run, which also holds the run state, and the logs follow its [retention rules](@ref retention). Only fallback logs in temporary storage are removed when the next run starts or the server stops.
 
 If execution fails before a run can be initialized, `run_finished` has only `state` and the run's ID, when supplied. The other fields above are absent.
 

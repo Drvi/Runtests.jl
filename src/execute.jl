@@ -317,8 +317,8 @@ mutable struct Run
     # The run's own temporary directory: coverage counts, which the run merges into
     # `lcov.info`, and the items' logs when there is no run state to keep them by.
     const scratch::String
-    # Where the items' logs go: beside the run state, which they share a lifetime with
-    # (see `logs_dir`), once it is open; `scratch` until then.
+    # Where the items' logs go: in the run's directory, beside its record, which they
+    # share a lifetime with (see `rundata_dir`), once it is open; `scratch` until then.
     logdir::String
     logprefix::String   # `logdir` and the part of a log's name that never varies
     # The same for the attempts' evidence (see `artifacts_path`), absolute: `logprefix`
@@ -723,12 +723,16 @@ function in_package_workspace(testproj, proj)
 end
 
 # The project at the top of the workspaces that `project` is a member of, or
-# `project` itself when it is a member of none.
+# `project` itself when it is a member of none, as every project is before Julia 1.12.
 function outermost_workspace(project)
-    while true
-        parent = Base.base_project(project)
-        (parent === nothing || samefile(parent, project)) && return project
-        project = parent
+    @static if isdefined(Base, :base_project)
+        while true
+            parent = Base.base_project(project)
+            (parent === nothing || samefile(parent, project)) && return project
+            project = parent
+        end
+    else
+        return project
     end
 end
 
@@ -798,8 +802,8 @@ function open_runstate(p::Plan, start::Float64)
         path = new_runstate_path(p.root)
         return init_run_state(path, p; start)
     catch e
-        # A name claimed and left empty would never be read, nor pruned.
-        path === nothing || rm(path; force = true)
+        # A directory claimed and left without a record would never be read, nor pruned.
+        path === nothing || remove_runstate(path)
         @warn "Runtests: could not open a run state file; continuing without one" exception = e
         return nothing
     end
@@ -813,7 +817,7 @@ function keep_logs_by_runstate!(run::Run)
     files = rs isa RunStateSet ? rs.files : [rs]
     for (k, rsf) in enumerate(files)
         rsf === nothing && continue
-        dir = logs_dir(rsf.path)
+        dir = rundata_dir(rsf.path)
         try
             mkpath(dir)
         catch e
@@ -890,9 +894,9 @@ function export_run!(run::Run)
             rsf === nothing && continue
             to = joinpath(dir, sub)
             mkpath(to)
-            cp(rsf.path, joinpath(to, basename(rsf.path)); force = true)
-            logs = logs_dir(rsf.path)
-            isdir(logs) && cp(logs, joinpath(to, basename(logs)); force = true)
+            # The run's directory: its record and its logs, as one.
+            rundata = rundata_dir(rsf.path)
+            cp(rundata, joinpath(to, basename(rundata)); force = true)
         end
         run.exported = dir
     catch e

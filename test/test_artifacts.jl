@@ -4,7 +4,7 @@
 # reason for a verdict to change.
 
 using Runtests.Private: prepare, execute, exclusively, nitems, read_config, read_run_state, runstate_files,
-    logs_dir, attempt_artifacts, stall_limit, STALL_LIMIT_OVERRIDE, RunStalled, ConfigError, plan, run_item,
+    rundata_dir, attempt_artifacts, stall_limit, STALL_LIMIT_OVERRIDE, RunStalled, ConfigError, plan, run_item,
     ItemSpec, PASSED, FAILED, ERRORED, SKIPPED, BROKEN_CHAIN, EVENT_ATTEMPT
 using Runtests.RuntestsWorkers: RuntestsWorkers, artifacts_log_path, ARTIFACT_FILES, ARTIFACT_PRODUCERS,
     PENDING_ARTIFACTS, finish_artifacts
@@ -382,14 +382,13 @@ end
             @test err isa RunStalled
             path = only(runstate_files(stalled))
             # Out of the directory that is deleted on the way out.
-            keep = mktempdir()
-            cp(path, joinpath(keep, basename(path)))
-            cp(logs_dir(path), logs_dir(joinpath(keep, basename(path))))
+            keep = joinpath(mktempdir(), basename(rundata_dir(path)))
+            cp(rundata_dir(path), keep)
             joinpath(keep, basename(path))
         end
         rs = read_run_state(path)
         @test only(rs.statuses).state === FAILED
-        dir = joinpath(logs_dir(path), "item_1_1.artifacts")
+        dir = joinpath(rundata_dir(path), "item_1_1.artifacts")
         @test read(joinpath(dir, "producer_1", "partial.txt"), String) == "started"
         @test occursin("the run was stopped while the producers ran", read(artifacts_log_path(dir), String))
         @test live_worker_processes() == 0

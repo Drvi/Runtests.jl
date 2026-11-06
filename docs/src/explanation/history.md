@@ -4,7 +4,7 @@ This page explains how Runtests remembers runs. Each run writes a run state: a b
 
 ## What a run state records
 
-Every run writes its run state while it goes on, and prints the path at the end. Even an interrupted run leaves a record of the items that it completed. A run state records these facts:
+Every run writes its run state while it goes on, and prints the path of its directory at the end. Even an interrupted run leaves a record of the items that it completed. A run state records these facts:
 
 - The outcome, the duration and the compilation time of each item, and every attempt.
 - Each start and exit of a worker, with whether the worker timed out, crashed, or got a signal from outside.
@@ -15,7 +15,7 @@ Every run writes its run state while it goes on, and prints the path at the end.
 - The environment variables `JULIA_*`, `RUNTESTS_*` and those of CI jobs, without names that look like credentials.
 - The `Project.toml` and the `Manifest.toml` of the test environment.
 
-Next to the run state, a directory with the same name and `.logs` in place of `.runstate` holds the logs. They hold captured item output, failure reports, [artifact evidence](@ref evidence), and the reason why a run ended before its first item. Under `logs = :eager`, ordinary item output is streamed and is not retained there; artifact producers still have their own captured output. [The files reference](@ref run-state-files) shows the layout.
+Each run keeps its run state, `run.runstate`, in a directory of its own, `<run>.rundata`. That directory also holds the logs of the run: captured item output, failure reports, [artifact evidence](@ref evidence), and the reason why a run ended before its first item. Under `logs = :eager`, ordinary item output is streamed and is not kept there. Artifact producers still have their own captured output. [The files reference](@ref run-state-files) shows the layout.
 
 ## How Runtests uses the history
 
@@ -38,7 +38,7 @@ Runtests keeps the newest 20 run states of this machine. It deletes an older run
 - the newest duration and source hash of the item,
 - whether the newest run that selected the item stopped before the item.
 
-An item that the suite no longer has stays on record, for a branch that still has it. It keeps no run state beyond the newest 20. The logs of a run state are deleted with it, and only with it.
+An item that the suite no longer has stays on record, for a branch that still has it. It keeps no run state beyond the newest 20. The directory of a run, with its logs, is deleted with its run state, and only with it.
 
 [`Runtests.chores()`](@ref chores) also looks for deleted projects in the default run-state location. It removes this machine's run states after the newest file is at least 30 days old. A project in the system's temporary files has no 30-day wait. A project whose parent directory is missing or empty is left alone, as with a drive that is not mounted. Ordinary runs prune their own project's history; they do not sweep deleted projects. The sweep is disabled when `RUNTESTS_RUNSTATE_DIR` is set.
 
@@ -46,15 +46,15 @@ An item that the suite no longer has stays on record, for a branch that still ha
 
 The name of the machine is `RUNTESTS_HOST` when it is set. In other cases, it is the name that macOS gives the machine, or the hostname on other systems. The macOS name stays the same when the hostname changes with the network.
 
-Normal retention leaves readable run states of other machines alone. The old-format cleanup below is an exception: files too old to read have no readable machine identity and can be deleted from the default location. A replay does not prune, and never deletes the run state that you give it.
+Retention leaves run states of other machines alone. A replay does not prune, and never deletes the run state that you give it.
 
 ### Formats
 
-Runtests reads the current run state format and the preceding format. A run warns once about formats that it does not read. `Runtests.chores()` deletes formats older than those it can read in the default location. It does not delete old-format files from a custom `RUNTESTS_RUNSTATE_DIR`, which may hold other projects' records.
+Runtests reads only run states in its own format. A run warns once when its run state directory holds run states of another version of Runtests. Runtests does not use those run states, and does not delete them.
 
 ## Concurrent runs
 
-An editor, a REPL and CI jobs can share one run state directory. Each run makes its own file, and writes it to disk at least every 30 seconds. The run states of active runs are never pruned.
+An editor, a REPL and CI jobs can share one run state directory. Each run makes its own directory, and writes its run state to disk at least every 30 seconds. The run states of active runs are never pruned.
 
 A run is dead when its run state did not change for 90 seconds, or when its local process is known to have exited. A dead run counts as cancelled, and an item that was running in it counts as failing. A run whose setup fails finishes its run state as a run that ended before its first item. Thus no other run waits for it.
 
@@ -62,4 +62,4 @@ Machines that share run states over a network must agree on the time to within a
 
 ## Read a run state
 
-`Runtests.read_run_state(path)` reads a run state file. It never throws. A file that is truncated, that a crashed run left, or that another version wrote gives as much as it can, or `nothing`. A broken record of an old run must not stop a new run.
+`Runtests.read_run_state(path)` reads a run state. `path` is the directory of a run or the `run.runstate` file in it. It never throws. A file that is truncated, that a crashed run left, or that another version wrote gives as much as it can, or `nothing`. A broken record of an old run must not stop a new run.

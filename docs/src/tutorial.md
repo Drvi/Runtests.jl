@@ -74,20 +74,20 @@ Pkg.test()
 The output starts with a header block, then one line for each event of the run. The abbreviated output below illustrates the format; worker counts, assignments, paths, seeds and timings depend on your run.
 
 ```text
-┌ [TEST] v0.1.0 · julia 1.13.3 · 2 test items in 1 file · seed 0x97c9d385063d42e1 · 2 workers · threads 2,1
-│ env: /tmp/jl_h1V1IT/Project.toml
-└ startup: files 0.0s · plan 0.0s · setup 0.3s
-⚫ w1 · 12:29:12 · UP   · pid 88963 · threads 2,1
-🔵 w1 · 12:29:12 · RUN  · 1/2 · "circle area" · at test/area_tests.jl:1
-🟢 w1 · 12:29:13 · DONE · 1/2 · "circle area" · PASS ·  0.4s (11% compile) · maxrss 0.3 GiB
-┌ [TEST] ran 2 test items in 1.5s on 2 workers, all passed
-└ run state: ~/.julia/runtests/runs/Geometry-…/1793446152191363-88961.runstate
+┌ [TEST] v0.1.0 · julia 1.13.3 · 2 test items in 1 file · seed 0xdd9c0263775e72e7 · 2 workers · threads 2,1
+│ env: /tmp/jl_4JWcNy/Project.toml
+└ startup: files 0.0s · plan 0.1s · setup 1.1s
+⚫ w1 · 14:54:35 · UP   · pid 45413 · threads 2,1
+🔵 w1 · 14:54:35 · RUN  · 1/2 · "circle area" · at test/area_tests.jl:1
+🟢 w1 · 14:54:36 · DONE · 1/2 · "circle area" · PASS ·  0.5s (11% compile) · maxrss 0.3 GiB
+┌ [TEST] ran 2 test items in 2.4s on 2 workers, all passed
+└ run state: ~/.julia/runtests/runs/Geometry-…/1793973275182436-45262.rundata
 Test Summary:        | Pass  Total  Time
-Runtests             |    3      3  1.5s
+Runtests             |    3      3  2.4s
   test/area_tests.jl |    3      3  0.5s
 ```
 
-This example uses two workers. The last line of the closing block names the run state file. [The output reference](reference/output.md) explains each part of the lines.
+This example uses two workers. The last line of the closing block names the directory of the run. The directory holds the run state and the logs of the run. [The output reference](reference/output.md) explains each part of the lines.
 
 ## Run the suite at the REPL
 
@@ -124,7 +124,7 @@ Run the suite again with `Runtests.runtests()`. The failed item gets a block wit
 │ Test Failed at test/area_tests.jl:3
 │   Expression: circle_area(2) ≈ 2π
 │    Evaluated: 12.566370614359172 ≈ 6.283185307179586
-│ No captured logs
+│ [ No captured logs
 └ @ test/area_tests.jl:1 on worker 1
 ```
 
@@ -165,9 +165,9 @@ Runtests.runtests(dry_run = true)
 ```
 
 ```text
-  # · worker · test item     · at                   ·    est · tags
-  1 ·     w1 · "circle area" · test/area_tests.jl:1 · 0.041s
-  2 ·     w2 · "square area" · test/area_tests.jl:6 · 0.034s · fast
+  # · worker · test item     · at                   ·  est · tags
+  1 ·     w1 · "circle area" · test/area_tests.jl:1 · 0.5s
+  2 ·     w2 · "square area" · test/area_tests.jl:6 · 0.4s · fast
 ```
 
 The `est` column shows the duration that the last run recorded for each item. [Run tests](guide/running.md) tells you all the ways to select items.
@@ -213,6 +213,7 @@ Runtests.chores()
 │ test items: 3 in 1 file, all valid
 │ config: none
 │ run states: 5 in ~/.julia/runtests/runs/Geometry-…, none to delete
+│ checkouts that are gone: none with run states to delete
 └ done: 1
 ```
 

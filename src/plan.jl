@@ -514,8 +514,8 @@ function count_slots(pools::Vector{Vector{Int}}, completion, cfg::RunConfig)
 end
 
 # Whether an item is what is being worked on: its source differs from the newest run
-# that ran it, or no kept run state records it although others record the suite. An
-# item recorded without a source hash, by an older format, is not taken for edited.
+# that ran it, or no kept run state records it although others record the suite. A
+# hash of 0 is none: an item with none recorded is not taken for edited.
 edited(it::RawItem, h::History) = (r = get(h.hashes, it.name, UInt32(0)); r != 0 && it.hash != 0 && r != it.hash)
 never_ran(it::RawItem, h::History) = !isempty(h.known) && !(it.name in h.known)
 

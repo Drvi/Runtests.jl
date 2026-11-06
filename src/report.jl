@@ -814,16 +814,10 @@ function conclusion_text(run, ended::Symbol = :finished)
         rs = run.runstate
         rs isa RunStateSet && print_package_lines(io, run, rs)
         if rs isa RunStateFile
+            # The run's directory: its record, and what its items printed and kept.
             print(io, "run state: ")
-            printstyled(io, rs.path; color = :light_black)
+            printstyled(io, rundata_dir(rs.path); color = :light_black)
             println(io)
-            # Whatever the run printed of its items, and more: what the passing ones
-            # printed, which only `logs = :batched` shows.
-            if run.logdir != run.scratch && isdir(run.logdir)
-                print(io, "logs: ")
-                printstyled(io, run.logdir; color = :light_black)
-                println(io)
-            end
             if !isempty(run.exported)
                 print(io, "copied to: ")
                 printstyled(io, run.exported; color = :light_black)
@@ -838,7 +832,7 @@ function conclusion_text(run, ended::Symbol = :finished)
             printstyled(io, "Runtests.runtestsf()"; bold = true)
             if !isempty(run.exported)
                 print(io, ", or where the copy is: ")
-                printstyled(io, "Runtests.runtestsf(replay = ", repr(basename(rs.path)), ")"; bold = true)
+                printstyled(io, "Runtests.runtestsf(replay = ", repr(basename(rundata_dir(rs.path))), ")"; bold = true)
             end
             println(io)
         elseif rs isa RunStateSet
@@ -866,7 +860,7 @@ function print_package_lines(io::IO, run, rs::RunStateSet)
             printstyled(io, run.logdirs[k]; color = :light_black)
         else
             print(io, " · run state ")
-            printstyled(io, rs.files[k].path; color = :light_black)
+            printstyled(io, rundata_dir(rs.files[k].path); color = :light_black)
         end
         println(io)
     end
@@ -1202,7 +1196,8 @@ function print_item_log(io::IO, run, i::ItemIdx, state::ItemState)
     # is a fact about the failure, not a reason to print nothing.
     (has_logs || is_non_pass(state) || p.cfg.verbose) || return nothing
     if !has_logs
-        printstyled(io, "No captured logs"; bold = true, color = Base.info_color())
+        # One line, so the inline bracket of a one-line log record, `[`.
+        printstyled(io, "[ No captured logs"; bold = true, color = Base.info_color())
         println(io)
         return nothing
     end

@@ -347,8 +347,8 @@ Runtests.chores()              # apply automatic fixes and report remaining prob
   changes, including manually edited expansions. A package without test files, such
   as a fixture package in another package's `test/testfixtures/`, has nothing to check.
 - Deletes the run states that a run's own pruning deletes, by the same
-  [retention rules](#storage-and-retention), with their logs, and those of a format
-  this version does not read. Records from other machines are preserved.
+  [retention rules](#storage-and-retention), with their runs' directories. Records
+  from other machines, and those this version does not read, are preserved.
 
 After applying automatic fixes, it returns `true` or throws
 `Runtests.ChoresError` if manual work remains. This lets you check the suite before
@@ -565,26 +565,28 @@ The output below and in [While it runs](#while-it-runs) illustrates a small suit
 timings and resource usage depend on the suite and machine.
 
 <pre>
-<b>┌ [TEST]</b> dry run · v0.1.0 · julia 1.13.0 · 6 test items in 2 files · 2 workers · threads 2,1
-<b>│ </b>startup: files 0.0s · plan 0.0s
+<b>┌ [TEST]</b> dry run · v0.1.0 · julia 1.13.3 · 6 test items in 2 files · 2 workers · threads 2,1
+<b>│ </b>startup: files 0.0s
 <b>│ </b>setups: `BasicSetup`
 <b>│ </b>timeout: 1800s · retries: 0 · failfast: false · logs: issues · memory_threshold: 0.9
-<b>└ </b>order and workers: predicted as if every item took as long, since no durations are recorded yet
+<b>│ </b>estimated work: w1 0.049s · w2 0.058s
+<b>└ </b>order and workers: predicted from the recorded durations, an item without one counting as a typical one
 
-  <b>#</b> · <b>worker</b> · <b>test item   </b> · <b>at                  </b> · <b>tags      </b> · <b>why here     </b> · <b>details</b>
-  1 ·     w1 · "slow thing" · test/sub/b_test.jl:9 · slow       · [order] first · timeout 120s
-  2 ·     w2 · "chain one"  · test/sub/b_test.jl:1 ·            ·               · chain `seq` 1/2
-  3 ·     w2 · "chain two"  · test/sub/b_test.jl:5 ·            ·               · chain `seq` 2/2
-  4 ·     w1 · "add works"  · test/a_test.jl:1     · fast
-  5 ·     w2 · "uses setup" · test/a_test.jl:11    ·            ·               · setup `BasicSetup`
-  6 ·     w1 · "mul works"  · test/a_test.jl:6     · fast, math
+  <b>#</b> · <b>worker</b> · <b>test item   </b> · <b>at                  </b> · <b> est</b> · <b>tags      </b> · <b>why here     </b> · <b>details</b>
+  1 ·     w1 · "slow thing" · test/sub/b_test.jl:9 · 0.0s · slow       · [order] first · timeout 120s
+  2 ·     w2 · "chain one"  · test/sub/b_test.jl:1 · 0.0s ·            ·               · chain `seq` 1/2
+  3 ·     w2 · "chain two"  · test/sub/b_test.jl:5 · 0.0s ·            ·               · chain `seq` 2/2
+  4 ·     w1 · "add works"  · test/a_test.jl:1     · 0.0s · fast
+  5 ·     w2 · "uses setup" · test/a_test.jl:11    · 0.0s ·            ·               · setup `BasicSetup`
+  6 ·     w1 · "mul works"  · test/a_test.jl:6     · 0.0s · fast, math
 </pre>
 
 The table lists the items in the order the run is expected to start them, each
 with the worker expected to run it. The prediction plays out the run's own
 dispatch with the durations earlier runs recorded, so it is as good as they are.
 When earlier runs recorded durations, the `est` column gives each item's newest
-one. It is blank for an item that has none yet.
+one, in seconds with one decimal, and `estimated work` gives the time each worker
+is expected to be busy. The column is blank for an item that has none yet.
 
 A run hands out, in this order:
 
@@ -618,15 +620,15 @@ every name whole.
 Workers, test items and the run itself each get lines of one shape:
 
 <pre>
-<b>┌ [TEST]</b> v0.1.0 · julia 1.13.0 · 6 test items in 2 files · seed 0x0c15831ed3676a15 · 2 workers · threads 2,1
-<b>│ </b>env: /var/folders/…/jl_vWMrc1/Project.toml
-<b>└ </b>startup: files 0.0s · plan 0.1s · setup 1.4s
-⚪ w0 · 12:54:36 · <b>INFO</b> · 0/6 · 0 failed · 0/2 workers · tree mem 845M (max 845M) · child max 448M · mem 89% · cpu 10.6/18 · testing 1s
-⚫ w1 · 12:54:37 · <b>UP  </b> · pid 96279 · threads 2,1
-⚫ w2 · 12:54:37 · <b>UP  </b> · pid 96280 · threads 2,1
-🔵 w1 · 12:54:37 · <b>RUN </b> · 1/6 · "slow thing" · at <b>test/sub/b_test.jl:9</b>
-🔵 w2 · 12:54:37 · <b>RUN </b> · 5/6 · "chain one"  · at <b>test/sub/b_test.jl:1</b>
-🟢 w1 · 12:54:37 · <b>DONE</b> · 1/6 · "slow thing" · PASS ·  0.0s (93% compile) · maxrss 0.3 GiB
+<b>┌ [TEST]</b> v0.1.0 · julia 1.13.3 · 6 test items in 2 files · seed 0x522fb3b30334cd75 · 2 workers · threads 2,1
+<b>│ </b>env: /var/folders/…/jl_7AEUWb/Project.toml
+<b>└ </b>startup: files 0.0s · plan 0.1s · setup 1.2s
+⚪ w0 · 14:52:16 · <b>INFO</b> · 0/6 · 0 failed · 0/2 workers · tree mem 920M (max 920M) · child max 449M · mem 82% · cpu  5.5/18 · testing 0s
+⚫ w1 · 14:52:16 · <b>UP  </b> · pid 35898 · threads 2,1
+⚫ w2 · 14:52:16 · <b>UP  </b> · pid 35899 · threads 2,1
+🔵 w2 · 14:52:16 · <b>RUN </b> · 5/6 · "chain one"  · at <b>test/sub/b_test.jl:1</b>
+🔵 w1 · 14:52:16 · <b>RUN </b> · 1/6 · "slow thing" · at <b>test/sub/b_test.jl:9</b>
+🟢 w1 · 14:52:16 · <b>DONE</b> · 1/6 · "slow thing" · PASS ·  0.0s (94% compile) · maxrss 0.3 GiB
 </pre>
 
 ⚫ is a worker starting or ending, 🔵 an item starting, 🟢 an item that passed, 🔴
@@ -647,26 +649,26 @@ An item that did not pass gets its results and captured output right after its
 <b>┌ [1/1] FAIL</b> "fails"
 <b>│ </b><b>Test Failed</b> at <b>test/faults_test.jl:6</b>
 <b>│ </b>  Expression: 1 == 2
-<b>│ </b><b>No captured logs</b>
+<b>│ </b><b>[ No captured logs</b>
 <b>└ </b>@ test/faults_test.jl:5 on worker 1
 </pre>
 
 The run ends with what it cost, stage by stage, followed by `Test`'s usual summary:
 
 <pre>
-<b>┌ [TEST]</b> ran 6 test items in 3.3s on 2 workers, all passed
-<b>│ </b>setup   · 1.3s · tree max  422M · child max  422M · coordinator
-<b>│ </b>testing · 1.8s · tree max  1.0G · child max  452M · coordinator + 2 workers · 87% compile
+<b>┌ [TEST]</b> ran 6 test items in 2.1s on 2 workers, all passed
+<b>│ </b>setup   · 1.1s · tree max  445M · child max  445M · coordinator
+<b>│ </b>testing · 0.9s · tree max  1.0G · child max  460M · coordinator + 2 workers · 85% compile
 <b>│ </b>(summed resident sizes over-count pages the processes share)
-<b>│ </b>machine · 57.7G of 64.0G in use at peak
-<b>│ </b>cpu · 9% of 18 threads for this run's processes, 14% for the whole machine (averages over the run)
-<b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276123456-96211.runstate
+<b>│ </b>machine · 52.9G of 64.0G in use at peak
+<b>│ </b>cpu · 8% of 18 threads for this run's processes, 24% for the whole machine (averages over the run)
+<b>└ </b>run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276123456-96211.rundata
 </pre>
 
-When items printed anything, the block also names the directory of their logs (see
-[Run state](#run-state)). When items failed, it says how to run them again:
-`Runtests.runtestsf()`, or `Runtests.runtestsf(replay = "<file>")` where the run
-state was copied for CI.
+The `run state` line names the run's directory, which also holds what the items
+printed (see [Run state](#run-state)). When items failed, the block says how to run
+them again: `Runtests.runtestsf()`, or `Runtests.runtestsf(replay = "<run>.rundata")`
+where the run's directory was copied for CI.
 
 The memory figures cover every process the run owns: the coordinator, the workers,
 and whatever they spawn, such as `Pkg` precompiling or a process a test starts.
@@ -816,8 +818,6 @@ a pass.
 ```julia
 import Runtests               # in the item's body
 Runtests.current_testitem()   # a TestItemInfo: name, file, line, attempt, profile; or nothing
-Runtests.in_testitem()        # Bool, for this task and the tasks it spawns
-Runtests.in_test_run()        # Bool, process-level, inherited by subprocesses
 ```
 
 These are for test infrastructure: temporary directories, fixture paths, switching
@@ -864,11 +864,11 @@ An attempt fails when an assertion fails or the item throws, in its body or in i
 profile's `test_end`. A skipped item, an expected-broken assertion, and an attempt
 that passes do not run producers. An attempt that passes deletes what it wrote.
 
-Each attempt keeps its evidence beside its log in the run's logs:
+Each attempt keeps its evidence beside its log, in the run's directory:
 
 ```text
-<run>.runstate
-<run>.logs/
+<run>.rundata/
+  run.runstate              # the run's record
   item_7_1.log
   item_7_1.failure.txt
   item_7_1.artifacts/
@@ -950,16 +950,17 @@ the combined run. To run the combined suites with `Pkg.test` of the root package
 
 ## Run state
 
-Every run writes a binary record as it progresses and prints its path at the end.
-Even an interrupted run leaves a record of completed items. Beside the record, a
-directory with the same name ending in `.logs` keeps what each item printed and the
-failure report of each item that did not pass. Use a record from a local run or a
-downloaded CI artifact to inspect or replay it:
+Every run writes a binary record as it progresses, `run.runstate` in a directory of
+its own, `<run>.rundata`, and prints the directory's path at the end. Even an
+interrupted run leaves a record of completed items. The same directory keeps what
+each item printed and the failure report of each item that did not pass. Give a
+run's directory from a local run or a downloaded CI artifact to inspect or replay
+it. The record file in it works as well:
 
 ```julia
-Runtests.read_run_state("run.runstate")
-Runtests.runtests(replay="run.runstate")
-Runtests.runtestsf(replay="run.runstate")
+Runtests.read_run_state("path/to/the.rundata")
+Runtests.runtests(replay="path/to/the.rundata")
+Runtests.runtestsf(replay="path/to/the.rundata")
 ```
 
 `runtests(replay=...)` uses the recorded items, settings, profiles, `[order]`, and
@@ -982,7 +983,7 @@ runs started after it. Earlier runs contribute durations only.
 - Each item's seed, and a hash of its source, which tells an edited item from one
   that only moved.
 - The Julia flags that change compiled code, such as `--check-bounds` and `-O`.
-- In the `.logs` directory beside the record: what each item printed, the failure
+- In the run's directory, beside the record: what each item printed, the failure
   report of each attempt that did not pass, and why a run ended before its first
   item.
 - `JULIA_*`, `RUNTESTS_*`, and CI job environment variables, excluding names that
@@ -1007,8 +1008,8 @@ its deletion would change what the records say about an item the suite has: its
 latest verdict and when it was recorded, the seed of a failure, its newest duration
 and source hash, or whether the newest run that selected it stopped before it. An
 item the suite no longer has stays on record, for a branch that still has it, and
-keeps no record beyond the newest 20. A record's logs are deleted with it, and only
-with it. Records of a deleted project are removed 30 days after its newest run,
+keeps no record beyond the newest 20. A record's directory, with its logs, is
+deleted with it, and only with it. Records of a deleted project are removed 30 days after its newest run,
 unless its parent directory is missing or empty, as with an unmounted drive. A
 project in the system's temporary files has no such wait. A run looks for deleted
 projects at most once a day.
@@ -1018,22 +1019,21 @@ macOS gives the machine, which stays the same when the hostname follows the
 network, and the hostname elsewhere. Records from other machines are never changed
 or deleted. Replay performs no pruning and never deletes the supplied record.
 
-Each version of Runtests reads the record format of the version before it. A run
-warns once about records of a format it does not read, and `Runtests.chores()`
-deletes those of older formats.
+Runtests reads only records in its own format. A run warns once about records of
+another version of Runtests, and leaves them alone.
 
 ### Keeping history on CI
 
 Cache run states between jobs to preserve scheduling history, and upload each
 job's own records and logs as an artifact. `RUNTESTS_ARTIFACT_DIR` names a
-directory into which each run copies its record and its logs when it ends, also
-after a failure or an interrupt. For a GitHub Actions matrix with `os`, `version`,
+directory into which each run copies its own directory, with its record and its
+logs, when it ends, also after a failure or an interrupt. For a GitHub Actions matrix with `os`, `version`,
 and a [`group`](#groups) per job:
 
 ```yaml
 - uses: actions/cache/restore@v4
   with:
-    path: ${{ runner.temp }}/runtests/*.runstate
+    path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
     restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
@@ -1045,7 +1045,7 @@ and a [`group`](#groups) per job:
 - uses: actions/cache/save@v4
   if: always()
   with:
-    path: ${{ runner.temp }}/runtests/*.runstate
+    path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
 - uses: actions/upload-artifact@v4
   if: failure()
@@ -1055,14 +1055,14 @@ and a [`group`](#groups) per job:
 ```
 
 The cache holds the records and leaves the logs out, because the next job plans
-from the records alone. Name the records with `*.runstate`. Do not name the
-directory with an exclusion such as `!**/*.logs`: the cache archives a directory
-whole, and the exclusion has no effect. The restore step and the save step must
+from the records alone. Name the records with `*.rundata/run.runstate`. Do not
+name the runs' directories, `*.rundata`, with an exclusion such as `!**/*.log`: the
+cache archives a directory whole, and the exclusion has no effect. The restore step and the save step must
 list the same `path`. The cache finds an entry by its key and by its paths, so a
 restore that lists other paths does not find it.
-The artifact holds this job's records and logs and none of the history. On your
-machine, run the failures of a downloaded record with
-`Runtests.runtestsf(replay = "<file>")`.
+The artifact holds this job's run directory, with its record and logs, and none of
+the history. On your machine, run the failures of a downloaded run with
+`Runtests.runtestsf(replay = "<run>.rundata")`.
 
 Use a unique cache key per run and `restore-keys` to retrieve the previous cache.
 Save it even when tests fail, so the next run sees those failures. A stable
@@ -1080,7 +1080,7 @@ what a run selects by default.
 ### Concurrent runs
 
 An editor, a REPL, or CI jobs can share a run-state directory. Each run claims its
-own file and flushes it at least every 30 seconds. Completed items supply timing
+own directory and flushes its record at least every 30 seconds. Completed items supply timing
 data immediately; verdicts affect failure history and scheduling priority only
 when the run finishes or is declared dead. Active records are never pruned.
 

@@ -112,11 +112,9 @@ Test infrastructure can ask Runtests about the item that runs. Examples are code
 ```julia
 import Runtests               # in the body of the item
 Runtests.current_testitem()   # a TestItemInfo, or nothing
-Runtests.in_testitem()        # true in this task and in the tasks that it starts
-Runtests.in_test_run()        # true in the process, and in its subprocesses
 ```
 
-`current_testitem()` gives the `name`, `file`, `line`, `attempt` and `profile` of the item. A task that started before the item, for example a service that a profile's `init` started, does not see the item. For that case, and for subprocesses, use `in_test_run()`.
+`current_testitem()` gives the `name`, `file`, `line`, `attempt` and `profile` of the item. The tasks that the item starts see the item too. A task that started before the item does not, for example a service that a profile's `init` started. A subprocess does not see it either.
 
 !!! warning
     Do not make library code change what it does because it is under test. Then the tests no longer test the library.

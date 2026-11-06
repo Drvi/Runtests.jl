@@ -43,8 +43,6 @@ setups_to_packages
 
 ```@docs
 current_testitem
-in_testitem
-in_test_run
 on_failure
 artifacts_dir
 RuntestsWorkers.TestItemInfo

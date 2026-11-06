@@ -98,29 +98,13 @@ The test item this task is running inside, or `nothing`.
 
 The value is dynamically scoped, so tasks spawned by the test item see it and a
 task created before the item started — a long-lived service started in a
-profile's `init` expression, say — does not. For that case, and for subprocesses,
-use [`in_test_run`](@ref).
+profile's `init` expression, say — does not. Neither does a subprocess.
 
 This is a hook for test infrastructure: temporary directories, fixture paths,
 switching off telemetry. Library code that changes what it does because it
 detects that it is under test stops testing the library.
 """
 current_testitem() = CURRENT_TESTITEM[]
-
-"""
-    in_testitem() -> Bool
-
-Whether this task is running inside a test item. See [`current_testitem`](@ref).
-"""
-in_testitem() = CURRENT_TESTITEM[] !== nothing
-
-"""
-    in_test_run() -> Bool
-
-Whether this process was started by a Runtests run. Unlike [`in_testitem`](@ref) this
-is process-level: it is visible to every task and inherited by subprocesses.
-"""
-in_test_run() = haskey(ENV, "RUNTESTS_RUN_ID")
 
 """
     cpu_time_ns() -> UInt64

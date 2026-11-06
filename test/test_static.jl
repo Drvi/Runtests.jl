@@ -21,14 +21,19 @@ const OURS = (P, W)
         Aqua.test_all(Runtests; stale_deps = (ignore = [:Pkg, :TestEnv],))
     end
 
-    # From each public entry point, and the worker's, through everything it calls.
-    @testset "JET: no error the analysis can find from $name" for (name, f, types) in (
-            ("runtests", Runtests.runtests, (String,)),
-            ("runtestsf", Runtests.runtestsf, (String,)),
+    # From each public entry point, and the worker's, through everything it calls. Those
+    # of a combined run only where workspaces are: before Julia 1.12, they always throw,
+    # to say that they need it.
+    mono = VERSION >= v"1.12" ? (
             ("runtests_mono", Runtests.runtests_mono, (String,)),
             ("chores_mono", Runtests.chores_mono, (String,)),
             ("activate_mono", Runtests.activate_mono, (String,)),
             ("serve_mono", Runtests.serve_mono, (String,)),
+        ) : ()
+    @testset "JET: no error the analysis can find from $name" for (name, f, types) in (
+            ("runtests", Runtests.runtests, (String,)),
+            ("runtestsf", Runtests.runtestsf, (String,)),
+            mono...,
             ("chores", Runtests.chores, (String,)),
             ("setups_to_packages", Runtests.setups_to_packages, (String,)),
             ("activate", Runtests.activate, (String,)),

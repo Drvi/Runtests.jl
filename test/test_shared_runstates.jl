@@ -88,7 +88,7 @@ end
             p, _ = prepare((pkg,); announce = false)
             # Started before every run the pruning keeps, and still going.
             going = shared_run(pkg, p, ["a" => PASSED]; ago = 1000, finish = false)
-            logs = mkpath(Runtests.Private.logs_dir(going.path))
+            logs = mkpath(Runtests.Private.rundata_dir(going.path))
             write(joinpath(logs, "item_1_1.log"), "still being written\n")
             for k in 1:(KEEP_RUNS + 3)
                 shared_run(pkg, p, ["a" => PASSED, "b" => PASSED]; ago = 900 - k)
@@ -138,9 +138,9 @@ end
             @test rs.complete && rs.aborted && !rs.cancelled && !is_live(rs)
             @test all(st -> st.state === UNSEEN, rs.statuses)
             # Why it ended is kept beside it, and goes where the run's evidence goes.
-            @test occursin("this setup does not load", read(joinpath(Runtests.Private.logs_dir(path), "setup.log"), String))
-            @test isfile(joinpath(artifacts, basename(path)))
-            @test isfile(joinpath(artifacts, basename(Runtests.Private.logs_dir(path)), "setup.log"))
+            @test occursin("this setup does not load", read(joinpath(Runtests.Private.rundata_dir(path), "setup.log"), String))
+            @test isfile(joinpath(artifacts, basename(Runtests.Private.rundata_dir(path)), "run.runstate"))
+            @test isfile(joinpath(artifacts, basename(Runtests.Private.rundata_dir(path)), "setup.log"))
         end
     end
 
@@ -216,8 +216,8 @@ end
             @test all(rs -> rs.complete && !is_live(rs) && all(st -> st.state === PASSED, rs.statuses), ran)
             @test length(runs) <= KEEP_RUNS + nruns
             # Each run copied its own run state, finished, and none of the history.
-            copied = filter(endswith(".runstate"), readdir(artifacts))
-            @test sort(copied) == sort([basename(rs.path) for rs in ran])
+            copied = filter(endswith(".rundata"), readdir(artifacts))
+            @test sort(copied) == sort([basename(Runtests.Private.rundata_dir(rs.path)) for rs in ran])
             @test all(f -> read_run_state(joinpath(artifacts, f)).complete, copied)
         end
     end

@@ -120,13 +120,13 @@ These environment variables configure Runtests:
 |:---------|:--------|
 | `RUNTESTS_<KEY>` | A [run key](@ref run-keys), for example `RUNTESTS_WORKERS=4`, `RUNTESTS_RETRIES=1` or `RUNTESTS_SEED=0x1234`. A true-or-false key takes `true`, `false`, `1`, `0`, `yes` or `no`. A keyword replaces it, and it replaces `[run]`. |
 | `RUNTESTS_GROUP` | The group to run when a call selects nothing else. An empty value counts as unset. |
-| `RUNTESTS_RUNSTATE_DIR` | The directory of the run states. The default is `runtests/runs/` in the Julia depot, with a directory for each project. |
+| `RUNTESTS_RUNSTATE_DIR` | The directory of the run states, which holds a directory `<run>.rundata` for each run. The default is `runtests/runs/` in the Julia depot, with a directory for each project. |
 | `RUNTESTS_HOST` | The name of this machine in the run states. The default is the macOS machine name, or the hostname on other systems. |
-| `RUNTESTS_ARTIFACT_DIR` | A directory into which each run copies its run state and its logs when it ends. |
+| `RUNTESTS_ARTIFACT_DIR` | A directory into which each run copies its own directory, with its run state and its logs, when it ends. |
 
 Runtests sets these variables in each worker. Do not set them yourself:
 
 | Variable | Meaning |
 |:---------|:--------|
-| `RUNTESTS_RUN_ID` | The ID of the run. `Runtests.in_test_run()` is `true` when it is set. Subprocesses of a worker inherit it. |
+| `RUNTESTS_RUN_ID` | The ID of the run, set for each worker. Subprocesses of a worker inherit it. |
 | `RUNTESTS_WORKER` | The number of the worker, as in `w1`. |

@@ -1,6 +1,7 @@
 # Runtests.jl
 
 [![CI](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Drvi/Runtests.jl/actions/workflows/CI.yml)
+[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://drvi.github.io/Runtests.jl/dev/)
 
 Runtests.jl runs a Julia package's tests as independent **test items** across
 worker processes. Call `Runtests.runtests()` to run the suite and

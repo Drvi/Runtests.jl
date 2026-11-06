@@ -99,14 +99,14 @@ end
 """
     list_items(root; config = nothing) -> NamedTuple
 
-Every test item of the package at `root`, as the scanner reads it; every problem
-that would stop a run: a file that does not parse, a name used twice, a setting
-`test/TestItems.toml` does not accept, or `config` when it names another file to
-read in its place; and the items that are failing — whose last verdict was not a
-pass — which [`runtestsf`](@ref) would run. Items come from the files that parse
-even when others do not, so an editor shows what it can beside what is broken. An
-item's `end_line` is the line before the next item in its file, or the file's last:
-the lines where `runtests("file.jl:line")` picks that item.
+Every test item of the package at `root`, as the scanner reads it, together with
+scanner and configuration problems found without running items, and the items
+whose last verdict was a failure, which [`runtestsf`](@ref) would run. The errors
+include files that do not parse, duplicate item names and settings that
+`test/TestItems.toml` (or `config` in its place) does not accept. Items come from
+files that parse even when others do not, so an editor shows what it can beside
+what is broken. An item's `end_line` is the line before the next item in its file,
+or the file's last: the lines where `runtests("file.jl:line")` picks that item.
 """
 function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     target = resolve_target((root,))
@@ -150,9 +150,8 @@ end
     list_items_mono(root) -> NamedTuple
 
 [`list_items`](@ref) for the packages of a combined run of the workspace at `root`:
-the items of each, with its package, and what would stop a combined run besides
-what stops one package's own: setups of one name, and imports that a package's own
-test environment cannot load.
+the items of each, with its package, and additional errors for duplicate setup
+names and written imports that a package's own test environment cannot load.
 """
 function list_items_mono(root::AbstractString)
     ps = find_participants(root)
@@ -174,9 +173,9 @@ end
 
 ### The server ##############################################################
 
-# What a run command may set besides its names: the `runtests` keywords that change
-# how it runs, or where its output goes, and `group` and `replay`, which select as
-# they do for `runtests`.
+# What a run command may set besides its item selection: the `runtests` keywords
+# that change how it runs or where its output goes, and `group` and `replay`, which
+# select as they do for `runtests`.
 const RUN_OPTIONS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries, :failfast,
     :item_failfast, :logs, :verbose, :memory_threshold, :full_stacktraces, :coverage, :seed,
@@ -186,7 +185,7 @@ const RUN_OPTIONS = (
 mutable struct Session
     const root::String
     const combined::Bool                   # serves the packages of a workspace (`serve_mono`)
-    const config::Union{Nothing, String}   # the file read in place of test/TestItems.toml
+    const config::Union{Nothing, String}   # override for `serve`; nothing for `serve_mono`
     const stream::EventStream
     task::Union{Nothing, Task}   # the run in flight, or the last one
     cancelled::Bool              # a cancel that arrived before the run's task started
@@ -225,7 +224,9 @@ end
 
 [`serve`](@ref) for the packages of a workspace, as [`runtests_mono`](@ref) runs them:
 the listing has the items of every package, each with its package, and a run is a
-combined run. A `run` names its items as keys of a `package` and a `name`.
+combined run. A `run` selects items by keys of a `package` and a `name`, not by
+name alone. Each package's own configuration is read; `serve_mono` has no `config`
+argument.
 """
 function serve_mono(root::Union{Nothing, AbstractString} = nothing; input::IO = stdin, output::IO = stdout)
     ps = find_participants(root)

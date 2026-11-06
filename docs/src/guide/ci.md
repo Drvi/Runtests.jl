@@ -53,22 +53,31 @@ Each run keeps its run state and its logs in a directory of its own, `<run>.rund
 This example is for a matrix with `os`, `version` and `group`:
 
 ```yaml
+# Restore the run states that the last job with this os, version and group saved.
 - uses: actions/cache/restore@v4
   with:
+    # The run states only, without their logs. The save step must name the same path.
     path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
+    # No entry has this key yet. The restore takes the newest entry whose key starts with restore-keys.
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
     restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
   env:
+    # The group of test items that this job runs.
     RUNTESTS_GROUP: ${{ matrix.group }}
+    # Where the run reads the restored run states and writes its own.
     RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
+    # A stable machine name, so that the run also prunes the restored run states.
     RUNTESTS_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
+    # Where the run copies its own directory when it ends, for the upload step.
     RUNTESTS_ARTIFACT_DIR: ${{ runner.temp }}/runtests-artifact
+# Save the run states for the next job, also when the tests fail.
 - uses: actions/cache/save@v4
   if: always()
   with:
     path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+# When the job fails, upload this run's directory: its run state, logs and failure evidence.
 - uses: actions/upload-artifact@v4
   if: failure()
   with:
@@ -95,7 +104,13 @@ The cache holds the run states and not the logs, because the next job plans from
 !!! warning
     Do not name the directories, `*.rundata`, in `path` with a pattern such as `!**/*.log` to exclude the logs. The cache archives a directory as a whole, and the exclusion has no effect.
 
-In a monorepo, each job can test one package with the `project` input of `julia-runtest`. Then add the package to the key and to the name of the artifact, as the example adds the group.
+In a monorepo, each job can test one package with the `project` input of `julia-runtest`. Then add the package to the key and to the name of the artifact, as the example adds the group. To run the [combined suites](@ref monorepos) in one job, launch Julia from the workspace root with a project whose `[deps]` declares Runtests:
+
+```yaml
+- run: julia --project=lib/A/test -e 'using Pkg; Pkg.instantiate(); using Runtests; Runtests.runtests_mono()'
+```
+
+A combined run writes one run state per selected package. The cache path above covers those run states when `RUNTESTS_RUNSTATE_DIR` is shared; `RUNTESTS_ARTIFACT_DIR` receives one subdirectory per package, each with that package's run directory and logs. A root package can instead use `Pkg.test` with a `test/runtests.jl` that calls `runtests_mono`, as the monorepo guide shows.
 
 ### The machine name
 

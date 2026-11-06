@@ -99,7 +99,7 @@ When the item ends, the run releases what its nonconstant globals refer to. An i
 
 ## Items on one worker
 
-A worker runs one item at a time, and runs many items one after the other. Each item sees the changes that earlier items made to the process. Examples are changes to `ENV`, to the global logger, to the working directory and to the loaded packages. Restore what an item changes, with `withenv` or `try` and `finally`. If an item cannot restore a change, give it `sandbox = true`.
+A worker runs one item at a time, and runs many items one after the other. Later items on that worker can see changes to `ENV`, the global logger and loaded packages. A working-directory change can persist when an item runs directly in the worker's directory. In a [combined run](@ref monorepos), an item of a member package below the workspace root temporarily enters that package's root and restores the worker's directory afterward; a root-package item can leave it changed. Restore process state that an item changes, with `withenv` or `try` and `finally`. If an item cannot restore it, give the item `sandbox = true`.
 
 Items on different workers run at the same time. If two items can write to the same path, make each of them use its own `mktempdir()`.
 

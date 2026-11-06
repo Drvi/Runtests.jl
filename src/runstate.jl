@@ -1,9 +1,10 @@
-# The run state file: binary, fixed-stride, written as the run goes, so that a
-# killed coordinator still leaves behind which items passed and how long they took.
-# It also holds what it takes to run the same run again elsewhere: a run state
-# downloaded from CI and passed to `runtests(replay = path)` brings back the items,
-# the configuration, the profiles and the seed, and says how the environment
-# differs from the one it was recorded in.
+# A run state is binary, with fixed-stride status and event records written as the
+# run goes, so that a killed coordinator still leaves behind which items passed and
+# how long they took. A standalone run writes one record; a combined run writes one
+# for each participating package. A record downloaded from CI and passed to
+# `runtests(replay = path)` or `runtests_mono(replay = path)` brings back the items,
+# configuration, profiles and seed, and says how the environment differs from the
+# one it was recorded in.
 #
 # Layout:
 #
@@ -17,17 +18,17 @@
 #               the compressed length, then the compressed bytes
 #   statuses    n_items x 32 B, fixed stride, overwritten in place
 #   memory      fixed block, rewritten whenever a peak is set
-#   events      32 B each, appended: every attempt, and every worker's start and end
+#   events      32 B each, appended: attempts and worker events of this record
 #
 # After the run starts only the statuses, the memory block, the events and the
 # header's flags and end time are written, which keeps a crash from corrupting
 # anything else; a reader drops a torn last event.
 #
 # The manifest is most of a file's bytes, and only a replay reads it, so it is
-# stored compressed and inflated only when asked for (`recorded_manifest`): the
-# reads that plan every run pay nothing for it.
+# stored compressed and inflated only when asked for (`recorded_manifest`):
+# planning a run does not decompress it.
 #
-# The file is `run.runstate` in a directory of the run's own, `<run>.rundata`
+# The file is `run.runstate` in the package record's own `<run>.rundata` directory
 # (`new_runstate_path`), which also holds what the items printed,
 # `item_<index>_<attempt>.log`, the failure report of each attempt that did not pass,
 # `item_<index>_<attempt>.failure.txt`, what each attempt kept (`artifacts.jl`), and
@@ -670,9 +671,11 @@ end
     read_run_state(path) -> Union{Nothing,RunStateRecord}
 
 Read a run state: a run's directory, `<run>.rundata`, or the `run.runstate` file in
-it. Never throws: a file that is truncated, from a crashed run, or written by a
-different version comes back as much as can be read (or `nothing`), because a broken
-record of an old run must not stop a new one.
+it. A file that is truncated, from a crashed run, or written by a different
+version gives as much as can be read, or `nothing`. The reader suppresses ordinary
+read and parse errors so a broken old record does not stop a new run. An interrupt
+during parsing is rethrown; a file removed between reading and checking its
+modification time can cause a file-system error.
 """
 function read_run_state(path::AbstractString)
     path = record_path(path)

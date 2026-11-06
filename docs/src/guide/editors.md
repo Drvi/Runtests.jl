@@ -4,7 +4,7 @@ Runtests has an extension for VS Code, and a server that any editor can drive. T
 
 ## The VS Code extension
 
-The extension shows the test items of a Julia package in the Test Explorer of VS Code, and runs them there. It shows each file under `test/` with its items. You can run items from the tree or from the gutter next to the code. Results show while the run goes on, and a failure is marked at the line of the `@test` that failed. Cancel stops the run and its workers at once.
+The extension shows test items in the Test Explorer of VS Code and runs them there. For one package, it shows each file under `test/` with its items. For a [workspace of packages](@ref monorepos), it groups files and items by package. You can run items from the tree or from the gutter next to the code. Results show while the run goes on, and a failure is marked at the line of the `@test` that failed. Cancel stops the run and its workers at once.
 
 The output of a run goes to the Test Results panel. It is the output that Runtests writes in a terminal, with colors. The `logs` value in `runtests.run.options` controls which item output the panel shows, as it does for `runtests`.
 
@@ -21,7 +21,9 @@ The extension is plain JavaScript with no dependencies, so there is nothing to b
    ln -s "$PWD/editors/vscode" ~/.vscode/extensions/runtests.runtests-0.1.0
    ```
 
-The server's environment must be able to run `using Runtests`. By default, the server uses `test/Project.toml` when there is one, and the package's environment otherwise. If Runtests is only in the package's `[extras]` and `[targets]`, it is not importable from the package environment. Set `runtests.environment` to an environment that contains Runtests; the server will still build the package's test environment for the tests.
+The server's environment must be able to run `using Runtests`. For one package, the extension uses its `test/Project.toml` when there is one, and the package's environment otherwise. If Runtests is only in `[extras]` and `[targets]`, set `runtests.environment` to a project that declares it; the server will still build the package's test environment for the tests.
+
+For a workspace folder, the extension tries the root `test` project, the root project, then each member's `test` project, choosing the first whose `[deps]` declares Runtests. Set `runtests.environment` if none of them does. By default, a folder is treated as a combined workspace when its root project lists members besides its own `test`; `runtests.monorepo` overrides this detection.
 
 ### VS Code settings of the extension
 
@@ -30,12 +32,13 @@ The server's environment must be able to run `using Runtests`. By default, the s
 | `runtests.julia.executable` | The `julia` that runs the server. By default, the `julia.executablePath` of the Julia extension, or `julia` on the `PATH`. |
 | `runtests.julia.args` | Arguments that go to `julia` first, for example `["+1.12"]` for a juliaup channel. |
 | `runtests.environment` | The environment that the server runs in, as an absolute path or relative to the folder. It must contain Runtests. |
+| `runtests.monorepo` | `auto` (default), `on`, or `off`. In `auto`, serve a folder as a combined workspace when its root project lists members besides its own `test`. |
 | `runtests.run.options` | The [editor protocol's run options](@ref editor-protocol) sent with every run, for example `{"workers": 2}`. |
-| `runtests.config` | A configuration file to read in place of `test/TestItems.toml`, relative to the folder. Restart the server after you change it. |
+| `runtests.config` | A configuration file to read in place of `test/TestItems.toml`, relative to the folder. It applies only to a single-package server; a combined server warns and reads each package's own file. Restart the server after changing this setting. |
 
 Other run settings come from the configuration file and environment variables, as for `Runtests.runtests()`. For example, set `artifacts_timeout` in `[run]` or `RUNTESTS_ARTIFACTS_TIMEOUT`; the editor's `options` field does not accept it.
 
-The extension has three commands: Runtests: Run Failed Tests, Runtests: Restart Server and Runtests: Show Log. Restart the server after you change the VS Code settings above or update Runtests.
+The extension has three commands: Runtests: Run Failed Tests, Runtests: Restart Server and Runtests: Show Log. Edits to the root project refresh the tree; a change of server mode or `runtests.environment` restarts the server. Restart it manually after changing the Julia executable, Julia arguments or `runtests.config`, or after updating Runtests in the server's environment. The extension requires editor protocol version 3 and stops with an error if that Julia environment loads a server of another protocol version.
 
 ### What the extension does not do
 
@@ -43,12 +46,20 @@ The extension has no debugger and no coverage view. The Julia extension also fin
 
 ## Drive Runtests from another editor
 
-`Runtests.serve(path)` lets an editor drive the suite of a package. The server lists the test items with their locations and keywords. It runs the items that the editor asks for, a group, or a replay of a run state. It reports the start and the outcome of each item while the run goes on, and cancels a run when the editor asks.
+`Runtests.serve(path)` lets an editor drive the suite of one package; `Runtests.serve_mono(root)` serves a workspace of packages. The server lists test items with their locations and keywords. It runs the items that the editor asks for, a group, or a replay of a run state. It reports the start and the outcome of each item while the run goes on, and cancels a run when the editor asks.
 
 The server uses one JSON object for each line. Commands come on stdin, and events go to stdout. Everything written for people goes to stderr.
+
+From a package whose `test/Project.toml` declares Runtests:
 
 ```sh
 cd MyPackage && julia --project=test -e 'using Runtests; Runtests.serve()'
 ```
 
-[The editor protocol](@ref editor-protocol) describes each command and event.
+From a workspace root whose `lib/A/test/Project.toml` declares Runtests:
+
+```sh
+julia --project=lib/A/test -e 'using Runtests; Runtests.serve_mono(pwd())'
+```
+
+[The editor protocol](@ref editor-protocol) describes each command and event. Check the version in its first `hello` event before sending commands; version 3 identifies items by package and name.

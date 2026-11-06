@@ -1,6 +1,6 @@
 # [Run tests](@id running)
 
-This page tells you how to start a run, how to select the items that run, and what a run returns. A run is one call to `Runtests.runtests` or `Runtests.runtestsf`.
+This page covers runs of one package: how to start one, select its items, and read its result. For one run across several packages in a Julia workspace, see [Run the suites of a monorepo](@ref monorepos).
 
 ## Start a run
 
@@ -9,9 +9,9 @@ There are two ways to start a run:
 1. Call `Pkg.test()` with the project of the package active. `Pkg.test` runs `test/runtests.jl`, which calls `Runtests.runtests()`.
 2. Call `Runtests.runtests()` at the REPL with the project of the package active. Runtests must be in an environment that Julia can load from, for example your default environment.
 
-In both cases, Runtests runs the suite of the package whose project is active. To run the suite of another package, give its directory as the first argument: `Runtests.runtests("path/to/Package")`.
+Under `Pkg.test()`, Runtests uses the package whose `test/runtests.jl` is running. At the REPL, it uses the package of the active project. To run the suite of another package, give its directory as the first argument: `Runtests.runtests("path/to/Package")`.
 
-At the REPL, Runtests prepares the test environment and keeps it for the session, reusing it while its input files remain unchanged. [The test environment](@ref test-environment) explains when it is rebuilt.
+At the REPL, Runtests reuses an active test project or prepares a test environment. It caches an environment it prepares for the session, reusing it while its input files remain unchanged. [The test environment](@ref test-environment) explains when it is rebuilt.
 
 ## Select items
 

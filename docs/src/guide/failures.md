@@ -46,6 +46,8 @@ A replay does these things:
 
 `runtestsf(replay = ...)` selects the failures from the verdicts of that run and of the runs that started after it. Earlier runs give only durations.
 
+For a combined workspace run, call `Runtests.runtests_mono(replay = "path/to/a.runstate")` with the run state of any participating package. [The monorepo guide](@ref monorepos) explains how it finds the other packages' records.
+
 A run state from CI works the same way. Download the artifact of the job, and give the path of the run state as `replay`. [Run on CI](@ref ci-history) tells you how to keep run states on CI.
 
 ## [Keep evidence from a failed attempt](@id evidence)

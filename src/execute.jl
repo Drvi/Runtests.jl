@@ -1,11 +1,11 @@
 # Running a plan: one task per slot. A slot takes its pool's head first, then walks
 # its own stretch of the pool's body, takes half of the largest stretch left when
 # its own is done, then the pool's tail. When its own pool has nothing left it
-# rebinds, restarting its process under another pool's profile: to a pool no slot
-# serves, or else to the pool whose slots have the most work left each, when that
-# is more than a fresh worker costs there. `workers` caps live processes
-# throughout: the run takes longer rather than start a process the caller did not
-# authorize.
+# may rebind, restarting its process under another pool's profile. It estimates
+# completion with and without that worker, including its start and compilation
+# cost, and rebinds only when the estimate says a pool finishes sooner. `workers` caps
+# live processes throughout: the run takes longer rather than start a process the
+# caller did not authorize.
 
 using Base: SIGKILL
 
@@ -67,8 +67,8 @@ PoolStats() = PoolStats(0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0)
 
 Every cursor a run has, behind one lock: each pool's head and tail, and each slot's
 stretch of its pool's body; and what the run has measured of each pool, which the
-slots write and a slot whose pool ran dry reads. A run claims a few thousand times,
-so an uncontended lock costs nothing, and one lock rules out racing cursors.
+slots write and a slot whose pool ran dry reads. Each claim takes the lock so the
+cursors and pool statistics remain consistent.
 """
 mutable struct Queues
     const lock::ReentrantLock
@@ -580,8 +580,8 @@ end
 Run `f` with the package's test environment active, and restore whatever was
 active afterwards. The environment is:
 
-1. the active one, when the call came from `<root>/test/runtests.jl`: that is
-   `Pkg.test`, which has built an environment with the test dependencies;
+1. the active one, when the call came from `<root>/test/runtests.jl`; `Pkg.test`
+   normally builds that environment with the test dependencies;
 2. the active one, when it is the package's own `test/Project.toml`, because
    activating that is a deliberate choice;
 3. the package's `test/Project.toml`, when it is a member of the workspace the
@@ -590,7 +590,9 @@ active afterwards. The environment is:
 
 The last two are cached for the session.
 
-Never the package's plain project, which lacks the test-only dependencies.
+Outside `test/runtests.jl`, the package's plain project is not reused because it
+lacks test-only dependencies. A call from that file assumes its active project
+already supplies them.
 """
 function with_test_env(f, target, run = nothing)
     # Building it is `Pkg`'s to narrate, and it draws its own progress by moving
@@ -736,8 +738,8 @@ function outermost_workspace(project)
     end
 end
 
-# `Pkg.test` runs `test/runtests.jl` in an environment it built for the purpose.
-# The file being evaluated is how we can tell.
+# A call from `test/runtests.jl` reuses the active project. `Pkg.test` normally
+# runs that file in an environment it built for the purpose.
 function running_from_runtests(target)
     source = get(task_local_storage(), :SOURCE_PATH, nothing)
     source === nothing && return false
@@ -877,10 +879,10 @@ end
 """
     export_run!(run)
 
-Copy the run's run state and its logs into the directory `RUNTESTS_ARTIFACT_DIR`
-names, when it names one: what a CI job uploads as the evidence of its own run,
-apart from the run-state directory, whose history it caches for the next run. Called
-once the run state is finished, however the run ended. Never a reason to fail it.
+When `RUNTESTS_ARTIFACT_DIR` names a directory, copy the run's `<run>.rundata`
+bundle there, with its record and logs. A combined run copies one bundle under
+each package's name. Called after the run state is finished, however the run ended;
+a copy failure is reported without changing the test verdict.
 """
 function export_run!(run::Run)
     dir = get(ENV, "RUNTESTS_ARTIFACT_DIR", "")
@@ -1070,16 +1072,15 @@ const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
 """
     environment_project(prof, root, announce = nothing) -> String
 
-The project the workers of a profile in an environment directory run in. A copy of
-that environment, in the system's temporary files so that nothing is written to the
-directory, which is the package's own; with the package under
-test at `root` developed into it by path, as it is in the test environment, which
-brings the packages its `[sources]` name with it; resolved; and with the
-environment's `LocalPreferences.toml` under the profile's preferences, as
-[`profile_project`](@ref) lays them. Kept for the session, and built again once a
-file it was built from changes: the environment's own, the package's project, the
-preferences, or the project of a package it holds by path. `announce` is called
-before building.
+Create the project in which workers run a profile that names an environment
+directory. Copy the environment into a temporary directory, add the package at
+`root` by path, apply the profile's preferences over the environment's
+`LocalPreferences.toml`, and resolve it. Developing the package by path lets
+resolution use its `[sources]` entries. The source environment is not modified.
+
+Keep the result for this session and rebuild it when an input file changes: the
+environment's files, the package's project, the preferences, or the project of a
+package held by path. Call `announce` before building.
 """
 function environment_project(prof::Profile, root, announce = nothing)
     root === nothing && throw(ConfigError(
@@ -2542,15 +2543,14 @@ end
 """
     ItemEvent
 
-What a function given as `runtests(on_item = f)` is called with, in this process:
+The event passed to `on_item` by `runtests` or `runtests_mono`, in this process:
 once as an attempt at a test item starts, `kind = :started`, and once as it ends,
 `kind = :finished`. A retry is another attempt, with a call of each.
 
-It says which item it is (`name`, `file`, `line`, `attempt`, and the `package` whose
-suite holds it, with its `root`, which tell apart two items of one name in a run of
-several packages), where it ran (`worker`,
-numbered as the run's lines number them, `w1`, and `pid`, its process), when it
-started or ended (`time`, as `time()` gives it), and how it went (`state`: `:running`
+It says which item it is (`name`, `file`, `line`, `attempt`, and the `package` and
+`root` of its suite), where it ran (`worker`, numbered as the run's lines number
+them, `w1`, and `pid`, its process), when it started or ended (`time`, as `time()`
+gives it), and how it went (`state`: `:running`
 as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped`,
 `:broken_chain` or `:cancelled`). `pid` is 0 when no process ran the attempt: the run
 could not start a worker for it, or it is an item of a chain whose worker died before
@@ -2559,9 +2559,9 @@ it ran, which has `worker` 0 as well.
 As it ends, it says what the attempt cost: `elapsed`, `cpu` (user and system time),
 `compile`, `recompile` (of `compile`) and `gc` in seconds, `allocated` in bytes,
 `allocations`, how many there were, and `maxrss`, the largest its process has been
-resident so far, in bytes. Every figure
-but `elapsed` is the whole process's, which runs one item at a time: its worker's,
-or with `workers = 0` this process's. `measured` says the item measured them itself.
+resident so far, in bytes. Every figure but `elapsed` is the whole process's,
+which runs one item at a time: its worker's, or with `workers = 0` this process's.
+`measured` says the item measured them itself.
 It is `false` as an attempt starts, and as it ends when the run decided the outcome,
 as for a timeout, a lost worker, a chain cut short or a stopped run: the figures are
 then 0, and `elapsed` is how long the attempt held its worker.

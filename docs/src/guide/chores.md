@@ -2,6 +2,8 @@
 
 `Runtests.chores()` does the maintenance work of a suite. It does the work that needs no person, then reports what does need a person. Run it after you add a setup, edit a template or change `test/TestItems.toml`.
 
+For all participating packages of a workspace in one pass, use [`Runtests.chores_mono()`](@ref monorepos).
+
 ```julia
 Runtests.chores(dry_run = true)  # report what to change, and change nothing
 Runtests.chores()                # do the changes, and report what remains

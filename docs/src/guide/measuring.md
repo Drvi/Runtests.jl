@@ -1,6 +1,6 @@
 # [Measure what each item costs](@id measuring)
 
-A run can give you figures for each attempt at an item: its time, CPU time, compilation, garbage collection, allocations and memory. Give `runtests` a function as `on_item`. The run calls the function in the process that called `runtests`.
+A run can give you figures for each attempt at an item: its time, CPU time, compilation, garbage collection, allocations and memory. Give `runtests` or `runtests_mono` a function as `on_item`. The run calls the function in the process that started it.
 
 ## Collect the figures
 
@@ -20,6 +20,7 @@ Each call gets a `Runtests.ItemEvent` with these fields:
 |:------|:--------|
 | `kind` | `:started` or `:finished`. |
 | `name`, `file`, `line` | The item. |
+| `package`, `root` | The name and root directory of the item's package. Together with `name`, these distinguish items in a combined run. |
 | `attempt` | 1 for the first attempt, 2 for the first retry, and so on. |
 | `worker`, `pid` | The number of the worker that ran the attempt, as in `w1` in the lines of the run, and the ID of its process. |
 | `time` | When the attempt started or ended, as `time()` gives it. |

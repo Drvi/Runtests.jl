@@ -4,7 +4,7 @@ This page lists every configuration key of a run, every key of `test/TestItems.t
 
 ## Precedence
 
-A run takes each value from the first source that sets it, in this order:
+With `runtests`, each value comes from the first source that sets it, in this order:
 
 1. the keyword of `runtests`,
 2. the environment variable `RUNTESTS_<KEY>`,
@@ -13,9 +13,11 @@ A run takes each value from the first source that sets it, in this order:
 
 An unknown key, an unknown keyword or an incorrect value is an error before any item runs. A mistake in the call is an `ArgumentError`. A mistake in a file or in an environment variable is a `Runtests.ConfigError`.
 
+For `runtests_mono`, the call and environment variables still take precedence. Run-wide keys then come from `[run]` at the workspace root; each package's own `[run]` supplies its other keys. Run-wide keys in another package's file have no effect. [Run the suites of a monorepo](@ref monorepos) lists the run-wide keys.
+
 ## [Run keys](@id run-keys)
 
-Each of these keys is a keyword of `runtests`, a key of `[run]`, and an environment variable `RUNTESTS_<KEY>`.
+Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[run]`, and an environment variable `RUNTESTS_<KEY>`.
 
 | Key | Default | Value |
 |:----|:--------|:------|
@@ -65,6 +67,8 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 | `replay` | The path of a run state to run again. |
 | `config` | The path of a file to read in place of `test/TestItems.toml`, relative to the current directory. The file must exist. |
 | `on_item` | A function that the run calls with a [`Runtests.ItemEvent`](@ref) when each attempt starts and ends. |
+
+`runtests_mono` also accepts `packages`, a list of package names or directories to include. It rejects `config`, because a combined run reads each package's own configuration file.
 
 ## TestItems.toml
 
@@ -122,7 +126,7 @@ These environment variables configure Runtests:
 | `RUNTESTS_GROUP` | The group to run when a call selects nothing else. An empty value counts as unset. |
 | `RUNTESTS_RUNSTATE_DIR` | The directory of the run states, which holds a directory `<run>.rundata` for each run. The default is `runtests/runs/` in the Julia depot, with a directory for each project. |
 | `RUNTESTS_HOST` | The name of this machine in the run states. The default is the macOS machine name, or the hostname on other systems. |
-| `RUNTESTS_ARTIFACT_DIR` | A directory into which each run copies its own directory, with its run state and its logs, when it ends. |
+| `RUNTESTS_ARTIFACT_DIR` | A directory into which a run copies its `<run>.rundata` directory, with its run state and logs, when it ends. A combined run puts each package's directory under a subdirectory named for the package. |
 
 Runtests sets these variables in each worker. Do not set them yourself:
 

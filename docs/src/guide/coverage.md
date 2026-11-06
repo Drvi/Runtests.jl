@@ -1,6 +1,6 @@
 # [Measure coverage](@id coverage)
 
-Runtests can count which lines of the package the tests run. There are two ways: Runtests merges the counts into one `lcov.info` file, or Julia writes `.cov` files under `Pkg.test(coverage = true)`.
+Runtests can count which lines of package source the tests run. It can merge worker counts into one `lcov.info` file, or Julia can write `.cov` files under `Pkg.test(coverage = true)`.
 
 ## Merge the counts into lcov.info
 
@@ -12,9 +12,9 @@ Set `coverage = true` in one of these ways:
 
 A keyword replaces the variable, and the variable replaces the file. The opening block of the run says which source set the value.
 
-Each worker then counts which lines of `src/` and `ext/` of the package run. At the end, the run merges the counts of the workers into `lcov.info` at the root of the package. Codecov and Coveralls read this file.
+Each worker then counts which lines of `src/` and `ext/` of the package run. At the end, a one-package run merges the counts into `lcov.info` at the package root. A [combined run](@ref monorepos) includes each participating package's `src/` and `ext/` and writes one `lcov.info` at the workspace root. Codecov and Coveralls read this file.
 
-The paths in `lcov.info` are relative to the root of the git checkout of the package, because these services resolve paths from there. Thus a package in a subdirectory, as in a monorepo, has its directory in front of its paths, for example `lib/Foo/src/Foo.jl`. Outside a git checkout, the paths are relative to the package.
+The paths in `lcov.info` are relative to the root of the package's git checkout, because these services resolve paths from there. Thus a package in a subdirectory has its directory in front of its paths, for example `lib/Foo/src/Foo.jl`. Outside a git checkout, paths are relative to the package in a one-package run, and to the workspace root in a combined run.
 
 Every line of a function that never ran counts as not covered. This also applies to a file that was never loaded. The closing block of the run gives the fraction of lines that ran:
 

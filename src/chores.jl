@@ -15,12 +15,13 @@ Look after a package's suite: do what needs no person, then say what does.
   `test/TestItems.toml`.
 - test setups: what [`setups_to_packages`](@ref) would do, making packages of the
   setups that are not and adding to their `[deps]` what they have come to import.
-- test templates: each `test/testtemplates/*_tests_template.jl` expanded into the test
-  file of its name in `test/`, in a process with the test environment, and the
-  expansion of a template that is gone deleted. Every template is expanded, since
-  what its code computes can change while its text does not; a dry run reads the
-  expansions' stamps instead and runs nothing. An expansion edited by hand, and a
-  test file in a template's way that `chores` did not write, are left to a person.
+- test templates: each `*_test_template.jl` or `*_tests_template.jl` under
+  `test/testtemplates/` expanded into a test file in `test/`, in a process with
+  the test environment. An expansion whose template is gone is deleted. Every
+  template is expanded because its computed inputs can change without a source
+  edit; a dry run checks expansion stamps and runs no templates. An expansion
+  edited by hand, or a test file in a template's way that `chores` did not write,
+  is left to a person.
 - run states: this machine's are pruned as a run prunes them, the same ones and no
   others (see `prunable_runstates`), with their logs. One recorded elsewhere, a CI
   artifact say, and one that cannot be read are never deleted.
@@ -33,8 +34,9 @@ Returns whether nothing is left to do. Having done the rest, it throws a
 [`ChoresError`](@ref) when something is left that a person has to fix, and otherwise
 returns `true`; so `Runtests.chores(); Runtests.runtests()` stops before any test
 runs on a suite a person has to fix first. With `dry_run = true` it changes nothing
-and never throws, and returns whether there is nothing to do, neither for a person
-nor for it. `path` finds the package as it does for [`runtests`](@ref).
+and does not throw `ChoresError` for reported problems; it returns whether there is
+nothing to do, neither for a person nor for it. An invalid `path` can still throw.
+`path` finds the package as it does for [`runtests`](@ref).
 """
 function chores(args...; dry_run::Bool = false,
                 config::Union{Nothing, AbstractString, AbstractVector{<:AbstractString}} = nothing)

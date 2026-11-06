@@ -93,6 +93,7 @@ attempt's evidence; what they throw, or a `@test` in them that fails, is reporte
 and never changes the verdict.
 
 Only in the body of a running test item, or in a task it starts and waits for.
+Other calls, including one after the body returns, throw `ArgumentError`.
 """
 function on_failure(f)
     a = current_artifacts("on_failure")
@@ -113,6 +114,7 @@ is asked for. What is written there is deleted if the attempt passes and kept if
 fails. The same directory every time within one attempt; another for each attempt.
 
 Only in the body of a running test item, or in a task it starts and waits for.
+Other calls, including one after the body returns, throw `ArgumentError`.
 """
 function artifacts_dir()
     a = current_artifacts("artifacts_dir")

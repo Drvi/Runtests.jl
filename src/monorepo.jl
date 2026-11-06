@@ -4,11 +4,12 @@
 """
     Participants
 
-The packages whose suites a combined run runs, one row each, sorted by directory,
-and the root of the workspace they belong to. An `isolated` package runs in its own
-test environment, on workers of its own. `skipped` holds each package of the
-workspace that does not take part, by its directory relative to the workspace root,
-with the reason, for the run to say.
+The package rows selected from a workspace for a combined run, one per package,
+sorted by directory, and the workspace root. Before item selection, a row is a
+candidate; the plan keeps only rows that contribute items. An `isolated` package
+runs in its own test environment, on workers of its own. `skipped` holds workspace
+packages excluded during discovery, by directory relative to the workspace root
+and reason, for the run to say.
 """
 struct Participants
     workspace::String
@@ -28,13 +29,14 @@ const MONOREPO_KEYS = (:packages, :isolated)
 """
     find_participants(dir = nothing; packages = nothing) -> Participants
 
-The packages of the workspace at `dir` whose suites a combined run runs. Without
-`dir`, the workspace of the active project. Every package of the workspace that has
-a suite takes part, or those that `packages` of `[monorepo]` in the root's
-`test/TestItems.toml` names by directory or glob. The keyword `packages` narrows that
-to the package names or directories it gives, a directory relative to the workspace
-root. A package that takes part needs its test project to be a member of the
-workspace. A mistake in a file is a `ConfigError`, one in the call an `ArgumentError`.
+The candidates with suites in the workspace rooted at `dir`; an explicit `dir` must
+be the root, not a member. Without `dir`, use the workspace of the active project.
+Every package of the workspace that has a suite is a candidate, or those that
+`packages` of `[monorepo]` in the root's `test/TestItems.toml` names by directory or
+glob. The keyword `packages` then narrows the candidates by package name or
+directory relative to the workspace root. Each candidate needs its test project to
+be a workspace member. Returned package names must be unique. A mistake in a file
+is a `ConfigError`, one in the call an `ArgumentError`.
 """
 function find_participants(dir::Union{Nothing, AbstractString} = nothing; packages = nothing)
     VERSION >= MONOREPO_JULIA || error(
@@ -561,8 +563,8 @@ settings, profiles, `[order]` and seeds, and the run's settings from the one nam
 with the call's own winning.
 
 `item_keys`, pairs of a package's name and an item's name, selects those items, as an
-editor asks for them: a key the workspace has no item of is returned in `unknown`
-rather than being an error.
+editor asks for them: keys the workspace has no item of are returned in `unknown`
+when at least one key matches; if none matches, the selection is an error.
 """
 function prepare_mono(paths = (); packages = nothing, name = nothing, tags = nothing, group = nothing,
                       replay = nothing, item_keys::Union{Nothing, Vector{Tuple{String, String}}} = nothing,
@@ -973,8 +975,9 @@ function with_union_env(f, run)
     end
 end
 
-# The workspace's manifest instantiated, which every package and test project of the
-# workspace shares; a resolve only when there is none.
+# Instantiate the workspace manifest shared by its packages and test projects.
+# Explicitly resolve when the manifest is missing; Pkg handles the manifest during
+# instantiate in either case.
 function instantiate_workspace(root::AbstractString)
     original = Base.active_project()
     try
@@ -1001,9 +1004,10 @@ end
 [`chores`](@ref) for each package of a combined run, as `runtests_mono` finds them,
 and what a combined run needs on top, in one report with paths from the workspace
 root. Before any package's chores change a file, it stops for what would stop a
-combined run and what no chore fixes: two setups of one name, one dependency name
-declared with two UUIDs, and two packages that set one preference differently. Then it
-does each package's chores in turn, and the run states of checkouts that are gone
+combined run and what no chore fixes: duplicate participating package names, setup
+names or a setup shadowed by a shared dependency, one dependency name declared with
+two UUIDs, and two packages that set one preference differently. Then it does each
+package's chores in turn, and the run states of checkouts that are gone
 once. After them, the report says which items can share a worker: the groups of
 profiles whose workers are alike, a profile that the workspace shares
 (`monorepo_default`) with the packages that use it, and each package's own. It checks

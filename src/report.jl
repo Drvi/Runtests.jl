@@ -999,11 +999,12 @@ end
 """
     RunTestSet
 
-What [`runtests`](@ref) returns: a testset that prints as one line. Everything else
-it hands to the `Test.DefaultTestSet` it holds, `ts.testset`, whose fields also
-read through it, so it records, finishes, counts and summarizes as that testset
-does. Recorded into a parent or finished inside one, it is the `DefaultTestSet`
-that goes into the parent, so no testset tree ever holds anything else.
+What [`runtests`](@ref) and [`runtests_mono`](@ref) return: a testset that prints as
+one line. A one-package run has a testset per file; a combined run has a testset per
+participating package, with that package's files beneath it. `RunTestSet` forwards
+other testset operations to its `Test.DefaultTestSet`, `ts.testset`, whose fields
+also read through it. Recorded into a parent or finished inside one, it is the
+`DefaultTestSet` that goes into the parent, so no testset tree holds anything else.
 """
 struct RunTestSet <: Test.AbstractTestSet
     testset::Test.DefaultTestSet

@@ -54,7 +54,7 @@ On a terminal, the progress line stays at the bottom, and the run draws it again
 - every `monitor_interval` seconds,
 - after every 10 finished items, but no sooner than 5 seconds after the last progress line,
 - when the run goes from setup to testing,
-- when the memory of the machine goes over 90%.
+- when memory use crosses one of the high-memory marks, starting at 90%.
 
 The progress line gives these values:
 

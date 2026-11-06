@@ -21,7 +21,7 @@ written with an AI coding assistant.
 - [Test setups](#test-setups) · [Test templates](#test-templates) · [Suite maintenance](#suite-maintenance)
 - [Configuration](#testtestitemstoml) · [Coverage](#coverage)
 - [The plan](#the-plan) · [While it runs](#while-it-runs)
-- [At the REPL](#at-the-repl) · [Run state](#run-state) · [Editors](#editors)
+- [At the REPL](#at-the-repl) · [Monorepos](#monorepos) · [Run state](#run-state) · [Editors](#editors)
 
 ## Quick start
 
@@ -602,13 +602,12 @@ A run hands out, in this order:
 6. the items `[order] last` names.
 
 The first four and the last go to whichever worker is free, and a worker that
-finishes its own stretch takes over half of the longest one left. A worker whose
-pool has nothing left restarts for another pool if that makes the pool finish
-sooner. The work left for each of the pool's workers must then be longer than its
-longest item or chain. It must also be longer than what a fresh worker costs:
-starting, and compiling what the others already have. Of those pools, the worker
-takes the one that finishes last. `why here` says which rule placed an item, when
-it was not file order.
+finishes its own stretch takes over half of the longest one left. When a pool runs
+dry, its worker may restart for another pool. The scheduler considers a pool when
+its estimated work per serving worker exceeds both its longest unclaimed item or
+chain and the cost of starting and compiling a fresh worker. It chooses the
+qualifying pool with the largest estimated share. `why here` says which rule placed
+an item, when it was not file order.
 
 A name much longer than the rest is shortened to `r"^…"`, here and in a run's
 `RUN` and `DONE` lines: a prefix that no other item's name in the suite starts
@@ -910,14 +909,16 @@ it when you no longer need it.
 
 ## The environment tests run in
 
-Under `Pkg.test`, Runtests uses the environment Pkg already built. Otherwise it builds
-one with `TestEnv`, so dependencies your package declares only for testing
-(`[extras]`/`[targets]`, or `test/Project.toml`) are importable from a test item.
-Whatever environment you had active is restored when the run ends.
+Under `Pkg.test`, Runtests uses the environment Pkg already built. Otherwise it
+keeps an already active `test/Project.toml`, activates a test project that shares
+the package's workspace, or builds a separate environment with `TestEnv`. Thus
+dependencies your package declares only for testing (`[extras]`/`[targets]`, or
+`test/Project.toml`) are importable from a test item. Whatever environment you had
+active is restored when the run ends.
 
-If your package lists `test` in its `[workspace]`, Runtests activates
-`test/Project.toml` and instantiates it, as `Pkg.test` does. The test project then
-shares the manifest of the package, so TestEnv does not build a separate environment.
+When a package and its `test/Project.toml` belong to the same workspace, Runtests
+activates the test project and instantiates it, as `Pkg.test` does. They share a
+manifest, so TestEnv does not build a separate environment.
 
 Environments are cached for the session, so calling `runtests()` again
 at the REPL does not re-resolve and re-precompile. The cache notices when you
@@ -930,13 +931,19 @@ stacked over this one.
 
 `Runtests.runtests_mono()` runs the test suites of the packages of a Julia workspace
 in one run, with one plan, one set of workers and one report. It needs Julia 1.12 or
-later. The root `Project.toml` lists each package and its test project under
-`[workspace]`, so that they share one manifest:
+later. The root `Project.toml` lists the packages under `[workspace]`. Each
+participating package has a `test/Project.toml` in that workspace, listed either by
+the root or the package's own `[workspace]`. A flat layout lists both in the root:
 
 ```toml
 [workspace]
 projects = ["lib/A", "lib/A/test", "lib/B", "lib/B/test"]
 ```
+
+Start Julia in a project that declares Runtests directly in `[deps]`, such as the
+root project or a member's test project. The workspace manifest alone does not
+make `using Runtests` available. If the root package calls `runtests_mono` from its
+`test/runtests.jl`, its test environment must declare Runtests.
 
 Items of different packages share workers when their profiles start workers the same
 way. Each item runs in the root of its own package, under its own package's profiles,
@@ -946,7 +953,9 @@ apart (`isolated`). Before any worker starts, the run stops for an import that a
 package's own test environment cannot load, and for two setups of one name. Each
 package gets its own run state, so `runtestsf()` in a package runs its failures from
 the combined run. To run the combined suites with `Pkg.test` of the root package, its
-`test/runtests.jl` calls `Runtests.runtests_mono()`.
+`test/runtests.jl` calls `Runtests.runtests_mono()`. See the
+[monorepo guide](docs/src/guide/monorepos.md) for setup, package selection and
+shared profiles.
 
 ## Run state
 
@@ -1031,22 +1040,31 @@ logs, when it ends, also after a failure or an interrupt. For a GitHub Actions m
 and a [`group`](#groups) per job:
 
 ```yaml
+# Restore the run states that the last job with this os, version and group saved.
 - uses: actions/cache/restore@v4
   with:
+    # The run states only, without their logs. The save step must name the same path.
     path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
+    # No entry has this key yet. The restore takes the newest entry whose key starts with restore-keys.
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
     restore-keys: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-
 - uses: julia-actions/julia-runtest@v1
   env:
+    # The group of test items that this job runs.
     RUNTESTS_GROUP: ${{ matrix.group }}
+    # Where the run reads the restored run states and writes its own.
     RUNTESTS_RUNSTATE_DIR: ${{ runner.temp }}/runtests
+    # A stable machine name, so that the run also prunes the restored run states.
     RUNTESTS_HOST: ci-${{ matrix.os }}-${{ matrix.version }}
+    # Where the run copies its own directory when it ends, for the upload step.
     RUNTESTS_ARTIFACT_DIR: ${{ runner.temp }}/runtests-artifact
+# Save the run states for the next job, also when the tests fail.
 - uses: actions/cache/save@v4
   if: always()
   with:
     path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
     key: runtests-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+# When the job fails, upload this run's directory: its run state, logs and failure evidence.
 - uses: actions/upload-artifact@v4
   if: failure()
   with:
@@ -1097,13 +1115,18 @@ The [VS Code extension](editors/vscode/README.md) provides a Test Explorer,
 per-item results, and a **Run Failed Tests** command. Its README covers local
 installation and settings.
 
-`Runtests.serve(path)` lets an editor drive a package's suite: it lists the test items
-with where they are and what they declare, runs the ones asked for (or a `group`, or
-a `replay` of a record), reports each
-item's start and outcome as it happens — failures with their file and line — and
-cancels a run on request. It speaks one JSON object per line: commands on stdin,
-events on stdout, and everything written for people on stderr.
+`Runtests.serve(path)` lets an editor drive a package's suite. It lists items with
+their locations and keywords, runs selected items (or a group or replay), reports
+each start and outcome as it happens, and cancels on request. It speaks one JSON
+object per line: commands on stdin, events on stdout, and output for people on
+stderr.
+
+For a package with a `test/Project.toml` that declares Runtests:
 
 ```sh
 cd MyPackage && julia --project=test -e 'using Runtests; Runtests.serve()'
 ```
+
+`Runtests.serve_mono(root)` serves a workspace; its item keys contain both the
+package name and the item name. See the
+[editor protocol](docs/src/reference/editor-protocol.md) for commands and events.

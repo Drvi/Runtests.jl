@@ -1,10 +1,10 @@
 # [Files](@id files)
 
-This page lists the files that Runtests reads and writes outside `test/`. [Syntax](@ref syntax) lists the files under `test/`.
+This page describes run-state bundles and files that Runtests writes. [Syntax](@ref syntax) describes the files it discovers under `test/`.
 
 ## [Run state files](@id run-state-files)
 
-Each run keeps its run state and its logs in a directory of its own, `<run>.rundata`, in the run state directory:
+A standalone run keeps its run state and logs in a directory of its own, `<run>.rundata`, in the run state directory. A combined run writes one such directory for each participating package; each contains only that package's items:
 
 ```text
 <run>.rundata/
@@ -42,10 +42,10 @@ When `RUNTESTS_ARTIFACT_DIR` is set, each run copies its directory, `<run>.runda
 
 ## Files in the package
 
-Runtests writes these files in the package:
+Runtests also writes these files in a package or workspace:
 
-- `lcov.info` at the root of the package, from a run with `coverage = true`. [Measure coverage](@ref coverage) describes the file.
+- `lcov.info` at the package root for a standalone run, or at the workspace root for a combined run, when `coverage = true`. [Measure coverage](@ref coverage) describes the file.
 - the expansion of each template, `test/<name>_tests.jl`, from `Runtests.chores()`,
 - `test/testsetups/<Name>/Project.toml` and `test/testsetups/<Name>/src/<Name>.jl`, from `Runtests.chores()` when it converts a setup into a package.
 
-Commit the files that `chores` writes.
+`Runtests.chores_mono()` performs the same file-writing chores for each participating package. Commit the files that either chores command writes.

@@ -1,10 +1,10 @@
-# The run states of a run of several packages: one in each package's own run state
-# directory, which that package reads as a run of its own.
+# The run states of a combined run: one attempted in each participating package's
+# own run state directory, which that package reads as a run of its own.
 
 """
     package_plan(p, k) -> Plan
 
-Package `k`'s part of a plan of several packages, as a plan of its own: its items,
+Package `k`'s part of a combined plan, as a plan of its own: its items,
 units and profiles in the order of `p`, renumbered, with paths relative to the
 package's root, and its own configuration under the run's own settings. What its run
 state holds. It has no pools or slots: the run's slots served every package.
@@ -64,7 +64,7 @@ end
 """
     RunStateSet
 
-The run states of a run of several packages, one in each package's own run state
+The run states of a combined run, one in each package's own run state
 directory, each holding only that package's items by their index in its own plan
 (see `package_plan`), so that the package's history, `runtestsf` and `debug` read the
 run as one of its own. A write about an item goes to its package's run state. A
@@ -125,11 +125,11 @@ finish_run_state!(set::RunStateSet; kwargs...) = (foreach(f -> finish_run_state!
 """
     open_runstate_set(p, start, runid) -> RunStateSet
 
-A run state for each package of `p`, in its own run state directory, with what tells
-the records of one run apart from the others: the run's ID, which every one of them
-holds, its packages, whether this one was isolated, and the environment directory of
-each of its items. A run state that cannot be opened is done without, as in a run of
-one package, and the others are written.
+Attempt a run state for each package of `p` in its own run state directory. Each
+record holds the shared run ID, the participant list, its isolation flag, and its
+items' environment directories, which link the package records for replay. A run
+state that cannot be opened is done without, as in a run of one package, and the
+others are written.
 """
 function open_runstate_set(p::Plan, start::Float64, runid::AbstractString)
     n = length(p.packages)

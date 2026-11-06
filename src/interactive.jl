@@ -1,7 +1,7 @@
 # Test items outside a run: `Runtests.activate`, and a `@testitem` pasted into a REPL.
 #
-# A pasted item is read by the scanner's parser, run by the worker's evaluator and
-# surrounded by the run's environment, so it behaves as it does under `runtests`.
+# A pasted item uses the scanner's parser and the worker's item evaluator. Without
+# a coordinator, run-only scheduling options need separate handling below.
 
 # What `activate` changed, for `deactivate` to undo: `(; project, setups, target, dir,
 # participants)`, or `nothing` when Runtests has not touched the session. `target` is
@@ -46,8 +46,9 @@ end
 """
     deactivate()
 
-Undo [`activate`](@ref): restore the environment that was active and take the
-setups back off `LOAD_PATH`. Does nothing if Runtests is not active.
+Undo [`activate`](@ref) or [`activate_mono`](@ref): restore the environment that
+was active and take the setups back off `LOAD_PATH`. Does nothing if Runtests is
+not active.
 """
 function deactivate()
     state = ACTIVATION[]
@@ -70,6 +71,8 @@ end
 [`activate`](@ref) for the packages of a workspace, as `runtests_mono` runs them: the
 union environment of their test dependencies active, and the setups of each package
 that shares workers on `LOAD_PATH`, so that the REPL loads what a shared worker loads.
+With no `root`, it finds the workspace of the active project (or of the current
+`test/runtests.jl` under `Pkg.test`).
 An isolated package is not part of it; `activate` it on its own. A test item runs as
 an item of the package whose directory holds its file, as on a shared worker: in the
 union environment, with its package loaded, in its package's root. For an item pasted
@@ -117,7 +120,7 @@ end
 """
     is_activated() -> Bool
 
-Whether [`activate`](@ref) is in force.
+Whether [`activate`](@ref) or [`activate_mono`](@ref) is in force.
 """
 is_activated() = ACTIVATION[] !== nothing
 
@@ -138,9 +141,10 @@ repl_ignored(sandboxed::Bool) = sandboxed ? REPL_IGNORED[3:3] : REPL_IGNORED
     run_interactive(ex, source) -> Test.AbstractTestSet
 
 Run one `@testitem` that was evaluated rather than scanned, and return its
-testset. It is read by the scanner's parser and evaluated by the worker's code;
-`sandbox`, a profile and an environment directory start a worker, and the keywords
-only a scheduler can honour are ignored with a warning.
+testset. It is read by the scanner's parser and evaluated by the worker's code.
+`sandbox`, a profile and an environment directory start a worker. Without a
+worker, `timeout` and `retries` are ignored with a warning; `chain` is always
+ignored because one pasted item has no chain to schedule.
 """
 function run_interactive(ex::Expr, source::LineNumberNode)
     path = source.file === nothing ? "REPL" : String(source.file)
@@ -167,9 +171,8 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     end
 end
 
-# The session's project, or `nothing`: a pasted item need not come from a package,
-# and then it runs with nothing arranged. After `activate_mono`, which activates no
-# one package, the package whose file `path` is.
+# The ordinary interactive target, or `nothing`: a pasted item need not come from a
+# package. `paste_target` handles package membership after `activate_mono`.
 function interactive_target(path::Union{Nothing, AbstractString} = nothing)
     state = ACTIVATION[]
     combined = state !== nothing && state.target === nothing

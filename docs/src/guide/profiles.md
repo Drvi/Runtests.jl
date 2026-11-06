@@ -30,7 +30,7 @@ An item runs under this profile with `profile = :bounds`:
 end
 ```
 
-The items of one profile share the workers of that profile. To run an item of the profile alone in a new process, add `sandbox = true`:
+Items of this profile reuse its workers. Another profile can use the same pool when its workers start the same way. To run an item alone in a new process, add `sandbox = true`:
 
 ```julia
 @testitem "indexes stay in bounds, alone" profile=:bounds sandbox=true begin
@@ -89,7 +89,9 @@ Discovery does not follow directory symlinks. A replay finds the environment of 
 
 ## Pools of workers
 
-A run keeps a pool of workers for each start configuration that its items use. The start configuration of a worker is what it gets when it starts: Julia flags, threads, environment variables, `init`, preferences and environment. Thus an item with `profile = :bounds` in `test/qa/` runs on a worker with the flags of `bounds` and the packages of `test/qa`. Two profiles that differ only in `test_end` share a pool. The `UP` line of a worker names its profile when an item of the run uses a profile other than `default`. It names the environment of the worker when an item uses an environment directory. [Output](@ref output) gives the details.
+A run keeps a pool of workers for each start configuration that its items use. The start configuration of a worker is what it gets when it starts: Julia flags, threads, environment variables, `init`, preferences and environment. Thus an item with `profile = :bounds` in `test/qa/` runs on a worker with the flags of `bounds` and the packages of `test/qa`. Two profiles that differ only in `test_end` share a pool, and each item still runs its own profile's `test_end`. Across packages of a workspace, an `init` must also run in the same directory for workers to be shared. [Share a profile](@ref shared-profiles) explains how the workspace root supplies one `init` to its packages.
+
+The `UP` line of a worker names its profile when an item of the run uses a profile other than `default`. It names the environment of the worker when an item uses an environment directory. [Output](@ref output) gives the details.
 
 Items of different pools run on different workers, and can run at the same time. `[order]` does not make them run one after the other. A `chain` runs its items in sequence on one worker. Thus all items of a chain must use the same profile and be in the same environment.
 

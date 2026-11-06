@@ -11,6 +11,7 @@ Run a package's tests as independent test items across worker processes.
 Test files live under `test/` and are named `*_test.jl` or `*_tests.jl`. They
 contain `@testitem` declarations and nothing else. Shared setup code goes in
 `test/testsetups/` as ordinary modules, which test items load with `using`.
+[`runtests_mono`](@ref) runs several packages of a Julia workspace in one run.
 """
 module Runtests
 
@@ -19,8 +20,8 @@ include("RuntestsWorkers/RuntestsWorkers.jl")
 """
     Runtests.Private
 
-Everything but the public API, which `Runtests` takes from here by name. `Runtests.<tab>`
-offers every name `Runtests` itself defines, and the public API is what it should offer.
+The implementation behind the public API. `Runtests` brings its public entry
+points into scope; call them through `Runtests`, not this module.
 """
 module Private
 
@@ -64,11 +65,13 @@ include("chores.jl")
 """
     runtests([paths...]; kwargs...)
 
-Run the test items under `test/`. With no arguments, the project of the active
-environment is used.
+Run the test items under a package's `test/`. With no paths, use the package of
+the active project, or the package whose `test/runtests.jl` is running under
+`Pkg.test`.
 
-`paths` narrow what is read: a directory, a test file, or `file.jl:42` to select
-the item that line is inside, which is given without other files or directories.
+`paths` narrow what runs, while the whole suite is still parsed for errors: a
+directory, a test file, or `file.jl:42` to select the item that line is inside,
+which is given without other files or directories.
 Several paths select what any of them does, so the package or its `test/` among them
 is the whole suite.
 
@@ -84,8 +87,8 @@ another task or thread, throws and leaves that run going.
 # Keywords
 
 Selection: `name` (`String` for an exact match, `Regex` for a partial one, or a
-set of exact names), `tags` (a symbol or vector of symbols an item must carry
-all of, or a string expression such as `"!slow"` or `"juliac || serializer"`), and
+vector or set of exact names), `tags` (a symbol or vector of symbols an item must
+carry all of, or a string expression such as `"!slow"` or `"juliac || serializer"`), and
 `group` (the name of a tag expression `[groups]` of `test/TestItems.toml` declares,
 or `"all"`, the whole suite, or `"default"`). The selections a call gives narrow
 together. A call that gives none selects the group `RUNTESTS_GROUP` names, when it is
@@ -351,11 +354,12 @@ their profiles start workers the same way. Julia 1.12 or later.
 The packages are the workspace's members that have a suite, or those that
 `packages` of a `[monorepo]` table in `test/TestItems.toml` of the workspace root
 lists, by directory or glob, and `isolated` there lists those that run in their own
-test environment, on workers of their own. The keyword `packages` narrows them to
-the names or directories it gives. Each package's test project has to be a member of
-the workspace. With no `paths`, the workspace of the active project; a path selects
-within the package that holds it, and the workspace root, a package's root or its
-`test/` selects all of it.
+test environment, on workers of their own. The keyword `packages` narrows them by
+name or directory relative to the workspace root. Each package's test project has
+to be a member of the workspace. With no `paths`, use the workspace of the active
+project, or of `test/runtests.jl` under `Pkg.test`. A path selects within the
+package that holds it; the workspace root, a package's root or its `test/` selects
+all of it.
 
 Each package's items run under its own profiles, setups and settings. The settings
 of the run itself (`workers`, `memory_threshold`, `logs`, `verbose`, `monitor`,
@@ -371,7 +375,9 @@ profile's `init` or `test_end` that the package's own test environment could not
 load stops the run, as do two packages' setups of one name. Each package gets a run
 state of its own, which its `runtestsf`, `debug` and next runs read as one of its own
 runs. Returns a [`RunTestSet`](@ref) with a testset for each package, and throws as
-[`runtests`](@ref) does when an item did not pass.
+[`runtests`](@ref) does when an item did not pass. `workers = 0` can run one selected
+package only, because this process holds one test environment. A dry run prints the
+combined plan and returns `nothing`.
 """
 function runtests_mono(args...; packages = nothing, name = nothing, tags = nothing, dry_run::Bool = false,
                        on_item = nothing, kwargs...)
@@ -403,13 +409,11 @@ end
 """
     runtestsf(paths...; kwargs...)
 
-Run the items that are failing: those whose last verdict, in the last run that ran
-them to one, was not a pass. Each item keeps its own, so running some of one run's
-failures again does not forget the others, and a run stopped before it reached an
-item leaves that item's verdict as it was. Only items the suite still has run: one
-renamed or deleted since it failed has nothing to run. With `replay`, the verdicts
-are that run's and those of the runs that started after it. See
-`failing_items`.
+Run the items whose latest verdict was not a pass. A skip does not replace an
+earlier verdict, and a run stopped before reaching an item leaves its verdict
+unchanged. Rerunning some failures does not forget the others. Only items still
+in the suite run; one renamed or deleted since it failed has nothing to run.
+With `replay`, the verdicts come from that run and runs started after it.
 
 Every other selection narrows the failing items: `name` keeps those it matches, as
 paths, a `file.jl:line`, `tags` and `group` do, so nothing that is not failing runs.

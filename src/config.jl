@@ -8,8 +8,10 @@ using TOML: TOML
 """
     Profile
 
-Everything that makes two worker processes non-interchangeable. Items with the
-same profile can share a worker; items with different profiles cannot.
+A named worker configuration: startup flags, threads, environment, preferences and
+`init`, plus the `test_end` run after each item. Different profiles can share a
+worker when their startup configuration and `init` directory agree; `test_end` does
+not split pools (see `pool_key`).
 """
 struct Profile
     name::Symbol
@@ -48,7 +50,8 @@ of the workspace root marks `monorepo_default = true`, by name, each with the wo
 root as the directory its `init` runs in. `path` is that file, empty for a package in
 no workspace. A package takes a shared profile that it does not declare, and one that
 it declares with the same `init` and `test_end`, as code, runs its `init` where the
-shared one does, so that the workers of both are alike (`share_profiles!`).
+shared one does. Their workers can share a pool when the other startup settings
+agree (`share_profiles!` and `pool_key`).
 """
 struct SharedProfiles
     path::String
@@ -150,7 +153,9 @@ const ALL_GROUP = "all"
 Merge `test/TestItems.toml` with explicit keyword arguments. An unknown key is an
 error, not a no-op: a misspelled option would otherwise be ignored in silence.
 `config` names another file to read in its place, relative to the current
-directory; named, it has to exist, where `test/TestItems.toml` may be absent.
+directory; named, it has to exist, where `test/TestItems.toml` may be absent. For a
+workspace member, profiles marked `monorepo_default = true` in the workspace root's
+file are also available; unrelated root profiles and run settings do not apply.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
@@ -422,7 +427,8 @@ same_file(a::AbstractString, b::AbstractString) = !isempty(b) && isfile(a) && is
 # A package's profiles with those its workspace shares: a shared profile that the
 # package does not declare is its own too, and one that it declares with the same
 # `init` and `test_end`, as code, runs that code where the shared one runs it. One
-# with another `init` or `test_end` stays the package's alone.
+# with another `init` or `test_end` keeps its own definition; it may still share
+# workers when its startup configuration and `init` directory match another's.
 function share_profiles!(profiles::Dict{Symbol, Profile}, shared::SharedProfiles)
     for (name, s) in shared.profiles
         own = get(profiles, name, nothing)
@@ -446,8 +452,9 @@ same_code(a::Expr, b::Expr) = Base.remove_linenums!(deepcopy(a)) == Base.remove_
     shared_profiles(path, toml, workspace) -> SharedProfiles
 
 The profiles that the configuration file `path` of the root of `workspace` marks
-`monorepo_default = true`, with `workspace` as the directory their `init` runs in. Only
-those are read: the rest of the file is the root's own, which its own runs check.
+`monorepo_default = true`, with `workspace` as the directory their `init` runs in.
+After TOML syntax is parsed, only marked profile declarations are validated here;
+the rest of the file is the root's own, which its own runs check.
 """
 function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
     out = Dict{Symbol, Profile}()
@@ -494,8 +501,8 @@ run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
             prof.dir) :
     prof
 
-# What a worker gets when it starts, and so what makes the workers of two profiles
-# interchangeable: everything but the name and `test_end`, which runs after each item.
+# The profile fields a worker gets when it starts: everything but its name,
+# `test_end` (run after each item) and `dir` (handled separately by `pool_key`).
 start_configuration(prof::Profile) =
     (prof.julia_args, prof.threads, prof.env, prof.init, prof.preferences, prof.environment)
 

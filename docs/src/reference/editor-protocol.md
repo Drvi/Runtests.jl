@@ -14,7 +14,7 @@ julia --project=<an environment with Runtests> -e 'using Runtests; Runtests.serv
 
 `Runtests.serve_mono("<workspace root>")` serves the packages of a workspace, as [`runtests_mono`](@ref monorepos) runs them. Its listing holds the items of every package, and each run is a combined run. Two items of two packages can have the same name, so an item is known by its key: the name of its package and its own name.
 
-The protocol version is `3`, and the `hello` event gives it. A change that can break an editor written against the protocol increases the version.
+`serve_mono` reads each package's own configuration file and has no `config` argument. The protocol version is `3`, and the `hello` event gives it. An editor should check that version before sending a selection: earlier versions use different item identifiers. A change that can break an editor written against the protocol increases the version.
 
 ## Commands
 
@@ -23,7 +23,7 @@ Every command is an object with a `command` field. It can have an `id` of any JS
 | Command | Fields | Answer |
 |:--------|:-------|:-------|
 | `list` | none | `items`, or `error`. |
-| `run` | `items`: item keys, each an object with `package` and `name`. `names`: exact item names, of every package, which `serve_mono` does not take. Without either, the run selects what a run selects when nothing else selects. `options`: an object of configuration values. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
+| `run` | `items`: item keys, each an object with `package` and `name`. `names`: exact item names for `serve` only; `serve_mono` rejects it. Without either selection, the run uses its default selection. `options`: an object of configuration values. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
 | `cancel` | none | No separate acknowledgement: the run ends with `run_finished`, `state` `cancelled`, and the original `run` ID. An `error` when nothing runs carries the `cancel` ID. |
 | `shutdown` | none | `bye`, without an ID. |
 

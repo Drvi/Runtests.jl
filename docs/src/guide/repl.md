@@ -11,6 +11,17 @@ Runtests.deactivate()
 
 `activate` makes the session look like the worker of a test item. It activates the test environment of the package and puts `test/testsetups/` on `LOAD_PATH`. Then `using MySetups` and the test-only dependencies of the package work as they do inside an item. `activate` returns the path of the environment. `deactivate` restores the environment that was active and the `LOAD_PATH`. `Runtests.is_activated()` tells you whether `activate` is in force.
 
+For the shared packages of a [workspace](@ref monorepos), use `Runtests.activate_mono()` after loading Runtests from a project in that workspace. It activates the combined test environment and the shared setups. A pasted item belongs to the package that holds the REPL's current directory; an item brought in with `include` belongs to the package that holds its file. In either case its body runs in that package's root:
+
+```julia
+Runtests.activate_mono()
+cd("lib/A")                 # from the workspace root, before pasting an A item
+# paste an @testitem from A here
+Runtests.deactivate()
+```
+
+`deactivate` restores the project and `LOAD_PATH`, but leaves the directory changed by `cd` alone. From the workspace root, use `Runtests.activate("lib/Legacy")` for an isolated package instead; `activate_mono` reports an error if an item belongs to one.
+
 ## Run a pasted test item
 
 A `@testitem` that you paste into the REPL runs at once:

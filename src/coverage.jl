@@ -1,9 +1,10 @@
-# Coverage. Each worker counts the lines of the package it runs and writes them to an
-# LCOV tracefile of its own when it exits; the run merges them into one `lcov.info`
-# at the package's root. Julia writes a tracefile whenever its exit hooks run, an
-# empty one when nothing counted ran: on a normal exit, and on the SIGTERM a timed-out
-# worker is stopped with (on Windows it is terminated outright, which runs nothing). A
-# worker that ran items and left none died without them, and what it counted is lost.
+# Coverage. Each worker counts the lines of the package it runs and writes them to
+# an LCOV tracefile when it exits. The run merges those files into one `lcov.info`
+# at the package root, or the workspace root of a combined run. Julia writes a
+# tracefile on normal exit and when a timed-out worker receives SIGTERM; it may be
+# empty if no counted line ran. Windows terminates a timed-out worker outright, so
+# it cannot write a tracefile. A worker that ran items and left none died without
+# reporting what it counted.
 
 # What the run's closing block says about coverage.
 struct CoverageSummary
@@ -26,16 +27,15 @@ coverage_flags(root::AbstractString, dir::AbstractString) =
 """
     merge_coverage(tracedir, roots, out) -> (files, lines, hit)
 
-Sum the LCOV tracefiles in `tracedir` over the `src/` and `ext/` of each package at
-`roots`, one or several, and write them to `out` as one. Outside a checkout, a path is
-relative to `base` when it is given, the root of a workspace, so that the files of
-two packages keep apart. Paths are relative to the root of the repository `root`
-is in (see [`repository_root`](@ref)), which is what Codecov and Coveralls resolve
-them against, so a package in a subdirectory, as in a monorepo, has its own path in
-front of them; outside a checkout they are relative to `root`. A tracefile has the
-lines of the functions that were compiled and no others, so every other line of a
-function body in those directories goes in as not run: a function nothing called,
-in a file nothing loaded, counts against the package.
+Sum the LCOV tracefiles in `tracedir` over the `src/` and `ext/` of each package in
+`roots`, and write them to `out` as one. Output paths are relative to each package's
+repository root (see [`repository_root`](@ref)), as Codecov and Coveralls expect.
+Thus a package in a subdirectory keeps that directory before `src/` or `ext/`.
+Outside a checkout, paths are relative to `base` when given, so packages of one
+workspace remain distinct; otherwise they are relative to each package root.
+Tracefiles include lines of compiled functions. The merge adds unreported function
+body lines in those directories with a zero count, including lines in files that
+were never loaded.
 """
 merge_coverage(tracedir::AbstractString, root::AbstractString, out::AbstractString) = merge_coverage(tracedir, [root], out)
 
@@ -197,10 +197,10 @@ end
 """
     collect_coverage(run) -> CoverageSummary
 
-The run's tracefiles merged into `lcov.info` at the package's root, or the workspace
-root for a run of several packages, over each package's `src/` and `ext/`, once every
-worker has exited, and how many workers that ran items left none. Never throws: a report
-that cannot be written is said in the closing block, and the run's verdict stands.
+Merge the run's tracefiles over each package's `src/` and `ext/` into `lcov.info` at
+the package root, or the workspace root for a combined run, after workers exit.
+Report how many workers that ran items left no tracefile. A merge failure is said
+in the closing block without changing the run's verdict; an interrupt is rethrown.
 """
 function collect_coverage(run)
     root = run.plan.root

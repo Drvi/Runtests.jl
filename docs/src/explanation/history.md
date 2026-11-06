@@ -1,10 +1,10 @@
 # [Run states and history](@id history)
 
-This page explains how Runtests remembers runs. Each run writes a run state: a binary file that records the run. The history of a suite is its set of run states. Runtests uses the history to plan the order of a run and to find the failing items.
+This page explains how Runtests remembers runs. A standalone run writes one run state, a binary record of that run. A combined run writes one for each package that took part, so each package keeps its own history. Runtests uses a suite's history to plan its next run and to find its failing items.
 
 ## What a run state records
 
-Every run writes its run state while it goes on, and prints the path of its directory at the end. Even an interrupted run leaves a record of the items that it completed. A run state records these facts:
+A run writes its run states while it goes on, and prints their directory paths at the end. Even an interrupted run leaves a record of the items it completed. Each run state records these facts for its package:
 
 - The outcome, the duration and the compilation time of each item, and every attempt.
 - Each start and exit of a worker, with whether the worker timed out, crashed, or got a signal from outside.
@@ -15,7 +15,7 @@ Every run writes its run state while it goes on, and prints the path of its dire
 - The environment variables `JULIA_*`, `RUNTESTS_*` and those of CI jobs, without names that look like credentials.
 - The `Project.toml` and the `Manifest.toml` of the test environment.
 
-Each run keeps its run state, `run.runstate`, in a directory of its own, `<run>.rundata`. That directory also holds the logs of the run: captured item output, failure reports, [artifact evidence](@ref evidence), and the reason why a run ended before its first item. Under `logs = :eager`, ordinary item output is streamed and is not kept there. Artifact producers still have their own captured output. [The files reference](@ref run-state-files) shows the layout.
+Each package record lives as `run.runstate` in its own `<run>.rundata` directory. That directory also holds its logs: captured item output, failure reports, [artifact evidence](@ref evidence), and the reason why a run ended before its first item. Under `logs = :eager`, ordinary item output is streamed and is not kept there. Artifact producers still have their own captured output. [The files reference](@ref run-state-files) shows the layout.
 
 ## How Runtests uses the history
 
@@ -54,7 +54,7 @@ Runtests reads only run states in its own format. A run warns once when its run 
 
 ## Concurrent runs
 
-An editor, a REPL and CI jobs can share one run state directory. Each run makes its own directory, and writes its run state to disk at least every 30 seconds. The run states of active runs are never pruned.
+An editor, a REPL and CI jobs can share one run state directory. Each package record gets its own directory, and Runtests writes it to disk at least every 30 seconds. The run states of active runs are never pruned.
 
 A run is dead when its run state did not change for 90 seconds, or when its local process is known to have exited. A dead run counts as cancelled, and an item that was running in it counts as failing. A run whose setup fails finishes its run state as a run that ended before its first item. Thus no other run waits for it.
 
@@ -62,4 +62,4 @@ Machines that share run states over a network must agree on the time to within a
 
 ## Read a run state
 
-`Runtests.read_run_state(path)` reads a run state. `path` is the directory of a run or the `run.runstate` file in it. It never throws. A file that is truncated, that a crashed run left, or that another version wrote gives as much as it can, or `nothing`. A broken record of an old run must not stop a new run.
+`Runtests.read_run_state(path)` reads a run state. `path` is the directory of a run or the `run.runstate` file in it. A truncated record, one left by a crashed run, or one written by another version gives as much as can be read, or `nothing`. Ordinary read and parse errors are suppressed so a broken old record does not stop a new run. An interrupt during parsing is rethrown; a file removed between reading and checking its modification time can cause a file-system error.

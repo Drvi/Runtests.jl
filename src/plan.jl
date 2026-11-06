@@ -1,5 +1,6 @@
-# Turning scanned items into a plan: what runs where and in what order, decided
-# once before anything starts. `--dry-run` prints it; a run executes exactly it.
+# Turning scanned items into a plan: units, pool order and initial worker slots,
+# decided before anything starts. A dry run prints it; drained slots can later
+# restart for another pool when doing so shortens estimated completion.
 
 """
     Items
@@ -74,12 +75,14 @@ Base.length(u::Units) = length(u.span)
 """
     Pool
 
-One profile's units in the order they are handed out, as three runs of
-consecutive unit indices:
+Units whose profiles have one worker start configuration, possibly from several
+profiles or packages, in the order they are handed out as three runs of consecutive
+unit indices. `profile` names the representative profile used to start workers;
+each item retains its own profile for `test_end`:
 
 - `head` goes first, in order, to whichever of the pool's workers asks next;
-- `body` is in file order, cut into one stretch per worker: each walks its own,
-  running neighbouring items that share compiled code;
+- `body` is in file order, cut into one stretch per initially assigned worker:
+  each walks its own, running neighbouring items that share compiled code;
 - `tail` goes last, in order.
 
 What goes where is decided by [`order_pool!`](@ref).
@@ -212,10 +215,10 @@ History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::C
 """
     plan(raw, cfg; history, histories, root, packages, strict_order, selection, suite_names) -> Plan
 
-Validate, group into units, put each profile's units in the order they are handed
-out, and cut each pool's body into one stretch per slot. `cfg` holds the run's own
-settings; `packages` the packages whose items `raw` holds, each with its own
-configuration, and `histories` what earlier runs of each measured.
+Validate, group into units and pools by worker start configuration, put each pool's
+units in the order they are handed out, and cut its body into one stretch per initial
+slot. `cfg` holds the run's own settings; `packages` holds each item's package and
+its own configuration, and `histories` holds what earlier runs of each measured.
 """
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(), histories::Vector{History} = [history],
@@ -341,10 +344,11 @@ function levenshtein(a::AbstractString, b::AbstractString)
     return prev[n + 1]
 end
 
-# The profiles the pools run under: of each package, each declared one in the test
-# environment, and each pair of a profile and an environment directory that the
-# package's items in `raw` use. A pool's workers are one pair's. Package by package,
-# its default profile in the test environment first. Also the package of each.
+# The profile/environment pairs available to units: each declared profile in each
+# package's test environment, and each pair used by an item in an environment
+# directory. `pool_units` later groups compatible pairs by start configuration.
+# Package by package, its default profile in the test environment first; record
+# the package of each pair too.
 function profile_table(packages::Packages, raw::Vector{RawItem})
     triples = Set{Tuple{Int32, Symbol, String}}()
     for k in eachindex(packages.name), n in keys(packages.cfg[k].profiles)

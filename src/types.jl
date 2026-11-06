@@ -25,8 +25,9 @@ is_whole_number(x) = x isa Integer && !(x isa Bool)
 """
     RawItem
 
-One `@testitem` as the scanner read it: a pure function of the file's bytes.
-`code` and `skip` are unevaluated; they only ever run where the item runs.
+One `@testitem` as the scanner read it. `code` and `skip` are unevaluated; they only
+run where the item runs. The scanner assigns package index 1; a combined run later
+sets `package` to the item's participant index.
 """
 struct RawItem
     name::String
@@ -93,8 +94,9 @@ end
 """
     NoTestsError
 
-Thrown when there is nothing to run: no test files, no item the selection matched,
-or no failures left to re-run. `msg` says which.
+Thrown when there is nothing to run: no test files or no item that a selection
+matched. `runtestsf()` with no failing items and no selection says so and
+returns `nothing`. `msg` describes the empty selection.
 """
 struct NoTestsError <: Exception
     msg::String
@@ -104,9 +106,9 @@ Base.showerror(io::IO, e::NoTestsError) = print(io, "Runtests: ", e.msg)
 """
     ConfigError
 
-Thrown when a run cannot be set up as asked: a keyword or `TestItems.toml` setting
-it does not accept, a profile or run state it cannot use, a test setup that does not
-precompile. `msg` says what and where.
+Thrown when a run cannot be set up as asked: a `TestItems.toml` or environment
+setting it does not accept, a profile or run state it cannot use, or a test setup
+that does not precompile. `msg` says what and where.
 """
 struct ConfigError <: Exception
     msg::String
@@ -116,8 +118,9 @@ Base.showerror(io::IO, e::ConfigError) = print(io, "Runtests: ", e.msg)
 """
     ChoresError
 
-Thrown by [`chores`](@ref) once it has done what it could, when what is left needs a
-person: the problems its report names. `msg` counts them.
+Thrown by [`chores`](@ref) or [`chores_mono`](@ref) when maintenance stops with a
+problem that needs a person. `msg` describes the problem; after `chores_mono` has
+worked on several packages, it can also name packages whose chores already ran.
 """
 struct ChoresError <: Exception
     msg::String

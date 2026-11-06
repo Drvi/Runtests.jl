@@ -502,7 +502,7 @@ end
 ### Driver #################################################################
 
 """
-    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names, environments) -> Vector{RawItem}
+    scan(files, filter, known_setups; ntasks, strays, templates, expansions, suite_names, environments, suite_tags) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
 (file, line). Throws a `ScanFailure` listing every problem, so one run surfaces every

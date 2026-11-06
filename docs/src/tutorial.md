@@ -170,7 +170,9 @@ Runtests.runtests(dry_run = true)
   2 ·     w2 · "square area" · test/area_tests.jl:6 · 0.4s · fast
 ```
 
-The `est` column shows the duration that the last run recorded for each item. [Run tests](guide/running.md) tells you all the ways to select items.
+The `est` column shows each item's most recent recorded duration. The most recent
+run may not have selected every item. [Run tests](guide/running.md) tells you all
+the ways to select items.
 
 ## Share code between items
 
@@ -227,3 +229,4 @@ You now have a suite that Runtests runs. These pages continue from here:
 - [Configure runs](guide/configuration.md) explains `test/TestItems.toml`.
 - [Run on CI](guide/ci.md) explains how to keep the history of runs between CI jobs.
 - [Generate test items from a template](guide/templates.md) explains how one loop makes many items.
+- [Run a monorepo](guide/monorepos.md) explains how packages in one Julia workspace share a run and workers.

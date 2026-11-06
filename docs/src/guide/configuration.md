@@ -13,6 +13,8 @@ A run takes each configuration value from the first of these sources that sets i
 
 The header of the run names each environment variable that set a value. CI can thus set the configuration of a job without a change to the project.
 
+In a [combined workspace run](@ref monorepos), run-wide values come from the workspace root's file. Each package's other settings come from its own file, with any [shared profile defaults](@ref shared-profiles) from the workspace root. A keyword or environment variable still takes precedence for every package.
+
 ```julia
 Runtests.runtests(workers = 4, timeout = 600, retries = 1)
 ```

@@ -16,7 +16,7 @@ From the imports of the selected items, the coordinator knows which [setups](@re
 
 Under `Pkg.test`, Runtests uses the environment that Pkg already built. It also respects an already active `test/Project.toml`. Otherwise it builds the environment with TestEnv, except for the workspace case below. Thus the dependencies that your package declares only for tests can be imported in a test item. These are the dependencies in `[extras]` and `[targets]`, or in `test/Project.toml`. When the run ends, the environment that was active before is active again.
 
-If your package lists `test` in its `[workspace]`, Runtests activates `test/Project.toml` and instantiates it, as `Pkg.test` does. The test project then shares the manifest of the package, so TestEnv does not build a separate environment.
+When a package and its `test/Project.toml` belong to the same outermost Julia workspace, Runtests activates the test project and instantiates it, as `Pkg.test` does. The workspace can list both projects directly, or the package can list its own `test` project. They share the workspace manifest, so TestEnv does not build a separate environment.
 
 Runtests keeps resolved environments for the session and rebuilds them when their input files, such as `Project.toml` or a manifest, change. Reusing an environment does not guarantee that all compilation is reusable: changed source or worker flags can require new compiled code. The items in an [environment directory](@ref environments) run in that environment, stacked over the test environment.
 

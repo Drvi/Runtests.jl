@@ -5,10 +5,11 @@
 
 Declare an independently runnable group of tests.
 
-`Runtests.runtests()` finds test items by parsing test files and runs each body in a
-fresh module on a worker process. Evaluating the macro itself — pasting an item
-into the REPL, or `include`ing its file — runs that one item the same way in this
-session, or on a worker of its own when it is sandboxed.
+`Runtests.runtests()` and `Runtests.runtests_mono()` find test items by parsing test
+files and run each body in a fresh module, on a worker or in the calling process
+under `workers = 0`. Evaluating the macro itself — pasting an item into the REPL,
+or `include`ing its file — runs that one item in this session, or on a worker of
+its own when `sandbox`, a named profile or an environment directory requires one.
 
 The body runs at the top level of its module with the REPL's soft scope, as in
 ReTestItems, so its variables are untyped globals. That matters to a test that
@@ -34,7 +35,7 @@ must give a `Bool`, and an error in it is the item's error.
 | Keyword | Meaning |
 |:--------|:--------|
 | `tags=[:a, :b]` | tags used for filtering |
-| `timeout=N` | seconds before the item is killed; overrides the run default |
+| `timeout=N` | seconds before a worker attempt is stopped; overrides the run default. An item in the caller's process under `workers = 0` has no enforceable timeout. |
 | `retries=N` | overrides the run default; a chain retries from its first item |
 | `skip=expr` | `Bool`, or an expression evaluated on the worker before the body |
 | `failfast=true` | stop this item at its first failure |
@@ -43,9 +44,9 @@ must give a `Bool`, and an error in it is the item's error.
 | `profile=:name` | run on the workers of `[profiles.name]` of `TestItems.toml` |
 
 `sandbox` and `profile` combine: `sandbox=true profile=:name` runs alone in a process
-of that profile. Neither chooses the item's packages: it runs in the environment of
-the innermost directory between its file and `test/` with a `Project.toml` of its
-own, and otherwise in the test environment.
+of that profile. Neither chooses the item's environment. An item runs in the
+environment of the innermost directory between its file and `test/` with a
+`Project.toml` or `JuliaProject.toml` of its own, and otherwise in the test environment.
 """
 macro testitem(args...)
     # The call goes to `run_interactive` whole, to be read by the scanner's own
@@ -59,9 +60,11 @@ end
         # tests, with `\$x` where the value of `x` goes
     end
 
-Declare a test item per iteration of the loop, in a test template: a file
-`test/testtemplates/*_tests_template.jl`, which [`chores`](@ref) runs in a process with
-the test environment and the setups, and expands into the test file of its name
+Declare a test item per iteration of the loop, in a file under
+`test/testtemplates/` ending in `_test_template.jl` or `_tests_template.jl`.
+[`chores`](@ref) or
+[`chores_mono`](@ref) runs it in a process with the test environment and the setups,
+and expands it into the test file of its name
 without `_template`, in `test/`.
 
 ```julia

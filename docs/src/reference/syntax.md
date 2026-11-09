@@ -122,8 +122,8 @@ Each new module is a module in `Main`, but it does not see the names in `Main`. 
 
 ### The working directory
 
-On a worker, the code of an item runs in the root of its package. This is true for `skip`, the body, the `test_end` of the profile and the producers. `init` runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles).
+The code of an item runs in the root of its package: its `skip`, its body, the `test_end` of its profile and its producers. This is true on a worker and in the process that calls `runtests` under `workers = 0`. It is also true under `Pkg.test`, which starts the tests in `test/`, and at the REPL. In a combined run, each item runs in the root of its own package. The run changes into that directory before the item, and changes back after it. Thus a change of the working directory in one item does not reach the next item.
 
-Under `workers = 0`, an item runs in the process that calls `runtests`, in the current directory of that process. Under `Pkg.test`, that directory is `test/`. The `init` of the default profile runs there too, once, in `Main` of that process, and the run warns about it. Some items need a process of their own, for a sandbox, a profile or an environment directory. Such an item still runs on a worker, in the root of its package.
+`init` runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, the `init` of the default profile runs once in `Main` of the process that calls `runtests`, in that directory too, and the run warns about it.
 
 The loop of a template runs in the current directory of the process that calls `chores`. To read a file, build its path from `@__DIR__`. In the body of an item and in a template, `@__DIR__` is the directory of the file that holds the code, in every process.

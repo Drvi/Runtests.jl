@@ -7,7 +7,7 @@ This page describes the output of a run, in five parts. These are the opening bl
 ```text
 ┌ [TEST] v0.1.0 · julia 1.13.3 · 6 test items in 2 files · seed 0x522fb3b30334cd75 · 2 workers · threads 2,1
 │ env: /var/folders/…/jl_7AEUWb/Project.toml
-└ startup: files 0.0s · plan 0.1s · setup 1.2s
+└ startup: scan 0.0s · plan 0.1s · setup 1.2s
 ```
 
 The first line gives the versions of Runtests and Julia, and the number of selected items and files. It also gives the seed, the number of workers and their threads. It names these values too, when they apply:
@@ -18,7 +18,7 @@ The first line gives the versions of Runtests and Julia, and the number of selec
 - the environment variables that set configuration values,
 - the source of the `coverage` value.
 
-The `env` line is the path of the test environment. The `startup` line gives the time to read the files, to make the plan and to set up the environment.
+The `env` line is the path of the test environment. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
 
 ## The lines of the run
 
@@ -115,7 +115,7 @@ After the block, `Test` prints its usual summary.
 
 ```text
 ┌ [TEST] dry run · v0.1.0 · julia 1.13.3 · 6 test items in 2 files · 2 workers · threads 2,1
-│ startup: files 0.0s
+│ startup: scan 0.0s
 │ setups: `BasicSetup`
 │ timeout: 1800s · retries: 0 · failfast: false · logs: issues · memory_threshold: 0.9
 │ estimated work: w1 0.049s · w2 0.058s

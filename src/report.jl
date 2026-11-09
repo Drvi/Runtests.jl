@@ -76,7 +76,7 @@ function profile_parts(prof::Profile, threads::AbstractString)
 end
 
 # Only profiles that actually change something are worth a line, one each however
-# many environments they run in, and the environments the items run in one more.
+# many environments they run in, and the environment directories the items run in one more.
 function print_profiles(io::IO, p::Plan)
     seen = Set{Symbol}()
     for prof in p.profiles
@@ -86,7 +86,7 @@ function print_profiles(io::IO, p::Plan)
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
     end
     envs = unique!(String[relpath_or_path(prof.environment, p.root) for prof in p.profiles if !isempty(prof.environment)])
-    isempty(envs) || println(io, length(envs) == 1 ? "environment: " : "environments: ", join(envs, ", "))
+    isempty(envs) || println(io, length(envs) == 1 ? "env dir: " : "env dirs: ", join(envs, ", "))
     return nothing
 end
 
@@ -643,7 +643,7 @@ end
 # Where the time before the first test item went: on a large suite, the wait.
 function print_startup(io::IO, s::Startup)
     parts = String[]
-    s.files > 0      && push!(parts, string("files ", fmt_seconds(s.files)))
+    s.files > 0      && push!(parts, string("scan ", fmt_seconds(s.files)))
     s.plan > 0.005   && push!(parts, string("plan ", fmt_seconds(s.plan)))
     s.setup > 0.005  && push!(parts, string("setup ", fmt_seconds(s.setup)))
     isempty(parts) || println(io, "startup: ", join(parts, " · "))

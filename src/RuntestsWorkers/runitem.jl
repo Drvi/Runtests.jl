@@ -55,9 +55,9 @@ struct ItemSpec
     # Where this attempt keeps its evidence (see `artifacts_dir`), made only if the item
     # asks; "" for nowhere.
     artifacts    :: String
-    # The directory the item, its `test_end` and its failure producers run in: the root
-    # of its package in a run of several packages, whose workers serve them all. ""
-    # leaves the process's working directory as it is.
+    # The directory the item, its `skip`, its `test_end` and its failure producers run
+    # in: the root of its package. "" leaves the process's working directory as it is,
+    # for a pasted item that belongs to no package.
     root         :: String
 end
 

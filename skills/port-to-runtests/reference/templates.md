@@ -6,8 +6,8 @@ or when a failure has to say which case failed.
 
 Item names are literals, so a loop that generates items lives in a template: a file
 in `test/testtemplates/` named `*_tests_template.jl`. `Runtests.chores()` runs its
-loops and writes the items to `test/<name>_tests.jl`. Commit both files. The README's
-"Test templates" section has the full rules.
+loops and writes the items to `test/<name>_tests.jl`. Commit both files. The
+[templates guide](../../../docs/src/guide/templates.md) has the full rules.
 
 A top-level `@testset "round trip $T" for T in (Int8, Int16, Float32) … end` becomes:
 

@@ -1,8 +1,8 @@
 name: CI ergonomics
 
 # What a project's CI gets from Runtests, checked end to end in one job. It runs a fake
-# suite, test/testfixtures/FakeCI.jl, whose items fail in every way the README describes,
-# with the README's recipe for CI: `julia-runtest`, the run-state cache, and
+# suite, test/testfixtures/FakeCI.jl, whose items fail in every way the docs describe,
+# with the recipe of docs/src/guide/ci.md: `julia-runtest`, the run-state cache, and
 # `RUNTESTS_ARTIFACT_DIR` uploaded as an artifact. Then it starts over from what it
 # saved, as the next job or a person would: the artifact downloaded and the cache
 # restored, and checks the run's directory, its run state and its logs, each failed

@@ -309,7 +309,8 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
         log = Base.BufferStream()
         proc = run(pipeline(
             setenv(`$(Base.julia_cmd()) $julia_args --project=$(REPO_ROOT) --startup-file=no $path`,
-                   "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
+                   "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":"),
+                   "RUNTESTS_RUNSTATE_DIR" => mktempdir()),
             stdout = log, stderr = err,
         ); wait = false)
         while time() < deadline && process_running(proc) && !running()

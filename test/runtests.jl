@@ -83,7 +83,12 @@ Run one test file in this process and let `Test` decide the verdict: a failing
 `@testset` throws, which is what makes the process exit non-zero.
 """
 run_file(file::AbstractString) = @testset "$file" begin
-    include(joinpath(@__DIR__, file))
+    # A run state directory of the file's own: what its runs record, and what its
+    # `chores` calls prune, stays out of the depot of whoever runs the suite, and out
+    # of every other file's way.
+    withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+        include(joinpath(@__DIR__, file))
+    end
 end
 
 # Where the suite ran, for a CI log read by someone who was not there.

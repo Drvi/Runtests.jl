@@ -548,14 +548,13 @@ const PACKAGE_KEYS = Tuple(k for k in RUN_KEYS if !(k in RUN_WIDE_KEYS))
 
 """
     prepare_mono(paths; packages, name, tags, group, replay, announce, expansions, kwargs...)
-        -> (; plan, participants, skipped, ignored)
+        -> (; plan, participants, skipped)
 
 Everything a combined run does up to starting a process, as `prepare` for one
 package: which packages take part, their items as the selection narrows each, and
 the plan. `paths` select within the packages that hold them; a path that is the
 workspace root, or a package's root or `test/`, selects the whole of it. `skipped`
-holds each package of the workspace that gives no item, with why; `ignored` each
-run-wide setting in a package's own `[run]`, which has no effect.
+holds each package of the workspace that gives no item, with why.
 
 `replay` names a run state of a combined run, any of its packages'. The run is made
 again from the run states of that run that the packages hold: each package's items,
@@ -672,7 +671,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
         rs === nothing ? Dict{Symbol, Any}() :
             Dict{Symbol, Any}(key => v for (key, v) in pairs(recorded_settings(rs)) if key in PACKAGE_KEYS)
     end
-    run_cfg, cfgs, ignored = mono_configs(ps, configs, kept, length(items), kwargs, overrides)
+    run_cfg, cfgs = mono_configs(ps, configs, kept, length(items), kwargs, overrides)
     if replayed !== nothing
         run_cfg, cfgs = replayed_configs(run_cfg, cfgs, [replayed.records[k] for k in kept], ps.root[kept], replayed.given,
                                          haskey(kwargs, :seed) && !haskey(recorded_settings(replayed.given), :seed))
@@ -697,12 +696,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     if replayed !== nothing && !isempty(replayed.gone)
         push!(p.notes, string("partial replay: no run state of ", join(replayed.gone, ", "), " is left from the replayed run"))
     end
-    for (pkg, keys_) in ignored
-        push!(p.notes, string("no effect: ", pkg, "'s [run] sets ", join(("`$k`" for k in keys_), ", "),
-                              ", which a combined run takes from the call, the `RUNTESTS_` variables and ",
-                              "test/TestItems.toml of the workspace root"))
-    end
-    return (; plan = p, participants = ps, skipped, ignored, unknown)
+    return (; plan = p, participants = ps, skipped, unknown)
 end
 
 # The workspace that `paths` are in, the paths as absolute ones, and the line of a
@@ -867,15 +861,14 @@ function mono_description(name, tags, group, paths::Vector{String}, workspace::A
 end
 
 """
-    mono_configs(ps, configs, kept, nunits, kwargs, overrides) -> (run, packages, ignored)
+    mono_configs(ps, configs, kept, nunits, kwargs, overrides) -> (run, packages)
 
 The settings of a combined run, and of each of its packages `kept`. The run's come
 from the call, the `RUNTESTS_` variables and the workspace root's file; with
 `workers = "auto"`, the CPU bound uses the most threads any of the packages'
 workers start with. A package's come from the call and the variables, then from
 `overrides` for it, a replayed run state's, and then from its own file, whose
-run-wide settings have no effect and are returned in `ignored`, each with its
-package; the root package's file is the root's. A package's `item_failfast` that
+run-wide settings have no effect; the root package's file is the root's. A package's `item_failfast` that
 nothing sets is the run's `failfast`.
 """
 function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int, kwargs,
@@ -890,23 +883,20 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
     run = build_config(root_path, root_toml; nunits, shared, run_kwargs...)
     package_kwargs = Dict{Symbol, Any}(k => v for (k, v) in pairs(kwargs) if k in PACKAGE_KEYS)
     cfgs = RunConfig[]
-    ignored = Pair{String, Vector{String}}[]
     for (n, k) in enumerate(kept)
         path, toml = configs[k]
         run_table = get(toml, "run", nothing)
         # The root's run-wide settings are the run's; another package's have no effect.
         if ps.root[k] != ps.workspace && run_table isa AbstractDict
-            dropped = sort!([key for key in keys(run_table) if Symbol(key) in RUN_WIDE_KEYS])
-            if !isempty(dropped)
-                push!(ignored, ps.name[k] => dropped)
-                toml = merge(toml, Dict("run" => Dict(key => v for (key, v) in run_table if !(key in dropped))))
-            end
+            dropped = [key for key in keys(run_table) if Symbol(key) in RUN_WIDE_KEYS]
+            isempty(dropped) ||
+                (toml = merge(toml, Dict("run" => Dict(key => v for (key, v) in run_table if !(key in dropped)))))
         end
         given = merge(overrides[n], package_kwargs)
         push!(cfgs, build_config(path, toml; given..., shared, workers = run.workers, failfast = run.failfast,
                                  seed = run.seed, logs = run.logs, coverage = false))
     end
-    return run, cfgs, ignored
+    return run, cfgs
 end
 
 # The `workers` a combined run asks for, as the call, the variable or the root's file

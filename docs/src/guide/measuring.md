@@ -1,20 +1,20 @@
 # [Measure what each item costs](@id measuring)
 
-A run can give you figures for each attempt at an item: its time, CPU time, compilation, garbage collection, allocations and memory. Give `runtests` or `runtests_mono` a function as `on_item`. The run calls the function in the process that started it.
+A run can give you figures for each attempt at an item: its time, CPU time, compilation, garbage collection, allocations and memory. Give `runtests` or `runtests_mono` a function as `on_event`. The run calls the function in the process that started it.
 
 ## Collect the figures
 
 The run calls the function when each attempt at an item starts, and again when the attempt ends. A retry is a new attempt, so it gets two calls of its own.
 
 ```julia
-events = Runtests.ItemEvent[]
-Runtests.runtests(on_item = ev -> ev.kind === :finished && push!(events, ev))
+events = Runtests.TestItemEvent[]
+Runtests.runtests(on_event = ev -> ev.kind === :finished && push!(events, ev))
 sort!(events; by = ev -> ev.cpu, rev = true)   # the items with the most CPU time first
 ```
 
-## The fields of an ItemEvent
+## The fields of a TestItemEvent
 
-Each call gets a `Runtests.ItemEvent` with these fields:
+Each call gets a `Runtests.TestItemEvent` with these fields:
 
 | Field | Meaning |
 |:------|:--------|
@@ -33,6 +33,7 @@ Each call gets a `Runtests.ItemEvent` with these fields:
 | `allocated` | Bytes allocated. |
 | `allocations` | The number of allocations. |
 | `maxrss` | The most memory that the process held in RAM up to this point, in bytes. |
+| `events_dir` | A directory for files that the function writes. See [Keep what the function writes](@ref events-dir). |
 
 `pid` is 0 when no process ran the attempt. This happens when the run cannot start a worker, for example because the `init` of the profile fails. It also happens to an item of a chain whose worker stopped before the item ran. For that item, `worker` is 0 too.
 
@@ -43,6 +44,17 @@ Only the second call has the figures. Each figure except `elapsed` is for the wh
 Measured item time excludes the profile's `test_end` and the deferred [artifact producers](@ref evidence). Their work still contributes to the run's total time. The `:finished` event is delivered after the verdict is recorded and before artifact collection begins; it does not signal that evidence files are complete.
 
 Sometimes the run decides the outcome, and the item measures nothing. Examples are a timeout, a worker that stopped, an item of a chain that cannot run, and a stopped run. Then `measured` is `false`, the figures are 0, and `elapsed` is the time that the attempt held its worker.
+
+## [Keep what the function writes](@id events-dir)
+
+Write the files of the function to `ev.events_dir`. This directory is `events` in the directory of the run, next to the record and the logs of the run. Thus `RUNTESTS_ARTIFACT_DIR` copies the files with the run, and [retention](@ref retention) deletes them with the run. In a combined run, each package has its own directory. The run makes the directory only when you give a function.
+
+```julia
+Runtests.runtests(on_event = ev -> ev.kind === :finished &&
+    open(io -> println(io, ev.name, ",", ev.cpu), joinpath(ev.events_dir, "cpu.csv"), "a"))
+```
+
+The calls do not overlap, so the function can add lines to one file without a lock.
 
 ## How the run calls the function
 

@@ -169,8 +169,8 @@ struct Plan
     startup::Startup
     selection::String   # how the items were chosen, as the run says it; empty for all of them
     suite_names::Vector{String}   # every item's name in the suite, chosen or not, sorted
-    # Lines the run's header adds: in a run of several packages, those left out and
-    # settings that have no effect.
+    # Lines the run's header adds: in a run of several packages, those left out and a
+    # replay that found no run state of some of them.
     notes::Vector{String}
 end
 

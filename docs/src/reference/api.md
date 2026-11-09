@@ -19,7 +19,7 @@ runtests
 runtestsf
 runtests_mono
 RunTestSet
-ItemEvent
+TestItemEvent
 ```
 
 ## Declare tests

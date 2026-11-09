@@ -375,10 +375,10 @@ mutable struct Run
     coverage::Union{Nothing, CoverageSummary}
     # An editor's, when it asked for the run: each item's start and end go there.
     const events::Union{Nothing, EventStream}
-    # The caller's `on_item`, or nothing: none was given, one call threw, or the
-    # process is exiting. Called under `on_item_lock`, so calls never overlap.
-    @atomic on_item::Any
-    const on_item_lock::ReentrantLock
+    # The caller's `on_event`, or nothing: none was given, one call threw, or the
+    # process is exiting. Called under `on_event_lock`, so calls never overlap.
+    @atomic on_event::Any
+    const on_event_lock::ReentrantLock
 end
 
 # One at a time in a process: a run, `chores` and a pasted item set the root paths
@@ -404,15 +404,15 @@ function exclusively(f)
 end
 
 """
-    execute(plan, target; on_item = nothing) -> Run
+    execute(plan, target; on_event = nothing) -> Run
 
 Run the plan to completion and return the run, whose `statuses` hold what
 happened to every item. Printing and the pass/fail verdict are `report`'s job,
 so a caller that wants to inspect the outcome does not have to catch anything.
-The caller holds the process (`exclusively`). `on_item` is called with an
-[`ItemEvent`](@ref) as each attempt starts and ends.
+The caller holds the process (`exclusively`). `on_event` is called with an
+[`TestItemEvent`](@ref) as each attempt starts and ends.
 """
-function execute(p::Plan, target; on_item = nothing)
+function execute(p::Plan, target; on_event = nothing)
     cfg = p.cfg
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
@@ -434,7 +434,7 @@ function execute(p::Plan, target; on_item = nothing)
         joinpath(scratch, "item_"), artifacts_prefixes[1], "", logdirs, [joinpath(d, "item_") for d in logdirs],
         artifacts_prefixes, local_item, String[], column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
-        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_item,
+        RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event,
         ReentrantLock()
     )
     run.events === nothing || (run.events.run = run)
@@ -509,7 +509,7 @@ function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, tes
     cfg = p.cfg
     check_replayed_environment(run)
     return with_load_path(setup_paths) do
-        precompile_phase(run, p, target)
+        precompile_phase(run, p)
         # From the start of the run, as the monitor's setup stage is, so the
         # header and the closing block give the same figure.
         p.startup.setup = time() - run.t0
@@ -656,7 +656,7 @@ function test_env(target, announce = nothing)
         # the hit is the point.
         announce === nothing || announce()
         original = Base.active_project()
-        try
+        failure = try
             # `Pkg` would precompile the new environment for this process's flags
             # only; `precompile_env` does it once for every set of flags the pools
             # use, and the time reported against this stays the resolve's.
@@ -685,15 +685,13 @@ function test_env(target, announce = nothing)
             return env
         catch e
             is_interrupt(e) && rethrow()
-            throw(
-                ConfigError(
-                    "could not build a test environment for $(relpath_or_path(proj)): " *
-                        sprint(showerror, e)
-                )
-            )
+            e
         finally
             Base.set_active_project(original)
         end
+        # Thrown after the `catch`: from inside it, Julia would print the error again
+        # under "caused by", and once more for each attempt that `TestEnv` makes.
+        throw(ConfigError("could not build a test environment for $(relpath_or_path(proj)): " * sprint(showerror, failure)))
     end
 end
 
@@ -833,6 +831,17 @@ function keep_logs_by_runstate!(run::Run)
         run.artifacts_prefixes[k] = abspath(run.logprefixes[k])
     end
     run.logdir, run.logprefix, run.artifacts_prefix = run.logdirs[1], run.logprefixes[1], run.artifacts_prefixes[1]
+    # Only for a caller that gave `on_event`: a run without one leaves no empty directory.
+    if (@atomic run.on_event) !== nothing
+        for k in eachindex(run.logdirs)
+            try
+                mkpath(events_dir(run, k))
+            catch e
+                is_interrupt(e) && rethrow()
+                @warn "Runtests: could not make $(events_dir(run, k)) for `on_event`" exception = e
+            end
+        end
+    end
     return nothing
 end
 
@@ -1141,7 +1150,7 @@ project_file_in(dir::AbstractString) =
 # `precompile_env` does it once for every set the pools use.
 function resolve_environment(dir::AbstractString, prof::Profile)
     original = Base.active_project()
-    try
+    failure = try
         withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
             with_pkg() do Pkg, _
                 Pkg.activate(dir; io = devnull)
@@ -1149,14 +1158,17 @@ function resolve_environment(dir::AbstractString, prof::Profile)
                 Pkg.instantiate(; io = devnull)
             end
         end
+        nothing
     catch e
         is_interrupt(e) && rethrow()
-        throw(ConfigError(string(
-            "could not build the environment of ", relpath_or_path(prof.environment), ": ", sprint(showerror, e)
-        )))
+        e
     finally
         Base.set_active_project(original)
     end
+    # Thrown after the `catch`, as in `test_env`, so that the error prints once.
+    failure === nothing || throw(ConfigError(string(
+        "could not build the environment of ", relpath_or_path(prof.environment), ": ", sprint(showerror, failure)
+    )))
     return nothing
 end
 
@@ -1229,12 +1241,15 @@ end
 
 # One process precompiles what every worker is about to need; otherwise the workers
 # hit the same cold cache at once and serialize on Julia's precompilation lock.
-function precompile_phase(run::Run, p::Plan, target)
+function precompile_phase(run::Run, p::Plan)
+    # Each set of julia arguments is asked of a process of its own, so once.
+    asked = Dict{Vector{String}, Union{Nothing, Base.CacheFlags}}()
+    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.julia_args)
     # The environment first: a setup module compiled before it would make its
     # worker build the dependencies itself, one at a time.
-    others = precompile_env(run, p)
+    others = precompile_env(run, p, flags_of)
     precompile_self(run, others)
-    precompile_setups(run, p, target, others)
+    precompile_setups(run, p, flags_of)
     return nothing
 end
 
@@ -1260,22 +1275,19 @@ function cache_flags_for(julia_args::Cmd)
 end
 
 """
-    precompile_env(run, p)
+    precompile_env(run, p, flags_of)
 
 Precompile the test environment once for every set of cache flags the run will
-use: this process's own, and one per pool with julia arguments of its own. A
-package image built under other flags cannot be used, so a worker with other flags
-would otherwise compile the package and its dependencies itself, serially and
-silently, while the run looks stalled on its first item. `test_env` turns off
-`Pkg`'s own precompilation so that this is the one pass.
+use: this process's own, and one per pool with julia arguments of its own, as
+`flags_of(profile)` gives them. A package image built under other flags cannot be
+used, so a worker with other flags would otherwise compile the package and its
+dependencies itself, serially and silently, while the run looks stalled on its first
+item. `test_env` turns off `Pkg`'s own precompilation so that this is the one pass.
 
 Returns every set of cache flags the pools' workers have besides this process's, with
-the julia arguments that give it, for the setups to be compiled for too.
+the julia arguments that give it, for Runtests itself to be compiled for too.
 """
-function precompile_env(run::Run, p::Plan)
-    # Each set of flags is asked of a process of its own, so once.
-    asked = Dict{Vector{String}, Union{Nothing, Base.CacheFlags}}()
-    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.julia_args)
+function precompile_env(run::Run, p::Plan, flags_of)
     # The flags this process runs under lead, because every pool without julia
     # arguments of its own uses them and because `test_env` switched `Pkg`'s own
     # precompilation off.
@@ -1357,65 +1369,197 @@ function precompile_configs(run::Run, configs, project, what::AbstractString)
 end
 
 """
-    precompile_setups(run, p, target, others)
+    precompile_setups(run, p, flags_of)
 
-Compile every setup the items load for this process's flags, and each setup that is
-a package for `others` too, the other sets of flags the pools' workers have (see
-[`precompile_env`](@ref)), wherever there is no valid cache for them. A setup that is
-not a package has a single cache file per depot, which a second set of flags would
-write over; its workers under other flags compile it for themselves.
+Compile each setup for every pool whose items load it, wherever a worker of that pool
+would find no valid cache: in the project and on the load path of those workers, and
+under their cache flags, as `flags_of(profile)` gives them. An item that runs in this
+process (`workers = 0`) loads the setup here, under this process's flags. The compiles
+run as many at a time as Julia's own precompiler runs them, each setup after the
+setups it depends on. A setup that is not a package has a single cache file per
+depot, which a second project or set of flags would write over: it is compiled for
+the first pool that loads it, and the workers of the others compile it themselves.
+The run warns about each such setup that its items load.
 """
-function precompile_setups(run::Run, p::Plan, target, others::Vector{Pair{Cmd, Base.CacheFlags}} = Pair{Cmd, Base.CacheFlags}[])
-    # An isolated package's setups are not on this process's load path: its workers
-    # compile them for themselves.
-    setups = any(p.packages.isolated) ?
-        sort!(unique!([s for i in 1:nitems(p) if !p.packages.isolated[p.items.package[i]] for s in setups_of(p.items, i)])) :
-        p.setups
-    isempty(setups) && return nothing
-    # A *valid* cache is the question: a cache file left over from another checkout
-    # of the same setup would be rebuilt by every worker at once, which is the whole
-    # thing this avoids.
-    stale = Tuple{Base.PkgId, Pair{Cmd, Base.CacheFlags}}[]
-    for name in setups
-        pkg = Base.identify_package(String(name))
-        if pkg === nothing
-            throw(
-                ConfigError(
-                    "test setup module `$name` is not loadable from " *
-                        "$(joinpath(target.testdir, TESTSETUPS_DIR))"
-                )
-            )
-        end
-        for config in (pkg.uuid === nothing ? [`` => Base.CacheFlags()] : [`` => Base.CacheFlags(); others])
-            has_fresh_cache(pkg, last(config)) || push!(stale, (pkg, config))
-        end
+function precompile_setups(run::Run, p::Plan, flags_of)
+    # The setups that are not packages, by name, with their source files.
+    once = Dict{Symbol, String}()
+    for (; project, load_path, needs) in setup_needs(run, p, flags_of)
+        jobs = in_worker_environment(() -> stale_setups(needs, once), project, load_path)
+        isempty(jobs) && continue
+        say(run, "precompiling ", join(unique(job.pkg.name for job in jobs), ", "))
+        in_worker_environment(() -> compile_setups(jobs), project, load_path)
     end
-    isempty(stale) && return nothing
-    say(run, "precompiling ", join(unique(pkg.name for (pkg, _) in stale), ", "))
-    for (pkg, (args, flags)) in stale
-        # Julia writes why a module would not precompile to the stream it is given,
-        # and throws an exception saying only that it failed; both go in the error.
-        out = IOBuffer()
-        try
-            # Given the source path: Julia 1.11's form without it takes no `cacheflags`.
-            # Without this process's modules, as in `precompile_self`.
-            path = Base.locate_package(pkg)
-            path === nothing && throw(ArgumentError("$pkg not found during precompilation"))
-            Base.compilecache(pkg, path, out, out, false; flags = args, cacheflags = flags)
-        catch e
-            is_interrupt(e) && rethrow()
-            detail = strip(String(take!(out)))
-            throw(
-                ConfigError(
-                    "test setup module `$(pkg.name)` failed to precompile" *
-                        (isempty(args) ? "" : string(" under `", join(args.exec, " "), "`")) * ":\n" *
-                        sprint(showerror, e) *
-                        (isempty(detail) ? "" : string("\n", detail))
-                )
-            )
-        end
+    if !isempty(once)
+        files = sort!([relpath_or_path(file, p.root) for file in values(once)])
+        one = length(files) == 1
+        @warn string(
+            "Runtests: the test setup", one ? " " : "s ", join(("`$f`" for f in files), ", "),
+            one ? " is not a package. It shares" : " are not packages. Each one shares",
+            " one precompile cache with every setup of its name in the depot. Each checkout, environment and set ",
+            "of Julia flags writes over that cache. Run `Runtests.setups_to_packages()` in ",
+            one ? "its package to give it" : "the package that holds each one to give it", " a cache of its own."
+        )
     end
     return nothing
+end
+
+const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String}
+
+# The setups the items load, by the project they load them in, in the order of the
+# pools: the project, the load path there, and each setup with the julia arguments and
+# cache flags it is loaded under and the directory of setups it comes from.
+function setup_needs(run::Run, p::Plan, flags_of)
+    out = @NamedTuple{project::String, load_path::Vector{String}, needs::Vector{SetupNeed}}[]
+    for pool in p.pools, u in first(pool.head):last(pool.tail)
+        j = pool.profile
+        here = single_process(p) && !needs_worker(p, u)
+        flags = here ? Base.CacheFlags() : flags_of(p.profiles[j])
+        # Flags that could not be read were said; those workers compile for themselves.
+        flags === nothing && continue
+        project = here ? something(Base.active_project(), "") : worker_project(run, j)
+        k = findfirst(c -> c.project == project, out)
+        if k === nothing
+            push!(out, (; project, load_path = here ? copy(LOAD_PATH) : worker_load_path(run, j), needs = SetupNeed[]))
+            k = lastindex(out)
+        end
+        needs = out[k].needs
+        args = here ? `` : Cmd(p.profiles[j].julia_args)
+        for i in p.units.span[u], name in setups_of(p.items, i)
+            any(n -> n.name === name && n.flags == flags, needs) && continue
+            push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR)))
+        end
+    end
+    return out
+end
+
+# `f()` with `project` active and `load_path` as the load path, as a worker started
+# with them has both; afterwards, both as they were.
+function in_worker_environment(f, project::AbstractString, load_path::Vector{String})
+    original_project, original_path = Base.active_project(), copy(LOAD_PATH)
+    try
+        Base.set_active_project(project)
+        copy!(LOAD_PATH, load_path)
+        return f()
+    finally
+        copy!(LOAD_PATH, original_path)
+        Base.set_active_project(original_project)
+    end
+end
+
+# The compiles `needs` calls for in the active environment: each setup under each set
+# of flags it has no valid cache for, with the compiles it waits for, those of the
+# setups it depends on. A setup that is not a package is skipped when `once` holds
+# it, and otherwise put there with its source file.
+function stale_setups(needs::Vector{SetupNeed}, once::Dict{Symbol, String})
+    jobs = @NamedTuple{pkg::Base.PkgId, args::Cmd, flags::Base.CacheFlags, after::Vector{Int}}[]
+    for (; name, args, flags, dir) in needs
+        pkg = Base.identify_package(String(name))
+        pkg === nothing && throw(ConfigError("test setup module `$name` is not loadable from $dir"))
+        if pkg.uuid === nothing
+            haskey(once, name) && continue
+            once[name] = something(Base.locate_package(pkg), dir)
+        end
+        # A *valid* cache is the question: a cache file left over from another checkout
+        # of the same setup would be rebuilt by every worker at once, which is the whole
+        # thing this avoids.
+        has_fresh_cache(pkg, flags) || push!(jobs, (; pkg, args, flags, after = Int[]))
+    end
+    # In topological order: the process compiling a setup compiles a stale setup it
+    # loads as well, and a later compile of that one replaces the build the first
+    # setup's cache was made against, which leaves that cache unusable. A dependency
+    # that closes a cycle is not waited for: it would wait forever, and Julia refuses to
+    # load such setups anyway.
+    deps = map(jobs) do job
+        names = setup_dependencies(job.pkg)
+        [d for (d, other) in pairs(jobs) if other.flags == job.flags && other.pkg.name in names]
+    end
+    state = zeros(Int8, length(jobs))   # 0 not seen, 1 being visited, 2 visited
+    function visit(k)
+        state[k] = 1
+        for d in deps[k]
+            state[d] == 1 && continue
+            state[d] == 0 && visit(d)
+            push!(jobs[k].after, d)
+        end
+        state[k] = 2
+    end
+    foreach(k -> state[k] == 0 && visit(k), eachindex(jobs))
+    return jobs
+end
+
+# The names of the modules setup `pkg` loads, as far as is known before it compiles:
+# the `[deps]` of a setup that is a package, which Julia holds it to, and the imports
+# in the source of one that is not, which miss those of included files and of
+# generated code.
+function setup_dependencies(pkg::Base.PkgId)
+    path = Base.locate_package(pkg)
+    path === nothing && return Set{String}()
+    if pkg.uuid === nothing
+        ex = parse_source(path)
+        return ex === nothing ? Set{String}() : Set{String}(String(root) for root in imported_roots(ex))
+    end
+    project = project_file(dirname(dirname(path)))
+    project === nothing && return Set{String}()
+    deps = get(parse_project(project), "deps", nothing)
+    return deps isa AbstractDict ? Set{String}(keys(deps)) : Set{String}()
+end
+
+# Runs `jobs` from `stale_setups`, each after the jobs it waits for, as many at a time
+# as Julia's own precompiler would run. Throws the failure of the first job that
+# failed once every job has ended; a job that waits for a failed one fails with it,
+# without being run.
+function compile_setups(jobs)
+    failed = Vector{Union{Nothing, ConfigError}}(nothing, length(jobs))
+    ended = [Base.Event() for _ in jobs]
+    limit = Base.Semaphore(precompile_tasks())
+    @sync for (k, job) in pairs(jobs)
+        @async try
+            foreach(d -> wait(ended[d]), job.after)
+            d = findfirst(d -> failed[d] !== nothing, job.after)
+            failed[k] = d === nothing ? Base.acquire(() -> compile_setup(job), limit) : failed[job.after[d]]
+        finally
+            notify(ended[k])
+        end
+    end
+    k = findfirst(!isnothing, failed)
+    k === nothing || throw(failed[k])
+    return nothing
+end
+
+# One setup under one set of flags: `nothing`, or the error that says why it failed.
+function compile_setup(job)
+    # An earlier compile that loads this setup compiled it on its way, when the order
+    # did not show that it loads it. Compiling it again would replace that build.
+    has_fresh_cache(job.pkg, job.flags) && return nothing
+    # Julia writes why a module would not precompile to the stream it is given,
+    # and throws an exception saying only that it failed; both go in the error.
+    out = IOBuffer()
+    try
+        # Given the source path: Julia 1.11's form without it takes no `cacheflags`.
+        # Without this process's modules, as in `precompile_self`.
+        path = Base.locate_package(job.pkg)
+        path === nothing && throw(ArgumentError("$(job.pkg) not found during precompilation"))
+        Base.compilecache(job.pkg, path, out, out, false; flags = job.args, cacheflags = job.flags)
+        return nothing
+    catch e
+        is_interrupt(e) && rethrow()
+        detail = strip(String(take!(out)))
+        return ConfigError(
+            "test setup module `$(job.pkg.name)` failed to precompile" *
+                (isempty(job.args) ? "" : string(" under `", join(job.args.exec, " "), "`")) * ":\n" *
+                sprint(showerror, e) *
+                (isempty(detail) ? "" : string("\n", detail))
+        )
+    end
+end
+
+# As many compiles at a time as Julia's own precompiler runs: `JULIA_NUM_PRECOMPILE_TASKS`,
+# or one more than the CPU threads, half of them on Windows, and at most 16.
+function precompile_tasks()
+    n = isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
+    default = min(Sys.iswindows() ? div(n, 2) + 1 : n + 1, 16)
+    return max(1, something(tryparse(Int, get(ENV, "JULIA_NUM_PRECOMPILE_TASKS", "")), default))
 end
 
 # Runtests itself, for each set of flags in `others` it has no cache for. A worker
@@ -2050,9 +2194,9 @@ function report_unfinished_run()
         # for the monitor's task, and a task frozen by the exit holding either
         # would hang it.
         run.monitor === nothing || (@atomic run.monitor.stop = true)
-        # Not called from here: `on_item` is the caller's code, which may wait on the
+        # Not called from here: `on_event` is the caller's code, which may wait on the
         # event loop, or on its lock held by a task the exit froze.
-        @atomic run.on_item = nothing
+        @atomic run.on_event = nothing
         # Nothing unwound, so the slots never recorded what they were holding.
         # They are frozen where they were, and each still names its item.
         foreach(slot -> record_stopped_item!(run, slot), run.slots)
@@ -2242,7 +2386,7 @@ function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer
     pid == 0 || @lock run.lock push!(run.item_pids, Int32(pid))
     pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
     run.events === nothing || event_item_started(run, i, attempt, slot, pid)
-    tell_on_item(run, i, :started, RUNNING, attempt, slot, now, 0.0, RuntestsWorkers.PerfStats(), false)
+    tell_on_event(run, i, :started, RUNNING, attempt, slot, now, 0.0, RuntestsWorkers.PerfStats(), false)
     return nothing
 end
 
@@ -2461,18 +2605,24 @@ function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
         p.items.failfast[i] == -1 ? item_cfg(p, i).item_failfast : p.items.failfast[i] == 1,
         is_combined(p) ? p.packages.name[p.items.package[i]] : run.project_name,
         item_profile(p, i).name, attempt, p.cfg.full_stacktraces, logpath,
-        item_seed(p.items.seed[i], p.items.name[i]), attempt_artifacts(run, i, attempt), item_root(p, i)
+        item_seed(p.items.seed[i], p.packages.name[p.items.package[i]], p.items.name[i]),
+        attempt_artifacts(run, i, attempt), item_root(p, i)
     )
 end
 
-# The directory item `i` runs in: its package's root, or "" where the worker already
-# is, in the root of the run's one package.
-item_root(p::Plan, i::Integer) = (r = p.packages.root[p.items.package[i]]) == p.root ? "" : r
+# The directory item `i` runs in, with its `skip`, `test_end` and failure producers:
+# the root of its package, whichever process runs it, so that a relative path means
+# the same in this process as on a worker, and in a combined run as in the package's own.
+item_root(p::Plan, i::Integer) = p.packages.root[p.items.package[i]]
 
-# The run's seed and the item's name, mixed so that each item draws its own numbers
-# whatever ran before it in the same process. CRC32c rather than `hash`, which may
-# change between Julia versions and would make a recorded seed mean something else.
-item_seed(seed::UInt64, name::AbstractString) = seed ⊻ (UInt64(crc32c(name)) * 0x9e3779b97f4a7c15)
+# The run's seed, the name of the item's package ("" when its project has none) and
+# the item's name, mixed so that each item draws its own numbers whatever ran before
+# it in the same process, and the same numbers in its package's own run as in a
+# combined run. A package name holds no NUL, so the NUL keeps package "A" with item
+# "BC" apart from "AB" with "C". CRC32c rather than `hash`, which may change between
+# Julia versions and would make a recorded seed mean something else.
+item_seed(seed::UInt64, package::AbstractString, name::AbstractString) =
+    seed ⊻ (UInt64(crc32c(name, crc32c("\0", crc32c(package)))) * 0x9e3779b97f4a7c15)
 
 item_timeout(p::Plan, i::ItemIdx) =
     p.items.timeout_s[i] == USE_RUN_DEFAULT ? item_cfg(p, i).timeout_s : Int(p.items.timeout_s[i])
@@ -2536,14 +2686,14 @@ function record!(
     @atomic run.last_finish = time()
     report_item!(run, i, state, count_done!(run, i), note)
     run.events === nothing || event_item_finished(run, i, state, attempt, slot, note)
-    tell_on_item(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
+    tell_on_event(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
     return nothing
 end
 
 """
-    ItemEvent
+    TestItemEvent
 
-The event passed to `on_item` by `runtests` or `runtests_mono`, in this process:
+The event passed to `on_event` by `runtests` or `runtests_mono`, in this process:
 once as an attempt at a test item starts, `kind = :started`, and once as it ends,
 `kind = :finished`. A retry is another attempt, with a call of each.
 
@@ -2565,8 +2715,13 @@ which runs one item at a time: its worker's, or with `workers = 0` this process'
 It is `false` as an attempt starts, and as it ends when the run decided the outcome,
 as for a timeout, a lost worker, a chain cut short or a stopped run: the figures are
 then 0, and `elapsed` is how long the attempt held its worker.
+
+`events_dir` is a directory for files that the function writes: `events` in the
+directory of the run of the item's package, next to the run's record and logs. The
+files go where that directory goes: `RUNTESTS_ARTIFACT_DIR` copies them, and retention
+deletes them with the run. The run makes the directory only when it is given a function.
 """
-struct ItemEvent
+struct TestItemEvent
     kind::Symbol
     name::String
     file::String
@@ -2589,33 +2744,37 @@ struct ItemEvent
     maxrss::Int64
     package::String
     root::String
+    events_dir::String
 end
 
-# The caller's `on_item` with one attempt's event, which is built only when there is
+# Where the caller's `on_event` keeps files for package `k` of the run: beside its logs.
+events_dir(run::Run, k::Integer) = joinpath(run.logdirs[k], "events")
+
+# The caller's `on_event` with one attempt's event, which is built only when there is
 # a function to call. A call that throws is reported and is the last: the function
 # is the caller's code, and a run goes on whatever its observer does.
-function tell_on_item(
+function tell_on_event(
         run::Run, i::ItemIdx, kind::Symbol, state::ItemState, attempt::Int8, slot::Integer, at::Float64,
         elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool
     )
-    (@atomic run.on_item) === nothing && return nothing
+    (@atomic run.on_event) === nothing && return nothing
     p = run.plan
-    event = ItemEvent(
+    event = TestItemEvent(
         kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, run.statuses.pid[i],
         at, Symbol(state_name(state)), measured, elapsed, stats.cpu_ns / 1.0e9, stats.compile_ns / 1.0e9,
         stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss,
-        p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]]
+        p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]], events_dir(run, p.items.package[i])
     )
-    @lock run.on_item_lock begin
+    @lock run.on_event_lock begin
         # Read again: a call another task made while this one waited may have failed.
-        f = @atomic run.on_item
+        f = @atomic run.on_event
         f === nothing && return nothing
         try
             f(event)
         catch e
             is_interrupt(e) && rethrow()
-            @atomic run.on_item = nothing
-            @error "Runtests: `on_item` threw for $(repr(event.name)), and is not called again in this run; the tests carry on" exception = (e, catch_backtrace())
+            @atomic run.on_event = nothing
+            @error "Runtests: `on_event` threw for $(repr(event.name)), and is not called again in this run; the tests carry on" exception = (e, catch_backtrace())
         end
     end
     return nothing
@@ -2706,7 +2865,8 @@ function run_in_process(run::Run, target)
     if any(u -> !needs_worker(p, u), UnitIdx(1):UnitIdx(length(p.units)))
         isempty(p.profiles[1].init.args) ||
             @warn "Runtests: the profile's `init` expression is evaluated in this process (workers=0)"
-        Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
+        # In the directory a worker of the profile would evaluate it in.
+        cd(() -> Core.eval(Main, Expr(:block, p.profiles[1].init.args...)), init_dir(p.profiles[1], p.packages.root[1]))
     end
     slot = run.slots[1]
     # Every unit, not just the one slot's queue: a pool that would have had a

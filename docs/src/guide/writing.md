@@ -73,7 +73,7 @@ Each keyword except `skip` must be a literal. Arithmetic on numeric literals is 
 
 ### Retries, chains and sandboxes
 
-A retry runs on the same worker, except in three cases: the worker timed out, the worker crashed, or the item has `sandbox = true`. A chain retries from its first item. All items in a chain must use the same profile and be in the same environment. `sandbox = true` and `chain` do not go together.
+A retry runs on the same worker, except in three cases: the worker timed out, the worker crashed, or the item has `sandbox = true`. A retry draws the same random numbers as the first attempt. [Random numbers](@ref random-numbers) shows how an item can draw new ones. A chain retries from its first item. All items in a chain must use the same profile and be in the same environment. `sandbox = true` and `chain` do not go together.
 
 The items of a profile share the workers of that profile, and of every profile whose workers start the same way. If an item needs a new process of its own, add `sandbox = true`. The two keywords combine: `profile = :bounds sandbox = true` runs the item alone, in a new process of the `bounds` profile. Neither keyword chooses the packages of the item. The location of its file does.
 
@@ -81,7 +81,7 @@ The items of a profile share the workers of that profile, and of every profile w
 
 The body of an item runs at the top level of a new module, with the soft scope of the REPL. Thus `x = 1` followed by a loop that changes `x` works as it does at the prompt. As in a script, the variables of the body are untyped globals.
 
-On a worker, the body runs in the root of its package. Under `workers = 0`, it runs in the current directory of the process that calls `runtests`, which is `test/` under `Pkg.test`. To read a file next to the test file, build its path from `@__DIR__`, the directory of the test file. [Where code runs](@ref where-code-runs) gives the module and the directory of each piece of code.
+The body runs in the root of its package, on a worker and in the process that calls `runtests`, also under `Pkg.test`, which starts the tests in `test/`. In a combined run, each item runs in the root of its own package. To read a file next to the test file, build its path from `@__DIR__`, the directory of the test file. [Where code runs](@ref where-code-runs) gives the module and the directory of each piece of code.
 
 !!! warning
     Put code whose speed or allocations a test measures inside a function or a `let` block. In the body, the measurement includes the access to the untyped globals.
@@ -101,11 +101,11 @@ When the item ends, the run releases what its nonconstant globals refer to. An i
 
 ## [Items on one worker](@id items-on-one-worker)
 
-A worker runs one item at a time, and runs many items one after the other. Later items on that worker can see changes to `ENV`, the global logger and loaded packages. A working-directory change can persist when an item runs directly in the worker's directory. In a [combined run](@ref monorepos), an item of a member package below the workspace root temporarily enters that package's root and restores the worker's directory afterward; a root-package item can leave it changed. Restore process state that an item changes, with `withenv` or `try` and `finally`. If an item cannot restore it, give the item `sandbox = true`.
+A worker runs one item at a time, and runs many items one after the other. Later items on that worker can see changes to `ENV`, the global logger and loaded packages. The working directory is the exception: the run changes into the root of the package of each item, and changes back after the item, so a change of the directory does not reach the next item. Restore other process state that an item changes, with `withenv` or `try` and `finally`. If an item cannot restore it, give the item `sandbox = true`.
 
 Items on different workers run at the same time. If two items can write to the same path, make each of them use its own `mktempdir()`.
 
-Each item draws its random numbers from the seed of the run, combined with the name of the item. The run prints its seed. If the expected values of an item come from a fixed seed, call `Random.seed!` in the item.
+Each item draws its random numbers from the seed of the run, combined with the name of its package and the name of the item. The run prints its seed. If the expected values of an item come from a fixed seed, call `Random.seed!` in the item.
 
 ## Use Runtests inside an item
 

@@ -126,12 +126,12 @@ end
 
 # A combined run of the workspace at `ws`: each item's state by package and name, the
 # run, and the plan.
-function run_mono(ws; on_item = nothing, kwargs...)
+function run_mono(ws; on_event = nothing, kwargs...)
     return exclusively() do
         r = prepare_mono((ws,); announce = false, kwargs...)
         p = r.plan
         run = execute(p, Target(p.root, joinpath(p.root, "Project.toml"), joinpath(p.root, "test"), String[], Int32(0));
-                      on_item)
+                      on_event)
         try
             states = Dict((p.packages.name[p.items.package[i]], p.items.name[i]) => run.statuses.state[i] for i in 1:nitems(p))
             return states, run, p

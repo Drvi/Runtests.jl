@@ -23,7 +23,7 @@ An item loads it as a package:
 end
 ```
 
-Runtests finds the `using` and `import` statements of the items. Before it starts the workers, it precompiles the setups that the selected items need.
+Runtests finds the `using` and `import` statements of the items. Before it starts the workers, it precompiles the setups that the selected items need. It precompiles each setup for each profile whose items load it, with the environment, the preferences and the Julia flags of that profile. It precompiles several setups at the same time. The limit is the same as for `Pkg.precompile`, and the environment variable `JULIA_NUM_PRECOMPILE_TASKS` sets it.
 
 ## Top-level code runs at precompilation
 
@@ -40,7 +40,7 @@ All items that a worker runs share the globals of the setup. Thus a mutable fixt
 3. It replaces `@__DIR__` with `pkgdir(MyPkg, "test", "testsetups")`, where `MyPkg` is the package under test. Thus a fixture path works also when you paste the code into the REPL.
 4. When a path rewrite needs the package under test, it adds `import MyPkg` if the setup does not already bind that module.
 
-Without a project and a UUID, all setups with the same name share one precompile cache in each depot. Each checkout and each set of Julia flags then writes over the cache of the others. After the conversion, each checkout has its own cache, and a run precompiles the setups for the Julia flags of each profile.
+Without a project and a UUID, all setups with the same name share one precompile cache in each depot. Each checkout, environment and set of Julia flags then writes over the cache of the others. Thus a run precompiles such a setup only for the first profile that loads it. Workers with other Julia flags or another environment compile it themselves. The run warns about each such setup that its items load. After the conversion, each checkout has its own cache, and a run precompiles the setup for each profile that loads it.
 
 A package can import only what its `[deps]` lists. Thus you must convert again after a setup starts to import a new package. The conversion adds what is missing, changes nothing else and keeps the UUIDs. The conversion cannot see an import in code that the setup generates or evaluates at load time. Add such an import to `[deps]` yourself.
 

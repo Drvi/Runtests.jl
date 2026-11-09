@@ -139,6 +139,20 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
+    @testset "a pasted item runs in the root of its package, and the session stays where it is" begin
+        with_activated(DEPS) do _
+            elsewhere = mktempdir()
+            ts, back = cd(elsewhere) do
+                ts, _ = capture_run(() -> @eval @testitem "pasted where" begin
+                    @test samefile(pwd(), $DEPS)
+                end)
+                ts, pwd()
+            end
+            @test state_of(ts) === PASSED
+            @test samefile(back, elsewhere)
+        end
+    end
+
     @testset "skip is honoured, literally and as an expression" begin
         with_activated(DEPS) do _
             static, _ = capture_run() do

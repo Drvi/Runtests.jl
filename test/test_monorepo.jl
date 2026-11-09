@@ -508,7 +508,8 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test r.plan.cfg.workers == 2 && r.plan.cfg.failfast && !r.plan.cfg.verbose
             @test [setting(r, "Root", "r", :timeout_s), setting(r, "A", "a", :timeout_s), setting(r, "B", "b", :timeout_s)] ==
                   [100, 50, 30 * 60]
-            @test r.ignored == ["A" => ["verbose", "workers"]]
+            # A's own `workers` and `verbose` are the run's, so A's file has no effect on them.
+            @test setting(r, "A", "a", :workers) == 2 && !setting(r, "A", "a", :verbose)
             @test [setting(r, "A", "a", :threads), setting(r, "B", "b", :threads)] == ["3", "2,1"]
             # An `item_failfast` that nothing sets is the run's `failfast`.
             @test setting(r, "A", "a", :item_failfast) && !setting(r, "B", "b", :item_failfast)
@@ -648,14 +649,19 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             )
             with_runtests_dep!(ws, ["A", "B"])
             with_runstate_dir() do runstates
-                events = Runtests.ItemEvent[]
+                events = Runtests.TestItemEvent[]
                 states, run, p = run_mono(ws; workers = 1, logs = :issues, monitor = false,
-                                          on_item = ev -> ev.kind === :finished && push!(events, ev))
+                                          on_event = ev -> ev.kind === :finished && push!(events, ev))
                 @test all(==(PASSED), values(states)) && length(states) == 5
                 # One worker ran both packages' items, each in its own package.
                 @test length(unique(ev.pid for ev in events)) == 1
                 @test sort!([(ev.package, ev.name) for ev in events if ev.name == "same"]) == [("A", "same"), ("B", "same")]
                 @test all(ev -> basename(ev.root) == ev.package, events)
+                # Each package's events directory is in its own run's directory.
+                for (k, f) in enumerate(run.runstate.files), ev in events
+                    ev.package == p.packages.name[k] && @test ev.events_dir == joinpath(dirname(f.path), "events")
+                end
+                @test all(ev -> isdir(ev.events_dir), events)
                 # A run state for each package, with its items alone, sharing the run's ID.
                 records = [read_run_state(f.path) for f in run.runstate.files]
                 @test [sort!([it.name for it in rs.items]) for rs in records] == [["db1", "db2", "same"], ["db1", "same"]]
@@ -814,6 +820,33 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "the setups of an isolated package are precompiled for its own workers" begin
+            # C's setup is on the load path of C's workers only. Its item asks, before it
+            # loads the setup, whether its worker has a cache to load. A name no earlier
+            # run compiled.
+            setup = string("Own", string(time_ns(); base = 16))
+            ws = e2e_workspace(
+                "A" => ["test/a_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n"],
+                "C" => [
+                    "test/c_test.jl" => """
+                        @testitem "c" begin
+                            @test Base.isprecompiled(Base.identify_package("$setup"))
+                            using $setup
+                            @test $setup.value() == 3
+                        end
+                        """,
+                    "test/testsetups/$setup/Project.toml" => "name = \"$setup\"\nuuid = \"$(next_uuid())\"\n",
+                    "test/testsetups/$setup/src/$setup.jl" => "module $setup\nvalue() = 3\nend\n",
+                ];
+                isolated = ["lib/C"],
+            )
+            with_runstate_dir() do _
+                (states, _, _), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+                @test states == Dict(("A", "a") => PASSED, ("C", "c") => PASSED)
+                @test occursin("precompiling $setup", out)
+            end
+        end
+
         @testset "each item runs in its package's root, under its package's settings" begin
             # A's `test_end` outlasts A's limit, and B's profile of the same name has a
             # limit of its own. On one worker, each item, skip expression, `test_end` and
@@ -911,20 +944,22 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
 
         @testset "a package whose run state cannot be written runs without one, the others with theirs" begin
             ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
-            withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
-                # In the default directories: B's is a file, so nothing can go in it.
-                a_dir, b_dir = runstate_dir(joinpath(ws, "lib", "A")), runstate_dir(joinpath(ws, "lib", "B"))
-                mkpath(dirname(b_dir)); write(b_dir, "")
-                try
+            # The default directories, in a depot of the test's own rather than the one of
+            # whoever runs the suite.
+            pushfirst!(DEPOT_PATH, mktempdir())
+            try
+                withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
+                    # B's is a file, so nothing can go in it.
+                    b_dir = runstate_dir(joinpath(ws, "lib", "B"))
+                    mkpath(dirname(b_dir)); write(b_dir, "")
                     states, run, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false)
                     @test all(==(PASSED), values(states))
                     @test run.runstate.files[1] !== nothing && run.runstate.files[2] === nothing
                     @test collect(keys(history(joinpath(ws, "lib", "A")).seconds)) == ["a"]
                     @test isempty(history(joinpath(ws, "lib", "B")).seconds)
-                finally
-                    rm(b_dir; force = true)
-                    rm(a_dir; force = true, recursive = true)
                 end
+            finally
+                popfirst!(DEPOT_PATH)
             end
         end
 
@@ -945,9 +980,9 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 value, out = capture_run(() -> Runtests.runtests_mono(ws; dry_run = true))
                 @test value === nothing && occursin("dry run", out)
                 @test isempty(readdir(dir)) && !isfile(joinpath(ws, "lcov.info"))
-                events = Runtests.ItemEvent[]
+                events = Runtests.TestItemEvent[]
                 states, _, _ = run_mono(ws; packages = ["A"], workers = 0, logs = :issues, monitor = false,
-                                        on_item = ev -> ev.kind === :finished && push!(events, ev))
+                                        on_event = ev -> ev.kind === :finished && push!(events, ev))
                 @test states == Dict(("A", "here") => PASSED, ("A", "sandboxed") => PASSED)
                 pid(name) = only(ev.pid for ev in events if ev.name == name)
                 @test pid("sandboxed") != 0 && pid("sandboxed") != pid("here")

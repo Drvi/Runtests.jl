@@ -54,13 +54,13 @@ isolated = ["lib/Legacy"]
 
 `packages` lists the packages that take part, as directories or globs relative to the root. `isolated` lists packages that run in their own test environment, on workers of their own. If two workspace members have the same package name, use `packages` to leave one out; a combined run cannot identify both by name. The header of the run lists the packages, names the isolated ones, and says why each other package of the workspace does not take part.
 
-## What the packages share
+## [What the packages share](@id combined-settings)
 
 Two profiles share workers when their workers start the same way: the same flags, threads, environment variables, preferences and environment. This is true for profiles of one package and for profiles of two packages. A profile with an `init` keeps workers of its own package, because `init` runs in the root of its package. A [shared profile](@ref shared-profiles) is the exception. An environment directory and an isolated package also keep workers of their own.
 
 Each item runs in the root of its own package and imports its own package. It runs under the profiles, setups and settings of its own package. `test_end` runs under the `test_end_timeout` of the package of the item.
 
-The settings of the run itself come from the call, the `RUNTESTS_` variables and `[run]` of the workspace root, in that order. These settings are `workers`, `memory_threshold`, `logs`, `verbose`, `monitor`, `monitor_interval`, `full_stacktraces`, `full_names`, `testset_name`, `coverage`, `seed` and `failfast`. Such a setting in the `[run]` of another package has no effect, and the header of the run says so. The other settings belong to each package. A keyword or a variable gives every package its value. Otherwise each package keeps the value of its own file.
+The settings of the run itself come from the call, the `RUNTESTS_` variables and `[run]` of the workspace root, in that order. These settings are `workers`, `memory_threshold`, `logs`, `verbose`, `monitor`, `monitor_interval`, `full_stacktraces`, `full_names`, `testset_name`, `coverage`, `seed` and `failfast`. Such a setting in the `[run]` of another package has no effect. The other settings belong to each package. A keyword or a variable gives every package its value. Otherwise each package keeps the value of its own file.
 
 ## [Share a profile](@id shared-profiles)
 

@@ -10,7 +10,7 @@ The process that calls `runtests` is the coordinator. The coordinator never runs
 
 The coordinator finds test items by parsing the test files. It does not evaluate the files. Thus it knows the name, the location, the keywords and the imports of each item before any worker starts. Each run parses the whole suite, also when the selection is one item. These problems stop the run: a file that does not parse, a name that two items use, and a Julia file in no category. The run then throws a `ScanFailure` that lists every problem.
 
-From the imports of the selected items, the coordinator knows which [setups](@ref setups) they need. It precompiles these setups before it starts the workers.
+From the imports of the selected items, the coordinator knows which [setups](@ref setups) they need. It precompiles these setups before it starts the workers, for each profile whose items load them.
 
 ## [The test environment](@id test-environment)
 

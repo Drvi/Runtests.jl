@@ -45,7 +45,14 @@ hooks_config(name, out; shared = false) = """
     init = 'using Test; global WHERE_INIT = 1; $(inline_note("$name:init named", out))'
     """
 
+# First in its file, so that it runs before the others on its process: the directory it
+# changes to must not be where any later piece runs.
 items_source(name) = """
+    @testitem "moves away" begin
+        cd(mktempdir())
+        @test true
+    end
+
     @testitem "plain" skip=(SKIP_DEF = 1; $name.note("$name:skip", @__MODULE__; draw = rand(), test = isdefined(@__MODULE__, :Test), package = isdefined(@__MODULE__, :$name)); println("printed by skip"); false) begin
         item_global = 1
         $name.note("$name:body plain", @__MODULE__; draw = rand(), dir = @__DIR__,
@@ -96,12 +103,12 @@ where_files(name, out; shared = false) = [
     "test/envdir/env_test.jl" => env_items(name),
 ]
 
-const WHERE_STATES = Dict("plain" => PASSED, "fails" => FAILED, "sandboxed" => PASSED, "named" => PASSED,
-                          "in an environment" => PASSED, "skipped" => SKIPPED)
+const WHERE_STATES = Dict("moves away" => PASSED, "plain" => PASSED, "fails" => FAILED, "sandboxed" => PASSED,
+                          "named" => PASSED, "in an environment" => PASSED, "skipped" => SKIPPED)
 
 # How many times the default profile's `test_end` runs for one package: after each
 # attempt at an item of that profile that was not skipped, `named` having none.
-const WHERE_TEST_ENDS = 4
+const WHERE_TEST_ENDS = 5
 
 # What the code wrote down, by tag: one `Dict` of facts for each time it ran.
 function notes(out)
@@ -177,44 +184,44 @@ end
         end
     end
 
-    @testset "under workers = 0, ordinary items and the default profile's init run here, in the current directory" begin
+    @testset "under workers = 0, ordinary items and the default profile's init run here, in the root of the package" begin
         out = mktempdir()
         pkg = write_package(mktempdir(), "WhereHere", where_files("WhereHere", out))
         elsewhere = mktempdir()
-        with_runstate_dir() do _
-            (states, run, p), output = cd(() -> capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false)),
-                                          elsewhere)
-            @test states == WHERE_STATES
-            # The run says so, as it evaluates `init` in this process.
-            @test occursin("`init` expression is evaluated in this process", output)
-            seen = notes(out)
-            check_scopes(seen, "WhereHere", pkg)
-            # This process: `skip`, the body, `test_end` and the producer of the ordinary
-            # items, and the default profile's `init`, once, in this process's `Main`.
-            for tag in ("skip", "body plain", "producer")
-                n = only(seen["WhereHere:$tag"])
-                @test here(n) && same(n["pwd"], elsewhere)
+        # A run state directory relative to the caller's directory, which the items leave:
+        # their logs still land in it.
+        (states, run, p), output = cd(elsewhere) do
+            withenv("RUNTESTS_RUNSTATE_DIR" => "runs") do
+                capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
             end
-            inits = seen["WhereHere:init default"]
-            @test count(here, inits) == 1
-            @test same(only(filter(here, inits))["pwd"], elsewhere)
-            ends = seen["WhereHere:test_end"]
-            @test length(ends) == WHERE_TEST_ENDS
-            @test count(here, ends) == 2 && all(n -> same(n["pwd"], elsewhere), filter(here, ends))
-            # A worker of its own, in the root of the package: the sandboxed item, the
-            # item of the named profile and the item of the environment directory, with
-            # the `init` and `test_end` of their profiles.
-            for tag in ("body sandboxed", "body named", "body env", "init named")
-                n = only(seen["WhereHere:$tag"])
-                @test !here(n) && same(n["pwd"], pkg)
-            end
-            @test all(n -> same(n["pwd"], pkg), filter(!here, inits))
-            @test all(n -> same(n["pwd"], pkg), filter(!here, ends))
-            @test skip_logged(run, p)
         end
+        @test states == WHERE_STATES
+        # The run says so, as it evaluates `init` in this process.
+        @test occursin("`init` expression is evaluated in this process", output)
+        seen = notes(out)
+        check_scopes(seen, "WhereHere", pkg)
+        @test length(seen["WhereHere:test_end"]) == WHERE_TEST_ENDS
+        # Every piece in the root of the package, in this process or on a worker of its own.
+        for ns in values(seen), n in ns
+            @test same(n["pwd"], pkg)
+        end
+        # This process: `skip`, the body, `test_end` and the producer of the ordinary
+        # items, and the default profile's `init`, once, in this process's `Main`.
+        for tag in ("skip", "body plain", "producer")
+            @test here(only(seen["WhereHere:$tag"]))
+        end
+        @test count(here, seen["WhereHere:init default"]) == 1
+        @test count(here, seen["WhereHere:test_end"]) == 3
+        # A worker of its own: the sandboxed item, the item of the named profile and the
+        # item of the environment directory, with the `init` and `test_end` of their profiles.
+        for tag in ("body sandboxed", "body named", "body env", "init named")
+            @test !here(only(seen["WhereHere:$tag"]))
+        end
+        @test same(dirname(Runtests.Private.rundata_dir(run.runstate.path)), joinpath(elsewhere, "runs"))
+        @test skip_logged(run, p)
     end
 
-    @testset "under Pkg.test with workers = 0, ordinary items run in test/" begin
+    @testset "under Pkg.test, which starts in test/, items in this process run in the root of the package" begin
         out = mktempdir()
         pkg = write_package(mktempdir(), "WhereUnderPkg",
                             [where_files("WhereUnderPkg", out); "test/runtests.jl" => "using Runtests\nRuntests.runtests()\n"])
@@ -230,15 +237,18 @@ end
         isempty(seen) && echo_captured(read(log, String))
         check_scopes(seen, "WhereUnderPkg", pkg)
         @test length(seen["WhereUnderPkg:test_end"]) == WHERE_TEST_ENDS
-        test_dir = joinpath(pkg, "test")
-        inproc = only(filter(n -> same(n["pwd"], test_dir), seen["WhereUnderPkg:init default"]))
-        for tag in ("skip", "body plain", "producer")
-            n = only(seen["WhereUnderPkg:$tag"])
-            @test n["pid"] == inproc["pid"] && same(n["pwd"], test_dir)
+        for ns in values(seen), n in ns
+            @test same(n["pwd"], pkg)
+        end
+        # The process that `Pkg.test` started runs the ordinary items and the default
+        # profile's `init`; the others get workers.
+        inproc = only(seen["WhereUnderPkg:body plain"])["pid"]
+        @test count(n -> n["pid"] == inproc, seen["WhereUnderPkg:init default"]) == 1
+        for tag in ("skip", "producer")
+            @test only(seen["WhereUnderPkg:$tag"])["pid"] == inproc
         end
         for tag in ("body sandboxed", "body named", "body env", "init named")
-            n = only(seen["WhereUnderPkg:$tag"])
-            @test n["pid"] != inproc["pid"] && same(n["pwd"], pkg)
+            @test only(seen["WhereUnderPkg:$tag"])["pid"] != inproc
         end
     end
 

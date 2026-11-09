@@ -998,16 +998,18 @@ end
 """
     runstate_dir(root) -> String
 
-`\$RUNTESTS_RUNSTATE_DIR` when set, otherwise a directory of the depot's own keyed by
-the project path, so nothing lands in the repository, and named for the project as
-well, so a person can tell which is whose. Not under `scratchspaces/`:
+`\$RUNTESTS_RUNSTATE_DIR` when set, made absolute against the current directory: an
+item runs in its package's root, and the logs it writes there land here all the same.
+Otherwise a directory of the depot's own keyed by the project path, so nothing lands
+in the repository, and named for the project as well, so a person can tell which is
+whose. Not under `scratchspaces/`:
 `Pkg.gc`, which `Pkg` also runs after its own operations, deletes every directory
 there that no package has registered, and with it the history that orders the
 next run. The path is printed at the end of a run so CI can upload it.
 """
 function runstate_dir(root::AbstractString)
     dir = get(ENV, "RUNTESTS_RUNSTATE_DIR", "")
-    isempty(dir) || return dir
+    isempty(dir) || return abspath(dir)
     key = string(crc32c(abspath(root)); base = 16, pad = 8)
     label = dir_label(root)
     return joinpath(runstate_root(), isempty(label) ? key : string(label, "-", key))

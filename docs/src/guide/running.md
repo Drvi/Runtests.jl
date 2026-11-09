@@ -86,7 +86,7 @@ The `retries` setting controls additional attempts within one run. [Configure ru
 
 `workers = 0` runs the items in the process that calls `runtests`, one after the other. An item that needs a process of its own still gets one. These are items with `sandbox = true`, items that run under a profile other than `default`, and items in an environment directory. The run starts a process for each such item or chain, stops it afterwards, and lists these items. A chain shares that process through its members and retries unless the process is lost.
 
-The items in this process run in its current directory, which is `test/` under `Pkg.test`. The `init` of the default profile runs once in `Main` of this process, before the first item, and the run warns about it. The items that get a process of their own run in the root of the package. [Where code runs](@ref where-code-runs) gives the details.
+The items in this process run in the root of the package, as on a worker. This is also true under `Pkg.test`, which starts the tests in `test/`. The `init` of the default profile runs once in `Main` of this process, in the root of the package, before the first item, and the run warns about it. [Where code runs](@ref where-code-runs) gives the details.
 
 Items that run in the caller's process, their profile hooks and their artifact producers have no enforceable timeout: there is no separate process to stop. Items that get a worker keep their timeouts. Coverage needs workers, so `workers = 0` with `coverage = true` is an error.
 
@@ -110,6 +110,6 @@ Some problems stop the run before any item runs. These problems throw an excepti
 | `Runtests.ScanFailure` | A test file that does not parse, a name that two items use, a Julia file under `test/` that is not a test file, or a template expansion that is missing or not current. |
 | `Runtests.NoTestsError` | No test files, no item that the selection matches, or existing failing items of which none matches the selection. With no failing items, `runtestsf()` returns `nothing`. |
 | `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, in another configuration file or in an environment variable. Examples are an incorrect value, an unknown profile, an undeclared group in `RUNTESTS_GROUP`, or a profile environment that does not resolve. |
-| `ArgumentError` | A mistake in the call. Examples are a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, or a path outside `test/`. |
+| `ArgumentError` | A mistake in the call. Examples are a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a path outside `test/` or in another package, and a line that the file does not have. |
 
 A `ScanFailure` lists every problem that Runtests found, so you can correct them all before the next run.

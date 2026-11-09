@@ -2,7 +2,21 @@
 # LOAD_PATH. That is the whole mechanism, and it is what lets a setup use anything
 # the package declares for testing — including another setup.
 
-using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, setup_modules, TOML
+using Runtests.Private: PASSED, FAILED, ERRORED, ConfigError, prepare, execute, nitems, setup_modules, TOML
+
+# A setup that is a package, `test/testsetups/<name>` in the package at `dir`, with
+# `deps`, pairs of a name and a UUID, in its `[deps]`. Returns its UUID.
+function write_setup(dir, name, body = ""; deps = Pair{String, String}[], uuid = next_uuid())
+    src = mkpath(joinpath(dir, "test", "testsetups", name, "src"))
+    write(joinpath(src, name * ".jl"), "module $name\n$body\nend\n")
+    write(joinpath(dir, "test", "testsetups", name, "Project.toml"),
+          "name = \"$name\"\nuuid = \"$uuid\"\n" * (isempty(deps) ? "" : "\n[deps]\n" * join("$n = \"$u\"\n" for (n, u) in deps)))
+    return uuid
+end
+
+# The cache files of setup `name` in the depot that new caches go to.
+setup_caches(name) =
+    filter(endswith(".ji"), readdir(joinpath(first(DEPOT_PATH), "compiled", "v$(VERSION.major).$(VERSION.minor)", name)))
 
 @testset "test setups" begin
     @testset "a setup may use any of the package's test-time dependencies" begin
@@ -83,6 +97,179 @@ using Runtests.Private: PASSED, ERRORED, ConfigError, prepare, execute, nitems, 
         (states, _, _), again = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
         @test states["plain"] === PASSED && states["checked"] === PASSED
         @test !occursin("precompiling $setup", again)
+    end
+
+    @testset "a setup is precompiled for the profiles whose items load it, and for no other" begin
+        # Each item asks, before it loads its setup, whether its process has a cache to
+        # load. `Plain` is loaded under this process's flags only, `Checked` under the
+        # `checked` profile's only, and each has the one cache it is loaded from.
+        for workers in (0, 1)
+            dir = make_pkg("ExactSetups")
+            plain, checked = (string(n, string(hash(dir); base=16)) for n in ("Plain", "Checked"))
+            write(joinpath(dir, "test", "TestItems.toml"), "[profiles.checked]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
+            write(joinpath(dir, "test", "a_test.jl"), """
+            @testitem "plain" begin
+                @test Base.isprecompiled(Base.identify_package("$plain"))
+                using $plain
+            end
+            @testitem "checked" profile=:checked begin
+                @test Base.isprecompiled(Base.identify_package("$checked"))
+                using $checked
+            end
+            """)
+            write_setup(dir, plain); write_setup(dir, checked)
+            states, _, _ = run_states(dir; workers, logs=:issues, monitor=false)
+            @test states["plain"] === PASSED && states["checked"] === PASSED
+            @test length(setup_caches(plain)) == 1 && length(setup_caches(checked)) == 1
+        end
+    end
+
+    @testset "an item in this process loads its setup under this process's flags" begin
+        # With workers = 0 the default profile's items run here, whatever julia arguments
+        # the profile gives its workers; with a worker, the setup is compiled for those.
+        for workers in (0, 1)
+            dir = make_pkg("HereSetup")
+            setup = string("Here", string(hash(dir); base=16))
+            write(joinpath(dir, "test", "TestItems.toml"), "[profiles.default]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
+            write(joinpath(dir, "test", "a_test.jl"), """
+            @testitem "uses it" begin
+                @test Base.isprecompiled(Base.identify_package("$setup"))
+                using $setup
+            end
+            """)
+            write_setup(dir, setup)
+            states, _, _ = run_states(dir; workers, logs=:issues, monitor=false)
+            @test states["uses it"] === PASSED
+        end
+    end
+
+    @testset "a setup is precompiled with the setups it depends on, and in an environment directory" begin
+        # `Outer` depends on `Inner`; an item of the environment directory `qa` loads
+        # `Outer` there, and an item of the test environment loads `Inner`.
+        dir = make_pkg("SetupChain")
+        inner, outer = (string(n, string(hash(dir); base=16)) for n in ("Inner", "Outer"))
+        u = write_setup(dir, inner, "value() = 7")
+        write_setup(dir, outer, "using $inner\nvalue() = $inner.value() + 1"; deps = [inner => u])
+        mkpath(joinpath(dir, "test", "qa"))
+        write(joinpath(dir, "test", "qa", "Project.toml"), "[deps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n")
+        write(joinpath(dir, "test", "qa", "qa_test.jl"), """
+        @testitem "outer" begin
+            @test Base.isprecompiled(Base.identify_package("$outer"))
+            @test Base.isprecompiled(Base.identify_package("$inner"))
+            using $outer
+            @test $outer.value() == 8
+        end
+        """)
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "inner" begin
+            @test Base.isprecompiled(Base.identify_package("$inner"))
+            using $inner
+            @test $inner.value() == 7
+        end
+        """)
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["outer"] === PASSED && states["inner"] === PASSED
+        @test occursin("precompiling $inner", out)
+    end
+
+    @testset "a setup's compile waits for the compiles of the setups it loads" begin
+        # `[deps]` says what a setup that is a package loads, and the imports in its source
+        # what one that is not loads. Of two setups that name each other, one waits.
+        dir = make_pkg("SetupOrder")
+        tag = string(hash(dir); base=16)
+        file, filedep, pkg, pkgdep, one, other = (n * tag for n in ("File", "FileDep", "Pkg", "PkgDep", "One", "Other"))
+        setups = mkpath(joinpath(dir, "test", "testsetups"))
+        write(joinpath(setups, filedep * ".jl"), "module $filedep\nend\n")
+        write(joinpath(setups, file * ".jl"), "module $file\nusing $filedep\nend\n")
+        write_setup(dir, pkg, "using $pkgdep"; deps = [pkgdep => write_setup(dir, pkgdep)])
+        uone, uother = next_uuid(), next_uuid()
+        write_setup(dir, one, "using $other"; deps = [other => uother], uuid = uone)
+        write_setup(dir, other, "using $one"; deps = [one => uone], uuid = uother)
+        needs = Runtests.Private.SetupNeed[(; name = Symbol(n), args = ``, flags = Base.CacheFlags(), dir = setups)
+                                           for n in (file, filedep, pkg, pkgdep, one, other)]
+        jobs = Runtests.Private.with_load_path(setups) do
+            Runtests.Private.stale_setups(needs, Dict{Symbol, String}())
+        end
+        at(n) = findfirst(j -> j.pkg.name == n, jobs)
+        @test jobs[at(file)].after == [at(filedep)] && isempty(jobs[at(filedep)].after)
+        @test jobs[at(pkg)].after == [at(pkgdep)] && isempty(jobs[at(pkgdep)].after)
+        @test length(jobs[at(one)].after) + length(jobs[at(other)].after) == 1
+    end
+
+    @testset "a setup stays precompiled when it loads another that compiles after it" begin
+        # One compile at a time, in the order the item names them. `Loader` loads `Loaded`
+        # through generated code, which its source does not show, so nothing orders the
+        # two: `Loader`'s compile builds `Loaded` too, and `Loaded`'s own compile, which
+        # comes next, finds it built.
+        dir = make_pkg("HiddenLoad")
+        loader, loaded = (n * string(hash(dir); base=16) for n in ("Loader", "Loaded"))
+        setups = mkpath(joinpath(dir, "test", "testsetups"))
+        write(joinpath(setups, loaded * ".jl"), "module $loaded\nvalue() = 1\nend\n")
+        write(joinpath(setups, loader * ".jl"), """
+        module $loader
+        Core.eval(@__MODULE__, Meta.parse("using " * "$loaded"))
+        value() = $loaded.value() + 1
+        end
+        """)
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "loads both" begin
+            @test Base.isprecompiled(Base.identify_package("$loader"))
+            @test Base.isprecompiled(Base.identify_package("$loaded"))
+            using $loader, $loaded
+            @test $loader.value() == 2
+        end
+        """)
+        states, _, _ = withenv("JULIA_NUM_PRECOMPILE_TASKS" => "1") do
+            run_states(dir; workers=1, logs=:issues, monitor=false)
+        end
+        @test states["loads both"] === PASSED
+    end
+
+    @testset "setups that depend on each other end the run's setup, and their item fails" begin
+        # Neither compile waits for the other. Julia refuses to load the pair, and says
+        # why in the item.
+        dir = make_pkg("SetupCycle")
+        a, b = (string(n, string(hash(dir); base=16)) for n in ("CycleA", "CycleB"))
+        ua, ub = next_uuid(), next_uuid()
+        write_setup(dir, a, "using $b"; deps = [b => ub], uuid = ua)
+        write_setup(dir, b, "using $a"; deps = [a => ua], uuid = ub)
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "uses both" begin
+            using $a
+            using $b
+        end
+        """)
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["uses both"] in (FAILED, ERRORED)
+        @test occursin("deadlock detected in loading", out)
+    end
+
+    @testset "a run warns about each setup it loads that is not a package" begin
+        # A file and a directory without a project are not packages; a setup no
+        # selected item loads, and a setup that is a package, are not named.
+        dir = make_pkg("UnconvertedSetups")
+        flat, nested, unused, converted = (string(n, string(hash(dir); base=16)) for n in ("Flat", "Nested", "Unused", "Converted"))
+        write(joinpath(mkpath(joinpath(dir, "test", "testsetups")), flat * ".jl"), "module $flat\nend\n")
+        write(joinpath(mkpath(joinpath(dir, "test", "testsetups", nested, "src")), nested * ".jl"), "module $nested\nend\n")
+        write(joinpath(dir, "test", "testsetups", unused * ".jl"), "module $unused\nend\n")
+        write_setup(dir, converted)
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "uses three" begin
+            using $flat, $nested, $converted
+        end
+        """)
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["uses three"] === PASSED
+        @test occursin("are not packages", out)
+        @test occursin("`$(joinpath("test", "testsetups", flat * ".jl"))`", out)
+        @test occursin("`$(joinpath("test", "testsetups", nested, "src", nested * ".jl"))`", out)
+        @test !occursin(unused, out)
+        @test !occursin(joinpath(converted, "src", converted * ".jl"), out)
+        # Converted, they are not warned about.
+        capture_run(() -> Runtests.setups_to_packages(dir))
+        (states, _, _), again = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false))
+        @test states["uses three"] === PASSED
+        @test !occursin("not a package", again) && !occursin("not packages", again)
     end
 
     @testset "setups are found as a file or as a directory" begin
@@ -428,6 +615,47 @@ end
                 haskey(entry, "path") && @test isdir(joinpath(proj, entry["path"]))
             end
         end
+    end
+
+    @testset "a setup is precompiled in the project of each profile that loads it" begin
+        # The setup depends on a package that reads a preference when it is compiled. The
+        # `tuned` profile's project holds another build of that package, and a cache of
+        # the setup built against one build cannot be loaded with the other.
+        dir = make_pkg("PrefSetup")
+        pkgdir = joinpath(dir, "PrefSource")
+        mkpath(joinpath(pkgdir, "src"))
+        u = next_uuid()
+        write(joinpath(pkgdir, "Project.toml"), "name = \"PrefSource\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n")
+        write(joinpath(pkgdir, "src", "PrefSource.jl"), """
+        module PrefSource
+        const UUID = Base.UUID("$u")
+        Base.record_compiletime_preference(UUID, "mode")
+        const MODE = get(Base.get_preferences(UUID), "mode", "unset")
+        end
+        """)
+        write(joinpath(dir, "prefs.toml"), "[PrefSource]\nmode = \"fast\"\n")
+        write(joinpath(dir, "test", "TestItems.toml"), "[profiles.tuned]\npreferences = \"../prefs.toml\"\n")
+        setup = string("Tuned", string(hash(dir); base=16))
+        write_setup(dir, setup, "using PrefSource\nmode() = PrefSource.MODE"; deps = ["PrefSource" => u])
+        write(joinpath(dir, "test", "t_test.jl"), """
+        @testitem "default" begin
+            @test Base.isprecompiled(Base.identify_package("$setup"))
+            using $setup
+            @test $setup.mode() == "unset"
+        end
+        @testitem "tuned" profile=:tuned begin
+            @test Base.isprecompiled(Base.identify_package("$setup"))
+            using $setup
+            @test $setup.mode() == "fast"
+        end
+        """)
+        Pkg = Base.require(Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
+        orig = Base.active_project()
+        Pkg.activate(dir; io=devnull)
+        Pkg.develop(path=pkgdir; io=devnull)
+        Pkg.activate(orig; io=devnull)
+        states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
+        @test states["default"] === PASSED && states["tuned"] === PASSED
     end
 
     @testset "a profile's project finds every package the environment found" begin

@@ -146,10 +146,10 @@ end
             @test first(pairs) == (:default, "")
             @test allunique(pairs)
             @test (:fast, qa) in pairs && (:default, joinpath(qa, "inner")) in pairs
-            # The dry run's header names the profiles once and the environments the items use.
+            # The dry run's header names the profiles once and the environment directories the items use.
             _, out = capture_run(() -> Runtests.runtests(dir; dry_run = true))
             @test count("profile `fast`: ", out) == 1
-            @test occursin("environments: $(joinpath("test", "qa")), $(joinpath("test", "qa", "inner"))", out)
+            @test occursin("env dirs: $(joinpath("test", "qa")), $(joinpath("test", "qa", "inner"))", out)
         end
 
         @testset "every entry point reads the environment's items" begin
@@ -332,17 +332,36 @@ end
             write(joinpath(bad, "test", "qa", "qa_tests.jl"), "@testitem \"qa\" begin\nend\n")
             write(joinpath(bad, "test", "main_tests.jl"), "@testitem \"main\" begin\nend\n")
             with_runstate_dir() do _
+                # How many errors Julia prints: the run's alone, with Pkg's in its message.
+                printed = 0
                 err = try
                     capture_run(() -> run_states(bad; workers = 1, monitor = false))
                     nothing
                 catch e
+                    printed = length(current_exceptions())
                     e
                 end
-                @test err isa ConfigError
+                @test err isa ConfigError && printed == 1
                 @test occursin("could not build the environment of $(joinpath("test", "qa"))", sprint(showerror, err))
                 @test isempty(runstate_files(bad))
                 @test live_worker_processes() == 0
             end
+        end
+
+        @testset "a test environment that does not resolve says so once" begin
+            # No registry and no path holds `Ghost`, so no attempt of `TestEnv`'s resolves.
+            bad = make_pkg("TestEnvBroken", "test/a_test.jl" => "@testitem \"a\" begin\nend\n",
+                           "test/Project.toml" => "[deps]\nGhost = \"$(next_uuid())\"\n")
+            printed = 0
+            err = try
+                capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                nothing
+            catch e
+                printed = length(current_exceptions())
+                e
+            end
+            @test err isa ConfigError && printed == 1
+            @test occursin("could not build a test environment", sprint(showerror, err))
         end
     end
 
@@ -392,7 +411,7 @@ end
             end
 
             @testset "the run says which environment, and builds it outside the package" begin
-                @test occursin("environment: $(joinpath("test", "qa"))", out)
+                @test occursin("env dir: $(joinpath("test", "qa"))", out)
                 # Each worker says whose profile and which environment it is.
                 ups = filter(l -> occursin("· UP ", l), split(out, '\n'))
                 @test any(l -> occursin("· profile default · test environment", l), ups)

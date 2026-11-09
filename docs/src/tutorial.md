@@ -76,7 +76,7 @@ The output starts with a header block, then one line for each event of the run. 
 ```text
 ┌ [TEST] v0.1.0 · julia 1.13.3 · 2 test items in 1 file · seed 0xdd9c0263775e72e7 · 2 workers · threads 2,1
 │ env: /tmp/jl_4JWcNy/Project.toml
-└ startup: files 0.0s · plan 0.1s · setup 1.1s
+└ startup: scan 0.0s · plan 0.1s · setup 1.1s
 ⚫ w1 · 14:54:35 · UP   · pid 45413 · threads 2,1
 🔵 w1 · 14:54:35 · RUN  · 1/2 · "circle area" · at test/area_tests.jl:1
 🟢 w1 · 14:54:36 · DONE · 1/2 · "circle area" · PASS ·  0.5s (11% compile) · maxrss 0.3 GiB

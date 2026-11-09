@@ -7,8 +7,8 @@ description: Port a Julia package's Test.jl, SafeTestsets, ReTestItems or TestIt
 
 Runtests runs a package's tests as independent **test items** on worker processes.
 Preserve what each test checks, then compare the ported suite's checks and outcomes
-with a baseline run under comparable conditions. The [README](../../README.md) is
-the reference for Runtests behavior.
+with a baseline run under comparable conditions. The
+[documentation](../../docs/src/index.md) is the reference for Runtests behavior.
 
 Follow the applicable steps in order. Record pre-existing failures rather than
 requiring a green baseline. Ask the user when a change to supported Julia versions,
@@ -218,9 +218,6 @@ Then go through its output:
      effect, or whose value has to be fresh, into `__init__` or into the items that
      use it: temporary directories, open files, `ENV` changes, random draws, the time,
      a server, data read from a file that can change.
-   - `__init__` also runs while another setup that loads this one precompiles. Guard
-     what changes another module or the process, such as `Mocking.activate()`:
-     `__init__() = ccall(:jl_generating_output, Cint, ()) == 1 || Mocking.activate()`.
    - The converter flags statements that are not definitions, but it counts
      `x = compute()` as a definition and moves it without a word.
    - A setup made from a file that every test file `include`d gives each item that
@@ -365,7 +362,9 @@ Leave the changes uncommitted unless the user asks you to commit.
 - **Process state.** Changes to `ENV`, the global logger, the working directory,
   preferences, or which packages and extensions are loaded used to last until the
   suite ended. Now the items on a worker run one after another, and each sees what
-  earlier ones changed. Restore what an item changes (`withenv`, `try … finally`). If
+  earlier ones changed, except the working directory: each item starts in the root of
+  its package, also with `workers = 0`. Restore what an item changes (`withenv`,
+  `try … finally`). If
   an item can't restore it, or needs a package not to be loaded, give it
   `sandbox = true`, which runs it in a process of its own.
 - **Printed types.** Where `Main` imported a type's module, types printed
@@ -374,8 +373,8 @@ Leave the changes uncommitted unless the user asks you to commit.
   the way the message builds it, with `"… $(FixedDecimal{Int64, 100}) …"`, or print
   with `sprint(show, x; context = :module => @__MODULE__)`.
 - **Randomness.** A `Random.seed!` in `runtests.jl` used to decide every draw. Each
-  item now draws from the run's seed combined with its own name, and the run prints
-  that seed. An item whose expected values come from a fixed seed calls
+  item now draws from the run's seed combined with its package's name and its own
+  name, and the run prints that seed. An item whose expected values come from a fixed seed calls
   `Random.seed!` itself.
 - **Threads.** Record the original process's thread count. Workers use
   `--threads=2,1` by default; set `threads` under `[run]` in `test/TestItems.toml`

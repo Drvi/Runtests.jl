@@ -123,7 +123,7 @@ const RUN_KEYS = (
 )
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
-const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_item)
+const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_event)
 
 # A keyword `runtests` does not take, with the nearest it does: a misspelled one would
 # otherwise be the one setting a run quietly goes without.

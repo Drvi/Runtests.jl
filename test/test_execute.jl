@@ -626,13 +626,13 @@ end
         @test peak[] <= 2
     end
 
-    @testset "on_item" begin
+    @testset "on_event" begin
         # Through `runtests`, outside any testset: the failures are the fixture's.
-        function heard(on_item, pkg; kwargs...)
+        function heard(on_event, pkg; kwargs...)
             return capture_run() do
                 try
                     Runtests.Private.without_enclosing_testset() do
-                        Runtests.runtests(pkg; logs = :issues, monitor = false, on_item, kwargs...)
+                        Runtests.runtests(pkg; logs = :issues, monitor = false, on_event, kwargs...)
                     end
                 catch e
                     e isa Test.TestSetException || rethrow()
@@ -641,7 +641,7 @@ end
         end
 
         @testset "is called as each attempt starts and as it ends, with what the item measured" begin
-            events = Runtests.ItemEvent[]
+            events = Runtests.TestItemEvent[]
             with_marker_dir() do _
                 heard(ev -> push!(events, ev), FAULTY; workers = 1,
                       name = r"^(passes|passes on the second try|chain start kills the worker|chain rest must not run)$")
@@ -671,6 +671,17 @@ end
             end
         end
 
+        @testset "each event names the events directory of its run, made only for a run given a function" begin
+            events = Runtests.TestItemEvent[]
+            heard(ev -> push!(events, ev), BASICPKG; workers = 1)
+            dir = only(unique(ev.events_dir for ev in events))
+            newest = last(Runtests.Private.runstate_files(BASICPKG))
+            @test dir == joinpath(dirname(newest), "events") && isdir(dir)
+            heard(nothing, BASICPKG; workers = 1)
+            newest = last(Runtests.Private.runstate_files(BASICPKG))
+            @test !ispath(joinpath(dirname(newest), "events"))
+        end
+
         @testset "hears what an attempt cost, on a worker and in this process" begin
             pkg = make_pkg("Costs", "test/costs_test.jl" => """
                 @testitem "works" begin
@@ -692,7 +703,7 @@ end
                 end
                 """)
             for workers in (0, 1)
-                events = Runtests.ItemEvent[]
+                events = Runtests.TestItemEvent[]
                 heard(ev -> ev.kind === :finished && push!(events, ev), pkg; workers)
                 works, waits = (only(filter(ev -> ev.name == n, events)) for n in ("works", "waits"))
                 @test all(ev -> ev.state === :passed && ev.measured && ev.maxrss > 0, events)
@@ -721,19 +732,19 @@ end
             calls = Ref(0)
             _, out = heard(_ -> (calls[] += 1; error("the observer broke")), BASICPKG; workers = 1)
             @test calls[] == 1
-            @test count("`on_item` threw", out) == 1
+            @test count("`on_event` threw", out) == 1
             @test occursin("the observer broke", out)
             @test occursin("all passed", out)
         end
 
-        @testset "a value that cannot take an ItemEvent is refused before anything runs" begin
+        @testset "a value that cannot take a TestItemEvent is refused before anything runs" begin
             for bad in (1, (x::Int) -> x)
                 e = try
-                    Runtests.runtests(BASICPKG; on_item = bad)
+                    Runtests.runtests(BASICPKG; on_event = bad)
                 catch e
                     e
                 end
-                @test e isa ArgumentError && occursin("`on_item` must be a function that takes a `Runtests.ItemEvent`", e.msg)
+                @test e isa ArgumentError && occursin("`on_event` must be a function that takes a `Runtests.TestItemEvent`", e.msg)
             end
         end
     end
@@ -768,6 +779,35 @@ end
                 err, _ = capture_run(() -> outside(() -> Runtests.runtests_mono(ws; workers = 1, logs = :issues,
                                                                                  monitor = false)))
                 @test err isa Test.TestSetException
+            end
+        end
+    end
+
+    @testset "a retry draws the numbers the first attempt drew, and reseeds from its attempt as documented" begin
+        dir = make_pkg("RetrySeeds", "test/r_test.jl" => """
+            @testitem "draws again" retries=1 begin
+                import Runtests
+                attempt = Runtests.current_testitem().attempt
+                write(joinpath(ENV["RUNTESTS_JOURNAL"], "same-\$attempt"), string(rand(UInt64)))
+                @test attempt == 2
+            end
+            @testitem "reseeds" retries=1 begin
+                import Random, Runtests
+                attempt = Runtests.current_testitem().attempt
+                attempt > 1 && Random.seed!(rand(UInt64) + attempt)
+                write(joinpath(ENV["RUNTESTS_JOURNAL"], "reseeded-\$attempt"), string(rand(UInt64)))
+                @test attempt == 2
+            end
+            """)
+        for workers in (0, 1)
+            with_journal() do jdir
+                with_runstate_dir() do _
+                    (states, _, _), _ = capture_run(() -> run_states(dir; workers, logs = :issues, monitor = false))
+                    @test states["draws again"] === PASSED && states["reseeds"] === PASSED
+                end
+                drawn(name) = read(joinpath(jdir, name), String)
+                @test drawn("same-1") == drawn("same-2")
+                @test drawn("reseeded-1") != drawn("reseeded-2")
             end
         end
     end
@@ -829,18 +869,27 @@ end
 
         @testset "every item draws from the run's seed, whatever ran before it, across packages too" begin
             with_journal() do jdir
-                draw(name) = "@testitem $(repr(name)) begin\n" *
-                             "    write(joinpath(ENV[\"RUNTESTS_JOURNAL\"], $(repr(name)) * \"-\" * string(time_ns())), " *
+                # `tag` names the journal file, so that items of one name in two packages
+                # write files of their own.
+                draw(name, tag = name) = "@testitem $(repr(name)) begin\n" *
+                             "    write(joinpath(ENV[\"RUNTESTS_JOURNAL\"], $(repr(tag)) * \"-\" * string(time_ns())), " *
                              "string(rand(UInt64)))\nend\n"
-                ws = e2e_workspace("A" => ["test/a_test.jl" => draw("a one") * draw("a two")],
-                                   "B" => ["test/b_test.jl" => draw("b one")])
+                ws = e2e_workspace("A" => ["test/a_test.jl" => draw("a one") * draw("a two") * draw("same", "A same")],
+                                   "B" => ["test/b_test.jl" => draw("b one") * draw("same", "B same")])
                 with_runstate_dir() do _
                     capture_run(() -> run_mono(ws; workers = 1, seed = 7, logs = :issues, monitor = false))
                     capture_run(() -> run_mono(ws; workers = 2, seed = 7, name = "a two", logs = :issues, monitor = false))
+                    capture_run(() -> run_states(joinpath(ws, "lib", "A"); workers = 0, seed = 7, name = "same",
+                                                 logs = :issues, monitor = false))
                 end
                 draws(prefix) = [read(f, String) for f in readdir(jdir; join = true) if startswith(basename(f), prefix)]
                 @test length(draws("a two-")) == 2 && allequal(draws("a two-"))
                 @test only(draws("a one-")) != first(draws("a two-"))
+                # The name of the package is part of the item's seed: one item name in two
+                # packages draws two streams, and the package's own run draws what the
+                # combined run drew.
+                @test only(draws("B same-")) != first(draws("A same-"))
+                @test length(draws("A same-")) == 2 && allequal(draws("A same-"))
             end
         end
 

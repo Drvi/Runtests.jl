@@ -66,8 +66,9 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
     print_debug_header(item, prof, run_seed, failure, seed === nothing && failed_with !== nothing)
     return with_interactive_env(target, prof) do
         withenv(prof.env...) do
-            isempty(prof.init.args) || Core.eval(Main, Expr(:block, prof.init.args...))
-            spec = interactive_spec(item, target, 1, item_seed(run_seed, item.name))
+            isempty(prof.init.args) || cd(() -> Core.eval(Main, Expr(:block, prof.init.args...)), init_dir(prof, target.root))
+            package = something(project_name_of(target.project), "")
+            spec = interactive_spec(item, target, 1, item_seed(run_seed, package, item.name))
             say(item, target, 1, nothing)
             # The item's testset prints its own summary as it finishes; a `test_end`
             # that then fails is nested under it, and said here.

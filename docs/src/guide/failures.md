@@ -114,7 +114,7 @@ An attempt fails when a test fails or the item throws, in its body or in the `te
 
 Producers run after the body and its profile's `test_end` finish and the run records the verdict. They see their values as they are when they run, not as they were at registration. A file that a `mktempdir() do` block deletes is gone by then. Write such a file to `artifacts_dir()` instead.
 
-Collection has its own time budget and does not count toward the item's measured time or timeout. It does take time in the run and occupies the worker until it ends. The [`on_item` callback](@ref measuring) receives `:finished` before collection begins; that event does not mean the evidence is ready.
+Collection has its own time budget and does not count toward the item's measured time or timeout. It does take time in the run and occupies the worker until it ends. The [`on_event` callback](@ref measuring) receives `:finished` before collection begins; that event does not mean the evidence is ready.
 
 A producer that throws, or a `@test` in a producer that fails, goes into the `.artifacts.log` file. It does not change the verdict, and the next producer still runs. All producers of an attempt together have `artifacts_timeout` seconds; this [run setting](@ref run-keys) defaults to `timeout`. If they take longer, or the worker stops, the run replaces the worker and keeps the files written so far. If the body or `test_end` times out or loses its worker, producers do not run. When producers were registered, the `.artifacts.log` file says why.
 

@@ -1,5 +1,5 @@
 # Checks what a CI run of the fake suite, `test/testfixtures/FakeCI.jl`, left for a person
-# to download, and that it works the way the README says it does:
+# to download, and that it works the way the docs say it does:
 #
 # - the artifact `RUNTESTS_ARTIFACT_DIR` filled: the run's directory, which holds its run
 #   state and its logs, and nothing else;

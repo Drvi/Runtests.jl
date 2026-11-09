@@ -100,9 +100,22 @@ These keys also control the output:
 
 `memory_threshold` is the fraction of the memory of the machine at which the run waits before it starts new items. The default is 0.9. The value must be greater than 0 and at most 1. [How a run works](@ref memory) explains what the run does when memory is low.
 
-## Random numbers
+## [Random numbers](@id random-numbers)
 
-`seed` sets the seed of the run. Each item draws its random numbers from this seed combined with its own name. Without `seed`, the run chooses a random seed and prints it in its header. A run with the same seed draws the same numbers in each item, whatever ran before the item. Environment variables take a seed as text, for example `RUNTESTS_SEED=0x1234`.
+`seed` sets the seed of the run. Each item draws its random numbers from this seed combined with the name of its package and its own name. Thus an item draws the same numbers in the run of its package as in a [combined run](@ref monorepos), and two items with one name in different packages draw different numbers. Without `seed`, the run chooses a random seed and prints it in its header. A run with the same seed draws the same numbers in each item, whatever ran before the item. Environment variables take a seed as text, for example `RUNTESTS_SEED=0x1234`.
+
+A retry draws the same numbers as the first attempt. Thus a failure that the numbers cause fails again, and does not pass on a lucky draw. To draw new numbers on a retry, reseed from the attempt number that `Runtests.current_testitem()` gives:
+
+```julia
+@testitem "random inputs" retries=2 begin
+    import Random, Runtests
+    attempt = Runtests.current_testitem().attempt
+    attempt > 1 && Random.seed!(rand(UInt64) + attempt)
+    @test all(x -> 0 <= x < 1, rand(100))
+end
+```
+
+For this, `Random` must be a test dependency of the package.
 
 ## [Order](@id order)
 
@@ -143,4 +156,4 @@ A declared group, including a declared `default`, makes the run a selection of t
 
 ## Values that only a keyword sets
 
-Some keywords of `runtests` are not configuration keys, so they cannot go in `[run]` or in an environment variable. These keywords are `name`, `tags`, `group`, `dry_run`, `replay`, `config` and `on_item`. `RUNTESTS_GROUP` is the exception: it selects a group when the call selects nothing else.
+Some keywords of `runtests` are not configuration keys, so they cannot go in `[run]` or in an environment variable. These keywords are `name`, `tags`, `group`, `dry_run`, `replay`, `config` and `on_event`. `RUNTESTS_GROUP` is the exception: it selects a group when the call selects nothing else.

@@ -160,9 +160,9 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     warn_ignored(item, sandboxed)
     return exclusively() do
         with_interactive_env(target; combined) do
-            sandboxed && return run_sandboxed(item, target, combined).testset
+            sandboxed && return run_sandboxed(item, target).testset
             say(item, target, 1, nothing)
-            spec = interactive_spec(item, target; combined)
+            spec = interactive_spec(item, target)
             result = run_item(spec; printing = true)
             say(item, target, 1, outcome(result))
             print_evidence(finish_here!(spec, result))
@@ -266,14 +266,14 @@ item_location(item::RawItem, target) = string(
 )
 
 # `prefix` is where its attempts keep their evidence (see `artifacts_path`), one for
-# all of them. `combined`: the item runs in its package's root, as on a shared worker.
+# all of them. The item runs in its package's root, as in a run.
 function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UInt64 = rand(RandomDevice(), UInt64),
-                          prefix::String = interactive_artifacts_prefix(); combined::Bool = false)
+                          prefix::String = interactive_artifacts_prefix())
     project = target === nothing ? "" : something(project_name_of(target.project), "")
     return ItemSpec(
         Int32(1), item.name, item.file, item.line, item.code, item.skip, item.failfast == 1,
         project, item.profile, Int8(attempt), false, "", seed, artifacts_path(prefix, 1, attempt),
-        combined ? target.root : ""
+        target === nothing ? "" : target.root
     )
 end
 
@@ -290,7 +290,7 @@ function sandbox_worker(prof, target, redirect_fn)
     )
 end
 
-function run_sandboxed(item::RawItem, target, combined::Bool = false)
+function run_sandboxed(item::RawItem, target)
     prof = interactive_profile(item, target)
     # The limits a run holds the profile's own code to; without a project, a run's defaults.
     limits = target === nothing ? RunConfig(; workers = 0) : read_config(target.testdir)
@@ -311,7 +311,7 @@ function run_sandboxed(item::RawItem, target, combined::Bool = false)
                 RuntestsWorkers.remote_eval(w, Expr(:block, prof.init.args...)), limits.init_timeout_s,
                 TimeoutException(limits.init_timeout_s, "the `init` expression of profile `$(prof.name)`", "", "init_timeout")
             )
-            spec = interactive_spec(item, target, attempt, seed, prefix; combined)
+            spec = interactive_spec(item, target, attempt, seed, prefix)
             fut = RuntestsWorkers.remote_run(w, spec)
             result = (
                 timeout === nothing ? fetch(fut) :

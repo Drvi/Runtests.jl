@@ -118,7 +118,7 @@ downloaded from CI, say) and runs it again: the same items, settings, profiles,
 given here winning, and a warning naming each package whose version differs from
 the one recorded and each recorded item the suite no longer has.
 
-Each item: `on_item`, a function this process calls with an [`ItemEvent`](@ref) as
+Each item: `on_event`, a function this process calls with a [`TestItemEvent`](@ref) as
 each attempt at an item starts, and again as it ends with what the attempt cost: its
 time, CPU time, compilation, garbage collection, allocations and the memory of its
 process. The calls come one at a time from the run's own tasks, which wait for each,
@@ -133,9 +133,9 @@ current directory, which has to exist; nothing but this keyword makes a run read
 one. A mistake in the call, such as a misspelled keyword or a value out of range, is
 an `ArgumentError`; one in a file or an environment variable is a `ConfigError`.
 """
-function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, on_item = nothing, kwargs...)
-    on_item === nothing || hasmethod(on_item, Tuple{ItemEvent}) || throw(ArgumentError(
-        "`on_item` must be a function that takes a `Runtests.ItemEvent`, got $(repr(on_item))"
+function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, on_event = nothing, kwargs...)
+    on_event === nothing || hasmethod(on_event, Tuple{TestItemEvent}) || throw(ArgumentError(
+        "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got $(repr(on_event))"
     ))
     return exclusively() do
         # A dry run says what it found in its own block, with the plan.
@@ -144,7 +144,7 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
             print_plan(stdout, p)
             return nothing
         end
-        run = execute(p, target; on_item)
+        run = execute(p, target; on_event)
         try
             return RunTestSet(report(run))
         finally
@@ -366,7 +366,7 @@ of the run itself (`workers`, `memory_threshold`, `logs`, `verbose`, `monitor`,
 `monitor_interval`, `full_stacktraces`, `full_names`, `testset_name`, `coverage`,
 `seed`, `failfast`) come from the call, the `RUNTESTS_` variables and `[run]` of the
 workspace root's `test/TestItems.toml`; one in another package's `[run]` has no
-effect, and the run says so. The others are each package's own: a keyword or a
+effect. The others are each package's own: a keyword or a
 variable gives every package its value. `name`, `tags` and `group` select within each
 package; a group or tag only some packages have is no error. `config` is an error.
 
@@ -380,9 +380,9 @@ package only, because this process holds one test environment. A dry run prints 
 combined plan and returns `nothing`.
 """
 function runtests_mono(args...; packages = nothing, name = nothing, tags = nothing, dry_run::Bool = false,
-                       on_item = nothing, kwargs...)
-    on_item === nothing || hasmethod(on_item, Tuple{ItemEvent}) || throw(ArgumentError(
-        "`on_item` must be a function that takes a `Runtests.ItemEvent`, got $(repr(on_item))"
+                       on_event = nothing, kwargs...)
+    on_event === nothing || hasmethod(on_event, Tuple{TestItemEvent}) || throw(ArgumentError(
+        "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got $(repr(on_event))"
     ))
     return exclusively() do
         r = prepare_mono(args; packages, name, tags, announce = !dry_run, kwargs...)
@@ -397,7 +397,7 @@ function runtests_mono(args...; packages = nothing, name = nothing, tags = nothi
             return nothing
         end
         project = something(project_file(p.root), joinpath(p.root, "Project.toml"))
-        run = execute(p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)); on_item)
+        run = execute(p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)); on_event)
         try
             return RunTestSet(report(run))
         finally
@@ -759,7 +759,7 @@ using Test
 using .Private: @testitem, @testtemplate, runtests, runtestsf, runtests_mono, chores_mono, activate_mono, current_testitem,
     serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
-    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 
 export @testitem, @testtemplate, runtests, runtestsf, chores, runtests_mono, chores_mono
 
@@ -773,6 +773,6 @@ end
 
 public activate_mono, serve_mono, current_testitem, on_failure, artifacts_dir,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
-    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, ItemEvent
+    ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 
 end # module Runtests

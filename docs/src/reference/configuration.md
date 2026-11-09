@@ -13,7 +13,7 @@ With `runtests`, each value comes from the first source that sets it, in this or
 
 An unknown key, an unknown keyword or an incorrect value is an error before any item runs. A mistake in the call is an `ArgumentError`. A mistake in a file or in an environment variable is a `Runtests.ConfigError`.
 
-For `runtests_mono`, the call and environment variables still take precedence. Run-wide keys then come from `[run]` at the workspace root; each package's own `[run]` supplies its other keys. Run-wide keys in another package's file have no effect. [Run the suites of a monorepo](@ref monorepos) lists the run-wide keys.
+For `runtests_mono`, the call and environment variables still take precedence. Run-wide keys then come from `[run]` at the workspace root; each package's own `[run]` supplies its other keys. A run-wide key in the `[run]` of another package has no effect. [What the packages share](@ref combined-settings) lists the run-wide keys. Run-wide keys in another package's file have no effect. [Run the suites of a monorepo](@ref monorepos) lists the run-wide keys.
 
 ## [Run keys](@id run-keys)
 
@@ -39,7 +39,7 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 | `full_names` | `false` | Print long names in full, in place of a unique prefix. |
 | `testset_name` | `"Runtests"` | The name of the testset that the run returns. |
 | `coverage` | `false` | Merge line coverage into `lcov.info`. See [Measure coverage](@ref coverage). |
-| `seed` | random | The seed that each item combines with its name. A run without a seed chooses one and prints it. |
+| `seed` | random | The seed that each item combines with the name of its package and its own name. A run without a seed chooses one and prints it. |
 
 A timeout must be positive and at most 2,147,483,647 seconds. A fraction rounds up to whole seconds. Work in the calling process with `workers = 0` cannot be forcibly timed out. In a TOML file or an environment variable, write a symbol as a string, for example `logs = "issues"`.
 
@@ -66,7 +66,7 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 | `dry_run` | `true` prints the plan and runs nothing. |
 | `replay` | The path of a run state to run again. |
 | `config` | The path of a file to read in place of `test/TestItems.toml`, relative to the current directory. The file must exist. |
-| `on_item` | A function that the run calls with a [`Runtests.ItemEvent`](@ref) when each attempt starts and ends. |
+| `on_event` | A function that the run calls with a [`Runtests.TestItemEvent`](@ref) when each attempt starts and ends. |
 
 `runtests_mono` also accepts `packages`, a list of package names or directories to include. It rejects `config`, because a combined run reads each package's own configuration file.
 
@@ -111,7 +111,7 @@ Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<n
 | `julia_args` | `[]` | A vector of command-line flags for `julia`, for example `["--check-bounds=yes"]`. |
 | `threads` | the `threads` of the run | The `--threads` value of the workers of the profile. |
 | `env` | `{}` | A table of environment variables for the workers, for example `{ JULIA_DEBUG = "Main" }`. |
-| `init` | none | Julia code, as a string, that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, the `init` of the default profile runs in the process that calls `runtests`, in its current directory. |
+| `init` | none | Julia code, as a string, that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, the `init` of the default profile runs in the process that calls `runtests`, in the same directory. |
 | `test_end` | none | Julia code, as a string, that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure counts toward the item. |
 | `preferences` | none | A TOML file, relative to the configuration file, whose contents go over the `LocalPreferences.toml` of the environment. The file must exist. |
 | `monorepo_default` | `false` | Only in the `test/TestItems.toml` of a workspace root. `true` shares the profile with the packages of the workspace, in their own runs and in combined runs. See [Share a profile](@ref shared-profiles). |

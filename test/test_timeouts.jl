@@ -15,7 +15,9 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         elapsed = @elapsed states, run, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["never finishes"] === TIMEDOUT
         @test run.statuses.attempt[1] == 3          # the first go and two retries
-        @test run.statuses.elapsed[1] >= 2          # it held its worker for its limit, not for nothing
+        # It held its worker for about its limit, not for nothing. The timer that ends the
+        # attempt and the clock that times it can disagree by a hair: 1.9999995 on Windows.
+        @test run.statuses.elapsed[1] > 1.9
         # Three attempts of two seconds, not one attempt of two shared between them.
         @test elapsed >= 6
         @test elapsed < 120

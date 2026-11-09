@@ -1557,7 +1557,8 @@ end
 # As many compiles at a time as Julia's own precompiler runs: `JULIA_NUM_PRECOMPILE_TASKS`,
 # or one more than the CPU threads, half of them on Windows, and at most 16.
 function precompile_tasks()
-    n = isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
+    # Chosen as the code is compiled: before 1.13 the name does not exist at all.
+    n = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
     default = min(Sys.iswindows() ? div(n, 2) + 1 : n + 1, 16)
     return max(1, something(tryparse(Int, get(ENV, "JULIA_NUM_PRECOMPILE_TASKS", "")), default))
 end

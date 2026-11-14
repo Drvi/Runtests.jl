@@ -609,6 +609,8 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     t_files = time()
     items, errors, all_tags = RawItem[], ScanError[], Set{Symbol}()
     suite_names = [String[] for _ in 1:n]
+    # Each package's environment directories, as `skip_environment` names them.
+    environment_names = [String[] for _ in 1:n]
     reasons = Union{Nothing, String}[nothing for _ in 1:n]
     for k in 1:n
         if replayed !== nothing && replayed.records[k] === nothing
@@ -625,6 +627,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             continue
         end
         files, strays, templates, environments = walk_test_dir(joinpath(ps.root[k], "test"))
+        environment_names[k] = String[rel_slash(dir, joinpath(ps.root[k], "test")) for dir in environments]
         tags_k = Set{Symbol}()
         its = try
             scan(files, filters[k], setups[k]; strays, templates, expansions, suite_names = suite_names[k], environments,
@@ -672,6 +675,13 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             Dict{Symbol, Any}(key => v for (key, v) in pairs(recorded_settings(rs)) if key in PACKAGE_KEYS)
     end
     run_cfg, cfgs = mono_configs(ps, configs, kept, length(items), kwargs, overrides)
+    # A name is some package's environment: the call and the variable give one list
+    # to every package, and not every package has every environment.
+    known_environments = unique!(reduce(vcat, environment_names[kept]; init = String[]))
+    for cfg in cfgs
+        check_skip_environment(cfg.skip_environment, known_environments,
+                               get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
+    end
     if replayed !== nothing
         run_cfg, cfgs = replayed_configs(run_cfg, cfgs, [replayed.records[k] for k in kept], ps.root[kept], replayed.given,
                                          haskey(kwargs, :seed) && !haskey(recorded_settings(replayed.given), :seed))

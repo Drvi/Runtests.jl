@@ -54,6 +54,28 @@ end
 
 `preferences` names a TOML file, relative to the configuration file. The file must exist. Its contents go over the `LocalPreferences.toml` of a temporary copy of the environment of the item. Runtests precompiles separately for the preferences of each profile.
 
+## [Precompilation](@id profile-precompile)
+
+Before the workers start, Runtests precompiles the environment of each profile for the Julia flags of that profile. A flag that changes how Julia compiles code, for example `--check-bounds=yes`, makes Runtests compile each package of the environment again. For a large environment, this can take longer than the items of the profile.
+
+`precompile` names the packages that Runtests precompiles for the profile instead, each with its dependencies:
+
+```toml
+[profiles.bounds]
+julia_args = ["--check-bounds=yes"]
+precompile = ["MyPackage", "Test"]
+```
+
+With `precompile = []`, Runtests precompiles no package of the environment for the profile. Without the key, it precompiles the whole environment.
+
+Each name must be a package of the environment of the items of the profile, a dependency of a dependency included. A name that no such environment holds is an error, and the run stops before the workers start.
+
+Runtests always compiles Runtests itself for the flags of the profile, because each worker loads Runtests before it connects. A worker compiles each other package when an item loads it for the first time. This time counts toward the timeout of the item. With the key, Runtests also does not compile the [setups](@ref setups) of these items before the workers start.
+
+Each worker compiles in parallel, with its own limit. Two workers do not compile the same package, but together they can start more compile processes than `JULIA_NUM_PRECOMPILE_TASKS` allows. To lower the limit of each worker, set the variable in `env` of the profile, for example `env = { JULIA_NUM_PRECOMPILE_TASKS = "4" }`.
+
+When items of another profile without the key run on the same workers, as [Pools of workers](@ref worker-pools) describes, Runtests still precompiles the whole environment for that profile.
+
 ## [Run items in an environment of their own](@id environments)
 
 A directory under `test/` with a `Project.toml` or `JuliaProject.toml` of its own is an environment directory. The test files in it run in that environment, not in the test environment. With this, a suite can keep tests whose dependencies the test environment must not carry. Examples are Aqua or JET tests, and a group that needs other versions of packages:
@@ -78,6 +100,29 @@ Runtests writes nothing into the directory. The copy is stacked over the test en
 
 Runtests resolves the copy once in each session, and again when a file that it was built from changes. A copy that does not resolve stops the run before any item runs.
 
+### Skip an environment
+
+Some environments do not work on every version of Julia. JET, for example, often does not resolve or compile on a prerelease. `skip_environment` names the environment directories that a run must not build, by their path from `test/`:
+
+```julia
+# test/runtests.jl
+using Runtests
+runtests(skip_environment = isempty(VERSION.prerelease) ? nothing : "qa")
+```
+
+The run does not resolve or precompile a skipped environment, and it starts no worker in it. It records each selected item of the directory as skipped, so the summary counts the items. The header of the run marks the directory: `env dir: test/qa (skipped)`.
+
+Without the keyword, the run reads the environment variable `RUNTESTS_SKIP_ENVIRONMENT`, and then `skip_environment` of `[run]`. Thus a CI job can skip an environment with no change to the suite:
+
+```yaml
+env:
+  RUNTESTS_SKIP_ENVIRONMENT: qa
+```
+
+A keyword in the call has precedence over the variable. The value `nothing` is the same as no keyword. Thus the call above decides on a prerelease, and the variable and the file decide on a release.
+
+`skip` on an item does not have this effect. The worker evaluates `skip` in the environment of the item, so the run builds the environment first. A run that selects no item of the directory, by name, tag or path, also does not build the environment.
+
 ### Directories that are not environments
 
 These directories are never environment directories, even with a project of their own:
@@ -89,7 +134,7 @@ These directories are never environment directories, even with a project of thei
 
 Discovery does not follow directory symlinks. A replay finds the environment of each item where its file is, in the checkout that the replay runs in.
 
-## Pools of workers
+## [Pools of workers](@id worker-pools)
 
 A run keeps a pool of workers for each start configuration that its items use. The start configuration of a worker is what it gets when it starts: Julia flags, threads, environment variables, `init`, preferences and environment. Thus an item with `profile = :bounds` in `test/qa/` runs on a worker with the flags of `bounds` and the packages of `test/qa`. Two profiles that differ only in `test_end` share a pool, and each item still runs its own profile's `test_end`. Across packages of a workspace, an `init` must also run in the same directory for workers to be shared. [Share a profile](@ref shared-profiles) explains how the workspace root supplies one `init` to its packages.
 

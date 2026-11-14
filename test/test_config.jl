@@ -39,6 +39,7 @@ end
         env = { FOO = "1" }
         init = "using Test"
         test_end = "GC.gc(true)"
+        precompile = ["Test"]
         """) do dir
             cfg = read_config(dir)
             @test cfg.workers == 3
@@ -54,6 +55,9 @@ end
             @test p.env == ["FOO" => "1"]
             @test p.init.head === :block && !isempty(p.init.args)
             @test p.test_end.head === :block
+            @test p.precompile == ["Test"]
+            # Without the key, the whole environment.
+            @test cfg.profiles[:default].precompile === nothing
         end
     end
 
@@ -221,6 +225,8 @@ end
                 "[profiles.p]\nenv = { A = [1] }\n" => "`env` of [profiles.p]",
                 "[profiles.p]\ninit = 1\n" => r"`init` of \[profiles\.p\] in \S*TestItems.toml must be a string",
                 "[profiles.p]\ntest_end = [\"x\"]\n" => "`test_end` of [profiles.p]",
+                "[profiles.p]\nprecompile = false\n" => r"`precompile` of \[profiles\.p\] in \S*TestItems.toml must be a list of strings",
+                "[profiles.p]\nprecompile = [\"A\", 1]\n" => "`precompile` of [profiles.p]",
                 "[order]\nfirst = \"one\"\n" => r"`first` of \[order\] in \S*TestItems.toml must be a list of strings",
                 "[order]\nlast = [1]\n" => "`last` of [order]",
                 "[run]\ntimeout = true\n" => "`timeout` must be a positive number of seconds",
@@ -242,9 +248,11 @@ end
             @test_throws r"`retries` must be an integer" read_config(dir; retries = false)
         end
         # What they are for still reads: numbers and flags for variables among them.
-        with_toml("[profiles.p]\njulia_args = []\nenv = { A = \"x\", N = 1, F = true }\n[order]\nfirst = []\n") do dir
+        with_toml("[profiles.p]\njulia_args = []\nenv = { A = \"x\", N = 1, F = true }\nprecompile = []\n[order]\nfirst = []\n") do dir
             cfg = read_config(dir)
             @test isempty(cfg.profiles[:p].julia_args)
+            # No package, which is not the whole environment.
+            @test cfg.profiles[:p].precompile == String[]
             @test cfg.profiles[:p].env == ["A" => "x", "F" => "true", "N" => "1"]
         end
     end

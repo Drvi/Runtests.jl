@@ -820,6 +820,23 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "`skip_environment` skips an environment of the packages that have it" begin
+            # A's environment does not resolve, and B has none of that name.
+            ws = e2e_workspace(
+                "A" => [
+                    "test/a_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n",
+                    "test/qa/Project.toml" => "[deps]\nGhost = \"$(next_uuid())\"\n\n[sources]\nGhost = {path = \"../ghost\"}\n",
+                    "test/qa/qa_test.jl" => "@testitem \"qa\" begin\n    @test false\nend\n",
+                ],
+                "B" => ["test/b_test.jl" => "@testitem \"b\" begin\n    @test true\nend\n"],
+            )
+            with_runstate_dir() do _
+                states, _, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = "qa")
+                @test states == Dict(("A", "a") => PASSED, ("A", "qa") => Runtests.Private.SKIPPED, ("B", "b") => PASSED)
+                @test_throws ArgumentError run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = "jet")
+            end
+        end
+
         @testset "the setups of an isolated package are precompiled for its own workers" begin
             # C's setup is on the load path of C's workers only. Its item asks, before it
             # loads the setup, whether its worker has a cache to load. A name no earlier

@@ -40,8 +40,11 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 | `testset_name` | `"Runtests"` | The name of the testset that the run returns. |
 | `coverage` | `false` | Merge line coverage into `lcov.info`. See [Measure coverage](@ref coverage). |
 | `seed` | random | The seed that each item combines with the name of its package and its own name. A run without a seed chooses one and prints it. |
+| `skip_environment` | `[]` | An [environment directory](@ref environments) that the run does not build, or a vector of them. Each name is the path of the directory from `test/`, for example `"qa"` for `test/qa`. The run records the selected items of the directory as skipped. In the environment variable, put commas between the names. |
 
 A timeout must be positive and at most 2,147,483,647 seconds. A fraction rounds up to whole seconds. Work in the calling process with `workers = 0` cannot be forcibly timed out. In a TOML file or an environment variable, write a symbol as a string, for example `logs = "issues"`.
+
+A name in `skip_environment` that is not an environment directory of the suite is an error. In a combined run, the name must be an environment directory of at least one package.
 
 ### logs
 
@@ -114,6 +117,7 @@ Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<n
 | `init` | none | Julia code, as a string, that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, the `init` of the default profile runs in the process that calls `runtests`, in the same directory. |
 | `test_end` | none | Julia code, as a string, that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure counts toward the item. |
 | `preferences` | none | A TOML file, relative to the configuration file, whose contents go over the `LocalPreferences.toml` of the environment. The file must exist. |
+| `precompile` | the whole environment | The packages that Runtests precompiles for the workers of the profile before they start, each with its dependencies, for example `["MyPackage", "Test"]`. `[]` precompiles none. A worker compiles each other package when an item loads it. A name that is not a package of the environment of the items is an error. See [Precompilation](@ref profile-precompile). |
 | `monorepo_default` | `false` | Only in the `test/TestItems.toml` of a workspace root. `true` shares the profile with the packages of the workspace, in their own runs and in combined runs. See [Share a profile](@ref shared-profiles). |
 
 ## [Environment variables](@id environment-variables)

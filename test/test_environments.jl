@@ -6,7 +6,7 @@
 
 using Runtests.Private: prepare, nitems, read_config, ConfigError, ScanFailure, environment_project,
     write_environment, read_run_state, runstate_files, failing_items, suite_item_names, resolve_target,
-    list_items, Profile, PASSED, FAILED, init_run_state, finish_run_state!, walk_test_dir, in_environment
+    list_items, Profile, PASSED, FAILED, SKIPPED, init_run_state, finish_run_state!, walk_test_dir, in_environment
 using Runtests.RuntestsWorkers: state_of
 using Runtests.Private: TOML
 
@@ -345,6 +345,109 @@ end
                 @test occursin("could not build the environment of $(joinpath("test", "qa"))", sprint(showerror, err))
                 @test isempty(runstate_files(bad))
                 @test live_worker_processes() == 0
+            end
+        end
+
+        @testset "an environment whose items the run leaves out is neither built nor precompiled" begin
+            # A suite keeps tests like JET's in an environment of their own, and a run
+            # on a Julia where that environment does not resolve leaves them out.
+            bad = env_pkg("EnvLeftOut")
+            write(joinpath(bad, "test", "qa", "Project.toml"),
+                  "[deps]\nGhost = \"$(next_uuid())\"\n\n[sources]\nGhost = {path = \"../ghost\"}\n")
+            write(joinpath(bad, "test", "qa", "qa_tests.jl"), "@testitem \"qa\" begin\nend\n")
+            write(joinpath(bad, "test", "main_tests.jl"), "@testitem \"main\" begin\nend\n")
+            with_runstate_dir() do _
+                (states, run, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false, name = "main"))
+                @test states == Dict("main" => PASSED)
+                @test isempty(run.profile_projects)
+                @test !occursin("resolving the environment", out)
+                @test !occursin("precompiling the environment", out)
+            end
+        end
+
+        @testset "`skip_environment` leaves an environment unbuilt and records its items as skipped" begin
+            # The environment does not resolve, so a run that builds it stops before any
+            # item runs. One of its items has julia arguments of its own, which nothing
+            # is compiled for either.
+            bad = env_pkg("EnvSkipped",
+                          "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n")
+            write(joinpath(bad, "test", "qa", "Project.toml"),
+                  "[deps]\nGhost = \"$(next_uuid())\"\n\n[sources]\nGhost = {path = \"../ghost\"}\n")
+            write(joinpath(bad, "test", "qa", "qa_tests.jl"), """
+            @testitem "qa" begin
+                @test false
+            end
+            @testitem "qa checked" profile=:bounds begin
+                @test false
+            end
+            """)
+            write(joinpath(bad, "test", "main_tests.jl"), "@testitem \"main\" begin\nend\n")
+            skipped = Dict("main" => PASSED, "qa" => SKIPPED, "qa checked" => SKIPPED)
+            ups(out) = count(l -> occursin("· UP ", l), split(out, '\n'))
+            with_runstate_dir() do _
+                @testset "the keyword names the directory by its path from test/" begin
+                    (states, run, _), out = capture_run(() -> run_states(bad; workers = 2, monitor = false, skip_environment = "qa"))
+                    @test states == skipped
+                    @test isempty(run.profile_projects)
+                    @test !occursin("resolving the environment", out)
+                    @test !occursin("precompiling the environment", out)
+                    @test !occursin("precompiling Runtests", out)
+                    # The test environment's worker is the only one, and each skipped item has a line.
+                    @test ups(out) == 1
+                    @test occursin("env dir: $(joinpath("test", "qa")) (skipped)", out)
+                    @test count(l -> occursin("· DONE ", l) && occursin("SKIP", l), split(out, '\n')) == 2
+                    # The record of the run says the same, with no process for either item.
+                    rs = read_run_state(only(runstate_files(bad)))
+                    @test Dict(it.name => rs.statuses[i].state for (i, it) in pairs(rs.items)) == skipped
+                    @test all(i -> rs.statuses[i].pid == 0 && rs.statuses[i].slot == 0,
+                              [i for (i, it) in pairs(rs.items) if it.name != "main"])
+                end
+
+                @testset "a run of the environment's items alone starts no process" begin
+                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false, name = "qa", skip_environment = ["qa"]))
+                    @test states == Dict("qa" => SKIPPED)
+                    @test ups(out) == 0
+                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 0, monitor = false, skip_environment = ["qa"]))
+                    @test states == skipped
+                    @test ups(out) == 0
+                end
+
+                @testset "the variable and the file set it, and the keyword wins" begin
+                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => " qa , qa") do
+                        (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                        @test states == skipped
+                        @test occursin("RUNTESTS_SKIP_ENVIRONMENT", out)
+                        # `nothing` is no keyword, so the variable still decides.
+                        (states, _, _), _ = capture_run(() -> run_states(bad; workers = 1, monitor = false, skip_environment = nothing))
+                        @test states == skipped
+                        # A keyword that skips none: the run builds the environment, which stops it.
+                        @test_throws ConfigError capture_run(() -> run_states(bad; workers = 1, monitor = false, skip_environment = String[]))
+                    end
+                    config = joinpath(bad, "test", "TestItems.toml")
+                    before = read(config, String)
+                    write(config, before * "\n[run]\nskip_environment = [\"qa\"]\n")
+                    try
+                        (states, _, _), _ = capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                        @test states == skipped
+                    finally
+                        write(config, before)
+                    end
+                end
+
+                @testset "a name that is no environment of the suite is an error that lists them" begin
+                    @test occursin("names `jet`, which is not an environment directory of the suite; the suite has `qa`",
+                                   message_of(() -> plan_of(bad; skip_environment = ["qa", "jet"])))
+                    @test_throws ArgumentError plan_of(bad; skip_environment = "test/qa")
+                    @test_throws ArgumentError plan_of(bad; skip_environment = 1)
+                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => "jet") do
+                        @test_throws ConfigError plan_of(bad)
+                    end
+                end
+
+                @testset "a replay skips what its run skipped" begin
+                    rs = first(sort(runstate_files(bad)))
+                    @test plan_of(bad; replay = rs).cfg.skip_environment == ["qa"]
+                end
             end
         end
 

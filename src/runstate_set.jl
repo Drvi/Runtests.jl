@@ -55,7 +55,8 @@ end
 # the run's for what is the run's (`RUN_WIDE_KEYS`) and how the run was made.
 function under_run_settings(own::RunConfig, run::RunConfig)
     from_own = (:threads, :timeout_s, :init_timeout_s, :test_end_timeout_s, :artifacts_timeout_s, :retries,
-                :item_failfast, :profiles, :groups, :order_first, :order_last, :item_seeds, :config_file)
+                :item_failfast, :profiles, :groups, :order_first, :order_last, :item_seeds, :config_file,
+                :skip_environment)
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(n -> getfield(fieldname(RunConfig, n) in from_own ? own : run, n),
                                                       fieldcount(RunConfig)))
     return RunConfig(; fields...)

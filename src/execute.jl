@@ -947,6 +947,21 @@ that never ran as written.
 """
 needs_worker(p::Plan, u::UnitIdx) = p.units.exclusive[u] || !is_plain(p.profiles[p.units.profile[u]])
 
+"""
+    skips_environment(p, j) -> Bool
+
+Whether the run skips the environment of profile `j`: an environment directory that
+`skip_environment` of the profile's package names, by its path from `test/`. The run
+does not build such an environment and starts no worker in it, and it records the
+items there as skipped itself (`attempt_skipped!`).
+"""
+function skips_environment(p::Plan, j::Integer)
+    dir = p.profiles[j].environment
+    isempty(dir) && return false
+    k = p.profile_package[j]
+    return rel_slash(dir, joinpath(p.packages.root[k], "test")) in p.packages.cfg[k].skip_environment
+end
+
 # The default profile in the test environment: what this process can be.
 is_plain(prof::Profile) = prof.name === DEFAULT_PROFILE && isempty(prof.environment)
 
@@ -1035,6 +1050,7 @@ environment directory runs in a copy of it instead (see
 """
 function profile_projects!(run::Run, p::Plan)
     for (j, prof) in enumerate(p.profiles)
+        skips_environment(p, j) && continue
         env = run.package_projects[p.profile_package[j]]
         announce = () -> say(run, "resolving the environment of ", relpath_or_path(prof.environment, p.root))
         # An environment directory gets the package of its own suite.
@@ -1253,8 +1269,9 @@ function precompile_phase(run::Run, p::Plan)
     return nothing
 end
 
-# Every field, in order: the set differs between versions (1.14 adds `coverage`).
-const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(join((getfield(f, i) for i in 1:nfields(f)), ' '))"
+# Every field, in order, as a tuple of literals: the set differs between versions (1.14
+# adds `coverage`, and `coverage_path`, a path that can hold a space, or `nothing`).
+const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(repr(ntuple(i -> getfield(f, i), nfields(f))))"
 
 """
     cache_flags_for(julia_args) -> Base.CacheFlags
@@ -1268,67 +1285,212 @@ function cache_flags_for(julia_args::Cmd)
         `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e $CACHE_FLAGS_CODE`,
         String
     )
-    f = split(out)
+    # Read, not evaluated: `nothing` reads as a name, and every other field as a literal.
+    ex = Meta.parse(out; raise = false)
+    f = ex isa Expr && ex.head === :tuple ? Any[a === :nothing ? nothing : a for a in ex.args] : Any[]
     T = Base.CacheFlags
     length(f) == fieldcount(T) || error("Runtests: could not read the cache flags of `julia $julia_args`: $out")
-    return T((parse(fieldtype(T, i), f[i]) for i in 1:fieldcount(T))...)
+    return T((convert(fieldtype(T, i), f[i]) for i in 1:fieldcount(T))...)
 end
 
 """
     precompile_env(run, p, flags_of)
 
-Precompile the test environment once for every set of cache flags the run will
-use: this process's own, and one per pool with julia arguments of its own, as
-`flags_of(profile)` gives them. A package image built under other flags cannot be
-used, so a worker with other flags would otherwise compile the package and its
-dependencies itself, serially and silently, while the run looks stalled on its first
-item. `test_env` turns off `Pkg`'s own precompilation so that this is the one pass.
+Precompile what the run's workers will load, in every project they will start in
+and under every set of cache flags they will start with, as `flags_of(profile)`
+gives them: a package image built under other flags cannot be used, so a worker
+with other flags would otherwise compile the package and its dependencies itself,
+serially and silently, while the run looks stalled on its first item. Only the
+pools of the run are asked, so an environment whose items the run leaves out is
+not compiled. A profile's `precompile` names the packages compiled for its items in
+place of their environment; their workers compile what else the items load.
+`test_env` turns off `Pkg`'s own precompilation so that these are the only passes.
 
-Returns every set of cache flags the pools' workers have besides this process's, with
-the julia arguments that give it, for Runtests itself to be compiled for too.
+Returns every set of cache flags the pools' workers have besides this process's,
+with the julia arguments that give it, for Runtests itself to be compiled for too.
 """
 function precompile_env(run::Run, p::Plan, flags_of)
-    # The flags this process runs under lead, because every pool without julia
-    # arguments of its own uses them and because `test_env` switched `Pkg`'s own
-    # precompilation off.
-    configs = Pair{Cmd, Base.CacheFlags}[`` => Base.CacheFlags()]
-    names = String[]
-    others = Pair{Cmd, Base.CacheFlags}[]
-    for pool in p.pools
-        prof = p.profiles[pool.profile]
-        # Only julia arguments reach the cache key.
-        isempty(prof.julia_args) && continue
-        flags = flags_of(prof)
-        flags === nothing && continue
-        flags == Base.CacheFlags() || flags in last.(others) || push!(others, Cmd(prof.julia_args) => flags)
-        # A profile with preferences runs in a project of its own, which `configs`
-        # cannot carry; it gets a call of its own below.
-        (haskey(run.profile_projects, pool.profile) || flags in last.(configs)) && continue
-        push!(configs, Cmd(prof.julia_args) => flags)
-        push!(names, String(prof.name))
-    end
-    # One call each: a project is part of a cache's identity, so two profiles with
-    # different preferences are two environments, not two configurations of one.
-    for (j, dir) in sort!(collect(run.profile_projects); by = first)
-        prof = p.profiles[j]
-        flags = flags_of(prof)
-        flags === nothing && continue
-        where_ = isempty(prof.environment) ? "the test environment" :
-            string("the environment of ", relpath_or_path(prof.environment, p.root))
-        say(run, "precompiling ", where_, " for profile ", prof.name)
-        precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$(prof.name)` in $where_")
-    end
-    # Named only when there is something to name: `Pkg` narrates the rest, and says
-    # nothing when there is nothing to do.
-    isempty(names) || say(run, "precompiling the test environment for ", plural(length(names), "profile"), ": ", join(names, ", "))
-    precompile_configs(run, configs, Base.active_project(), join(names, ", "))
-    # An isolated package's items run in its own test project, a project of its own.
-    for k in eachindex(p.packages.name)
-        p.packages.isolated[k] || continue
-        say(run, "precompiling the test environment of ", p.packages.name[k])
-        precompile_configs(run, configs, run.package_projects[k], p.packages.name[k])
+    needs, others = precompile_needs(run, p, flags_of)
+    for call in precompile_calls(needs)
+        label = string(call.subject, isempty(call.profiles) ? "" :
+            string(" for ", plural(length(call.profiles), "profile"), ": ", join(call.profiles, ", ")))
+        # Named only when there is something to name: `Pkg` narrates the rest.
+        label == TEST_ENVIRONMENT || say(run, "precompiling ", label)
+        precompile_configs(run, call.configs, call.project, label; pkgs = call.names)
     end
     return others
+end
+
+const PrecompileConfig = Pair{Cmd, Base.CacheFlags}
+const TEST_ENVIRONMENT = "the test environment"
+
+# What the pools of one project need compiled under one set of cache flags: every
+# dependency of the project (`whole`), or `names` and their dependencies. `subject`
+# is the project as a message names it, and `profiles` the profiles a message names.
+const PrecompileNeed = @NamedTuple{project::String, config::PrecompileConfig, whole::Bool, names::Set{String},
+                                   subject::String, profiles::Set{String}}
+
+# One call of the precompiler: `names` and their dependencies, or every dependency
+# of `project` when `names` is empty, under each of `configs`.
+const PrecompileCall = @NamedTuple{project::String, configs::Vector{PrecompileConfig}, names::Vector{String},
+                                   subject::String, profiles::Vector{String}}
+
+# The needs of the run's pools, one for each project and set of cache flags, and the
+# sets of flags besides this process's. In a run of one package a pool needs its
+# whole project, as a pool in an environment directory does. In a combined run a
+# pool needs the test dependencies of the packages its items belong to, so the julia
+# arguments of one package's profile do not compile the rest of the workspace's. An
+# item whose profile has a `precompile` list needs the packages of the list that its
+# project holds, and Runtests. A pool can hold items of several profiles, so each
+# item's own profile decides. A name in a list that no project of the profile's items
+# holds is a `ConfigError`: misspelled, it would compile nothing.
+function precompile_needs(run::Run, p::Plan, flags_of)
+    needs = PrecompileNeed[]
+    others = PrecompileConfig[]
+    # A run without a project holds an empty path for it.
+    file_of(project) = isempty(project) ? nothing : isdir(project) ? project_file_in(project) : project
+    env_deps = Dict{String, Set{String}}()
+    deps_of(project) = get!(env_deps, project) do
+        file = file_of(project)
+        file === nothing && return Set{String}()
+        return Set{String}(keys(get(parse_project(file), "deps", Dict{String, Any}())))
+    end
+    # Every package that the precompiler can find in `project`: its own, its
+    # dependencies and theirs.
+    env_packages = Dict{String, Set{String}}()
+    packages_of(project) = get!(env_packages, project) do
+        file = file_of(project)
+        file === nothing && return Set{String}()
+        names = copy(deps_of(project))
+        own = get(parse_project(file), "name", nothing)
+        own isa String && push!(names, own)
+        manifest = Base.project_file_manifest_path(file)
+        if manifest !== nothing && isfile(manifest)
+            data = TOML.parsefile(manifest)
+            # Format 1 has the packages at the top level.
+            entries = get(data, "deps", nothing)
+            union!(names, keys(entries isa AbstractDict ? entries : data))
+        end
+        return names
+    end
+    # The names of each profile's list, by package and profile, until a project of its
+    # items holds them.
+    unheld = Dict{Tuple{Int32, Symbol}, Set{String}}()
+    # The names the items of package `k` can load: the package, its test project's
+    # dependencies and Runtests.
+    names_of = Dict{Int32, Set{String}}()
+    test_dep_names(k::Integer) = get!(names_of, Int32(k)) do
+        names = Set{String}([p.packages.name[k], "Runtests"])
+        test = project_file_in(joinpath(p.packages.root[k], "test"))
+        test === nothing || union!(names, keys(get(parse_project(test), "deps", Dict{String, Any}())))
+        return names
+    end
+    # The packages whose names each need holds already.
+    held = Set{Tuple{Int, Int32}}()
+    for pool in p.pools
+        j = pool.profile
+        skips_environment(p, j) && continue
+        prof = p.profiles[j]
+        flags = isempty(prof.julia_args) ? Base.CacheFlags() : flags_of(prof)
+        # Flags that could not be read were said; those workers compile for themselves.
+        flags === nothing && continue
+        project = worker_project(run, j)
+        own = haskey(run.profile_projects, ProfileIdx(j))
+        k = p.profile_package[j]
+        subject = !isempty(prof.environment) ? string("the environment of ", relpath_or_path(prof.environment, p.root)) :
+            p.packages.isolated[k] ? string(TEST_ENVIRONMENT, " of ", p.packages.name[k]) : TEST_ENVIRONMENT
+        whole = !is_combined(p) || !isempty(prof.environment)
+        for u in first(pool.head):last(pool.tail)
+            here = single_process(p) && !needs_worker(p, u)
+            default = here || flags == Base.CacheFlags()
+            config = default ? (`` => Base.CacheFlags()) : (Cmd(prof.julia_args) => flags)
+            default || flags in last.(others) || push!(others, config)
+            i = findfirst(n -> n.project == project && last(n.config) == last(config), needs)
+            if i === nothing
+                push!(needs, (; project, config, whole = false, names = Set{String}(), subject, profiles = Set{String}()))
+                i = lastindex(needs)
+            end
+            unit_profile = p.units.profile[u]
+            listed = p.profiles[unit_profile].precompile
+            if listed !== nothing
+                held_here = intersect(listed, packages_of(project))
+                setdiff!(get!(() -> Set{String}(listed), unheld, (p.profile_package[unit_profile], p.profiles[unit_profile].name)),
+                         held_here)
+                union!(needs[i].names, held_here)
+                isempty(held_here) || ((own || !default) && push!(needs[i].profiles, String(prof.name)))
+                # A worker loads Runtests before it connects. Where the project does not
+                # hold it, `precompile_self` compiles it.
+                "Runtests" in deps_of(project) && push!(needs[i].names, "Runtests")
+                continue
+            end
+            # A profile in a project of its own is named, and one with flags of its own.
+            (own || !default) && push!(needs[i].profiles, String(prof.name))
+            if whole
+                needs[i].whole || (needs[i] = merge(needs[i], (; whole = true)))
+                continue
+            end
+            for item in p.units.span[u]
+                package = p.items.package[item]
+                (i, package) in held && continue
+                push!(held, (i, package))
+                union!(needs[i].names, intersect(test_dep_names(package), deps_of(project)))
+            end
+        end
+    end
+    for ((k, name), names) in sort!(collect(unheld); by = first)
+        isempty(names) && continue
+        throw(ConfigError(string(
+            "`precompile` of profile `", name, "`", is_combined(p) ? string(" of ", p.packages.name[k]) : "", " names ",
+            join(("`$n`" for n in sort!(collect(names))), ", "), ", which ",
+            length(names) == 1 ? "is not a package" : "are not packages", " of the environment of its items"
+        )))
+    end
+    return needs, others
+end
+
+"""
+    precompile_calls(needs) -> Vector{PrecompileCall}
+
+The calls of the precompiler that cover `needs`, the largest first. One call
+compiles its packages under each of its sets of flags in one queue, so a project
+gets one call for the sets of flags that need the whole of it, and one for each
+group of names that the same sets of flags need: at most one call for each set of
+flags. No package is compiled under flags that no pool loads it with. Each call
+has a queue of its own: Julia's precompiler takes one project for a call, and one
+list of flags for all its packages.
+"""
+function precompile_calls(needs::Vector{PrecompileNeed})
+    calls = PrecompileCall[]
+    add!(mine, names) = push!(calls, (;
+        project = first(mine).project, configs = PrecompileConfig[n.config for n in mine], names,
+        subject = first(mine).subject, profiles = sort!(collect(union((n.profiles for n in mine)...)))
+    ))
+    for project in unique(n.project for n in needs)
+        mine = filter(n -> n.project == project, needs)
+        # This process's flags lead, then the others in the order of their arguments.
+        sort!(mine; by = n -> (last(n.config) != Base.CacheFlags(), first(n.config).exec))
+        whole = filter(n -> n.whole, mine)
+        isempty(whole) || add!(whole, String[])
+        named = filter(n -> !n.whole && !isempty(n.names), mine)
+        # Each name with the needs that hold it: equal lists, one call.
+        holders = Dict{String, Vector{Int}}()
+        for (i, n) in pairs(named), name in n.names
+            push!(get!(Vector{Int}, holders, name), i)
+        end
+        groups = Dict{Vector{Int}, Vector{String}}()
+        for (name, is) in holders
+            push!(get!(Vector{String}, groups, is), name)
+        end
+        if length(groups) <= length(named)
+            for (is, names) in groups
+                add!(named[is], sort!(names))
+            end
+        else
+            # More groups than sets of flags: a call for each set of flags is fewer.
+            foreach(n -> add!([n], sort!(collect(n.names))), named)
+        end
+    end
+    return sort!(calls; by = c -> (!isempty(c.names), -length(c.names), c.project, c.names))
 end
 
 # The cache flags a profile's workers will have, or `nothing` — said once — when
@@ -1344,24 +1506,27 @@ function profile_flags(prof::Profile)
     end
 end
 
-# One precompilation of `project`'s dependencies. Work brought forward, not work that
-# has to succeed: a worker that finds nothing cached still compiles what it needs, one
-# process at a time. The precompiler draws its own progress by moving the cursor, so
-# ours comes down while it does. Base's, as `Pkg.precompile` calls it, without the
-# `Pkg` context that call builds: making one rewrites the depot's whole manifest
-# usage log, most of the step's cost when there is nothing to compile, and records
-# the temporary test environment in it.
-function precompile_configs(run::Run, configs, project, what::AbstractString)
+# One precompilation of `pkgs` and their dependencies in `project`, or of all of
+# them when `pkgs` is empty, under each of `configs`. `label` is what a message
+# calls it. Work brought forward, not work that has to succeed: a worker that finds
+# nothing cached still compiles what it needs, one process at a time. The
+# precompiler draws its own progress by moving the cursor, so ours comes down while
+# it does. Base's, as `Pkg.precompile` calls it, without the `Pkg` context that call
+# builds: making one rewrites the depot's whole manifest usage log, most of the
+# step's cost when there is nothing to compile, and records the temporary test
+# environment in it.
+function precompile_configs(run::Run, configs, project, label::AbstractString; pkgs::Vector{String} = String[])
     original = Base.active_project()
     try
         with_status_line_off(run.monitor) do
-            Base.set_active_project(project)
-            Base.Precompilation.precompilepkgs(String[]; configs, warn_loaded = false, io = stdout)
+            # A run without a project holds an empty path for it.
+            Base.set_active_project(isempty(project) ? nothing : project)
+            Base.Precompilation.precompilepkgs(pkgs; configs, warn_loaded = false, io = stdout)
         end
     catch e
         is_interrupt(e) && rethrow()
-        @warn "Runtests: could not precompile the test environment for $what; its workers \
-               will compile what they need themselves" exception = e
+        @warn "Runtests: could not precompile $label; its workers will compile what they \
+               need themselves" exception = e
     finally
         Base.set_active_project(original)
     end
@@ -1413,6 +1578,10 @@ function setup_needs(run::Run, p::Plan, flags_of)
     out = @NamedTuple{project::String, load_path::Vector{String}, needs::Vector{SetupNeed}}[]
     for pool in p.pools, u in first(pool.head):last(pool.tail)
         j = pool.profile
+        skips_environment(p, j) && continue
+        # A profile with a `precompile` list leaves its setups to its workers: compiled
+        # here, a setup would build each dependency that has no cache, one at a time.
+        p.profiles[p.units.profile[u]].precompile === nothing || continue
         here = single_process(p) && !needs_worker(p, u)
         flags = here ? Base.CacheFlags() : flags_of(p.profiles[j])
         # Flags that could not be read were said; those workers compile for themselves.
@@ -1536,11 +1705,11 @@ function compile_setup(job)
     # and throws an exception saying only that it failed; both go in the error.
     out = IOBuffer()
     try
-        # Given the source path: Julia 1.11's form without it takes no `cacheflags`.
+        # Given the source: Julia 1.11's form without it takes no `cacheflags`.
         # Without this process's modules, as in `precompile_self`.
-        path = Base.locate_package(job.pkg)
-        path === nothing && throw(ArgumentError("$(job.pkg) not found during precompilation"))
-        Base.compilecache(job.pkg, path, out, out, false; flags = job.args, cacheflags = job.flags)
+        source = package_source(job.pkg)
+        source === nothing && throw(ArgumentError("$(job.pkg) not found during precompilation"))
+        Base.compilecache(job.pkg, source, out, out, false; flags = job.args, cacheflags = job.flags)
         return nothing
     catch e
         is_interrupt(e) && rethrow()
@@ -1571,8 +1740,8 @@ end
 function precompile_self(run::Run, others::Vector{Pair{Cmd, Base.CacheFlags}})
     pkg = RuntestsWorkers.PKGID
     stale = filter(config -> !has_fresh_cache(pkg, last(config)), others)
-    path = Base.locate_package(pkg)
-    (isempty(stale) || path === nothing) && return nothing
+    source = package_source(pkg)
+    (isempty(stale) || source === nothing) && return nothing
     say(run, "precompiling Runtests for workers started with ", join(("`$(join(first(c).exec, " "))`" for c in stale), ", "))
     for (args, flags) in stale
         out = IOBuffer()
@@ -1580,7 +1749,7 @@ function precompile_self(run::Run, others::Vector{Pair{Cmd, Base.CacheFlags}})
             # Without this process's modules (`false`): the child would be held to the
             # builds of them loaded here, which are compiled under other flags and so
             # cannot be loaded there. That failure is returned, not thrown.
-            r = Base.compilecache(pkg, path, out, out, false; flags = args, cacheflags = flags)
+            r = Base.compilecache(pkg, source, out, out, false; flags = args, cacheflags = flags)
             r isa Exception && throw(r)
         catch e
             is_interrupt(e) && rethrow()
@@ -1595,14 +1764,35 @@ end
 # Whether a new process with cache flags `flags` finds a cache of `pkg` it can load.
 # Asked as of a fresh session (`ignore_loaded`), as a worker is one: otherwise the
 # answer is about the builds this process has loaded, which for other flags is no.
+# `sourcepath` names the source directly, for a package this process cannot locate.
 # 1.12's `isprecompiled` takes the flags; from 1.13 it asks for this process's only,
-# and the function behind it takes them.
-@static if hasmethod(Base.isprecompiled, Tuple{Base.PkgId}, (:flags,))
-    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) =
-        Base.isprecompiled(pkg; flags, ignore_loaded = true)
+# and the function behind it takes them. It also renames `sourcepath` for the
+# `Base.PkgLoadSpec` that 1.14's `compilecache` takes, and `VERSION_EDITION` is the
+# syntax edition of a project that names none.
+function has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags;
+                         sourcepath::Union{String, Nothing} = nothing)
+    # `nothing` is not theirs to pass on: their own fallback locates the package.
+    kw = sourcepath === nothing ? (;) : source_kwarg(sourcepath)
+    @static if hasmethod(Base.isprecompiled, Tuple{Base.PkgId}, (:flags,))
+        return Base.isprecompiled(pkg; flags, ignore_loaded = true, kw...)
+    else
+        return Base.compilecache_freshest_path(pkg; flags, ignore_loaded = true,
+                                               verify_checksums = false, kw...) !== nothing
+    end
+end
+@static if isdefined(Base, :PkgLoadSpec)
+    source_kwarg(path) = (; sourcespec = Base.PkgLoadSpec(path, Base.VERSION_EDITION))
 else
-    has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags) =
-        Base.compilecache_freshest_path(pkg; flags, ignore_loaded = true, verify_checksums = false) !== nothing
+    source_kwarg(path) = (; sourcepath = path)
+end
+
+# The source of `pkg` in the form that the positional `Base.compilecache` takes, or
+# `nothing`: from 1.14 a load spec, the path with the syntax edition of the package,
+# and before that the path alone.
+@static if isdefined(Base, :locate_package_load_spec)
+    package_source(pkg::Base.PkgId) = Base.locate_package_load_spec(pkg)
+else
+    package_source(pkg::Base.PkgId) = Base.locate_package(pkg)
 end
 
 ### Workers ################################################################
@@ -2361,8 +2551,10 @@ end
 # was lost part way through, which leaves the rest of the unit unable to run.
 function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8, max_attempts::Int)
     p = run.plan
-    exclusive = p.units.exclusive[u]
-    attempt_item! = single_process(p) && !needs_worker(p, u) ? attempt_here! : attempt_on_worker!
+    skipped = skips_environment(p, p.units.profile[u])
+    exclusive = p.units.exclusive[u] && !skipped
+    attempt_item! = skipped ? attempt_skipped! :
+        single_process(p) && !needs_worker(p, u) ? attempt_here! : attempt_on_worker!
     # A sandbox is a process to itself, and the slot may arrive holding a worker
     # that has already run other items.
     exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
@@ -2426,6 +2618,21 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     record_result!(run, i, slot, attempt, result, max_attempts)
     # Then the evidence, before a retry, the chain's next item or a sandbox's end.
     return finish_attempt!(run, slot, i, attempt, result, w)
+end
+
+# One attempt at item `i` of an environment the run skips (`skips_environment`): the
+# run records the item as skipped itself. No process runs it, so none is started.
+function attempt_skipped!(run::Run, _, i::ItemIdx, _, attempt::Int8, _)
+    p = run.plan
+    began!(run, i, SlotIdx(0), attempt, 0)
+    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + run.statuses.start[i])
+    Test.record(ts, Test.Broken(:skipped, p.items.name[i]))
+    ended = time()
+    finished_at!(ts, ended)
+    printline(run, item_line(run, nothing, i, attempt, (; state = SKIPPED, elapsed_ns = 0, compile_ns = 0, maxrss = 0)))
+    record!(run, i, SlotIdx(0), attempt, SKIPPED, ts, RuntestsWorkers.PerfStats(), true,
+            string("the run skips ", environment_name(p.profiles[p.units.profile[p.items.unit[i]]].environment)); ended)
+    return true
 end
 
 # One attempt at item `i` in this process. There is no second process to kill, so
@@ -2705,7 +2912,7 @@ gives it), and how it went (`state`: `:running`
 as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped`,
 `:broken_chain` or `:cancelled`). `pid` is 0 when no process ran the attempt: the run
 could not start a worker for it, or it is an item of a chain whose worker died before
-it ran, which has `worker` 0 as well.
+it ran or an item of an environment the run skips, which have `worker` 0 as well.
 
 As it ends, it says what the attempt cost: `elapsed`, `cpu` (user and system time),
 `compile`, `recompile` (of `compile`) and `gc` in seconds, `allocated` in bytes,

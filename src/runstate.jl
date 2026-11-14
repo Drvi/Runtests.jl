@@ -254,12 +254,13 @@ const REPLAYED_SETTINGS = (
     :test_end_timeout => s -> parse(Int, s), :artifacts_timeout => s -> parse(Int, s), :retries => s -> parse(Int, s),
     :failfast => s -> parse(Bool, s), :item_failfast => s -> parse(Bool, s),
     :logs => Symbol, :memory_threshold => s -> parse(Float64, s),
-    :seed => s -> parse(UInt64, s),
+    :seed => s -> parse(UInt64, s), :skip_environment => s -> String[n for n in split(s, ',')],
 )
 
 run_setting(cfg::RunConfig, key::Symbol) =
     key === :timeout ? cfg.timeout_s : key === :init_timeout ? cfg.init_timeout_s :
     key === :test_end_timeout ? cfg.test_end_timeout_s : key === :artifacts_timeout ? cfg.artifacts_timeout_s :
+    key === :skip_environment ? join(cfg.skip_environment, ',') :
     getfield(cfg, key)
 
 # Variables a run's behaviour can depend on, and the ones that find the CI job it
@@ -858,7 +859,7 @@ function read_profiles_section(io::IO, strings)
         test_end = parse_block(lookup(strings, read(io, UInt32)))
         path = lookup(strings, read(io, UInt32))
         content = lookup(strings, read(io, UInt32))
-        profiles[name] = Profile(name, args, threads, env, init, test_end, path, "", "")
+        profiles[name] = Profile(name, args, threads, env, init, test_end, path, "", "", nothing)
         isempty(content) || (preferences[name] = content)
     end
     return profiles, preferences

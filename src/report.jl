@@ -85,7 +85,8 @@ function print_profiles(io::IO, p::Plan)
         parts = profile_parts(prof, p.profiles[1].threads)
         isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
     end
-    envs = unique!(String[relpath_or_path(prof.environment, p.root) for prof in p.profiles if !isempty(prof.environment)])
+    envs = unique!(String[string(relpath_or_path(prof.environment, p.root), skips_environment(p, j) ? " (skipped)" : "")
+                          for (j, prof) in pairs(p.profiles) if !isempty(prof.environment)])
     isempty(envs) || println(io, length(envs) == 1 ? "env dir: " : "env dirs: ", join(envs, ", "))
     return nothing
 end

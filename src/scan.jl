@@ -131,6 +131,26 @@ end
 environment_name(dir::AbstractString) = isempty(dir) ? "the test environment" : "the environment of $(relpath_or_path(dir))"
 
 """
+    check_skip_environment(names, known, err)
+
+Throw `err` for a name in `names`, the environments a run is told to skip, that is
+not in `known`: the environment directories of the suite, each as its path from
+`test/`. A misspelled name would otherwise skip nothing, and the run would build the
+environment it was told to leave alone.
+"""
+function check_skip_environment(names::Vector{String}, known::Vector{String}, err)
+    unknown = String[n for n in names if !(n in known)]
+    isempty(unknown) && return nothing
+    throw(err(string(
+        "`skip_environment` names ", join(("`$n`" for n in unknown), ", "), ", which ",
+        length(unknown) == 1 ? "is not an environment directory" : "are not environment directories",
+        " of the suite; ", isempty(known) ? "the suite has none" :
+            string("the suite has ", join(("`$n`" for n in sort(known)), ", ")),
+        ". An environment directory is named by its path from `test/`, as in `qa` for `test/qa`"
+    )))
+end
+
+"""
     environment_of(path, testdir) -> String
 
 The same for one file, `path`, read from the disk rather than from a walk of

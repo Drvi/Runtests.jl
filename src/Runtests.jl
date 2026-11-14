@@ -96,6 +96,12 @@ set, and otherwise `default`: the group of that name when `[groups]` declares on
 and the whole suite when it does not. A name, tag or group the suite does not have
 is an error that says the nearest it does.
 
+`skip_environment` names environment directories, each by its path from `test/`
+(`"qa"` for `test/qa`), or one of them: the run does not build these environments and
+starts no worker in them, and it records the items it selected there as skipped. A
+name that is not an environment directory of the suite is an error. Also
+`RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, and `[run]`.
+
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
 expressions are timed separately from the items, and default to `timeout`),
@@ -247,6 +253,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
+    check_skip_environment(cfg.skip_environment, String[rel_slash(dir, target.testdir) for dir in environments],
+                           get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
     rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
@@ -322,8 +330,9 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
     for (name, prof) in rs.profiles
         prefs = get(rs.preferences, name, "")
         path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
+        # `precompile` from this checkout's configuration, as a run state does not hold it.
         profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, "",
-                                 get(dirs, name, ""))
+                                 get(dirs, name, ""), get(cfg.profiles, name, prof).precompile)
     end
     # The code its workers compiled, which this process's flags need not match: the
     # recorded flags go first, before each profile's own, as the recorded workers had
@@ -336,7 +345,7 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
     if !isempty(julia_flags)
         for (name, prof) in profiles
             profiles[name] = Profile(prof.name, [julia_flags; prof.julia_args], prof.threads, prof.env, prof.init,
-                                     prof.test_end, prof.preferences, prof.environment, prof.dir)
+                                     prof.test_end, prof.preferences, prof.environment, prof.dir, prof.precompile)
         end
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))

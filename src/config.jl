@@ -34,13 +34,18 @@ struct Profile
     # profile that a workspace shares with its packages (see `SharedProfiles`), or
     # empty for the root of the package whose configuration holds it.
     dir::String
+    # The packages the run precompiles for its workers before they start, with their
+    # dependencies: `nothing` for the whole environment of its items. A worker compiles
+    # any other package as an item loads it. Not part of the start configuration, and
+    # not in a run state: it changes when packages compile, not how a worker starts.
+    precompile::Union{Nothing, Vector{String}}
 end
 
 Profile(
     name::Symbol; julia_args = String[], threads = "2,1", env = Pair{String, String}[],
-    init = Expr(:block), test_end = Expr(:block), preferences = "", environment = "", dir = ""
+    init = Expr(:block), test_end = Expr(:block), preferences = "", environment = "", dir = "", precompile = nothing
 ) =
-    Profile(name, julia_args, threads, env, init, test_end, preferences, environment, dir)
+    Profile(name, julia_args, threads, env, init, test_end, preferences, environment, dir, precompile)
 
 """
     SharedProfiles
@@ -114,12 +119,16 @@ Base.@kwdef struct RunConfig
     replayed_from::String = ""
     # The file a call named to read in place of `test/TestItems.toml`, or empty.
     config_file::String = ""
+    # The environment directories the run does not build, each as its path from
+    # `test/`: the run records their items as skipped itself.
+    skip_environment::Vector{String} = String[]
 end
 
 const RUN_KEYS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :artifacts_timeout, :retries,
     :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
     :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
+    :skip_environment,
 )
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
@@ -138,7 +147,7 @@ function unknown_keyword(k::Symbol)
 end
 
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :monorepo_default)
+const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :monorepo_default, :precompile)
 const TOP_KEYS = (:run, :order, :profiles, :groups, :monorepo)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
@@ -246,6 +255,8 @@ env_setting_name(key::Symbol) = string("RUNTESTS_", uppercase(String(key)))
 # the setting's own check then refuses by name.
 function env_setting(key::Symbol, name::String, text::String)
     key in FLAG_SETTINGS && return env_flag(name)
+    # Names with commas between them.
+    key === :skip_environment && return String[strip(n) for n in split(text, ','; keepempty = false)]
     (key in (:threads, :logs, :testset_name) || (key === :workers && text == "auto")) && return text
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
@@ -323,6 +334,12 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
     testset_name = pick(:testset_name, "Runtests")
     (testset_name isa AbstractString && !isempty(testset_name)) ||
         throw(bad("`testset_name` must be a non-empty string, got $(repr(testset_name))", :testset_name))
+    skip = pick(:skip_environment, String[])
+    skip isa AbstractString && (skip = [skip])
+    (skip isa AbstractVector && all(n -> n isa AbstractString && !isempty(n), skip)) || throw(bad(
+        "`skip_environment` must be the name of an environment directory, as in \"qa\" for `test/qa`, " *
+            "or a vector of them, got $(repr(skip))", :skip_environment
+    ))
 
     return RunConfig(;
         workers, threads, timeout_s = timeout,
@@ -341,7 +358,9 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
         seed = seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed),
-        config_file = String(config_file)
+        config_file = String(config_file),
+        # With `/` between the directories, whatever the system writes.
+        skip_environment = unique!(String[rstrip(replace(n, '\\' => '/'), '/') for n in skip])
     )
 end
 
@@ -411,13 +430,14 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString)
     shares isa Bool || throw(ConfigError(
         "`monorepo_default` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(shares))"
     ))
+    precompile = haskey(p, "precompile") ? string_list(path, p, "precompile", label) : nothing
     prof = Profile(
         Symbol(name), args,
         haskey(p, "threads") ? threads_spec("threads", p["threads"]; where_ = " of [$label] in $(relpath_or_path(path))") : "",
         env,
         parse_expr(path, name, "init", string_setting(path, p, "init", label)),
         parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
-        profile_preferences(path, name, get(p, "preferences", "")), "", ""
+        profile_preferences(path, name, get(p, "preferences", "")), "", "", precompile
     )
     return prof, shares
 end
@@ -436,7 +456,7 @@ function share_profiles!(profiles::Dict{Symbol, Profile}, shared::SharedProfiles
             profiles[name] = s
         elseif same_code(own.init, s.init) && same_code(own.test_end, s.test_end)
             profiles[name] = Profile(own.name, own.julia_args, own.threads, own.env, s.init, s.test_end,
-                                     own.preferences, own.environment, s.dir)
+                                     own.preferences, own.environment, s.dir, own.precompile)
         end
     end
     return profiles
@@ -464,7 +484,7 @@ function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
         (given isa AbstractDict && get(given, "monorepo_default", false) === true) || continue
         prof, _ = parse_profile(path, tbl, name)
         out[prof.name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end,
-                                 prof.preferences, prof.environment, String(workspace))
+                                 prof.preferences, prof.environment, String(workspace), prof.precompile)
     end
     return SharedProfiles(String(path), out)
 end
@@ -498,11 +518,12 @@ end
 # sets none.
 run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
     Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment,
-            prof.dir) :
+            prof.dir, prof.precompile) :
     prof
 
 # The profile fields a worker gets when it starts: everything but its name,
-# `test_end` (run after each item) and `dir` (handled separately by `pool_key`).
+# `test_end` (run after each item), `dir` (handled separately by `pool_key`) and
+# `precompile` (what the run compiles before any worker starts).
 start_configuration(prof::Profile) =
     (prof.julia_args, prof.threads, prof.env, prof.init, prof.preferences, prof.environment)
 
@@ -510,7 +531,7 @@ start_configuration(prof::Profile) =
 # or in the test environment when it is empty.
 in_environment(prof::Profile, environment::AbstractString) =
     Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, prof.preferences,
-            String(environment), prof.dir)
+            String(environment), prof.dir, prof.precompile)
 
 """
     read_groups(path, toml) -> Dict{String, TagExpr}

@@ -208,7 +208,7 @@ end
         foreach(closewrite, logs)
         outputs = [read(l, String) for l in logs]
         @test all(proc -> proc.exitcode == 0, procs) || (foreach(println, outputs); false)
-        @test reads > 0 && isempty(bad)
+        @test (reads > 0 && isempty(bad)) || (println("reads: ", reads); foreach(println, bad); false)
         withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             runs = filter(!isnothing, read_run_state.(runstate_files(pkg)))
             ran = filter(rs -> rs.start_unix > seeded, runs)

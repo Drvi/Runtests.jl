@@ -304,6 +304,17 @@ end
     end
 end
 
+@testset "a coverage run precompiles for the flags its workers count lines under" begin
+    # From 1.14 the path whose lines are counted is in the cache flags, and the package
+    # there needs a cache built under them. Before, coverage leaves the flags as they are.
+    dir = make_pkg("CoveragePrecompile", "test/t_test.jl" => "@testitem \"plain\" begin\n    @test true\nend\n")
+    with_runstate_dir() do _
+        (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, coverage = true))
+        @test all(==(PASSED), values(states))
+        @test occursin("precompiling the test environment for 1 profile: default", out) == (VERSION >= v"1.14-")
+    end
+end
+
 @testset "a profile whose items the run leaves out is not precompiled" begin
     # Its preferences give it a project of its own, which only its own items load.
     dir = make_pkg(

@@ -256,15 +256,18 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     ready = joinpath(tmp, "ready")
     ignored = joinpath(tmp, "sigint_ignored")
     script = """
-    # Julia 1.12 on macOS can come up ignoring SIGINT: its signal thread sets it to
-    # SIG_IGN, racing the handler the main thread installs, and when it lands second
-    # the runtime drops every Ctrl-C before any Julia code sees it (fixed in 1.13 by
-    # JuliaLang/julia#62471). Looked at before Runtests is loaded, so nothing of Runtests'
-    # can be what set it.
-    let act = zeros(UInt8, 256)   # a `struct sigaction`, whose first field is the handler
+    # Julia 1.11 and 1.12 on macOS can come up ignoring SIGINT: its signal thread sets
+    # it to SIG_IGN, racing the handler the main thread installs, and when it lands
+    # second the runtime drops every Ctrl-C before any Julia code sees it (fixed in 1.13
+    # by JuliaLang/julia#62471). Looked at before Runtests is loaded, and again just
+    # before the run: on a busy machine the signal thread can land seconds late.
+    # Runtests never changes how SIGINT is handled.
+    function sigint_ignored()
+        act = zeros(UInt8, 256)   # a `struct sigaction`, whose first field is the handler
         ccall(:sigaction, Cint, (Cint, Ptr{Cvoid}, Ptr{UInt8}), 2, C_NULL, act) == 0 || error("sigaction")
-        reinterpret(UInt, act[1:sizeof(UInt)])[1] == 1 && (touch($(repr(ignored))); exit())
+        return reinterpret(UInt, act[1:sizeof(UInt)])[1] == 1
     end
+    sigint_ignored() && (touch($(repr(ignored))); exit())
     # A script exits on SIGINT unless told otherwise; a REPL raises it.
     $(repl ? "Base.exit_on_sigint(false)" : "")
     using Runtests
@@ -280,6 +283,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
             @test true
         end
         \"\"\" for i in 1:$items], "\\n"))
+    sigint_ignored() && (touch($(repr(ignored))); exit())
     # From 1.14 Ctrl-C cancels this script's scope, where every later wait throws
     # again: what it says afterwards is said shielded.
     try
@@ -301,10 +305,14 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     # while a worker is still starting and has yet to print the pid looked for below.
     running() = all(i -> isfile(ready * string(i)), 1:items)
     deadline = time() + 300
-    # A coordinator that came up ignoring SIGINT is started again: the runtime, not
-    # the run, is what would lose its Ctrl-C.
+    # A coordinator that came up ignoring SIGINT is started again, until the deadline:
+    # the runtime, not the run, is what would lose its Ctrl-C. On a machine with many
+    # more busy processes than CPUs, Julia 1.11 and 1.12 lose that race most times,
+    # and an attempt that loses it at once ends before it loads Runtests.
     local proc, err, log
-    for attempt in 1:5
+    attempts = 0
+    while true
+        attempts += 1
         err = Base.BufferStream()
         log = Base.BufferStream()
         proc = run(pipeline(
@@ -319,7 +327,8 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
         isfile(ignored) || break
         wait(proc)
         rm(ignored)
-        attempt == 5 && error("Julia $VERSION came up ignoring SIGINT five times running: JuliaLang/julia#62471")
+        time() < deadline ||
+            error("Julia $VERSION came up ignoring SIGINT on all $attempts attempts before the deadline: JuliaLang/julia#62471")
     end
     got_running = running()
     sleep(delay)

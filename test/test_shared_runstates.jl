@@ -164,6 +164,32 @@ end
         end
     end
 
+    # On Windows a record that another run is deleting can refuse even `stat` until
+    # every process has closed it. A directory that this user cannot search gives the same
+    # error here. Windows has no such mode, and root searches every directory.
+    (Sys.iswindows() || ccall(:getuid, Cuint, ()) == 0) ||
+    @testset "a record that cannot even be looked at is passed over" begin
+        pkg = make_pkg("SharedHidden", "test/t_test.jl" => shared_items("a", "b"))
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            p, _ = prepare((pkg,); announce = false)
+            shared_run(pkg, p, ["a" => FAILED, "b" => PASSED]; ago = 100)
+            hidden = shared_run(pkg, p, ["a" => PASSED, "b" => FAILED]; ago = 50)
+            dir = dirname(hidden.path)
+            chmod(dir, 0o000)
+            try
+                @test_throws Base.IOError isfile(hidden.path)   # what the readers meet
+                @test read_run_state(hidden.path) === nothing
+                @test read_run_state(dir) === nothing
+                @test length(runstate_files(pkg)) == 1
+                # The newer run is not there to pass `a` or fail `b`.
+                @test failing_items(pkg) == ["a"]
+                @test !haskey(history(pkg).failed, "b")
+            finally
+                chmod(dir, 0o755)
+            end
+        end
+    end
+
     @testset "runs that share a directory read, write and prune it at once" begin
         nruns = 3
         pkg = make_pkg("SharedBusy", "test/t_test.jl" => join(

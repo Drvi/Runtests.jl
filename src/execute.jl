@@ -1260,7 +1260,7 @@ end
 function precompile_phase(run::Run, p::Plan)
     # Each set of julia arguments is asked of a process of its own, so once.
     asked = Dict{Vector{String}, Union{Nothing, Base.CacheFlags}}()
-    flags_of(prof) = get!(() -> profile_flags(prof), asked, prof.julia_args)
+    flags_of(prof) = (args = worker_julia_args(run, prof); get!(() -> profile_flags(prof, args), asked, args))
     # The environment first: a setup module compiled before it would make its
     # worker build the dependencies itself, one at a time.
     others = precompile_env(run, p, flags_of)
@@ -1391,7 +1391,8 @@ function precompile_needs(run::Run, p::Plan, flags_of)
         j = pool.profile
         skips_environment(p, j) && continue
         prof = p.profiles[j]
-        flags = isempty(prof.julia_args) ? Base.CacheFlags() : flags_of(prof)
+        args = worker_julia_args(run, prof)
+        flags = isempty(args) ? Base.CacheFlags() : flags_of(prof)
         # Flags that could not be read were said; those workers compile for themselves.
         flags === nothing && continue
         project = worker_project(run, j)
@@ -1403,7 +1404,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
         for u in first(pool.head):last(pool.tail)
             here = single_process(p) && !needs_worker(p, u)
             default = here || flags == Base.CacheFlags()
-            config = default ? (`` => Base.CacheFlags()) : (Cmd(prof.julia_args) => flags)
+            config = default ? (`` => Base.CacheFlags()) : (Cmd(args) => flags)
             default || flags in last.(others) || push!(others, config)
             i = findfirst(n -> n.project == project && last(n.config) == last(config), needs)
             if i === nothing
@@ -1493,11 +1494,21 @@ function precompile_calls(needs::Vector{PrecompileNeed})
     return sort!(calls; by = c -> (!isempty(c.names), -length(c.names), c.project, c.names))
 end
 
-# The cache flags a profile's workers will have, or `nothing` — said once — when
-# they cannot be read, in which case the workers compile what they need themselves.
-function profile_flags(prof::Profile)
+# The julia arguments a worker of profile `prof` starts with: its own, and under
+# coverage those that count the package's lines. A process that compiles for the
+# workers starts with them too. From 1.14 the cache flags hold the path whose lines
+# are counted, and a package there needs a cache built under them. The lines that
+# compiling runs, the package's top level, are counted as they are when a worker
+# compiles the package itself.
+worker_julia_args(run::Run, prof::Profile) =
+    run.plan.cfg.coverage ? [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args
+
+# The cache flags of the workers of `prof`, which start with `args`, or `nothing`
+# (said once) when they cannot be read, in which case the workers compile what they
+# need themselves.
+function profile_flags(prof::Profile, args::Vector{String})
     return try
-        isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(Cmd(prof.julia_args))
+        isempty(args) ? Base.CacheFlags() : cache_flags_for(Cmd(args))
     catch e
         is_interrupt(e) && rethrow()
         @warn "Runtests: could not read the cache flags of profile `$(prof.name)`; its \
@@ -1593,7 +1604,7 @@ function setup_needs(run::Run, p::Plan, flags_of)
             k = lastindex(out)
         end
         needs = out[k].needs
-        args = here ? `` : Cmd(p.profiles[j].julia_args)
+        args = here ? `` : Cmd(worker_julia_args(run, p.profiles[j]))
         for i in p.units.span[u], name in setups_of(p.items, i)
             any(n -> n.name === name && n.flags == flags, needs) && continue
             push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR)))
@@ -1767,8 +1778,8 @@ end
 # `sourcepath` names the source directly, for a package this process cannot locate.
 # 1.12's `isprecompiled` takes the flags; from 1.13 it asks for this process's only,
 # and the function behind it takes them. It also renames `sourcepath` for the
-# `Base.PkgLoadSpec` that 1.14's `compilecache` takes, and `VERSION_EDITION` is the
-# syntax edition of a project that names none.
+# `Base.PkgLoadSpec` that 1.14's `compilecache` takes, with the syntax edition that
+# Base gives a package it knows only by the path of its source.
 function has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags;
                          sourcepath::Union{String, Nothing} = nothing)
     # `nothing` is not theirs to pass on: their own fallback locates the package.
@@ -1781,7 +1792,9 @@ function has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags;
     end
 end
 @static if isdefined(Base, :PkgLoadSpec)
-    source_kwarg(path) = (; sourcespec = Base.PkgLoadSpec(path, Base.VERSION_EDITION))
+    # `LATEST_EDITION` from 1.14.0-beta1, `VERSION_EDITION` in the builds before it.
+    const SOURCE_EDITION = isdefined(Base, :LATEST_EDITION) ? Base.LATEST_EDITION : Base.VERSION_EDITION
+    source_kwarg(path) = (; sourcespec = Base.PkgLoadSpec(path, SOURCE_EDITION))
 else
     source_kwarg(path) = (; sourcepath = path)
 end
@@ -2073,8 +2086,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
         began = time()
         w = try
             RuntestsWorkers.Worker(;
-                julia_args = run.plan.cfg.coverage ?
-                    [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args,
+                julia_args = worker_julia_args(run, prof),
                 threads = prof.threads,
                 extra_env = worker_env(run.runid, slot.id, worker_project(run, slot.profile), prof;
                                        load_path = worker_load_path(run, slot.profile)),

@@ -674,18 +674,20 @@ end
 Read a run state: a run's directory, `<run>.rundata`, or the `run.runstate` file in
 it. A file that is truncated, from a crashed run, or written by a different
 version gives as much as can be read, or `nothing`. The reader suppresses ordinary
-read and parse errors so a broken old record does not stop a new run. An interrupt
-during parsing is rethrown; a file removed between reading and checking its
-modification time can cause a file-system error.
+read and parse errors so a broken old record does not stop a new run, and a record
+that another run deletes while it reads gives `nothing`. An interrupt during parsing
+is rethrown.
 """
 function read_run_state(path::AbstractString)
-    path = record_path(path)
-    bytes = try
-        read(path)
+    # Another run prunes records at any moment. On Windows a file that is being deleted
+    # can refuse even `stat` until every process has closed it, so the look at the path
+    # and at the modification time can fail as the read does.
+    path, bytes, written = try
+        p = record_path(path)
+        p, read(p), mtime(p)
     catch
         return nothing
     end
-    written = mtime(path)
     length(bytes) >= RS_HEADER_BYTES || return nothing
     io = IOBuffer(bytes)
     total = length(bytes)
@@ -1097,7 +1099,14 @@ function runstate_files(root::AbstractString)
         e isa Base.IOError || rethrow()
         return String[]
     end
-    return sort!(filter!(isfile, files))   # names start with a unix timestamp, so this is oldest-first
+    # A record that cannot be looked at is one being deleted (see `read_run_state`).
+    is_record(f) = try
+        isfile(f)
+    catch e
+        e isa Base.IOError || rethrow()
+        false
+    end
+    return sort!(filter!(is_record, files))   # names start with a unix timestamp, so this is oldest-first
 end
 
 const KEEP_RUNS = 20

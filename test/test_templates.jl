@@ -430,9 +430,11 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             @test err isa Runtests.ChoresError && elapsed < 50
             @test occursin("took longer than 2.0s, the `init_timeout` setting, and was stopped", out)
             # Where it was stopped, as Julia says on SIGTERM: the template's line once
-            # the process has got that far, which under load it may not have. Windows
-            # has no signals, and the process ends without a word.
-            Sys.iswindows() || @test occursin("was stopped:\n│     in expression starting at ", out)
+            # the process has got that far, which under load it may not have. The
+            # expander says when it starts the loop. Windows has no signals, and the
+            # process ends without a word.
+            reached = occursin("gone_tests_template.jl:1: running the loop", out)
+            Sys.iswindows() || !reached || @test occursin("was stopped:\n│     in expression starting at ", out)
             @test !isfile(expansion_of(t))
         end
     end

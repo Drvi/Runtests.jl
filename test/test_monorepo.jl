@@ -684,11 +684,12 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
         end
 
         @testset "a shared profile's workers serve every package that has it, its init run in the workspace root" begin
-            # Each item writes where the `init` of its worker ran, and the worker.
-            log = tempname()
+            # Each item writes where the `init` of its worker ran, and the worker, to a file
+            # of its own: two workers appending to one file can write over each other.
+            logdir = mktempdir()
             records(name) = """
                 @testitem $(repr(name)) begin
-                    open(io -> println(io, Main.SHARED_INIT, '\t', getpid()), $(repr(log)), "a")
+                    write(joinpath($(repr(logdir)), $(repr(name))), string(Main.SHARED_INIT, '\t', getpid()))
                 end
                 """
             shared = "[profiles.default]\nmonorepo_default = true\ninit = \"global SHARED_INIT = pwd()\"\n"
@@ -696,7 +697,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                                "Copies" => ["test/b_test.jl" => records("b"),
                                             "test/TestItems.toml" => "[profiles.default]\ninit = \"global SHARED_INIT = pwd()\"\n"];
                                root = ["test/r_test.jl" => records("r"), "test/TestItems.toml" => shared])
-            lines() = [split(l, '\t') for l in readlines(log)]
+            lines() = [split(read(f, String), '\t') for f in readdir(logdir; join = true)]
             # The same directory, however a system spells it: Windows has short names too.
             in_ws(l) = samefile(l[1], ws) || (println("init ran in ", l[1], ", not ", ws); false)
             with_runstate_dir() do _
@@ -711,7 +712,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 replayed = Runtests.Private.replayed_config(read_config(joinpath(member, "test")), records_[2], member)
                 @test samefile(replayed.profiles[:default].dir, ws)
                 # A package's own run runs the shared `init` where the combined run did.
-                rm(log)
+                foreach(rm, readdir(logdir; join = true))
                 states, _, _ = run_states(member; workers = 1, logs = :issues, monitor = false)
                 @test states == Dict("a" => PASSED)
                 @test in_ws(only(lines()))

@@ -695,7 +695,19 @@ end
     end
 
     @testset "the summary reports each stage the run went through" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
+        # Each item holds memory while both run, so that the testing stage peaks while
+        # the workers are alive. The coordinator, this process, has run the whole file
+        # and is larger than the worker of a small package: without the items' memory,
+        # a sample of it alone at either end of the stage could be the peak.
+        dir = make_pkg("StagePeaks", "test/t_test.jl" => join((
+            """
+            @testitem "holds memory $i" begin
+                x = fill(UInt8(1), 400_000_000)   # written, so resident
+                sleep(2)
+                @test sum(view(x, 1:1000)) == 1000
+            end
+            """ for i in 1:2), "\n"))
+        p, target = prepare((dir,); workers=2, logs=:issues, monitor=true)
         run = execute(p, target)
         rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats

@@ -951,15 +951,18 @@ needs_worker(p::Plan, u::UnitIdx) = p.units.exclusive[u] || !is_plain(p.profiles
     skips_environment(p, j) -> Bool
 
 Whether the run skips the environment of profile `j`: an environment directory that
-`skip_environment` of the profile's package names, by its path from `test/`. The run
-does not build such an environment and starts no worker in it, and it records the
-items there as skipped itself (`attempt_skipped!`).
+`skip_environment` of the profile's package names, by its path from the root of the
+repository (`naming_root`). The run does not build such an environment and starts no
+worker in it, and it records the items there as skipped itself (`attempt_skipped!`).
 """
 function skips_environment(p::Plan, j::Integer)
     dir = p.profiles[j].environment
     isempty(dir) && return false
     k = p.profile_package[j]
-    return rel_slash(dir, joinpath(p.packages.root[k], "test")) in p.packages.cfg[k].skip_environment
+    names = p.packages.cfg[k].skip_environment
+    isempty(names) && return false
+    # From the run's root, the workspace of a combined run, as `prepare` names them.
+    return rel_slash(dir, naming_root(p.root)) in names
 end
 
 # The default profile in the test environment: what this process can be.

@@ -100,28 +100,32 @@ Runtests writes nothing into the directory. The copy is stacked over the test en
 
 Runtests resolves the copy once in each session, and again when a file that it was built from changes. A copy that does not resolve stops the run before any item runs.
 
-### Skip an environment
+### [Skip an environment](@id skip-environment)
 
-Some environments do not work on every version of Julia. JET, for example, often does not resolve or compile on a prerelease. `skip_environment` names the environment directories that a run must not build, by their path from `test/`:
+Some environments do not work on every version of Julia. JET, for example, often does not resolve or compile on a prerelease. `skip_environment` names the environment directories that a run must not build, by their path from the root of the repository:
 
 ```julia
 # test/runtests.jl
 using Runtests
-runtests(skip_environment = isempty(VERSION.prerelease) ? nothing : "qa")
+runtests(skip_environment = isempty(VERSION.prerelease) ? nothing : "test/qa")
 ```
 
 The run does not resolve or precompile a skipped environment, and it starts no worker in it. It records each selected item of the directory as skipped, so the summary counts the items. The header of the run marks the directory: `env dir: test/qa (skipped)`.
 
-Without the keyword, the run reads the environment variable `RUNTESTS_SKIP_ENVIRONMENT`, and then `skip_environment` of `[run]`. Thus a CI job can skip an environment with no change to the suite:
+Without the keyword, the run reads the environment variable `RUNTESTS_SKIP_ENVIRONMENT`. Thus a CI job can skip an environment with no change to the suite:
 
 ```yaml
 env:
-  RUNTESTS_SKIP_ENVIRONMENT: qa
+  RUNTESTS_SKIP_ENVIRONMENT: test/qa
 ```
 
-A keyword in the call has precedence over the variable. The value `nothing` is the same as no keyword. Thus the call above decides on a prerelease, and the variable and the file decide on a release.
+A keyword in the call has precedence over the variable. The value `nothing` is the same as no keyword. Thus the call above decides on a prerelease, and the variable decides on a release. `[run]` does not take `skip_environment`, because one list in the file holds on every version of Julia.
+
+The root of the repository is the directory that holds `.git`. Outside a git checkout, it is the root of the outermost workspace that holds the package, or else the root of the package. In a monorepo, a name is thus `lib/A/test/qa`. It skips that environment of `A` in the run of `A` and in each combined run that includes `A`. A run that does not include `A` accepts the name without an error, so one variable can serve the CI job of each package. A name that is no environment directory is an error.
 
 `skip` on an item does not have this effect. The worker evaluates `skip` in the environment of the item, so the run builds the environment first. A run that selects no item of the directory, by name, tag or path, also does not build the environment.
+
+A dependency that fails on some versions of Julia must be in an environment directory, not in the test environment. The run always builds the test environment.
 
 ### Directories that are not environments
 

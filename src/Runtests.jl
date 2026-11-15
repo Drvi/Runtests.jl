@@ -96,11 +96,13 @@ set, and otherwise `default`: the group of that name when `[groups]` declares on
 and the whole suite when it does not. A name, tag or group the suite does not have
 is an error that says the nearest it does.
 
-`skip_environment` names environment directories, each by its path from `test/`
-(`"qa"` for `test/qa`), or one of them: the run does not build these environments and
-starts no worker in them, and it records the items it selected there as skipped. A
-name that is not an environment directory of the suite is an error. Also
-`RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, and `[run]`.
+`skip_environment` names environment directories, each by its path from the root of
+the repository (`"test/qa"`, or `"lib/A/test/qa"` in a monorepo), or one of them: the
+run does not build these environments and starts no worker in them, and it records the
+items it selected there as skipped. A run that does not include the package of a
+named directory accepts the name, and a name that is no environment directory is an
+error. Also
+`RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, but not `[run]`.
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
@@ -253,7 +255,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
-    check_skip_environment(cfg.skip_environment, String[rel_slash(dir, target.testdir) for dir in environments],
+    naming = naming_root(target.root)
+    check_skip_environment(cfg.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming,
                            get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
     rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
     merge!(cfg.item_seeds, item_seeds)

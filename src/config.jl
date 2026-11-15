@@ -119,11 +119,14 @@ Base.@kwdef struct RunConfig
     replayed_from::String = ""
     # The file a call named to read in place of `test/TestItems.toml`, or empty.
     config_file::String = ""
-    # The environment directories the run does not build, each as its path from
-    # `test/`: the run records their items as skipped itself.
+    # The environment directories the run does not build, each as its path from the
+    # root of the repository (`naming_root`): the run records their items as skipped
+    # itself. From the call or `RUNTESTS_SKIP_ENVIRONMENT` only, never from a file.
     skip_environment::Vector{String} = String[]
 end
 
+# Each is a keyword, a variable and a key of `[run]`, but for `skip_environment`, which
+# `[run]` refuses (see `build_config`).
 const RUN_KEYS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :artifacts_timeout, :retries,
     :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
@@ -270,6 +273,13 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
     # environment is the configuration's.
     given(keys...) = any(k -> get(kwargs, k, nothing) !== nothing, keys)
     run = section(path, toml, "run", RUN_KEYS)
+    # Which environments a version of Julia cannot build is the caller's to say: one
+    # list in the file would hold on every version.
+    haskey(run, "skip_environment") && throw(ConfigError(
+        "`skip_environment` of [run] in $(relpath_or_path(path)): a configuration file skips no environment. " *
+            "Give the names to the call, as `test/runtests.jl` can compute them from `VERSION`, or in " *
+            "`RUNTESTS_SKIP_ENVIRONMENT`"
+    ))
     # A keyword wins over the environment, the environment over the file, and the file
     # over the default: CI sets a job's settings without editing the project. A
     # variable is read only when no keyword decides, so a bad value there fails only a
@@ -337,8 +347,8 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
     skip = pick(:skip_environment, String[])
     skip isa AbstractString && (skip = [skip])
     (skip isa AbstractVector && all(n -> n isa AbstractString && !isempty(n), skip)) || throw(bad(
-        "`skip_environment` must be the name of an environment directory, as in \"qa\" for `test/qa`, " *
-            "or a vector of them, got $(repr(skip))", :skip_environment
+        "`skip_environment` must be the path of an environment directory from the root of the repository, " *
+            "as in \"test/qa\", or a vector of them, got $(repr(skip))", :skip_environment
     ))
 
     return RunConfig(;

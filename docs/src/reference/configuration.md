@@ -40,11 +40,8 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 | `testset_name` | `"Runtests"` | The name of the testset that the run returns. |
 | `coverage` | `false` | Merge line coverage into `lcov.info`. See [Measure coverage](@ref coverage). |
 | `seed` | random | The seed that each item combines with the name of its package and its own name. A run without a seed chooses one and prints it. |
-| `skip_environment` | `[]` | An [environment directory](@ref environments) that the run does not build, or a vector of them. Each name is the path of the directory from `test/`, for example `"qa"` for `test/qa`. The run records the selected items of the directory as skipped. In the environment variable, put commas between the names. |
 
 A timeout must be positive and at most 2,147,483,647 seconds. A fraction rounds up to whole seconds. Work in the calling process with `workers = 0` cannot be forcibly timed out. In a TOML file or an environment variable, write a symbol as a string, for example `logs = "issues"`.
-
-A name in `skip_environment` that is not an environment directory of the suite is an error. In a combined run, the name must be an environment directory of at least one package.
 
 ### logs
 
@@ -59,7 +56,7 @@ An interactive session with one worker or less uses `:eager` by default. All oth
 
 ## Call keywords
 
-These keywords of `runtests` are not configuration keys and cannot go in `[run]`. They have no environment-variable equivalent except `group`, as described below.
+These keywords of `runtests` are not configuration keys and cannot go in `[run]`. They have no environment-variable equivalent except `group` and `skip_environment`, as described below.
 
 | Keyword | Value |
 |:--------|:------|
@@ -69,6 +66,7 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 | `dry_run` | `true` prints the plan and runs nothing. |
 | `replay` | The path of a run state to run again. |
 | `config` | The path of a file to read in place of `test/TestItems.toml`, relative to the current directory. The file must exist. |
+| `skip_environment` | An [environment directory](@ref environments) that the run does not build, or a vector of them. Each name is the path of the directory from the root of the repository, for example `"test/qa"`, or `"lib/A/test/qa"` in a monorepo. The run records the selected items of the directory as skipped. A run that does not include the package of a named directory accepts the name without an error. A name that is no environment directory is an error. `RUNTESTS_SKIP_ENVIRONMENT` gives the names when the call gives none. See [Skip an environment](@ref skip-environment). |
 | `on_event` | A function that the run calls with a [`Runtests.TestItemEvent`](@ref) when each attempt starts and ends. |
 
 `runtests_mono` also accepts `packages`, a list of package names or directories to include. It rejects `config`, because a combined run reads each package's own configuration file.
@@ -128,6 +126,7 @@ These environment variables configure Runtests:
 |:---------|:--------|
 | `RUNTESTS_<KEY>` | A [run key](@ref run-keys), for example `RUNTESTS_WORKERS=4`, `RUNTESTS_RETRIES=1` or `RUNTESTS_SEED=0x1234`. A true-or-false key takes `true`, `false`, `1`, `0`, `yes` or `no`. A keyword replaces it, and it replaces `[run]`. |
 | `RUNTESTS_GROUP` | The group to run when a call selects nothing else. An empty value counts as unset. |
+| `RUNTESTS_SKIP_ENVIRONMENT` | The environment directories that the run does not build when the call gives no `skip_environment`, with commas between the names. An empty value counts as unset. |
 | `RUNTESTS_RUNSTATE_DIR` | The directory of the run states, which holds a directory `<run>.rundata` for each run. The default is `runtests/runs/` in the Julia depot, with a directory for each project. |
 | `RUNTESTS_HOST` | The name of this machine in the run states. The default is the macOS machine name, or the hostname on other systems. |
 | `RUNTESTS_ARTIFACT_DIR` | A directory into which a run copies its `<run>.rundata` directory, with its run state and logs, when it ends. A combined run puts each package's directory under a subdirectory named for the package. |

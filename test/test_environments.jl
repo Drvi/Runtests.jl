@@ -385,8 +385,9 @@ end
             skipped = Dict("main" => PASSED, "qa" => SKIPPED, "qa checked" => SKIPPED)
             ups(out) = count(l -> occursin("· UP ", l), split(out, '\n'))
             with_runstate_dir() do _
-                @testset "the keyword names the directory by its path from test/" begin
-                    (states, run, _), out = capture_run(() -> run_states(bad; workers = 2, monitor = false, skip_environment = "qa"))
+                # Outside a checkout and a workspace, the root is the package's.
+                @testset "the keyword names the directory by its path from the root" begin
+                    (states, run, _), out = capture_run(() -> run_states(bad; workers = 2, monitor = false, skip_environment = "test/qa"))
                     @test states == skipped
                     @test isempty(run.profile_projects)
                     @test !occursin("resolving the environment", out)
@@ -404,16 +405,17 @@ end
                 end
 
                 @testset "a run of the environment's items alone starts no process" begin
-                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false, name = "qa", skip_environment = ["qa"]))
+                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false, name = "qa",
+                                                                       skip_environment = ["test/qa"]))
                     @test states == Dict("qa" => SKIPPED)
                     @test ups(out) == 0
-                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 0, monitor = false, skip_environment = ["qa"]))
+                    (states, _, _), out = capture_run(() -> run_states(bad; workers = 0, monitor = false, skip_environment = ["test/qa"]))
                     @test states == skipped
                     @test ups(out) == 0
                 end
 
-                @testset "the variable and the file set it, and the keyword wins" begin
-                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => " qa , qa") do
+                @testset "the variable sets it, the keyword wins, and the file refuses it" begin
+                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => " test/qa , test/qa") do
                         (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false))
                         @test states == skipped
                         @test occursin("RUNTESTS_SKIP_ENVIRONMENT", out)
@@ -425,28 +427,44 @@ end
                     end
                     config = joinpath(bad, "test", "TestItems.toml")
                     before = read(config, String)
-                    write(config, before * "\n[run]\nskip_environment = [\"qa\"]\n")
+                    # One list in the file would hold on every version of Julia.
+                    write(config, before * "\n[run]\nskip_environment = [\"test/qa\"]\n")
                     try
-                        (states, _, _), _ = capture_run(() -> run_states(bad; workers = 1, monitor = false))
-                        @test states == skipped
+                        @test occursin("a configuration file skips no environment", message_of(() -> plan_of(bad)))
+                        @test_throws ConfigError plan_of(bad)
                     finally
                         write(config, before)
                     end
                 end
 
-                @testset "a name that is no environment of the suite is an error that lists them" begin
-                    @test occursin("names `jet`, which is not an environment directory of the suite; the suite has `qa`",
-                                   message_of(() -> plan_of(bad; skip_environment = ["qa", "jet"])))
-                    @test_throws ArgumentError plan_of(bad; skip_environment = "test/qa")
+                @testset "a name that is no environment directory is an error that lists the run's" begin
+                    msg = message_of(() -> plan_of(bad; skip_environment = ["test/qa", "test/jet"]))
+                    @test occursin("names `test/jet`, which is not an environment directory", msg)
+                    @test occursin("this run has `test/qa`", msg)
+                    # A path from `test/`, and a project that is not under a `test/`.
+                    @test_throws ArgumentError plan_of(bad; skip_environment = "qa")
+                    @test_throws ArgumentError plan_of(bad; skip_environment = "lib/EnvSkippedCore")
                     @test_throws ArgumentError plan_of(bad; skip_environment = 1)
-                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => "jet") do
+                    withenv("RUNTESTS_SKIP_ENVIRONMENT" => "test/jet") do
                         @test_throws ConfigError plan_of(bad)
+                    end
+                end
+
+                @testset "the environment directory of a package outside the run is not an error" begin
+                    # As one list for every package of a repository names it. The run builds
+                    # no environment of that package in any case.
+                    other = mkpath(joinpath(bad, "other", "test", "qa"))
+                    write(joinpath(other, "Project.toml"), "[deps]\n")
+                    try
+                        @test plan_of(bad; skip_environment = "other/test/qa").cfg.skip_environment == ["other/test/qa"]
+                    finally
+                        rm(joinpath(bad, "other"); recursive = true)
                     end
                 end
 
                 @testset "a replay skips what its run skipped" begin
                     rs = first(sort(runstate_files(bad)))
-                    @test plan_of(bad; replay = rs).cfg.skip_environment == ["qa"]
+                    @test plan_of(bad; replay = rs).cfg.skip_environment == ["test/qa"]
                 end
             end
         end

@@ -131,22 +131,43 @@ end
 environment_name(dir::AbstractString) = isempty(dir) ? "the test environment" : "the environment of $(relpath_or_path(dir))"
 
 """
-    check_skip_environment(names, known, err)
+    naming_root(root) -> String
 
-Throw `err` for a name in `names`, the environments a run is told to skip, that is
-not in `known`: the environment directories of the suite, each as its path from
-`test/`. A misspelled name would otherwise skip nothing, and the run would build the
-environment it was told to leave alone.
+The directory from which `skip_environment` names the environment directories of the
+package at `root`: the root of its checkout, or outside a checkout the root of the
+outermost workspace that holds it, or `root` itself. One name then means one
+directory, in the package's own run and in a combined run of its workspace.
 """
-function check_skip_environment(names::Vector{String}, known::Vector{String}, err)
-    unknown = String[n for n in names if !(n in known)]
+function naming_root(root::AbstractString)
+    repo = repository_root(root)
+    repo === nothing || return repo
+    project = project_file(root)
+    project === nothing && return String(root)
+    outer = outermost_workspace(project)
+    return haskey(parse_project(outer), "workspace") ? dirname(outer) : String(root)
+end
+
+"""
+    check_skip_environment(names, known, root, err)
+
+Throw `err` for a name in `names`, the environments a run is told to skip, that names
+no environment directory. Each name is a path from `root` (see `naming_root`), and
+`known` holds the environment directories of the run in that form. A directory under
+a `test/` with a project of its own that is not in `known` is the environment of a
+package that the run does not include, so the run builds it in no case: one list can
+serve each package of a repository, and such a name is not an error. A misspelled
+name would otherwise skip nothing, and the run would build the environment it was
+told to leave alone.
+"""
+function check_skip_environment(names::Vector{String}, known::Vector{String}, root::AbstractString, err)
+    elsewhere(n) = "test" in split(dirname(n), '/') && project_file_in(joinpath(root, n)) !== nothing
+    unknown = String[n for n in names if !(n in known) && !elsewhere(n)]
     isempty(unknown) && return nothing
     throw(err(string(
         "`skip_environment` names ", join(("`$n`" for n in unknown), ", "), ", which ",
         length(unknown) == 1 ? "is not an environment directory" : "are not environment directories",
-        " of the suite; ", isempty(known) ? "the suite has none" :
-            string("the suite has ", join(("`$n`" for n in sort(known)), ", ")),
-        ". An environment directory is named by its path from `test/`, as in `qa` for `test/qa`"
+        ". A name is the path of the directory from the root of the repository, ", root, ", as in `test/qa`; ",
+        isempty(known) ? "this run has none" : string("this run has ", join(("`$n`" for n in sort(known)), ", "))
     )))
 end
 

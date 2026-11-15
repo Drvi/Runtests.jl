@@ -609,7 +609,9 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     t_files = time()
     items, errors, all_tags = RawItem[], ScanError[], Set{Symbol}()
     suite_names = [String[] for _ in 1:n]
-    # Each package's environment directories, as `skip_environment` names them.
+    # Each package's environment directories, as `skip_environment` names them: by their
+    # paths from the root of the repository.
+    naming = naming_root(workspace)
     environment_names = [String[] for _ in 1:n]
     reasons = Union{Nothing, String}[nothing for _ in 1:n]
     for k in 1:n
@@ -627,7 +629,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             continue
         end
         files, strays, templates, environments = walk_test_dir(joinpath(ps.root[k], "test"))
-        environment_names[k] = String[rel_slash(dir, joinpath(ps.root[k], "test")) for dir in environments]
+        environment_names[k] = String[rel_slash(dir, naming) for dir in environments]
         tags_k = Set{Symbol}()
         its = try
             scan(files, filters[k], setups[k]; strays, templates, expansions, suite_names = suite_names[k], environments,
@@ -675,11 +677,11 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             Dict{Symbol, Any}(key => v for (key, v) in pairs(recorded_settings(rs)) if key in PACKAGE_KEYS)
     end
     run_cfg, cfgs = mono_configs(ps, configs, kept, length(items), kwargs, overrides)
-    # A name is some package's environment: the call and the variable give one list
-    # to every package, and not every package has every environment.
+    # The call and the variable give one list to every package, and each name is one
+    # package's environment.
     known_environments = unique!(reduce(vcat, environment_names[kept]; init = String[]))
     for cfg in cfgs
-        check_skip_environment(cfg.skip_environment, known_environments,
+        check_skip_environment(cfg.skip_environment, known_environments, naming,
                                get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
     end
     if replayed !== nothing

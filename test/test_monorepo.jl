@@ -821,20 +821,38 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
-        @testset "`skip_environment` skips an environment of the packages that have it" begin
-            # A's environment does not resolve, and B has none of that name.
+        @testset "`skip_environment` names the environment of a package by its path from the root" begin
+            # A's environment does not resolve. B's environment of the same name works.
             ws = e2e_workspace(
                 "A" => [
                     "test/a_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n",
                     "test/qa/Project.toml" => "[deps]\nGhost = \"$(next_uuid())\"\n\n[sources]\nGhost = {path = \"../ghost\"}\n",
                     "test/qa/qa_test.jl" => "@testitem \"qa\" begin\n    @test false\nend\n",
                 ],
-                "B" => ["test/b_test.jl" => "@testitem \"b\" begin\n    @test true\nend\n"],
+                "B" => [
+                    "test/b_test.jl" => "@testitem \"b\" begin\n    @test true\nend\n",
+                    "test/qa/Project.toml" => "[deps]\n",
+                    "test/qa/qa_test.jl" => "@testitem \"qa of B\" begin\n    @test true\nend\n",
+                ],
             )
+            skip = "lib/A/test/qa"
+            SKIPPED = Runtests.Private.SKIPPED
             with_runstate_dir() do _
-                states, _, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = "qa")
-                @test states == Dict(("A", "a") => PASSED, ("A", "qa") => Runtests.Private.SKIPPED, ("B", "b") => PASSED)
-                @test_throws ArgumentError run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = "jet")
+                states, _, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = skip)
+                @test states == Dict(("A", "a") => PASSED, ("A", "qa") => SKIPPED, ("B", "b") => PASSED, ("B", "qa of B") => PASSED)
+                # The same name in the run of A alone. A run without A, B's own or a combined
+                # run of B, builds no environment of A anyway and accepts the name: one list
+                # serves the CI job of each package.
+                states, _, _ = run_states(joinpath(ws, "lib", "A"); workers = 1, logs = :issues, monitor = false, skip_environment = skip)
+                @test states == Dict("a" => PASSED, "qa" => SKIPPED)
+                states, _, _ = run_states(joinpath(ws, "lib", "B"); workers = 1, logs = :issues, monitor = false, skip_environment = skip)
+                @test states == Dict("b" => PASSED, "qa of B" => PASSED)
+                states, _, _ = run_mono(ws; packages = ["B"], workers = 1, logs = :issues, monitor = false, skip_environment = skip)
+                @test states == Dict(("B", "b") => PASSED, ("B", "qa of B") => PASSED)
+                # A path from `test/` of the package names no directory of the repository.
+                @test_throws ArgumentError run_mono(ws; workers = 1, logs = :issues, monitor = false, skip_environment = "test/qa")
+                @test_throws ArgumentError run_states(joinpath(ws, "lib", "A"); workers = 1, logs = :issues, monitor = false,
+                                                      skip_environment = "test/qa")
             end
         end
 

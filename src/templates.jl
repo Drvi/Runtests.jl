@@ -102,7 +102,7 @@ template in `templates` not expanded yet, or with a test file in its way that
 that was edited by hand, or whose template is gone.
 """
 function expansion_errors(files::Vector{String}, templates::Vector{String})
-    errors = ScanError[]
+    errors = ScanError[ScanError(t, 0, clash_message(t, other)) for (t, other) in expansion_clashes(templates)]
     for t in templates
         o = expansion_of(t)
         state = isfile(o) ? (read_stamp(o) === nothing ? :in_the_way : :current) : :missing
@@ -118,6 +118,36 @@ function expansion_errors(files::Vector{String}, templates::Vector{String})
     end
     return errors
 end
+
+"""
+    expansion_clashes(templates) -> Vector{Pair{String, String}}
+
+Each template whose expansion has, in another case, the name of another file of its
+directory or of the expansion of another template, with that name. macOS and Windows
+hold one file for both, so the expansion would write over the other file there.
+"""
+function expansion_clashes(templates::Vector{String})
+    out = Pair{String, String}[]
+    expansions = Dict{String, Vector{String}}()   # by the fold of the path
+    for t in templates
+        o = expansion_of(t)
+        push!(get!(Vector{String}, expansions, fold_name(o)), basename(o))
+    end
+    listings = Dict{String, Vector{String}}()
+    for t in templates
+        o = expansion_of(t)
+        name = basename(o)
+        listing = get!(() -> isdir(dirname(o)) ? readdir(dirname(o)) : String[], listings, dirname(o))
+        i = findfirst(e -> e != name && fold_name(e) == fold_name(name), [listing; expansions[fold_name(o)]])
+        i === nothing || push!(out, t => [listing; expansions[fold_name(o)]][i])
+    end
+    return out
+end
+
+clash_message(template::AbstractString, other::AbstractString) = string(
+    "expands into `", basename(expansion_of(template)), "`, which macOS and Windows take for `", other,
+    "`, another file of ", relpath_or_path(dirname(expansion_of(template))), ". Rename the template"
+)
 
 ### Writing an expansion ###################################################
 
@@ -423,12 +453,14 @@ function chore_templates!(io::IO, target, fix::Bool)
     deleted = Pair{String, String}[]    # file => why it goes
     problems = Pair{String, String}[]   # file => what a person has to fix
     states = Dict(t => expansion_state(t) for t in templates)
+    clashes = Dict(expansion_clashes(templates))
     for t in templates
         state = states[t]
         state in (:edited, :in_the_way) && push!(problems, expansion_of(t) => expansion_message(state, t))
+        haskey(clashes, t) && push!(problems, t => clash_message(t, clashes[t]))
     end
     if fix
-        todo = filter(t -> !(states[t] in (:edited, :in_the_way)), templates)
+        todo = filter(t -> !(states[t] in (:edited, :in_the_way)) && !haskey(clashes, t), templates)
         # Said now rather than in the report: the expansion can take minutes.
         isempty(todo) || println(stdout, label_prefix(), "expanding ", plural(length(todo), "template"), " in a process ",
                                  "with the test environment: ", join((relpath_or_path(t) for t in todo), ", "))

@@ -18,7 +18,7 @@ end
 
 ## Expand the template
 
-Run `Runtests.chores()`. It writes `test/periods_tests.jl`, the name of the template without `_template`. The file holds four ordinary `@testitem` declarations. The first loop variable changes slowest: `Day` with 1 and 2, then `Month` with 1 and 2. The first item is:
+Run `Runtests.chores()`. It writes `test/periods_tests.jl`, the name of the template without `_template`. A template whose expansion has the name of another file of `test/` in another case is an error, because macOS and Windows hold one file for both names. The file holds four ordinary `@testitem` declarations. The first loop variable changes slowest: `Day` with 1 and 2, then `Month` with 1 and 2. The first item is:
 
 ```julia
 @testitem "doubling a Day of 1" tags=[:gen] begin

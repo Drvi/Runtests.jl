@@ -265,12 +265,12 @@ end
         write(joinpath(dir, "test", "a_test.jl"), """@testitem "x" profile=:p begin\n @test true\n end\n""")
         write(joinpath(dir, "test", "TestItems.toml"), """
         [profiles.p]
-        julia_args = ["--check-bounds=yes"]
-        threads = "3"
+        julia_args = ["--check-bounds=yes", "--threads=3"]
         env = { FOO = "bar" }
-        init = "const A = 1"
-        test_end = "GC.gc(true)"
         """)
+        mkpath(joinpath(dir, "test", "testconfigs", "p"))
+        write(joinpath(dir, "test", "testconfigs", "p", "worker_init.jl"), "const A = 1\n")
+        write(joinpath(dir, "test", "testconfigs", "p", "test_end.jl"), "GC.gc(true)\n")
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
         path = joinpath(mktempdir(), "run.runstate")
@@ -1300,7 +1300,7 @@ end
             "Replayed",
             "test/a_test.jl" => """@testitem "x" profile=:p begin\n @test true\nend\n""",
             "test/TestItems.toml" =>
-                "[profiles.p]\njulia_args = [\"--check-bounds=yes\"]\nthreads = \"3\"\n"
+                "[profiles.p]\njulia_args = [\"--check-bounds=yes\", \"--threads=3\"]\n"
         )
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
@@ -1396,7 +1396,7 @@ end
             @testitem "own" profile=:own begin\n @test true\nend
             @testitem "inherits" profile=:inherits begin\n @test true\nend
             """,
-            "test/TestItems.toml" => "[profiles.own]\nthreads = \"3\"\n[profiles.inherits]\nenv = { X = \"1\" }\n"
+            "test/TestItems.toml" => "[profiles.own]\njulia_args = [\"--threads=3\"]\n[profiles.inherits]\nenv = { X = \"1\" }\n"
         )
         items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
         p = plan(items, read_config(joinpath(dir, "test"); threads = "2,1"); root=dir)

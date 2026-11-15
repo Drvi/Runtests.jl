@@ -152,6 +152,19 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
         @test occursin("not expanded yet", refusal(alone))
     end
 
+    @testset "an expansion with the name of another file in another case stops the run and chores" begin
+        # macOS and Windows hold one file for `Cased_tests.jl` and `cased_tests.jl`.
+        pkg = make_pkg("Cased", "test/cased_tests.jl" => PLAIN_ITEM,
+            "test/testtemplates/Cased_tests_template.jl" => "@testtemplate \"c \$n\" for n in 1:2\n    @test \$n > 0\nend\n")
+        said = "expands into `Cased_tests.jl`, which macOS and Windows take for `cased_tests.jl`"
+        @test occursin(said, refusal(pkg))
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            _, out = template_chores(pkg)
+            @test occursin(said, out)
+        end
+        @test read(joinpath(pkg, "test", "cased_tests.jl"), String) == PLAIN_ITEM
+    end
+
     @testset "a template is a `*_tests_template.jl` in `test/testtemplates/`, and nothing else is" begin
         pkg = make_pkg("Placed", "test/other_test.jl" => PLAIN_ITEM,
             "test/testtemplates/placed_tests_template.jl" => "@testtemplate \"p \$n\" for n in 1:2\n    @test \$n > 0\nend\n",

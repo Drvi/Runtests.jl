@@ -36,7 +36,7 @@ Runtests.runtests_mono()
 
 Runtests instantiates the workspace once. Then it writes one environment for the shared workers. This environment holds the test dependencies of all packages, in the versions of the workspace manifest, and Julia loads it without a resolve.
 
-`runtests_mono` takes the selections of `runtests`. `name`, `tags` and `group` select within each package. A group or a tag that only some packages have is no error. A path selects within the package that holds it. The keyword `packages` takes package names, or directories relative to the workspace root, and runs only those packages:
+`runtests_mono` takes the selections of `runtests`. `name`, `tags` and `group` select within each package. A group or a tag that only some packages have is no error. `runtestsd_mono` runs the `default` group of each package, as `runtestsd` does for one package. A path selects within the package that holds it. The keyword `packages` takes package names, or directories relative to the workspace root, and runs only those packages:
 
 ```julia
 Runtests.runtests_mono(; packages = ["A", "lib/B"], group = "fast")
@@ -52,7 +52,7 @@ packages = ["lib/*", "."]
 isolated = ["lib/Legacy"]
 ```
 
-`packages` lists the packages that take part, as directories or globs relative to the root. `isolated` lists packages that run in their own test environment, on workers of their own. If two workspace members have the same package name, use `packages` to leave one out; a combined run cannot identify both by name. The header of the run lists the packages, names the isolated ones, and says why each other package of the workspace does not take part.
+`packages` lists the packages that take part, as directories or globs relative to the root. `isolated` lists packages that run in their own test environment, on workers of their own. If two workspace members have the same package name, use `packages` to leave one out. A combined run cannot identify both by name. This is also true for two names that differ only in case, because `RUNTESTS_ARTIFACT_DIR` gets a directory for each package, and macOS and Windows do not tell such directory names apart. The header of the run lists the packages, names the isolated ones, and says why each other package of the workspace does not take part.
 
 ## [What the packages share](@id combined-settings)
 
@@ -69,10 +69,13 @@ To give the packages of a workspace one profile, `init` included, declare it in 
 ```toml
 [profiles.default]
 monorepo_default = true
-init = "global WORKER_STARTED = time()"
 ```
 
-A package of the workspace that does not declare a profile of this name uses the shared profile. A package that declares it with the same `init` and `test_end` uses the shared profile too. The code must be the same, but the layout and the comments can be different. A package whose `init` or `test_end` differs keeps its own profile. Profiles with different `test_end` expressions can still share workers when their start configuration and `init` directory are the same; `test_end` runs after each item.
+Its code is in the `test/testconfigs/` of the workspace root, for example `test/testconfigs/worker_init.jl` for the default profile. [init and test_end](@ref profile-code) gives the layout.
+
+A package of the workspace that has no profile of this name uses the shared profile. A package has the default profile of its own when it declares `[profiles.default]` or has files in `test/testconfigs/` for it. A package that has the profile with the same `init` and `test_end` uses the shared profile too. The code must be the same, but the layout and the comments can be different. A package whose `init` or `test_end` differs keeps its own profile. Its files are in its own `test/testconfigs/`.
+
+The keywords `worker_init` and `test_end` of `runtests_mono` give the code of the default profile of every package. The `init` then runs in the workspace root, as the `init` of a shared profile does. Profiles with different `test_end` expressions can still share workers when their start configuration and `init` directory are the same; `test_end` runs after each item.
 
 The `init` of a shared profile runs in the workspace root, in the runs of each package and in combined runs. Thus the packages that use the profile share its workers. Shared profiles need Julia 1.12 or later, which has workspaces.
 
@@ -107,7 +110,7 @@ The replay finds the run states of the other packages of the run. It runs their 
 
 ## Maintain the suites and work at the REPL
 
-`Runtests.chores_mono()` does the [chores](@ref chores) of every package that takes part. Before the chores of any package change a file, it stops for the problems that no chore fixes: two setups of one name, a dependency name with two UUIDs, and preferences that disagree. It writes one report for all packages, with paths from the workspace root. After the chores, the report shows the [groups of workers](@ref shared-profiles) and checks the imports of every package that shares workers, as a combined run does. It also names each `test/runtests.jl` that does more than call `Runtests.runtests()`, because a combined run does not run that file. Move what that file sets to `test/TestItems.toml` of its package. Run settings go to `[run]`, the group that a run selects goes to `default` of `[groups]`, and variables go to `env` of a profile. A variable whose value the file computes goes to `init` of the profile.
+`Runtests.chores_mono()` does the [chores](@ref chores) of every package that takes part. Before the chores of any package change a file, it stops for the problems that no chore fixes: two setups of one name, a dependency name with two UUIDs, and preferences that disagree. It writes one report for all packages, with paths from the workspace root. After the chores, the report shows the [groups of workers](@ref shared-profiles) and checks the imports of every package that shares workers, as a combined run does. It also names each `test/runtests.jl` that does more than call `Runtests.runtests()` or `Runtests.runtestsd()`, because a combined run does not run that file. Move what that file sets to `test/TestItems.toml` of its package. Run settings go to `[run]`, and variables go to `env` of a profile. The group that the file runs goes to `default` of `[groups]`, which `runtestsd` and `runtestsd_mono` run. A variable whose value the file computes goes to the `init` of the profile, in `test/testconfigs/`.
 
 `Runtests.activate_mono()` makes the REPL look like a shared worker. It activates the environment of the shared workers and puts the setups of every package that shares workers on `LOAD_PATH`. An included test item runs as an item of the package that holds its file, with that package loaded and its root as the working directory. A test item pasted at the REPL uses the package that holds the REPL's current directory, so `cd` into a package first. `Runtests.deactivate()` restores the environment and `LOAD_PATH`; it does not undo `cd`. To work with an isolated package, use `Runtests.activate` with that package. [Work at the REPL](@ref repl) has an example.
 

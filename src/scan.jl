@@ -7,6 +7,12 @@ const TESTTEMPLATES_DIR = "testtemplates"
 # Input to the suite's tests, which the suite itself never reads: packages, broken
 # projects and sources, reference files. Only the one at the top of `test/`.
 const TESTFIXTURES_DIR = "testfixtures"
+# The code of the profiles: the default profile's two files at its top, and a
+# directory for each other profile, named for it, with its two files.
+const TESTCONFIGS_DIR = "testconfigs"
+const WORKER_INIT_FILE = "worker_init.jl"
+const TEST_END_FILE = "test_end.jl"
+const TESTCONFIG_FILES = (WORKER_INIT_FILE, TEST_END_FILE)
 
 is_test_file(path::AbstractString) = any(s -> endswith(path, s), TEST_FILE_SUFFIXES)
 
@@ -25,8 +31,8 @@ saying where such a file belongs; every test template, a `*_tests_template.jl` i
 `testtemplates/` (see [`expansion_errors`](@ref)); and every directory with an
 environment of its own, a `Project.toml` or a `JuliaProject.toml`, whose items run
 in that environment (see [`environment_of`](@ref)). Each is sorted by path. Hidden
-files and directories, `testsetups/`, and `testfixtures/` at the top of `testdir`
-are skipped. The strays are reported, not skipped: a file of tests not named
+files and directories, `testsetups/`, and `testfixtures/` and `testconfigs/` at the
+top of `testdir` are skipped. The strays are reported, not skipped: a file of tests not named
 `*_test.jl` would otherwise never run, and the run would pass without it, and a
 template anywhere but `testtemplates/` would never be expanded.
 """
@@ -160,7 +166,14 @@ name would otherwise skip nothing, and the run would build the environment it wa
 told to leave alone.
 """
 function check_skip_environment(names::Vector{String}, known::Vector{String}, root::AbstractString, err)
-    elsewhere(n) = "test" in split(dirname(n), '/') && project_file_in(joinpath(root, n)) !== nothing
+    # A name in another case would skip on macOS and Windows and not on Linux.
+    for n in names
+        i = findfirst(k -> k != n && fold_name(k) == fold_name(n), known)
+        i === nothing || throw(err("`skip_environment` names `$n`, which is the environment directory `$(known[i])` " *
+                                   "in another case. Give the name as the directory has it"))
+    end
+    elsewhere(n) = "test" in split(dirname(n), '/') && exists_exactly(root, split(n, '/')...) &&
+        project_file_in(joinpath(root, n)) !== nothing
     unknown = String[n for n in names if !(n in known) && !elsewhere(n)]
     isempty(unknown) && return nothing
     throw(err(string(
@@ -190,9 +203,10 @@ function environment_of(path::AbstractString, testdir::AbstractString)
 end
 
 # Whether the walk of `testdir` goes from `dir` into its directory `d`: never into a
-# hidden one or a setup's, nor into the templates and fixtures at the top.
+# hidden one or a setup's, nor into the templates, fixtures and profile code at the top.
 suite_descends(testdir::AbstractString, dir::AbstractString, d::AbstractString) =
-    !(startswith(d, '.') || d == TESTSETUPS_DIR || (dir == testdir && (d == TESTTEMPLATES_DIR || d == TESTFIXTURES_DIR)))
+    !(startswith(d, '.') || d == TESTSETUPS_DIR ||
+      (dir == testdir && (d == TESTTEMPLATES_DIR || d == TESTFIXTURES_DIR || d == TESTCONFIGS_DIR)))
 
 """
     suite_reads(testdir, dir) -> Bool
@@ -247,7 +261,10 @@ const NOT_A_TEMPLATE = "not a test template. `test/$TESTTEMPLATES_DIR/` holds te
 """
     setup_modules(testdir) -> Dict{Symbol,String}
 
-The modules `test/testsetups/` makes loadable: `Name.jl` or `Name/src/Name.jl`.
+The modules `test/testsetups/` makes loadable: `Name.jl` or `Name/src/Name.jl`. The
+name of a module is the name of its file or directory, so two setups of one name, and
+two whose names differ only in case, which macOS and Windows hold as one file, are a
+`ConfigError`, as is a name that some system cannot give a file.
 """
 function setup_modules(testdir::AbstractString)
     out = Dict{Symbol, String}()
@@ -255,13 +272,25 @@ function setup_modules(testdir::AbstractString)
     isdir(dir) || return out
     for n in sort!(readdir(dir))
         path = joinpath(dir, n)
-        if isfile(path) && endswith(n, ".jl")
-            out[Symbol(chop(n; tail = 3))] = path
-        elseif isdir(path)
-            inner = joinpath(path, "src", n * ".jl")
-            isfile(inner) && (out[Symbol(n)] = inner)
+        name = if isfile(path) && endswith(n, ".jl")
+            String(chop(n; tail = 3))
+        elseif isdir(path) && isfile(joinpath(path, "src", n * ".jl"))
+            n
+        else
+            continue
         end
+        why = unportable_name(name)
+        why === nothing || throw(ConfigError("$(relpath_or_path(path)): the name of a setup is the name of its file, and $why"))
+        haskey(out, Symbol(name)) && throw(ConfigError(
+            "$(relpath_or_path(dir)) holds the setup `$name` twice, as `$name.jl` and as `$name/`. Remove one"
+        ))
+        out[Symbol(name)] = isdir(path) ? joinpath(path, "src", n * ".jl") : path
     end
+    clashes = case_clashes(String.(keys(out)))
+    isempty(clashes) || throw(ConfigError(string(
+        relpath_or_path(dir), " holds the setups ", join((join(("`$n`" for n in g), " and ") for g in clashes), ", "),
+        ", whose names differ only in case: macOS and Windows hold one file for each such pair. Rename one"
+    )))
     return out
 end
 

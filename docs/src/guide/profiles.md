@@ -6,7 +6,7 @@ Three things decide where a test item runs, and each has its own control:
 - `sandbox = true` decides that the item runs alone, in a new process.
 - The location of the test file decides the environment: the packages that the item can load.
 
-A profile is a named worker configuration in `test/TestItems.toml`. An environment directory is a directory under `test/` with a `Project.toml` of its own. The three controls combine freely.
+A profile is a named worker configuration in `test/TestItems.toml`, with its code in `test/testconfigs/`. An environment directory is a directory under `test/` with a `Project.toml` of its own. The three controls combine freely.
 
 ## Declare a profile
 
@@ -14,13 +14,12 @@ Profiles go under `[profiles]` in `test/TestItems.toml`:
 
 ```toml
 [profiles.bounds]
-julia_args = ["--check-bounds=yes"]
-threads = "4"
+julia_args = ["--check-bounds=yes", "--threads=4"]
 env = { JULIA_DEBUG = "Main" }
-init = "using MyPkg"
-test_end = "GC.gc(true)"
 preferences = "prefs/bounds.toml"
 ```
+
+The Julia code of the profile goes in files of a directory with its name, `test/testconfigs/bounds/`. [init and test_end](@ref profile-code) tells you how.
 
 An item runs under this profile with `profile = :bounds`:
 
@@ -40,15 +39,37 @@ end
 
 [The configuration reference](@ref profile-keys) lists each key of a profile. A profile has no `environment` key. A configuration file that gives one is an error, and the message tells you to give the items `profile = :name` instead.
 
+The name of a profile is also the name of a directory. Thus a name must be a valid file name on Linux, macOS and Windows: no `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>` or `|`, no space or dot at the end, and not a name that Windows keeps for a device, such as `CON`. macOS and Windows do not tell names apart by case. Thus two profiles must not differ only in case, and `Default` is an error.
+
 ## The default profile
 
-`[profiles.default]` configures the workers of every item without a `profile`, sandboxed or not. Without this table, the default profile has no flags, no environment variables and no expressions. A profile without `threads` uses the `threads` of the run.
+`[profiles.default]` configures the workers of every item without a `profile`, sandboxed or not. Without this table and without code, the default profile has no flags, no environment variables and no expressions. A profile whose `julia_args` give no `--threads` (or `-t`) uses the `threads` of the run. The number of threads does not change the compiled code, so Runtests does not precompile again for it.
 
-## init and test_end
+## [init and test_end](@id profile-code)
 
-`init` runs once in each worker of the profile, before the first item. `test_end` runs after each attempt at an item that was not skipped, a failed attempt before its retry too. Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
+The `init` of a profile is Julia code that runs once in each worker of the profile, before the first item. Its `test_end` is code that runs after each attempt at an item that was not skipped, a failed attempt before its retry too. Each is a file of `test/testconfigs/`:
 
-`init` runs at the top level of `Main` of the worker. Under `workers = 0`, the `init` of the default profile runs in `Main` of the process that calls `runtests`, and the run warns about it. Items run in modules of their own, and do not see what `init` defines or imports. Thus `init = "using Plots"` loads Plots before the first item, and an item that uses Plots must still import it. `test_end` runs in a new module of its own, with `Test` and the package in scope. It does not see the variables of the item. [Where code runs](@ref where-code-runs) gives the details.
+```text
+test/
+  testconfigs/
+    worker_init.jl      # the init of the default profile
+    test_end.jl         # the test_end of the default profile
+    bounds/
+      worker_init.jl    # the init of the profile bounds
+      test_end.jl       # the test_end of the profile bounds
+```
+
+Each file is optional. The default profile needs no table for its files. Another profile must have a table in `[profiles]`. `test/testconfigs/` holds nothing else. A file with another name, or a directory that is no profile of `[profiles]`, is an error in each run and in `chores`. Hidden files, such as `.DS_Store`, are not errors. An error in the code names its file and its line.
+
+The keywords `worker_init` and `test_end` of `runtests` give the code of the default profile in place of its files, as expressions:
+
+```julia
+runtests(worker_init = :(using Plots), test_end = quote GC.gc(true) end)
+```
+
+Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
+
+`init` runs at the top level of `Main` of the worker. Under `workers = 0`, the `init` of the default profile runs in `Main` of the process that calls `runtests`, and the run warns about it. Items run in modules of their own, and do not see what `init` defines or imports. Thus a `worker_init.jl` that holds `using Plots` loads Plots before the first item, and an item that uses Plots must still import it. `test_end` runs in a new module of its own, with `Test` and the package in scope. It does not see the variables of the item. [Where code runs](@ref where-code-runs) gives the details.
 
 ## Preferences
 
@@ -133,7 +154,7 @@ These directories are never environment directories, even with a project of thei
 
 - `test/` itself, which holds the test environment,
 - the directories in `test/testsetups/`, which are setup packages,
-- the directories in `test/testtemplates/` and `test/testfixtures/`,
+- the directories in `test/testtemplates/`, `test/testfixtures/` and `test/testconfigs/`,
 - hidden directories, whose names start with `.`.
 
 Discovery does not follow directory symlinks. A replay finds the environment of each item where its file is, in the checkout that the replay runs in.

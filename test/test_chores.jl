@@ -259,7 +259,7 @@ end)
         end
         # A profile only the named file has: the suite's own file lacks it, and the
         # named one still serves the item that names it.
-        prof = conf("prof.toml", "[profiles.fast]\nthreads = \"1\"\n")
+        prof = conf("prof.toml", "[profiles.fast]\njulia_args = [\"--threads=1\"]\n")
         dir = make_pkg("ChoreProfile", "test/a_test.jl" => "@testitem \"fast\" profile=:fast begin\n    @test true\nend\n")
         withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
             ok, out = chores_out(dir; dry_run = true, config = prof)

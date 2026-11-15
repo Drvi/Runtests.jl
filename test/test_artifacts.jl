@@ -178,15 +178,12 @@ end
 
 # A profile's `test_end` that may not register, and that fails one item on its own.
 const ART_TEST_END = raw"""
-[profiles.default]
-test_end = '''
 try
     Main.Runtests.on_failure(identity)
 catch e
     e isa ArgumentError && touch(joinpath(ENV["RUNTESTS_ART_MARKS"], "test_end refused"))
 end
 Main.Runtests.current_testitem().name == "fails in test_end" && @test false
-'''
 """
 
 # Run `pkg` with `kwargs`, `marks` as the items' marker directory, and hand back the
@@ -287,7 +284,7 @@ end
 @testset "artifacts" begin
     withenv("RUNTESTS_GROUP" => nothing) do; with_runstate_dir() do states_dir
 
-    pkg = make_pkg("Evidence", "test/evidence_tests.jl" => ART_ITEMS, "test/TestItems.toml" => ART_TEST_END)
+    pkg = make_pkg("Evidence", "test/evidence_tests.jl" => ART_ITEMS, profile_files(test_end = ART_TEST_END)...)
 
     @testset "on workers, with eager logs, copied for CI" begin
         marks, exported = mktempdir(), mktempdir()

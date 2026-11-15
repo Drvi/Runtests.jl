@@ -1,7 +1,7 @@
 # Named selections. `[groups]` in TestItems.toml gives tag expressions names, which a
-# run selects by with the `group` keyword or `RUNTESTS_GROUP`, and the `default` group
-# when nothing else selects; and a selection that names a tag no item carries is a
-# slip to report, not a selection of everything or of nothing.
+# run selects by with the `group` keyword or `RUNTESTS_GROUP`, and `runtestsd` by the
+# `default` group; and a selection that names a tag no item carries is a slip to
+# report, not a selection of everything or of nothing.
 
 using Runtests.Private: prepare, nitems, NoTestsError, ConfigError, read_config, read_run_state,
     runstate_files, failing_items, PASSED, FAILED
@@ -58,8 +58,23 @@ end)
     # This process's own RUNTESTS_GROUP, if it has one, is not this file's to inherit.
     withenv("RUNTESTS_GROUP" => nothing) do
 
-    @testset "a run that selects nothing else selects the default group" begin
-        @test selected(dir) == ["core one", "core slow", "untagged"]
+    @testset "a run that selects nothing runs the whole suite, and runtestsd the default group" begin
+        @test selected(dir) == EVERY_ITEM
+        d(; kw...) = Runtests.Private.default_group_kwargs("runtestsd", (; kw...))
+        @test selected(dir; d()...) == ["core one", "core slow", "untagged"]
+        @test selected(dir; d(tags = :slow)...) == ["core slow"]
+        # It runs one group, and a call that asks for another contradicts it.
+        err = thrown(() -> Runtests.runtestsd(dir; group = "gpu"))
+        @test err isa ArgumentError && occursin("call `runtests` with that group", sprint(showerror, err))
+        # The variable replaces `default` in a call that selects nothing else, as it
+        # replaces the whole suite in a call of `runtests`.
+        withenv("RUNTESTS_GROUP" => "gpu") do
+            @test selected(dir; d()...) == ["gpu one"]
+            @test selected(dir; d(tags = :slow)...) == ["core slow"]
+        end
+        withenv("RUNTESTS_GROUP" => "all") do
+            @test selected(dir; d()...) == EVERY_ITEM
+        end
     end
 
     @testset "the group keyword selects a group, by string or by symbol" begin
@@ -70,15 +85,14 @@ end)
 
     @testset "a line picks the item it is in, and a group keeps it or leaves nothing" begin
         at(line) = string(joinpath(dir, "test", "a_test.jl"), ":", line)
-        # Line 10 is inside "gpu one"; a line is a selection, so the default group
-        # does not apply.
+        # Line 10 is inside "gpu one".
         @test selected(at(10)) == ["gpu one"]
         # A group named beside it keeps that item or leaves nothing, never the item above.
         @test thrown(() -> selected(at(10); group = "quick")) isa NoTestsError
         @test thrown(() -> selected(at(6); group = "quick")) isa NoTestsError
         @test selected(at(2); group = "quick") == ["core one"]
-        # The environment's group, like the default, is what a call that selects
-        # nothing runs: a line is a selection, so its item runs whatever its group.
+        # The environment's group is what a call that selects nothing runs: a line is
+        # a selection, so its item runs whatever its group.
         withenv("RUNTESTS_GROUP" => "quick") do
             @test selected(at(10)) == ["gpu one"]
             @test selected(at(2)) == ["core one"]
@@ -94,9 +108,10 @@ end)
         withenv("RUNTESTS_GROUP" => " quick\n") do
             @test selected(dir) == ["core one"]
         end
-        # Empty is unset, as a CI matrix leaves it for a lane without a group.
+        # Empty is unset, as a CI matrix leaves it for a lane without a group: the
+        # whole suite.
         withenv("RUNTESTS_GROUP" => "") do
-            @test selected(dir) == ["core one", "core slow", "untagged"]
+            @test selected(dir) == EVERY_ITEM
         end
     end
 
@@ -111,7 +126,7 @@ end)
         @test selected(plain) == EVERY_ITEM
     end
 
-    @testset "any other selection takes the place of the default group" begin
+    @testset "a selection without a group picks from the whole suite" begin
         @test selected(dir; tags = :gpu) == ["gpu one"]
         @test selected(dir; name = "gpu one") == ["gpu one"]
         @test selected(dir; name = r"one$") == ["core one", "gpu one"]
@@ -127,7 +142,7 @@ end)
         @test_throws NoTestsError selected(dir; group = "quick", name = "gpu one")
     end
 
-    @testset "RUNTESTS_GROUP gives way to any selection the call makes, as the default does" begin
+    @testset "RUNTESTS_GROUP gives way to any selection the call makes" begin
         withenv("RUNTESTS_GROUP" => "quick") do
             @test selected(dir; name = "gpu one") == ["gpu one"]
             @test selected(dir; tags = :slow) == ["core slow"]
@@ -155,6 +170,9 @@ end)
             err = thrown(() -> selected(dir))
             @test err isa ConfigError
             @test occursin("`RUNTESTS_GROUP` asks for group `nightly`", sprint(showerror, err))
+            err = thrown(() -> selected(dir; Runtests.Private.default_group_kwargs("runtestsd", (;))...))
+            @test err isa ConfigError
+            @test occursin("`RUNTESTS_GROUP` asks for group `nightly`", sprint(showerror, err))
         end
         # Names are matched exactly, as a TOML key is written, and a near miss is named.
         err = thrown(() -> selected(dir; group = "GPU"))
@@ -170,7 +188,7 @@ end)
     end
 
     @testset "`default` and `all` are reserved, and always mean something" begin
-        # Undeclared, `default` is what a run selects by default: the whole suite,
+        # Undeclared, `default` selects the whole suite,
         # in a run that counts as one of the whole suite.
         plain = make_pkg("NoDefault", "test/a_test.jl" => GROUPED, "test/TestItems.toml" => "[groups]\ngpu = \"gpu\"\n")
         @test selected(plain; group = "default") == EVERY_ITEM
@@ -216,9 +234,15 @@ end)
         _, out = capture_run(() -> Runtests.runtests(dir; dry_run = true, group = "gpu"))
         @test occursin("group `gpu` = \"gpu\", from the `group` keyword", out)
         _, out = capture_run(() -> Runtests.runtests(dir; dry_run = true))
-        @test occursin("group `default` = \"!gpu\", the default", out)
+        @test !occursin("group", out)
+        _, out = capture_run(() -> Runtests.runtestsd(dir; dry_run = true))
+        @test occursin("group `default` = \"!gpu\", from `runtestsd`", out)
         _, out = withenv("RUNTESTS_GROUP" => "quick") do
             capture_run(() -> Runtests.runtests(dir; dry_run = true))
+        end
+        @test occursin("group `quick` = \"core && !slow\", from `RUNTESTS_GROUP`", out)
+        _, out = withenv("RUNTESTS_GROUP" => "quick") do
+            capture_run(() -> Runtests.runtestsd(dir; dry_run = true))
         end
         @test occursin("group `quick` = \"core && !slow\", from `RUNTESTS_GROUP`", out)
         # The whole suite is no group, and says nothing of one.
@@ -277,7 +301,7 @@ end)
         with_runstate_dir() do _
             states, _, _ = run_states(failing; group = "gpu", workers = 1, monitor = false, logs = :issues)
             @test states["gpu one"] === FAILED
-            states, _, _ = run_states(failing; workers = 1, monitor = false, logs = :issues)
+            states, _, _ = run_states(failing; group = "default", workers = 1, monitor = false, logs = :issues)
             @test !haskey(states, "gpu one")
             @test failing_items(failing) == ["gpu one"]
             newest = read_run_state(last(runstate_files(failing)))
@@ -292,12 +316,13 @@ end)
     @testset "[order] is strict on the whole suite only, as it is under any selection" begin
         ordered = make_pkg("GroupOrdered", "test/a_test.jl" => GROUPED,
                            "test/TestItems.toml" => GROUPS * "\n[order]\nfirst = [\"no such item\"]\n")
-        @test selected(ordered) == ["core one", "core slow", "untagged"]
+        @test selected(ordered; group = "default") == ["core one", "core slow", "untagged"]
         @test thrown(() -> selected(ordered; group = "all")) isa ConfigError
+        @test thrown(() -> selected(ordered)) isa ConfigError
         # A pin outside the group's items is no error and no item.
         pinned = make_pkg("GroupPinned", "test/a_test.jl" => GROUPED,
                           "test/TestItems.toml" => GROUPS * "\n[order]\nfirst = [\"gpu one\"]\n")
-        @test selected(pinned) == ["core one", "core slow", "untagged"]
+        @test selected(pinned; group = "default") == ["core one", "core slow", "untagged"]
         @test selected(pinned; group = "gpu") == ["gpu one"]
     end
 
@@ -343,7 +368,7 @@ end)
         # The default group is checked whenever it is the one selected.
         default_typo = make_pkg("DefaultTypo", "test/a_test.jl" => GROUPED,
                                 "test/TestItems.toml" => "[groups]\ndefault = \"!gpuu\"\n")
-        err = thrown(() -> selected(default_typo))
+        err = thrown(() -> selected(default_typo; group = "default"))
         @test err isa ConfigError && occursin("group `default` of [groups]", sprint(showerror, err))
         @test length(selected(default_typo; tags = :core)) == 2
     end

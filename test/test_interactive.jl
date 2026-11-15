@@ -247,8 +247,8 @@ const DEPS = fixture("TestDeps.jl")
     @testset "profile=:profile uses that profile's flags and init" begin
         dir = make_pkg(
             "PastedProfile",
-            "test/TestItems.toml" =>
-                "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\ninit = \"const FROM_INIT = 7\"\n",
+            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n",
+            profile_files("bounds"; init = "const FROM_INIT = 7")...,
         )
         with_activated(dir) do _
             ts, _ = capture_run() do
@@ -292,7 +292,8 @@ const DEPS = fixture("TestDeps.jl")
     end
 
     @testset "a pasted profile's test_end counts, and a skipped item runs none" begin
-        dir = make_pkg("PastedEnd", "test/TestItems.toml" => "[profiles.checked]\ntest_end = \"@test false\"\n")
+        dir = make_pkg("PastedEnd", "test/TestItems.toml" => "[profiles.checked]\n",
+                       profile_files("checked"; test_end = "@test false")...)
         with_activated(dir) do _
             failed, _ = capture_run() do
                 @testitem "pasted checked" profile=:checked begin
@@ -436,11 +437,10 @@ end
             test_end_timeout = 2
 
             [profiles.slow_init]
-            init = "sleep(60)"
 
             [profiles.slow_end]
-            test_end = "sleep(60)"
-            """)
+            """,
+            profile_files("slow_init"; init = "sleep(60)")..., profile_files("slow_end"; test_end = "sleep(60)")...)
         with_activated(dir) do _
             for profile in (:slow_init, :slow_end)
                 ex = :(@testitem $("pasted $profile") profile=$(QuoteNode(profile)) begin

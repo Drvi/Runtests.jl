@@ -91,9 +91,8 @@ const STEPPED = make_pkg(
     [profiles.flagged]
     julia_args = ["--check-bounds=yes"]
     env = { RUNTESTS_FROM_PROFILE = "env" }
-    init = "RUNTESTS_FROM_INIT = 7"
-    test_end = "write(ENV[\\"RUNTESTS_END\\"], \\"ran\\")"
     """,
+    profile_files("flagged"; init = "RUNTESTS_FROM_INIT = 7", test_end = "write(ENV[\"RUNTESTS_END\"], \"ran\")")...,
 )
 const STEPPED_FILE = joinpath(STEPPED, "test", "s_test.jl")
 line_of(text) = findfirst(contains(text), readlines(STEPPED_FILE))

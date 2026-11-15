@@ -5,17 +5,17 @@
 
 using Runtests.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
 
-# An expression that kills the process where it stands the first `n` times it is
-# reached, counting in a file. Written as a TOML literal string, which passes the
-# Julia source through untouched.
-crash_until(marker, n) = string(
-    "init_or_end = 'let p = ENV[\"RUNTESTS_CRASH_MARKER\"]; ",
+# Code that kills the process where it stands the first `n` times it is reached,
+# counting in the file `RUNTESTS_CRASH_MARKER` names.
+crash_until(n) = string(
+    "let p = ENV[\"RUNTESTS_CRASH_MARKER\"]; ",
     "k = isfile(p) ? parse(Int, read(p, String)) : 0; write(p, string(k + 1)); ",
-    "k < ", n, " && ccall(:abort, Cvoid, ()); end'"
+    "k < ", n, " && ccall(:abort, Cvoid, ()); end"
 )
 
-init_crashes(marker, n) = "[profiles.default]\n" * replace(crash_until(marker, n), "init_or_end" => "init")
-end_crashes(marker, n) = "[profiles.default]\n" * replace(crash_until(marker, n), "init_or_end" => "test_end")
+# The files of the default profile, with that code as its `init` or its `test_end`.
+init_crashes(n) = profile_files(; init = crash_until(n))
+end_crashes(n) = profile_files(; test_end = crash_until(n))
 
 const ONE_ITEM = """
 @testitem "the item" begin
@@ -64,7 +64,7 @@ end
         with_marker_dir() do work
             marker = joinpath(work, "count")
             dir = make_pkg("FlakyInit", "test/t_test.jl" => ONE_ITEM,
-                           "test/TestItems.toml" => init_crashes(marker, 2))
+                           init_crashes(2)...)
             states, _, _ = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 run_states(dir; workers=1, logs=:issues, monitor=false)
             end
@@ -79,7 +79,7 @@ end
         with_marker_dir() do work
             marker = joinpath(work, "count")
             dir = make_pkg("DeadInit", "test/t_test.jl" => ONE_ITEM,
-                           "test/TestItems.toml" => init_crashes(marker, 99))
+                           init_crashes(99)...)
             (states, _, _), out = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 capture_run() do
                     run_states(dir; workers=1, logs=:issues, monitor=false)
@@ -97,7 +97,7 @@ end
         with_marker_dir() do work
             marker = joinpath(work, "count")
             dir = make_pkg("DeadEnd", "test/t_test.jl" => ONE_ITEM,
-                           "test/TestItems.toml" => end_crashes(marker, 99))
+                           end_crashes(99)...)
             (states, run, _), out = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 capture_run() do
                     run_states(dir; workers=1, logs=:issues, monitor=false, retries=1)
@@ -121,7 +121,7 @@ end
             @testitem "second" begin
                 @test true
             end
-            """, "test/TestItems.toml" => end_crashes(marker, 1))
+            """, end_crashes(1)...)
             states, _, _ = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 run_states(dir; workers=1, logs=:issues, monitor=false)
             end

@@ -101,7 +101,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             "test/qa/Project.toml" => "[deps]\n",
             "test/qa/q_test.jl" => item("in qa"),
             "test/broken_test.jl" => "@testitem \"broken\" begin\n",
-            "test/TestItems.toml" => "[profiles.big]\nthreads = \"1\"\n",
+            "test/TestItems.toml" => "[profiles.big]\njulia_args = [\"--threads=1\"]\n",
         )
         r = list_items(dir)
         @test r.root == dir
@@ -264,7 +264,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
     @testset "a session reads the config file it was started with, to list and to run" begin
         dir = make_pkg("ServedConfig", "test/a_test.jl" => string(item("plain"), item("fast"; opts = "profile=:fast")))
         config = joinpath(mktempdir(), "editor.toml")
-        write(config, "[run]\nworkers = 1\n[profiles.fast]\nthreads = \"1\"\n")
+        write(config, "[run]\nworkers = 1\n[profiles.fast]\njulia_args = [\"--threads=1\"]\n")
         with_runstate_dir() do _
             # Without it, the profile the item names is unknown, and said to be.
             s = open_session(dir)
@@ -303,15 +303,16 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             s = open_session(dir)
             next_event(s)
             started(seen) = only(e for e in seen if e["event"] == "run_started")
-            # Asked for no names: the default group, which `run_started` says.
-            send(s, (; id = 1, command = "run"))
-            seen = events_until(e -> e["event"] == "run_finished", s)
+            # Asked for no names: the whole suite, as `runtests` runs it, which
+            # `run_started` says.
             names(e) = [k["name"] for k in e["items"]]
+            send(s, (; id = 1, command = "run"))
+            @test sort(names(started(events_until(e -> e["event"] == "run_finished", s)))) == ["fast", "slow"]
+            send(s, (; id = 2, command = "run", options = (; group = "default")))
+            seen = events_until(e -> e["event"] == "run_finished", s)
             @test names(started(seen)) == ["fast"]
             recorded = last(seen)["runstate"]
-            send(s, (; id = 2, command = "run", options = (; group = "all")))
-            @test sort(names(started(events_until(e -> e["event"] == "run_finished", s)))) == ["fast", "slow"]
-            # The run state of the first, run again: its items, not the whole suite.
+            # The run state of the default group's run, run again: its items, not the whole suite.
             send(s, (; id = 3, command = "run", options = (; replay = recorded)))
             @test names(started(events_until(e -> e["event"] == "run_finished", s))) == ["fast"]
             close_session(s)

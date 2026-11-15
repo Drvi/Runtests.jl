@@ -34,13 +34,13 @@ end
         last = ["z"]
 
         [profiles.bounds]
-        julia_args = ["--check-bounds=yes"]
-        threads = "4"
+        julia_args = ["--check-bounds=yes", "--threads=4"]
         env = { FOO = "1" }
-        init = "using Test"
-        test_end = "GC.gc(true)"
         precompile = ["Test"]
         """) do dir
+            code = mkpath(joinpath(dir, "testconfigs", "bounds"))
+            write(joinpath(code, "worker_init.jl"), "using Test\n")
+            write(joinpath(code, "test_end.jl"), "GC.gc(true)\n")
             cfg = read_config(dir)
             @test cfg.workers == 3
             @test cfg.timeout_s == 120
@@ -54,7 +54,9 @@ end
             @test p.threads == "4"
             @test p.env == ["FOO" => "1"]
             @test p.init.head === :block && !isempty(p.init.args)
-            @test p.test_end.head === :block
+            @test p.test_end.head === :block && !isempty(p.test_end.args)
+            # Parsed with the path of its file, so an error in it names the file and the line.
+            @test first(p.init.args) == LineNumberNode(1, Symbol(joinpath(code, "worker_init.jl")))
             @test p.precompile == ["Test"]
             # Without the key, the whole environment.
             @test cfg.profiles[:default].precompile === nothing
@@ -168,14 +170,105 @@ end
         end
     end
 
-    @testset "init expressions are parsed here, not on a worker" begin
-        with_toml("[profiles.p]\ninit = \"using \"\n") do dir
+    @testset "the code of a profile is parsed here, not on a worker" begin
+        with_toml("[profiles.p]\n") do dir
+            code = mkpath(joinpath(dir, "testconfigs", "p"))
+            write(joinpath(code, "worker_init.jl"), "using ")
             err = try; read_config(dir); catch e; e; end
             @test err isa ConfigError
-            @test occursin("could not parse `init`", sprint(showerror, err))
-        end
-        with_toml("[profiles.p]\ntest_end = \"1 +\"\n") do dir
+            @test occursin(r"could not parse \S*worker_init.jl", sprint(showerror, err))
+            write(joinpath(code, "worker_init.jl"), "")
+            write(joinpath(code, "test_end.jl"), "1 +")
             @test_throws ConfigError read_config(dir)
+        end
+    end
+
+    @testset "the code of a profile is in files, not in TestItems.toml" begin
+        with_toml("[profiles.p]\ninit = \"using Test\"\n") do dir
+            msg = sprint(showerror, try; read_config(dir); catch e; e; end)
+            @test occursin("the code of a profile is in a file of its own", msg)
+            @test occursin(joinpath("testconfigs", "p", "worker_init.jl"), msg)
+        end
+        with_toml("[profiles.default]\ntest_end = \"nothing\"\n") do dir
+            @test occursin(joinpath("testconfigs", "test_end.jl"),
+                           sprint(showerror, try; read_config(dir); catch e; e; end))
+        end
+        # The default profile's code needs no table.
+        with_toml("") do dir
+            mkpath(joinpath(dir, "testconfigs"))
+            write(joinpath(dir, "testconfigs", "worker_init.jl"), "const FROM_FILE = 1\n")
+            @test !isempty(read_config(dir).profiles[DEFAULT_PROFILE].init.args)
+        end
+    end
+
+    @testset "the threads of a profile are a flag of julia_args, taken out of them" begin
+        for (args, threads, rest) in (("[\"-t\", \"4\"]", "4", String[]), ("[\"-t4\", \"-O1\"]", "4", ["-O1"]),
+                                      ("[\"--threads\", \"2,1\"]", "2,1", String[]),
+                                      ("[\"--threads=auto\", \"--check-bounds=yes\"]", "auto", ["--check-bounds=yes"]))
+            with_toml("[profiles.p]\njulia_args = $args\n") do dir
+                p = read_config(dir).profiles[:p]
+                @test p.threads == threads && p.julia_args == rest
+            end
+        end
+        for (toml, said) in (
+                "[profiles.p]\nthreads = \"4\"\n" =>
+                    "the threads of a profile are a flag of `julia_args`, as in `julia_args = [\"--threads=4\"]`",
+                "[profiles.p]\njulia_args = [\"-t\"]\n" => "`-t` in `julia_args` of [profiles.p]",
+                "[profiles.p]\njulia_args = [\"-t2\", \"--threads=3\"]\n" => "is given twice",
+                "[profiles.p]\njulia_args = [\"-t0\"]\n" => "must be what `--threads` takes",
+            )
+            with_toml(toml) do dir
+                err = try; read_config(dir); catch e; e; end
+                @test err isa ConfigError && occursin(said, sprint(showerror, err))
+            end
+        end
+        # Without `--threads`, the workers get the run's.
+        with_toml("[profiles.p]\njulia_args = [\"-O1\"]\n") do dir
+            @test read_config(dir).profiles[:p].threads == ""
+        end
+    end
+
+    @testset "the name of a profile is a directory name on every system" begin
+        for (toml, said) in (
+                "[profiles.\"a/b\"]\n" => "it holds '/'",
+                "[profiles.\"x:y\"]\n" => "it holds ':'",
+                "[profiles.CON]\n" => "Windows takes it for a device",
+                "[profiles.\"end.\"]\n" => "Windows drops a space or a dot at its end",
+                "[profiles.Default]\n" => "differs from `default` only in case",
+                "[profiles.\"Worker_Init.jl\"]\n" => "it is the name of a file there",
+                "[profiles.Bounds]\n[profiles.bounds]\n" => "`Bounds` and `bounds`, which differ only in case",
+            )
+            with_toml(toml) do dir
+                err = try; read_config(dir); catch e; e; end
+                @test err isa ConfigError
+                @test occursin(said, sprint(showerror, err))
+            end
+        end
+    end
+
+    @testset "test/testconfigs holds the code of the profiles and nothing else" begin
+        with_toml("[profiles.bounds]\n") do dir
+            code = joinpath(dir, "testconfigs")
+            mkpath(joinpath(code, "bounds"))
+            write(joinpath(code, "worker_init.jl"), "")
+            write(joinpath(code, "bounds", "test_end.jl"), "")
+            write(joinpath(code, ".DS_Store"), "")              # hidden: passed over
+            @test read_config(dir).profiles[:bounds].test_end == Expr(:block)
+            for (extra, said) in (
+                    joinpath("notes.md") => "`notes.md`",
+                    joinpath("bounds", "helpers.jl") => "`bounds/helpers.jl`",
+                    joinpath("default", "worker_init.jl") => "`default/`",
+                    joinpath("fast", "worker_init.jl") => "`fast/`",
+                )
+                path = joinpath(code, extra)
+                mkpath(dirname(path)); write(path, "")
+                msg = sprint(showerror, try; read_config(dir); catch e; e; end)
+                @test occursin(said, msg)
+                @test occursin("The other profiles are `bounds`", msg)
+                rm(dirname(path) == code ? path : (dirname(path) == joinpath(code, "bounds") ? path : dirname(path));
+                   recursive = true)
+            end
+            @test read_config(dir).profiles[:bounds].test_end == Expr(:block)
         end
     end
 
@@ -188,7 +281,7 @@ end
                      "[run]\ninit_timeout = nan\n", "[run]\nworkers = 2.5\n", "[run]\nworkers = 40000\n",
                      "[run]\nfailfast = 1\n", "[run]\nverbose = \"yes\"\n", "[run]\nseed = -1\n",
                      "[run]\nmemory_threshold = \"high\"\n", "[run]\nthreads = \"x\"\n",
-                     "[run]\nthreads = \"0\"\n", "[profiles.p]\nthreads = \"4,1,1\"\n")
+                     "[run]\nthreads = \"0\"\n", "[profiles.p]\njulia_args = [\"--threads=4,1,1\"]\n")
             with_toml(toml) do dir
                 @test_throws ConfigError read_config(dir)
             end
@@ -223,7 +316,7 @@ end
                 "[profiles.p]\njulia_args = [\"-O0\", 1]\n" => "`julia_args` of [profiles.p]",
                 "[profiles.p]\nenv = [\"A=1\"]\n" => r"`env` of \[profiles\.p\] in \S*TestItems.toml must be a table of variables",
                 "[profiles.p]\nenv = { A = [1] }\n" => "`env` of [profiles.p]",
-                "[profiles.p]\ninit = 1\n" => r"`init` of \[profiles\.p\] in \S*TestItems.toml must be a string",
+                "[profiles.p]\ninit = 1\n" => r"`init` of \[profiles\.p\] in \S*TestItems.toml: the code of a profile is in a file",
                 "[profiles.p]\ntest_end = [\"x\"]\n" => "`test_end` of [profiles.p]",
                 "[profiles.p]\nprecompile = false\n" => r"`precompile` of \[profiles\.p\] in \S*TestItems.toml must be a list of strings",
                 "[profiles.p]\nprecompile = [\"A\", 1]\n" => "`precompile` of [profiles.p]",
@@ -326,7 +419,7 @@ end
         end
         """)
         profile = joinpath(mktempdir(), "ci.toml")
-        write(profile, "[run]\ntimeout = 77\n[profiles.fast]\nthreads = \"1\"\n")
+        write(profile, "[run]\ntimeout = 77\n[profiles.fast]\njulia_args = [\"--threads=1\"]\n")
         no_profile = joinpath(dirname(profile), "bare.toml")
         write(no_profile, "[run]\ntimeout = 78\n")
         message(f) = (err = try; f(); nothing; catch e; e; end; err isa ConfigError ? sprint(showerror, err) : "")

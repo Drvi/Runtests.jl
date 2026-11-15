@@ -118,8 +118,8 @@ const plain = text => text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
 /**
  * The keys an editor queued for a run that the run did not select: a run asked for
- * no items in particular selects the items of the suite's default group, which can
- * be fewer than the tree shows. Keys the suite does not have are left out; the run
+ * no items in particular selects the group that RUNTESTS_GROUP names in the server's
+ * environment, which can be fewer than the tree shows. Keys the suite does not have are left out; the run
  * says those are unknown.
  * @param {string[]} queued  the keys queued
  * @param {{items?: Array<{package: string, name: string}>, unknown?: Array<{package: string, name: string}>}} started

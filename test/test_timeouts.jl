@@ -50,7 +50,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         dir = make_pkg(
             "SlowInit",
             "test/t_test.jl" => """@testitem "quick" timeout=5 begin\n    @test true\nend\n""",
-            "test/TestItems.toml" => "[profiles.default]\ninit = \"sleep(7)\"\n"
+            profile_files(init = "sleep(7)")...
         )
         states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["quick"] === PASSED
@@ -70,7 +70,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
                 @test true
             end
             """,
-            "test/TestItems.toml" => "[profiles.default]\ninit = \"sleep(600)\"\n"
+            profile_files(init = "sleep(600)")...
         )
         (states, run, _), out = capture_run() do
             run_states(dir; workers=1, logs=:issues, monitor=false, init_timeout=2)
@@ -99,7 +99,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         dir = make_pkg(
             "SlowEnd",
             "test/t_test.jl" => """@testitem "quick" timeout=5 begin\n    @test true\nend\n""",
-            "test/TestItems.toml" => "[profiles.default]\ntest_end = \"sleep(7)\"\n"
+            profile_files(test_end = "sleep(7)")...
         )
         states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["quick"] === PASSED
@@ -109,7 +109,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         dir = make_pkg(
             "HangingEnd",
             "test/t_test.jl" => """@testitem "fine on its own" begin\n    @test true\nend\n""",
-            "test/TestItems.toml" => "[profiles.default]\ntest_end = \"sleep(600)\"\n"
+            profile_files(test_end = "sleep(600)")...
         )
         (states, _, _), out = capture_run() do
             run_states(dir; workers=1, logs=:issues, monitor=false, test_end_timeout=2)
@@ -125,7 +125,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
             dir = make_pkg(
                 "EndFails",
                 "test/t_test.jl" => """@testitem "passes on its own" begin\n    @test true\nend\n""",
-                "test/TestItems.toml" => "[profiles.default]\ntest_end = \"@test 1 == 2\"\n"
+                profile_files(test_end = "@test 1 == 2")...
             )
             states, run, _ = run_states(dir; workers, logs=:issues, monitor=false)
             @test states["passes on its own"] === FAILED
@@ -139,7 +139,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
             dir = make_pkg(
                 "EndPasses",
                 "test/t_test.jl" => """@testitem "checked twice" begin\n    @test true\nend\n""",
-                "test/TestItems.toml" => "[profiles.default]\ntest_end = \"@test 1 == 1\"\n"
+                profile_files(test_end = "@test 1 == 1")...
             )
             states, run, _ = run_states(dir; workers, logs=:issues, monitor=false)
             @test states["checked twice"] === PASSED
@@ -159,8 +159,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
                 @test false
             end
             """,
-            "test/TestItems.toml" =>
-                "[profiles.default]\ntest_end = \"open(ENV[\\\"RUNTESTS_END_LOG\\\"], \\\"a\\\") do io; println(io, 1); end\"\n"
+            profile_files(test_end = "open(ENV[\"RUNTESTS_END_LOG\"], \"a\") do io; println(io, 1); end")...
         )
         mktempdir() do work
             log = joinpath(work, "ends")

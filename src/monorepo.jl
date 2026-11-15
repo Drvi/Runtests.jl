@@ -35,8 +35,8 @@ Every package of the workspace that has a suite is a candidate, or those that
 `packages` of `[monorepo]` in the root's `test/TestItems.toml` names by directory or
 glob. The keyword `packages` then narrows the candidates by package name or
 directory relative to the workspace root. Each candidate needs its test project to
-be a workspace member. Returned package names must be unique. A mistake in a file
-is a `ConfigError`, one in the call an `ArgumentError`.
+be a workspace member. Returned package names must be unique, also when case is
+ignored. A mistake in a file is a `ConfigError`, one in the call an `ArgumentError`.
 """
 function find_participants(dir::Union{Nothing, AbstractString} = nothing; packages = nothing)
     VERSION >= MONOREPO_JULIA || error(
@@ -86,6 +86,14 @@ function find_participants(dir::Union{Nothing, AbstractString} = nothing; packag
             relpath_or_path(config, workspace), " or with the keyword `packages`"
         )))
     end
+    # `RUNTESTS_ARTIFACT_DIR` gets a directory of each package's name.
+    clashes = case_clashes(found.name[kept])
+    isempty(clashes) || throw(ConfigError(string(
+        "a combined run puts the run state of each package in a directory of its name, and the packages ",
+        join((join(g, " and ") for g in clashes), ", "), " that take part differ only in case, which macOS and ",
+        "Windows hold as one directory. Rename one, or leave one out with `packages` of [monorepo] in ",
+        relpath_or_path(config, workspace), " or with the keyword `packages`"
+    )))
     outside = [k for k in kept if !test_project_in_workspace(found.root[k])]
     isempty(outside) || throw(ConfigError(string(
         "a combined run runs each package's tests in the environment of the workspace at ", workspace, ", ",
@@ -311,7 +319,7 @@ function narrow_participants(found, chosen::Vector{Int}, why, packages, workspac
 end
 
 """
-    import_problems(ps, items, item_participant, profiles, setups, configs) -> Vector{ScanError}
+    import_problems(ps, items, item_participant, profiles, setups) -> Vector{ScanError}
 
 The imports that a shared worker could load but the participant's own test
 environment could not, each where it is written, so that a combined run gives no
@@ -326,15 +334,15 @@ load is a problem: a package, a test dependency or a setup of a participant, or
 Runtests. Any other fails, or loads from a directory the code puts on `LOAD_PATH`,
 the same way in a combined run as in the package's own.
 
-`item_participant[i]` is the participant of `items[i]`; `profiles[k]`, `setups[k]` and
-`configs[k]` are participant `k`'s profiles, setup modules and configuration file.
+`item_participant[i]` is the participant of `items[i]`; `profiles[k]` and `setups[k]` are
+participant `k`'s profiles and setup modules.
 `all_setups` checks every setup of a participant, those no item loads too.
 What this checks is the syntax as written, a macro call's arguments included: not an
 import built at run time, as with `Core.eval`, quoted code or a file that `include` reads.
 """
 function import_problems(
         ps::Participants, items::Vector{RawItem}, item_participant::Vector{Int},
-        profiles::Vector{Dict{Symbol, Profile}}, setups::Vector{Dict{Symbol, String}}, configs::Vector{String};
+        profiles::Vector{Dict{Symbol, Profile}}, setups::Vector{Dict{Symbol, String}};
         all_setups::Bool = false
     )
     eachindex(items) == eachindex(item_participant) || throw(DimensionMismatch("one participant per item"))
@@ -352,9 +360,8 @@ function import_problems(
         testproj = existing_project_file(joinpath(ps.root[k], "test"))
         allowed = union(common, dependency_names(testproj), (Symbol(ps.name[k]),), keys(setups[k]))
         declarer = string(ps.name[k], "'s test project, ", relpath_or_path(testproj, ps.workspace))
-        # A profile's expression has lines of its own, not of the file that holds it.
-        check(file, ex, what, in_file = true) = for (root, line) in imports_in(ex)
-            (root in allowed || !(root in shared)) || push!(problems, ScanError(file, in_file ? line : Int32(0), string(
+        check(file, ex, what) = for (root, line) in imports_in(ex)
+            (root in allowed || !(root in shared)) || push!(problems, ScanError(file, line, string(
                 what, "imports ", root, ", which is not in [deps] of ", declarer, ", so ", ps.name[k],
                 "'s own run cannot load it"
             )))
@@ -371,10 +378,10 @@ function import_problems(
         for name in sort!(collect(used_profiles))
             prof = get(profiles[k], name, nothing)
             prof === nothing && continue
-            # A profile the workspace shares has its code in the root's file.
-            file = isempty(prof.dir) ? configs[k] : joinpath(prof.dir, "test", "TestItems.toml")
-            check(file, prof.init, "`init` of [profiles.$name] ", false)
-            check(file, prof.test_end, "`test_end` of [profiles.$name] ", false)
+            # A profile the workspace shares has its code in the root's `test/testconfigs/`.
+            dir = profile_code_dir(joinpath(isempty(prof.dir) ? ps.root[k] : prof.dir, "test"), String(name))
+            check(joinpath(dir, WORKER_INIT_FILE), prof.init, "")
+            check(joinpath(dir, TEST_END_FILE), prof.test_end, "")
         end
         all_setups && union!(used_setups, keys(setups[k]))
         # A setup module's sibling setups load with it.
@@ -567,7 +574,8 @@ when at least one key matches; if none matches, the selection is an error.
 """
 function prepare_mono(paths = (); packages = nothing, name = nothing, tags = nothing, group = nothing,
                       replay = nothing, item_keys::Union{Nothing, Vector{Tuple{String, String}}} = nothing,
-                      announce::Bool = true, expansions::Bool = true, kwargs...)
+                      announce::Bool = true, expansions::Bool = true, worker_init = nothing, test_end = nothing,
+                      kwargs...)
     haskey(kwargs, :config) && throw(ArgumentError(
         "`config` names a file to read in place of one package's test/TestItems.toml, and a combined run reads " *
             "each package's own"
@@ -689,11 +697,14 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
                                          haskey(kwargs, :seed) && !haskey(recorded_settings(replayed.given), :seed))
         check_replayed_environments(items, [replayed.records[k] for k in kept], ps.root[kept])
     end
+    # The code a call gives is every package's, and runs in the workspace root, as a
+    # shared default's does, so that the packages can share workers.
+    foreach(cfg -> call_code!(cfg.profiles, worker_init, test_end; dir = workspace), cfgs)
     sub = Participants(workspace, ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], ps.skipped)
     # Of the packages that run: one that gives no item shares no worker and no load path.
     check_setup_names(sub, setups[kept])
     problems = import_problems(sub, items, Int[it.package for it in items],
-                               [c.profiles for c in cfgs], setups[kept], [configs[k][1] for k in kept])
+                               [c.profiles for c in cfgs], setups[kept])
     isempty(problems) || throw(ScanFailure(problems))
     histories = History[history(ps.root[k]) for k in kept]
     full = name === nothing && tags === nothing && all(g -> g === nothing, gsel) && isempty(chosen)
@@ -777,28 +788,19 @@ end
     mono_groups(groups, paths, requested, selected) -> (selections, lacking, name)
 
 The group each package of a combined run selects by, as `select_group` gives it for
-one package: the `group` keyword, `requested`, and for a call that selects nothing
-else, `RUNTESTS_GROUP`, and otherwise `$DEFAULT_GROUP`. A package that does not
-declare a group that the call or the variable asks for gives no items (`lacking`);
-it is an error only when no package declares it. `$DEFAULT_GROUP` is each package's
-own, and the whole suite of a package that does not declare it. `name` is the group
-asked for, `$ALL_GROUP` when none is.
+one package: the `group` keyword, `requested`; for a call that selects nothing else,
+`RUNTESTS_GROUP`; else the group `$DEFAULT_GROUP` when `runtestsd_mono` asks for it. A
+package that does not declare a group that the call or the
+variable asks for gives no items (`lacking`); it is an error only when no package
+declares it. `$DEFAULT_GROUP` is each package's own, and the whole suite of a package
+that does not declare it. `name` is the group asked for, `$ALL_GROUP` when none is.
 """
 function mono_groups(groups::Vector{Dict{String, TagExpr}}, paths::Vector{String}, requested, selected::Bool)
     n = length(groups)
     none = (Union{Nothing, GroupSelection}[nothing for _ in 1:n], falses(n), ALL_GROUP)
-    if requested !== nothing
-        (requested isa Union{AbstractString, Symbol} && !isempty(string(requested))) || throw(ArgumentError(
-            "`group = $(repr(requested))`: expected the name of a group of [groups], \"$ALL_GROUP\" or \"$DEFAULT_GROUP\""
-        ))
-        name, asker = String(string(requested)), "the `group` keyword"
-    else
-        selected && return none
-        env = strip(get(ENV, "RUNTESTS_GROUP", ""))
-        name, asker = isempty(env) ? (DEFAULT_GROUP, "") : (String(env), "`RUNTESTS_GROUP`")
-    end
-    name == ALL_GROUP && return none
-    source = isempty(asker) ? "the default" : string("from ", asker)
+    name, asker = requested_group(requested, selected)
+    (name === nothing || name == ALL_GROUP) && return none
+    source = string("from ", asker)
     sel = Union{Nothing, GroupSelection}[haskey(g, name) ? GroupSelection(name, g[name], source, paths[k]) : nothing
                                          for (k, g) in enumerate(groups)]
     name == DEFAULT_GROUP && return sel, falses(n), name
@@ -810,7 +812,7 @@ function mono_groups(groups::Vector{Dict{String, TagExpr}}, paths::Vector{String
         msg = string(asker, " asks for group `", name, "`, which no package of the combined run declares", hint,
                      isempty(declared) ? "" : string("; they declare ", join(("`$g`" for g in declared), ", ")),
                      ", and `$ALL_GROUP` is the whole of every suite")
-        throw(requested !== nothing ? ArgumentError(msg) : ConfigError(msg))
+        throw(asker == ENV_GROUP_ASKER ? ConfigError(msg) : ArgumentError(msg))
     end
     return sel, lacking, name
 end
@@ -867,7 +869,7 @@ function mono_description(name, tags, group, paths::Vector{String}, workspace::A
     parts = String[]
     name === nothing || push!(parts, "name = $(repr(name))")
     tags === nothing || push!(parts, "tags = $(repr(tags))")
-    group === nothing || push!(parts, "group `$(group)`")
+    group === nothing || push!(parts, "group `$(group isa DefaultGroupCall ? DEFAULT_GROUP : group)`")
     isempty(paths) || push!(parts, "paths " * join((rel_slash(p, workspace) for p in paths), ", "))
     return isempty(parts) ? "the filter" : join(parts, " and ")
 end
@@ -1100,6 +1102,9 @@ function print_worker_groups(io::IO, ps::Participants)
         testdir = joinpath(ps.root[k], "test")
         path, toml = config_toml(testdir, nothing)
         declared = declared_in(toml)
+        # The default profile is the package's own when its code is in files, with no table.
+        init, test_end = profile_code(testdir, String(DEFAULT_PROFILE))
+        isempty(init.args) && isempty(test_end.args) || push!(declared, DEFAULT_PROFILE)
         profiles = read_profiles(path, toml; shared)
         threads = package_threads(toml)
         for name in sort!(collect(keys(profiles)); by = n -> (n !== DEFAULT_PROFILE, string(n)))
@@ -1133,7 +1138,8 @@ function print_worker_groups(io::IO, ps::Participants)
         foreach(name -> println(io, "    with ", who(name)), names[2:end])
         any(m -> m[3] !== :own, members) && println(io, "    shared by ", relpath_or_path(root_path, ps.workspace))
         copies = [of(m[1]) for m in members if m[3] === :copy]
-        isempty(copies) || println(io, "    the same in the test/TestItems.toml of ", and(copies), ", which can leave it out")
+        isempty(copies) ||
+            println(io, "    the same in test/TestItems.toml and test/$TESTCONFIGS_DIR/ of ", and(copies), ", which can leave it out")
         for m in members
             m[5] && println(io, "    the same as the root's `", m[2], "`: `monorepo_default = true` in ",
                             relpath_or_path(root_path, ps.workspace), " makes them one group")
@@ -1161,12 +1167,12 @@ end
 function written_import_problems(ps::Participants; all_setups::Bool = true)
     shared = shared_profiles(config_toml(joinpath(ps.workspace, "test"), nothing)..., ps.workspace)
     items, owner = RawItem[], Int[]
-    profiles, setups, configs = Dict{Symbol, Profile}[], Dict{Symbol, String}[], String[]
+    profiles, setups = Dict{Symbol, Profile}[], Dict{Symbol, String}[]
     for k in eachindex(ps.root)
         testdir = joinpath(ps.root[k], "test")
         s = setup_modules(testdir)
         path, toml = config_toml(testdir, nothing)
-        push!(setups, s); push!(configs, path)
+        push!(setups, s)
         push!(profiles, try read_profiles(path, toml; shared) catch e; e isa ConfigError || rethrow(); Dict{Symbol, Profile}() end)
         w = walk_test_dir(testdir)
         its = try
@@ -1177,16 +1183,17 @@ function written_import_problems(ps::Participants; all_setups::Bool = true)
         end
         append!(items, its); append!(owner, fill(k, length(its)))
     end
-    return import_problems(ps, items, owner, profiles, setups, configs; all_setups)
+    return import_problems(ps, items, owner, profiles, setups; all_setups)
 end
 
 # A line for each package whose `test/runtests.jl` does more than load packages and
-# call `runtests()` or `runtests_mono()`, with nothing given: a combined run reads the
-# package's files and not that one, so what else it does is done in the package's own
-# runs alone. Loading packages, the package itself and Runtests among them, changes
-# nothing in a run.
+# call `runtests`, `runtestsd` or their `_mono` forms, with nothing given: a combined
+# run reads the package's files and not that one, so what else it does is done in the
+# package's own runs alone. Loading packages, the package itself and Runtests among
+# them, changes nothing in a run.
 function launcher_lines(ps::Participants)
-    calls = (:runtests, :runtests_mono, :(Runtests.runtests), :(Runtests.runtests_mono))
+    calls = (:runtests, :runtests_mono, :runtestsd, :runtestsd_mono, :(Runtests.runtests), :(Runtests.runtests_mono),
+             :(Runtests.runtestsd), :(Runtests.runtestsd_mono))
     plain_call(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 1 && any(isequal(ex.args[1]), calls)
     loads(ex) = ex isa Expr && ex.head in (:using, :import)
     lines = String[]
@@ -1199,8 +1206,9 @@ function launcher_lines(ps::Participants)
         push!(lines, string(relpath_or_path(path, ps.workspace), " does more than call `Runtests.runtests()`, and a combined run does not ",
                             "run it"))
         push!(lines, string("  move what it sets to test/TestItems.toml of its package: run settings to [run], the group ",
-                            "a run takes to `default` of [groups], and variables to `env` of a profile, or to its `init` ",
-                            "for a computed value"))
+                            "it runs to `default` of [groups], which `runtestsd` and `runtestsd_mono` run, and variables to `env` of a profile, ",
+                            "or to its `init` ",
+                            "in test/$TESTCONFIGS_DIR/ for a computed value"))
     end
     return lines
 end

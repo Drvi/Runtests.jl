@@ -62,7 +62,7 @@ To read another file in place of `test/TestItems.toml`, give the `config` keywor
 
 `workers = "auto"` is the default. It chooses the number of workers from the number of CPUs, the threads of each worker and an assumed 4 GiB for each worker. The maximum is 8. Give an integer to set the number yourself. `workers = 0` runs ordinary items in the process that calls `runtests`; sandboxed items and items of a named profile still use workers. [Run tests](@ref running) explains this mode.
 
-`threads` is the `--threads` value of each worker. The default is `"2,1"`: two threads in the default pool and one interactive thread. A worker with `threads = "auto"` takes every CPU.
+`threads` is the `--threads` value of each worker. The default is `"2,1"`: two threads in the default pool and one interactive thread. A worker with `threads = "auto"` takes every CPU. A profile gives its workers other threads with `--threads` in its `julia_args`.
 
 ## Timeouts and retries
 
@@ -143,12 +143,22 @@ gpu = "gpu"
 quick = "fast && !slow"
 ```
 
-`runtests(group = "gpu")`, or `RUNTESTS_GROUP=gpu`, runs the items that the expression selects. The header of the run says which group ran and what selected it: the keyword, the variable, or the `default` when nothing else selected. `RUNTESTS_GROUP` and `default` apply only to a call that selects nothing else. A path, a line, `name`, `tags` or `group` in the call replaces them.
+`runtests(group = "gpu")`, or `RUNTESTS_GROUP=gpu`, runs the items that the expression selects. `runtests()` without a selection runs the whole suite. `runtestsd()` runs the group `default`. `RUNTESTS_GROUP` applies only to a call that selects nothing else. It replaces the whole suite of `runtests()` and the group `default` of `runtestsd()`. If the call gives a path, a line, `name`, `tags` or `group`, the variable does not apply. The header of the run says which group ran and what selected it: the keyword, the variable, or `runtestsd`.
+
+A suite that keeps slow items out of `Pkg.test` declares them out of `default`, and calls `runtestsd` in `test/runtests.jl`:
+
+```julia
+# test/runtests.jl
+using Runtests
+runtestsd()
+```
+
+A CI job of this suite can still run another group with `RUNTESTS_GROUP`.
 
 Two names are reserved:
 
 - `all` is the whole suite. You cannot declare it.
-- `default` is what a run selects when nothing else selects. It is the group with this name, or the whole suite when no group has this name.
+- `default` is what `runtestsd` selects. It is the group with this name, or the whole suite when no group has this name.
 
 A name that differs from `all` or `default` only in case is an error. A group that `[groups]` does not declare is an error that lists the declared groups. An expression with a tag that no item carries is also an error. `Runtests.chores()` makes sure that every group is valid.
 

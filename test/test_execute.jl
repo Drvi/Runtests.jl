@@ -487,9 +487,8 @@ end
                 @test getpid() == parse(Int, ENV["RUNTESTS_SOLO_PID"])
             end
             """,
-            "test/TestItems.toml" =>
-                "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n" *
-                "init = \"const FROM_PROFILE_INIT = 7\"\n",
+            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n",
+            profile_files("bounds"; init = "const FROM_PROFILE_INIT = 7")...,
         )
         before = live_worker_processes()
         out = Ref("")
@@ -554,10 +553,23 @@ end
         @test states["checked flags"] === PASSED
     end
 
+    @testset "the call's worker_init and test_end are the default profile's, in place of its files" begin
+        dir = make_pkg("CallCode",
+            "test/t_test.jl" => "@testitem \"sees the call's init\" begin\n    @test Main.FROM === :call\nend\n",
+            profile_files(; init = "global FROM = :file", test_end = "@test false")...)
+        states, _, _ = run_states(dir; workers = 1, logs = :issues, monitor = false,
+                                  worker_init = :(global FROM = :call), test_end = :(@test true))
+        @test states["sees the call's init"] === PASSED
+        # The files alone: the item fails, in its body and in its `test_end`.
+        states, _, _ = run_states(dir; workers = 1, logs = :issues, monitor = false)
+        @test states["sees the call's init"] === FAILED
+        @test_throws ArgumentError run_states(dir; workers = 1, logs = :issues, monitor = false, worker_init = "global FROM = 1")
+    end
+
     @testset "profiles that differ only in test_end share workers, each item running its own" begin
         # A `test_end` that leaves an entry in the journal, as the items do.
-        end_mark(tag) = string("test_end = '''open(joinpath(ENV[\"RUNTESTS_JOURNAL\"], string(time_ns(), \"-\", getpid())), ",
-                               "\"w\") do io; println(io, \"end ", tag, "\\t\", getpid(), \"\\t\", time()); end'''")
+        end_mark(tag) = string("open(joinpath(ENV[\"RUNTESTS_JOURNAL\"], string(time_ns(), \"-\", getpid())), ",
+                               "\"w\") do io; println(io, \"end ", tag, "\\t\", getpid(), \"\\t\", time()); end")
         dir = make_pkg(
             "EndOnly",
             "test/a_test.jl" => journal_item("a1"; opts = "profile=:a", body = "@test Main.Runtests.current_testitem().profile === :a") *
@@ -569,7 +581,8 @@ end
                                     touch(flag)
                                     @test tried
                                     """),
-            "test/TestItems.toml" => "[profiles.a]\n$(end_mark("a"))\n\n[profiles.b]\n$(end_mark("b"))\n",
+            "test/TestItems.toml" => "[profiles.a]\n\n[profiles.b]\n",
+            profile_files("a"; test_end = end_mark("a"))..., profile_files("b"; test_end = end_mark("b"))...,
         )
         with_journal() do journal_dir
             (states, _, p), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
@@ -590,7 +603,7 @@ end
         end
         # In this process, with `workers = 0`, the default profile's own `test_end`.
         solo = make_pkg("EndInProcess", "test/a_test.jl" => journal_item("d1"),
-                        "test/TestItems.toml" => "[profiles.default]\n$(end_mark("d"))\n")
+                        profile_files(; test_end = end_mark("d"))...)
         with_journal() do journal_dir
             states, _, _ = run_states(solo; workers = 0, logs = :issues, monitor = false)
             @test states["d1"] === PASSED

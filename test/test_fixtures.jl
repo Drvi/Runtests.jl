@@ -111,6 +111,19 @@ end
         @test fx_snapshot(fixtures) == before
     end
 
+    @testset "a path into test/testconfigs selects no item" begin
+        code = mkpath(joinpath(dir, "test", "testconfigs"))
+        write(joinpath(code, "worker_init.jl"), "")
+        try
+            for path in (code, joinpath(code, "worker_init.jl"))
+                e = fx_thrown(() -> fx_plan(path))
+                @test e isa ArgumentError && occursin("which holds the code of the profiles and no test items", sprint(showerror, e))
+            end
+        finally
+            rm(code; recursive = true)
+        end
+    end
+
     @testset "a package kept there runs as a suite of its own" begin
         inner = joinpath(fixtures, "Inner")
         @test resolve_target((joinpath(inner, "test", "inner_tests.jl"),)).root == inner

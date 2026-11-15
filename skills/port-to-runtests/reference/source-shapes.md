@@ -83,9 +83,8 @@ Runtests.runtests(; tags = isempty(group) || group == "all" ? "!gpu" : Symbol(gr
 ```
 
 The selection can live in `test/TestItems.toml` instead, where `Runtests.chores()`
-checks it and the run's header names it. `default` is what a run selects when
-nothing else does, so `All` maps to it rather than to Runtests' `all`, the whole
-suite:
+checks it and the run's header names it. `runtestsd()` runs the group `default`,
+so `All` maps to it rather than to Runtests' `all`, the whole suite:
 
 ```toml
 [groups]
@@ -97,10 +96,11 @@ gpu = "gpu"
 ```julia
 using Runtests
 group = lowercase(get(ENV, "GROUP", ""))
-Runtests.runtests(; group = isempty(group) || group == "all" ? "default" : group)
+isempty(group) || group == "all" ? Runtests.runtestsd() : Runtests.runtests(; group)
 ```
 
-On CI, `RUNTESTS_GROUP` selects a group without any of this in `runtests.jl`.
+Without the `GROUP` variable, `runtests.jl` is `using Runtests; Runtests.runtestsd()`.
+It runs `default`, or the group that `RUNTESTS_GROUP` names on CI.
 
 Some groups build an environment of their own: `Pkg.activate` and `Pkg.develop` in
 `runtests.jl`, often for downstream or QA tests. The converter leaves the files of a
@@ -169,7 +169,7 @@ The items carry over. What changes around them:
 | `nworkers`, `nworker_threads`, `testitem_timeout` | `workers`, `threads`, `timeout` |
 | `retries`, `memory_threshold`, `failfast` | the same names |
 | `testitem_failfast` | `item_failfast` |
-| `worker_init_expr`, `test_end_expr` | `init` and `test_end` of `[profiles.default]`, as strings of code |
+| `worker_init_expr`, `test_end_expr` | the code of the default profile, in `test/testconfigs/worker_init.jl` and `test/testconfigs/test_end.jl`, or the keywords `worker_init` and `test_end` of `Runtests.runtests` for an expression that the call computes |
 | `report = true` (JUnit XML) | no equivalent: tell the user |
 | `@testsetup module S … end` | `module S … end` in `test/testsetups/S.jl` |
 | `setup = [S]` on an item | `using S` at the top of its body |

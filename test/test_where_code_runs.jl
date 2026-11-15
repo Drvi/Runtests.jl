@@ -33,17 +33,18 @@ note_source(name, out) = """
 const INLINE_NOTE = raw"""write(joinpath(OUT, string(getpid(), "-", hash("TAG"), "-", time_ns())), string("TAG\tmodule=", @__MODULE__, "\tparent=", parentmodule(@__MODULE__), "\tpwd=", pwd(), "\tpid=", getpid()FACTS))"""
 inline_note(tag, out, facts = "") = replace(INLINE_NOTE, "TAG" => tag, "FACTS" => facts, "OUT" => repr(out))
 
-# The profiles of package `name`: the default one, shared with the members of a
-# workspace when `shared`, and `named`. Each `init` imports a test dependency, `Test`.
-hooks_config(name, out; shared = false) = """
-    [profiles.default]
-    $(shared ? "monorepo_default = true" : "")
-    init = 'using Test; global WHERE_INIT = 1; $(inline_note("$name:init default", out))'
-    test_end = '$(inline_note("$name:test_end", out, raw""", "\titem_global=", isdefined(@__MODULE__, :item_global), "\tinit=", isdefined(@__MODULE__, :WHERE_INIT), "\ttest=", isdefined(@__MODULE__, :Test)"""))'
+# The `init` of profile `profile` of package `name`, which imports a test dependency,
+# `Test`.
+named_init(name, profile, out) = string("using Test; global WHERE_INIT = 1; ", inline_note("$name:init $profile", out))
 
-    [profiles.named]
-    init = 'using Test; global WHERE_INIT = 1; $(inline_note("$name:init named", out))'
-    """
+# The profiles of package `name`: the default one, shared with the members of a
+# workspace when `shared`, and `named`, each with its code in `test/testconfigs/`.
+hooks_files(name, out; shared = false) = [
+    "test/TestItems.toml" => string("[profiles.default]\n", shared ? "monorepo_default = true\n" : "", "\n[profiles.named]\n"),
+    profile_files(; init = named_init(name, "default", out),
+                  test_end = inline_note("$name:test_end", out, raw""", "\titem_global=", isdefined(@__MODULE__, :item_global), "\tinit=", isdefined(@__MODULE__, :WHERE_INIT), "\ttest=", isdefined(@__MODULE__, :Test)"""))...,
+    profile_files("named"; init = named_init(name, "named", out))...,
+]
 
 # First in its file, so that it runs before the others on its process: the directory it
 # changes to must not be where any later piece runs.
@@ -97,7 +98,7 @@ env_items(name) = """
 # The files of package `name`, which notes into `out`, under its directory.
 where_files(name, out; shared = false) = [
     "src/$name.jl" => note_source(name, out),
-    "test/TestItems.toml" => hooks_config(name, out; shared),
+    hooks_files(name, out; shared)...,
     "test/where_test.jl" => items_source(name),
     "test/envdir/Project.toml" => "[deps]\n",
     "test/envdir/env_test.jl" => env_items(name),
@@ -256,11 +257,8 @@ end
         @testset "in a combined run, each item runs in the root of its package, and a shared init in the workspace root" begin
             out = mktempdir()
             # The root shares its default profile; A declares only `named`, its own.
-            a_files = filter(f -> first(f) != "test/TestItems.toml", where_files("A", out))
-            push!(a_files, "test/TestItems.toml" => """
-                [profiles.named]
-                init = 'using Test; global WHERE_INIT = 1; $(inline_note("A:init named", out))'
-                """)
+            a_files = filter(f -> first(f) != "test/TestItems.toml" && !occursin("testconfigs", first(f)), where_files("A", out))
+            push!(a_files, "test/TestItems.toml" => "[profiles.named]\n", profile_files("named"; init = named_init("A", "named", out))...)
             ws = e2e_workspace("A" => a_files; root = where_files("Root", out; shared = true))
             a = joinpath(ws, "lib", "A")
             with_runstate_dir() do _

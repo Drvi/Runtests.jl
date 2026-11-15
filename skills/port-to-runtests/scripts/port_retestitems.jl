@@ -181,7 +181,7 @@ function main(args)
     if isfile(runtests) && occursin("ReTestItems", read(runtests, String))
         given = unique([m[1] for m in eachmatch(r"\b(nworkers|nworker_threads|testitem_timeout|retries|memory_threshold|failfast|testitem_failfast|worker_init_expr|test_end_expr|report|name|tags|verbose_results|logs)\s*=", read(runtests, String))])
         push!(notes, "runtests.jl calls ReTestItems: make it `using Runtests; Runtests.runtests()`, and move what it gives the call" *
-                     (isempty(given) ? "" : " ($(join(given, ", ")))") * " into test/TestItems.toml, as reference/source-shapes.md maps it")
+                     (isempty(given) ? "" : " ($(join(given, ", ")))") * " into test/TestItems.toml and test/testconfigs/, as reference/source-shapes.md maps it")
     end
     foreach(println, moves)
     isempty(notes) || println("\nfor a person to look at:\n  ", join(unique(notes), "\n  "))

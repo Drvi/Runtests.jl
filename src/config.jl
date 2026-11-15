@@ -135,7 +135,7 @@ const RUN_KEYS = (
 )
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
-const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_event)
+const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_event, :worker_init, :test_end)
 
 # A keyword `runtests` does not take, with the nearest it does: a misspelled one would
 # otherwise be the one setting a run quietly goes without.
@@ -150,14 +150,76 @@ function unknown_keyword(k::Symbol)
 end
 
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences, :monorepo_default, :precompile)
+const PROFILE_KEYS = (:julia_args, :env, :preferences, :monorepo_default, :precompile)
 const TOP_KEYS = (:run, :order, :profiles, :groups, :monorepo)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
-# The group a run selects when nothing else selects, the whole suite unless declared,
-# and the name of the whole suite, which no `[groups]` entry may take.
+### Names that become paths ###################################################
+
+# What some system refuses in the name of a file: the separators of every system and
+# the characters that Windows reserves. Control characters are refused apart.
+const UNPORTABLE_CHARS = ('/', '\\', ':', '*', '?', '"', '<', '>', '|')
+# The names that Windows takes for devices, in any case and with any extension.
+const DEVICE_NAMES = Set(["con", "prn", "aux", "nul", ("com$i" for i in 1:9)..., ("lpt$i" for i in 1:9)...])
+
+"""
+    unportable_name(name) -> Union{Nothing, String}
+
+Why `name` cannot be the name of one file or directory on each system that Runtests
+runs on, or `nothing` when it can.
+"""
+function unportable_name(name::AbstractString)
+    isempty(name) && return "it is empty"
+    isvalid(name) || return "it is not valid UTF-8"
+    name in (".", "..") && return "it names a directory itself"
+    i = findfirst(c -> c in UNPORTABLE_CHARS || c < ' ' || c == '\x7f', name)
+    i === nothing || return string("it holds ", repr(name[i]))
+    (endswith(name, ' ') || endswith(name, '.')) && return "Windows drops a space or a dot at its end"
+    lowercase(first(split(name, '.'))) in DEVICE_NAMES && return "Windows takes it for a device"
+    ncodeunits(name) > 255 && return "it is longer than 255 bytes"
+    return nothing
+end
+
+"""
+    fold_name(name) -> String
+
+`name` as a system that ignores case compares it: macOS and Windows hold one file for
+two names with the same fold. The fold also composes Unicode, as macOS does.
+"""
+fold_name(name::AbstractString) = Base.Unicode.normalize(String(name); casefold = true)
+
+# The groups of `names` that differ only in case, each sorted: on macOS and Windows,
+# each group is one file.
+function case_clashes(names)
+    groups = Dict{String, Vector{String}}()
+    for n in unique(names)
+        push!(get!(Vector{String}, groups, fold_name(n)), String(n))
+    end
+    return sort!([sort!(g) for g in values(groups) if length(g) > 1])
+end
+
+# Whether `base` holds `parts`, one inside the other, each with its case as written:
+# on macOS and Windows, `isfile` finds `Bounds/x` for `bounds/x` too.
+function exists_exactly(base::AbstractString, parts::AbstractString...)
+    dir = String(base)::String
+    for part in parts
+        name = String(part)::String
+        (isdir(dir) && name in readdir(dir)) || return false
+        dir = joinpath(dir, name)
+    end
+    return true
+end
+
+# The group that `runtestsd` selects, the whole suite unless declared, and the name of
+# the whole suite, which no `[groups]` entry may take.
 const DEFAULT_GROUP = "default"
 const ALL_GROUP = "all"
+
+# What `runtestsd` and `runtestsd_mono` ask for in place of a `group`: the group
+# `default`, which the header of the run says that they selected.
+struct DefaultGroupCall
+    caller::String
+end
 
 """
     read_config(testdir; config = nothing, kwargs...) -> RunConfig
@@ -171,7 +233,8 @@ file are also available; unrelated root profiles and run settings do not apply.
 """
 function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
-    return build_config(path, toml; config_file = config === nothing ? "" : path,
+    # The code of the profiles is the suite's, wherever the file that `config` names is.
+    return build_config(path, toml; config_file = config === nothing ? "" : path, testdir,
                         shared = package_shared_profiles(dirname(abspath(testdir))), kwargs...)
 end
 
@@ -230,14 +293,6 @@ function string_list(path, table::AbstractDict, key::AbstractString, label::Abst
     return String[x for x in v]
 end
 
-# `key` of the table labelled `label`, a string, empty when absent.
-function string_setting(path, table::AbstractDict, key::AbstractString, label::AbstractString)
-    v = get(table, key, "")
-    v isa AbstractString ||
-        throw(ConfigError("`$key` of [$label] in $(relpath_or_path(path)) must be a string, got $(repr(v))"))
-    return String(v)
-end
-
 # `true` or `false` from an environment variable, or `nothing` when it is unset or empty.
 function env_flag(name::AbstractString)
     v = lowercase(strip(get(ENV, name, "")))
@@ -264,7 +319,7 @@ function env_setting(key::Symbol, name::String, text::String)
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
 
-function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
+function build_config(path, toml; nunits = 0, config_file::AbstractString = "", testdir::AbstractString = dirname(path),
                       shared::Union{Nothing, SharedProfiles} = nothing, kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
@@ -363,7 +418,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "",
         full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml; shared),
+        profiles = read_profiles(path, toml; shared, testdir),
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
@@ -392,17 +447,21 @@ default_logs(workers::Integer, interactive::Bool = isinteractive()) =
     interactive && workers <= 1 ? :eager : :issues
 
 # The profiles of the configuration file `path`, `default` always among them, with
-# those that the package's workspace shares (`share_profiles!`). `shared` is `nothing`
-# where the workspace is not known, as before Julia 1.12.
-function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = nothing)
+# those that the package's workspace shares (`share_profiles!`), and their code from
+# `testdir`'s `testconfigs/`. `shared` is `nothing` where the workspace is not known,
+# as before Julia 1.12.
+function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = nothing,
+                       testdir::AbstractString = dirname(path))
     profiles = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
     # Numbered in a byte in a run state, `default` among them.
     length(tbl) <= MAX_PACKAGE_PROFILES ||
         throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $MAX_PACKAGE_PROFILES fit"))
+    check_profile_names(path, collect(String, keys(tbl)))
+    check_testconfigs(testdir, collect(String, keys(tbl)))
     for name in keys(tbl)
-        prof, shares = parse_profile(path, tbl, name)
+        prof, shares = parse_profile(path, tbl, name; testdir)
         (shares && shared !== nothing && !same_file(path, shared.path)) && throw(ConfigError(string(
             "`monorepo_default` of [profiles.", name, "] in ", relpath_or_path(path), ": only the test/TestItems.toml ",
             "of a workspace's root shares a profile with the packages of the workspace",
@@ -411,15 +470,154 @@ function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = noth
         )))
         profiles[prof.name] = prof
     end
-    shared === nothing || share_profiles!(profiles, shared)
+    # The package's own default profile, with no table, when its code is in files: a
+    # default that the workspace shares takes its place only where the package has none.
+    if !haskey(profiles, DEFAULT_PROFILE)
+        init, test_end = profile_code(testdir, String(DEFAULT_PROFILE))
+        isempty(init.args) && isempty(test_end.args) ||
+            (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = "", init, test_end))
+    end
+    if shared !== nothing
+        share_profiles!(profiles, shared)
+        clashes = case_clashes(String.(keys(profiles)))
+        isempty(clashes) || throw(ConfigError(string(
+            relpath_or_path(path), " and ", relpath_or_path(shared.path), ", which shares its profiles, declare ",
+            join((join(("`$n`" for n in g), " and ") for g in clashes), ", "), ", which differ only in case: ",
+            "macOS and Windows hold one directory in test/$TESTCONFIGS_DIR/ for each such pair. Rename one"
+        )))
+    end
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = ""))
     return profiles
 end
 
-# Profile `name` of the `[profiles]` table `tbl` of the configuration file `path`, and
-# whether it says `monorepo_default = true`.
-function parse_profile(path, tbl::AbstractDict, name::AbstractString)
+# The names of the profiles that `path` declares, each the name of a directory in
+# `test/testconfigs/` (see `check_testconfigs`): a name that some system cannot give a
+# directory, `default` in another case, the name of a file of the directory, and two
+# names that differ only in case are errors.
+function check_profile_names(path, names::Vector{String})
+    for n in names
+        bad(why) = ConfigError("[profiles.$n] in $(relpath_or_path(path)): the name of a profile is the name of " *
+                               "its directory in test/$TESTCONFIGS_DIR/, and $why")
+        why = unportable_name(n)
+        why === nothing || throw(bad(why))
+        fold_name(n) == String(DEFAULT_PROFILE) && n != String(DEFAULT_PROFILE) &&
+            throw(bad("it differs from `default` only in case, which macOS and Windows do not tell apart"))
+        fold_name(n) in map(fold_name, TESTCONFIG_FILES) && throw(bad("it is the name of a file there"))
+    end
+    clashes = case_clashes(names)
+    isempty(clashes) || throw(ConfigError(string(
+        relpath_or_path(path), " declares the profiles ", join((join(("`$n`" for n in g), " and ") for g in clashes), ", "),
+        ", which differ only in case: macOS and Windows hold one directory in test/$TESTCONFIGS_DIR/ for each such ",
+        "pair. Rename one"
+    )))
+    return nothing
+end
+
+"""
+    check_testconfigs(testdir, names)
+
+Throw a `ConfigError` for each entry of `test/testconfigs/` that is not code of a
+profile: the default profile's `worker_init.jl` and `test_end.jl` at its top, and for
+each other profile in `names` a directory with its exact name that holds the two files.
+Hidden entries are passed over. A directory that is a profile's name in another case
+is an error: macOS and Windows would read it, and Linux would not.
+"""
+function check_testconfigs(testdir::AbstractString, names::Vector{String})
+    dir = joinpath(testdir, TESTCONFIGS_DIR)
+    (exists_exactly(testdir, TESTCONFIGS_DIR) && isdir(dir)) || return nothing
+    others = filter(!=(String(DEFAULT_PROFILE)), names)
+    bad = String[]
+    notes = String[]
+    for e in readdir(dir)
+        startswith(e, '.') && continue
+        path = joinpath(dir, e)
+        if !isdir(path)
+            e in TESTCONFIG_FILES || push!(bad, "`$e`")
+        elseif e in others
+            for f in readdir(path)
+                startswith(f, '.') || (f in TESTCONFIG_FILES && isfile(joinpath(path, f))) || push!(bad, "`$e/$f`")
+            end
+        else
+            push!(bad, "`$e/`")
+            i = findfirst(n -> fold_name(n) == fold_name(e), others)
+            i === nothing || push!(notes, "`$e/` is the profile `$(others[i])` in another case")
+        end
+    end
+    isempty(bad) && return nothing
+    throw(ConfigError(string(
+        relpath_or_path(dir), " holds ", join(bad, ", "), ". It holds `", WORKER_INIT_FILE, "` and `", TEST_END_FILE,
+        "`, the code of the default profile, and for each other profile of [profiles] a directory of its name ",
+        "with those two files. ", isempty(others) ? "No other profile is declared" :
+            string("The other profiles are ", join(("`$n`" for n in sort(others)), ", ")),
+        isempty(notes) ? "" : string(". ", join(notes, ", ")),
+        ". A profile that the workspace shares takes its code from the workspace root's test/$TESTCONFIGS_DIR/"
+    )))
+end
+
+# The directory of the code of profile `name` in `testdir`.
+profile_code_dir(testdir::AbstractString, name::AbstractString) =
+    name == String(DEFAULT_PROFILE) ? joinpath(testdir, TESTCONFIGS_DIR) : joinpath(testdir, TESTCONFIGS_DIR, name)
+
+"""
+    profile_code(testdir, name) -> (init, test_end)
+
+The `init` and `test_end` of profile `name`, from `test/testconfigs/` in `testdir`:
+each file parsed with its path, so that an error in it names the file and the line.
+An empty block for a file that is not there with its exact name.
+"""
+function profile_code(testdir::AbstractString, name::AbstractString)
+    parts = name == String(DEFAULT_PROFILE) ? (TESTCONFIGS_DIR,) : (TESTCONFIGS_DIR, name)
+    code(file) = exists_exactly(testdir, parts..., file) ? parse_code_file(joinpath(testdir, parts..., file)) : Expr(:block)
+    return code(WORKER_INIT_FILE), code(TEST_END_FILE)
+end
+
+"""
+    call_code!(profiles, worker_init, test_end; dir = "")
+
+Put the `worker_init` and `test_end` that a call gave, expressions or `nothing`, in
+place of the code that the default profile in `profiles` has from its files. A call
+wins over a file, as a keyword wins over the file for a setting. The code runs in
+`dir` (see `init_dir`): the package's root when empty, as for code that its files
+give, or a workspace root for a combined run.
+"""
+function call_code!(profiles::Dict{Symbol, Profile}, worker_init, test_end; dir::AbstractString = "")
+    worker_init === nothing && test_end === nothing && return profiles
+    block(key, ex) = ex isa Expr ? (ex.head === :block ? ex : Expr(:block, ex)) : throw(ArgumentError(
+        "`$key` must be an expression, as in `$key = :(using Foo)` or a `quote` block, got $(repr(ex))"
+    ))
+    p = profiles[DEFAULT_PROFILE]
+    profiles[DEFAULT_PROFILE] = Profile(
+        p.name, p.julia_args, p.threads, p.env,
+        worker_init === nothing ? p.init : block(:worker_init, worker_init),
+        test_end === nothing ? p.test_end : block(:test_end, test_end),
+        p.preferences, p.environment, String(dir), p.precompile
+    )
+    return profiles
+end
+
+function parse_code_file(path::AbstractString)
+    bad(what) = ConfigError("could not parse $(relpath_or_path(path)): $what")
+    ex = try
+        Meta.parseall(read(path, String); filename = path)
+    catch e
+        throw(bad(sprint(showerror, e)))
+    end
+    # `parseall` reports a bad parse as an `:error`/`:incomplete` node rather than
+    # by throwing, so an unchecked result would defer the failure to the worker.
+    for a in ex.args
+        a isa Expr && a.head in (:error, :incomplete) && throw(bad(a.args[1]))
+    end
+    # A file of comments and blank lines is no code: a profile without code shares
+    # workers more widely, and a default without code gives way to a shared one.
+    all(a -> a isa LineNumberNode, ex.args) && return Expr(:block)
+    return Expr(:block, ex.args...)
+end
+
+# Profile `name` of the `[profiles]` table `tbl` of the configuration file `path`, with
+# its code from `testdir` (see `profile_code`), and whether it says
+# `monorepo_default = true`.
+function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::AbstractString = dirname(path))
     label = "profiles.$name"
     given = tbl[name]
     given isa AbstractDict && haskey(given, "environment") && throw(ConfigError(
@@ -427,6 +625,16 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString)
             "a directory under `test/` with a Project.toml of its own run in that environment, under any " *
             "profile; remove the key, and give those items `profile = :$name` where they need this profile"
     ))
+    given isa AbstractDict && haskey(given, "threads") && throw(ConfigError(
+        "`threads` of [$label] in $(relpath_or_path(path)): the threads of a profile are a flag of `julia_args`, " *
+            "as in `julia_args = [\"--threads=$(get(given, "threads", "4"))\"]`. Move them there, and remove the key"
+    ))
+    for (key, file) in (("init", WORKER_INIT_FILE), ("test_end", TEST_END_FILE))
+        given isa AbstractDict && haskey(given, key) && throw(ConfigError(string(
+            "`", key, "` of [", label, "] in ", relpath_or_path(path), ": the code of a profile is in a file of its own. ",
+            "Move it to ", relpath_or_path(joinpath(profile_code_dir(testdir, name), file)), ", and remove the key"
+        )))
+    end
     p = section(path, tbl, name, PROFILE_KEYS, label)
     args = string_list(path, p, "julia_args", label)
     vars = get(Dict{String, Any}, p, "env")
@@ -441,15 +649,49 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString)
         "`monorepo_default` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(shares))"
     ))
     precompile = haskey(p, "precompile") ? string_list(path, p, "precompile", label) : nothing
+    init, test_end = profile_code(testdir, name)
+    threads = take_threads!(args, " in `julia_args` of [$label] in $(relpath_or_path(path))")
     prof = Profile(
-        Symbol(name), args,
-        haskey(p, "threads") ? threads_spec("threads", p["threads"]; where_ = " of [$label] in $(relpath_or_path(path))") : "",
-        env,
-        parse_expr(path, name, "init", string_setting(path, p, "init", label)),
-        parse_expr(path, name, "test_end", string_setting(path, p, "test_end", label)),
+        Symbol(name), args, threads, env, init, test_end,
         profile_preferences(path, name, get(p, "preferences", "")), "", "", precompile
     )
     return prof, shares
+end
+
+"""
+    take_threads!(args, where_) -> String
+
+The `--threads` that the julia arguments `args` give, as `-t 4`, `-t4`, `--threads 4`
+or `--threads=4`, taken out of `args`; empty when they give none. The workers get the
+threads apart from the other arguments, the run's `threads` when a profile gives
+none, and the threads never reach the cache flags (`cache_flags_for`): the number of
+threads compiles no code differently. `where_` says where the arguments are, for an
+error.
+"""
+function take_threads!(args::Vector{String}, where_::AbstractString)
+    threads = ""
+    i = firstindex(args)
+    while i <= lastindex(args)
+        a = args[i]
+        value = if a == "-t" || a == "--threads"
+            i < lastindex(args) || throw(ConfigError("`$a`$where_ has no value after it"))
+            v = args[i + 1]
+            deleteat!(args, i:(i + 1))
+            v
+        elseif startswith(a, "--threads=")
+            deleteat!(args, i)
+            a[(ncodeunits("--threads=") + 1):end]
+        elseif startswith(a, "-t") && !startswith(a, "--")
+            deleteat!(args, i)
+            a[3:end]
+        else
+            i += 1
+            continue
+        end
+        isempty(threads) || throw(ConfigError("`--threads`$where_ is given twice"))
+        threads = threads_spec("--threads", value; where_)
+    end
+    return threads
 end
 
 same_file(a::AbstractString, b::AbstractString) = !isempty(b) && isfile(a) && isfile(b) && samefile(a, b)
@@ -490,8 +732,10 @@ function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
     out = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
     tbl isa AbstractDict || return SharedProfiles(String(path), out)
-    for (name, given) in tbl
-        (given isa AbstractDict && get(given, "monorepo_default", false) === true) || continue
+    marked = String[name for (name, given) in tbl if given isa AbstractDict && get(given, "monorepo_default", false) === true]
+    check_profile_names(path, marked)
+    for name in marked
+        # Its code is in the workspace root's `test/testconfigs/`.
         prof, _ = parse_profile(path, tbl, name)
         out[prof.name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end,
                                  prof.preferences, prof.environment, String(workspace), prof.precompile)
@@ -548,9 +792,9 @@ in_environment(prof::Profile, environment::AbstractString) =
 
 The `[groups]` table: names for tag expressions, each written as a string as `tags`
 takes one, which a run selects by with the `group` keyword or `RUNTESTS_GROUP`. Two
-names are reserved: `$DEFAULT_GROUP` is what a run selects when nothing else selects,
-the whole suite unless declared here, and `$ALL_GROUP` is the whole suite, and is not
-declared. A name that differs from either only in case is an error.
+names are reserved: `$DEFAULT_GROUP` is what `runtestsd` selects, the whole suite
+unless declared here, and `$ALL_GROUP` is the whole suite, and is not declared. A
+name that differs from either only in case is an error.
 """
 function read_groups(path, toml)
     tbl = get(Dict{String, Any}, toml, "groups")
@@ -564,7 +808,7 @@ function read_groups(path, toml)
         reserved in (ALL_GROUP, DEFAULT_GROUP) && name != DEFAULT_GROUP && throw(ConfigError(string(
             what, ": `", reserved, "` is reserved, and this differs from it only in case; ",
             reserved == ALL_GROUP ? "`all` is the whole suite, and is not declared" :
-                "declare the group a run selects by default as `default`"
+                "declare the group that `runtestsd` selects as `default`"
         )))
         value isa AbstractString || throw(ConfigError(
             "$what must be a tag expression written as a string, as in `$name = \"fast && !slow\"`, got $(repr(value))"
@@ -583,28 +827,18 @@ end
     select_group(groups, path, requested, selected) -> Union{Nothing, GroupSelection}
 
 The group a run selects by: the `group` keyword, `requested`; else, for a run that
-selects nothing else (`selected` false), the group `RUNTESTS_GROUP` names, else
-`$DEFAULT_GROUP`. `nothing` for the whole suite: `$ALL_GROUP`, and `$DEFAULT_GROUP`
-when `[groups]` of the config file `path` does not declare it. A name `[groups]` does
-not declare is an error that says the nearest it does: an `ArgumentError` from the
-keyword, a `ConfigError` from the environment.
+selects nothing else (`selected` false), the group `RUNTESTS_GROUP` names; else the
+group `default` when `runtestsd` asks for it with a `DefaultGroupCall`. `nothing` for
+the whole suite: no group asked for, `$ALL_GROUP`, and `$DEFAULT_GROUP` when `[groups]`
+of the config file `path` does not declare it. A name `[groups]` does not declare is
+an error that says the nearest it does: an `ArgumentError` from the keyword, a
+`ConfigError` from the environment.
 """
 function select_group(groups::Dict{String, TagExpr}, path::AbstractString, requested, selected::Bool)
-    if requested !== nothing
-        (requested isa Union{AbstractString, Symbol} && !isempty(string(requested))) || throw(ArgumentError(
-            "`group = $(repr(requested))`: expected the name of a group of [groups], \"$ALL_GROUP\" or \"$DEFAULT_GROUP\""
-        ))
-        name, asker = String(string(requested)), "the `group` keyword"
-    else
-        # Like the default, the environment's group is what a run selects when the
-        # call selects nothing: a name or a line asked for runs whatever group it is in.
-        selected && return nothing
-        env = strip(get(ENV, "RUNTESTS_GROUP", ""))
-        name, asker = isempty(env) ? (DEFAULT_GROUP, "") : (String(env), "`RUNTESTS_GROUP`")
-    end
+    name, asker = requested_group(requested, selected)
+    name === nothing && return nothing
     name == ALL_GROUP && return nothing
-    haskey(groups, name) &&
-        return GroupSelection(name, groups[name], isempty(asker) ? "the default" : string("from ", asker), path)
+    haskey(groups, name) && return GroupSelection(name, groups[name], string("from ", asker), path)
     name == DEFAULT_GROUP && return nothing
     file = relpath_or_path(path)
     declared = sort!(collect(keys(groups)))
@@ -613,7 +847,26 @@ function select_group(groups::Dict{String, TagExpr}, path::AbstractString, reque
     msg = isempty(groups) ? string(asker, " asks for group `", name, "`, and ", file, " declares no [groups]", hint) :
         string(asker, " asks for group `", name, "`, which [groups] of ", file, " does not declare", hint,
                "; it declares ", join(("`$g`" for g in declared), ", "), ", and `$ALL_GROUP` is the whole suite")
-    throw(requested !== nothing ? ArgumentError(msg) : ConfigError(msg))
+    throw(asker == ENV_GROUP_ASKER ? ConfigError(msg) : ArgumentError(msg))
+end
+
+const ENV_GROUP_ASKER = "`RUNTESTS_GROUP`"
+
+# The name of the group a call asks for and what asks for it, or `nothing` for none.
+# `RUNTESTS_GROUP` replaces the group a call without a `group` keyword runs: the whole
+# suite, or `default` from `runtestsd`. A name or a line asked for runs whatever group
+# it is in, so a call that selects anything else does not read the variable.
+function requested_group(requested, selected::Bool)
+    if requested === nothing || requested isa DefaultGroupCall
+        env = selected ? "" : strip(get(ENV, "RUNTESTS_GROUP", ""))
+        isempty(env) || return String(env), ENV_GROUP_ASKER
+        requested === nothing && return nothing, ""
+        return DEFAULT_GROUP, string("`", requested.caller, "`")
+    end
+    (requested isa Union{AbstractString, Symbol} && !isempty(string(requested))) || throw(ArgumentError(
+        "`group = $(repr(requested))`: expected the name of a group of [groups], \"$ALL_GROUP\" or \"$DEFAULT_GROUP\""
+    ))
+    return String(string(requested)), "the `group` keyword"
 end
 
 # The names among `candidates` that `name` most likely meant, without regard to case:
@@ -645,22 +898,6 @@ function profile_preferences(config_path, name, value)
         throw(bad(": could not parse $(relpath_or_path(path)): $(sprint(showerror, e))"))
     end
     return path
-end
-
-function parse_expr(path, profile, key, str::AbstractString)
-    isempty(strip(str)) && return Expr(:block)
-    bad(what) = ConfigError("could not parse `$key` of [profiles.$profile] in $(relpath_or_path(path)): $what")
-    ex = try
-        Meta.parseall(str; filename = "$(relpath_or_path(path)):[profiles.$profile].$key")
-    catch e
-        throw(bad(sprint(showerror, e)))
-    end
-    # `parseall` reports a bad parse as an `:error`/`:incomplete` node rather than
-    # by throwing, so an unchecked result would defer the failure to the worker.
-    for a in ex.args
-        a isa Expr && a.head in (:error, :incomplete) && throw(bad(a.args[1]))
-    end
-    return Expr(:block, ex.args...)
 end
 
 """

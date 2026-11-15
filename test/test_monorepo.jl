@@ -20,7 +20,7 @@ pool_of(p, i) = (u = p.items.unit[i]; findfirst(pl -> first(pl.head) <= u <= las
 # of each, and its profiles, setups and configuration file.
 function scan_participants(ps)
     items, owner = RawItem[], Int[]
-    profiles, setups, configs = Dict{Symbol, Profile}[], Dict{Symbol, String}[], String[]
+    profiles, setups = Dict{Symbol, Profile}[], Dict{Symbol, String}[]
     for k in eachindex(ps.root)
         testdir = joinpath(ps.root[k], "test")
         w = walk_test_dir(testdir)
@@ -28,9 +28,9 @@ function scan_participants(ps)
         its = scan(w.tests, Filter(), s; environments = w.environments)
         append!(items, its); append!(owner, fill(k, length(its)))
         path, toml = config_toml(testdir, nothing)
-        push!(profiles, read_profiles(path, toml)); push!(setups, s); push!(configs, path)
+        push!(profiles, read_profiles(path, toml)); push!(setups, s)
     end
-    return items, owner, profiles, setups, configs
+    return items, owner, profiles, setups
 end
 # A path or a message as it reads with `/` between directories, which Windows writes
 # as `\`.
@@ -239,7 +239,8 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                             using FixtureOnly
                         end
                         """,
-                    "test/TestItems.toml" => "[profiles.p]\ninit = \"using OnlyB\"\ntest_end = \"using Test\"\n",
+                    "test/TestItems.toml" => "[profiles.p]\n",
+                    profile_files("p"; init = "using OnlyB", test_end = "using Test")...,
                     "test/testsetups/ASetup.jl" => "module ASetup\nusing ASibling\nusing OnlyB\nend\n",
                     "test/testsetups/ASibling.jl" => "module ASibling\nusing OwnDep, LinearAlgebra\nend\n",
                     "test/testsetups/APkg/Project.toml" => "name = \"APkg\"\n\n[deps]\nFoo = \"$(next_uuid())\"\n",
@@ -263,7 +264,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             declared = "which is not in [deps] of A's test project, lib/A/test/Project.toml, so A's own run cannot load it"
             @test found == sort!([
                 [("lib/A/test/forms_test.jl", line, "imports OnlyB, $declared") for (_, line) in forms_at];
-                ("lib/A/test/TestItems.toml", 0, "`init` of [profiles.p] imports OnlyB, $declared");
+                ("lib/A/test/testconfigs/p/worker_init.jl", 1, "imports OnlyB, $declared");
                 ("lib/A/test/testsetups/ASetup.jl", 3, "imports OnlyB, $declared");
                 ("lib/A/test/testsetups/APkg/src/APkg.jl", 3,
                  "imports OwnDep, which is not in [deps] of the setup package APkg, lib/A/test/testsetups/APkg/Project.toml");
@@ -352,17 +353,18 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
         end
 
         @testset "a profile the workspace root marks monorepo_default is each package's whose code is the same" begin
-            shared = "[profiles.default]\nmonorepo_default = true\ninit = \"global SHARED_INIT = pwd()\"\ntest_end = \"nothing\"\n"
+            shared = "[profiles.default]\nmonorepo_default = true\n"
             ws = make_workspace(
                 "Inherits" => ["test/a_test.jl" => item_text("a")],
                 # The same code, written another way.
-                "Copies" => ["test/b_test.jl" => item_text("b"), "test/TestItems.toml" =>
-                    "[profiles.default]\ninit = '''\nglobal SHARED_INIT  =  pwd()\n'''\ntest_end = '''\n# done\nnothing\n'''\n"],
-                "OwnInit" => ["test/c_test.jl" => item_text("c"), "test/TestItems.toml" =>
-                    "[profiles.default]\ninit = \"global OTHER = 1\"\ntest_end = \"nothing\"\n"],
-                "OwnEnd" => ["test/d_test.jl" => item_text("d"), "test/TestItems.toml" =>
-                    "[profiles.default]\ninit = \"global SHARED_INIT = pwd()\"\n"];
-                root = ["test/r_test.jl" => item_text("r"), "test/TestItems.toml" => shared],
+                "Copies" => ["test/b_test.jl" => item_text("b"), "test/TestItems.toml" => "[profiles.default]\n",
+                             profile_files(; init = "\nglobal SHARED_INIT  =  pwd()\n", test_end = "\n# done\nnothing\n")...],
+                "OwnInit" => ["test/c_test.jl" => item_text("c"), "test/TestItems.toml" => "[profiles.default]\n",
+                              profile_files(; init = "global OTHER = 1", test_end = "nothing")...],
+                "OwnEnd" => ["test/d_test.jl" => item_text("d"), "test/TestItems.toml" => "[profiles.default]\n",
+                             profile_files(; init = "global SHARED_INIT = pwd()")...];
+                root = ["test/r_test.jl" => item_text("r"), "test/TestItems.toml" => shared,
+                        profile_files(; init = "global SHARED_INIT = pwd()", test_end = "nothing")...],
             )
             # In each package's own runs: the shared `init` runs in the workspace root.
             dir_of(rel) = read_config(joinpath(ws, rel, "test")).profiles[:default].dir
@@ -391,13 +393,16 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             ws = make_workspace("A" => ["test/a_test.jl" => item_text("a")]; root = nothing)
             config = joinpath(ws, "test", "TestItems.toml")
             mkpath(dirname(config))
-            write(config, "[run]\nnot_a_setting = 1\n\n[profiles.unused]\nthreads = \"nonsense\"\n\n" *
-                          "[profiles.default]\nmonorepo_default = true\ninit = \"global X = 1\"\n")
+            write(config, "[run]\nnot_a_setting = 1\n\n[profiles.unused]\njulia_args = [\"--threads=nonsense\"]\n\n" *
+                          "[profiles.default]\nmonorepo_default = true\n")
+            mkpath(joinpath(ws, "test", "testconfigs"))
+            write(joinpath(ws, "test", "testconfigs", "worker_init.jl"), "global X = 1\n")
             @test read_config(joinpath(ws, "lib", "A", "test")).profiles[:default].dir == ws
             # One that it shares is checked as the root's own runs check it, and its file named.
-            write(config, "[profiles.default]\nmonorepo_default = true\nthreads = \"nonsense\"\n")
+            write(config, "[profiles.default]\nmonorepo_default = true\njulia_args = [\"--threads=nonsense\"]\n")
             err = try read_config(joinpath(ws, "lib", "A", "test")); nothing catch e; e end
-            @test err isa ConfigError && occursin(r"`threads` of \[profiles\.default\] in \S*TestItems\.toml must be", slashed(err.msg))
+            @test err isa ConfigError &&
+                occursin(r"`--threads` in `julia_args` of \[profiles\.default\] in \S*TestItems\.toml must be", slashed(err.msg))
         end
 
         @testset "two packages of one name do not take part together" begin
@@ -413,17 +418,29 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test root_rel(find_participants(ws; packages = ["tools/Dup"])) == ["tools/Dup"]
         end
 
+        @testset "two packages whose names differ only in case do not take part together" begin
+            # `RUNTESTS_ARTIFACT_DIR` gets a directory of each package's name.
+            ws = make_workspace("Dup" => ["test/a_test.jl" => item_text("same")]; root = nothing,
+                                members = ["tools/Other", "tools/Other/test"])
+            write_package(joinpath(ws, "tools", "Other"), "dup", ["test/a_test.jl" => item_text("same")])
+            err = try find_participants(ws); nothing catch e; e end
+            @test err isa ConfigError && occursin("the packages Dup and dup that take part differ only in case", err.msg)
+            @test names_of(find_participants(ws; packages = ["tools/Other"])) == ["dup"]
+        end
+
         @testset "a shared profile's imports are checked for each package that has it, at the root's file" begin
             ws = make_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")];
                                 root = nothing, deps = Dict("B" => ["OnlyB"]))
             config = joinpath(ws, "test", "TestItems.toml")
             mkpath(dirname(config))
-            write(config, "[profiles.default]\nmonorepo_default = true\ninit = \"using OnlyB\"\n")
+            write(config, "[profiles.default]\nmonorepo_default = true\n")
+            code = joinpath(mkpath(joinpath(ws, "test", "testconfigs")), "worker_init.jl")
+            write(code, "using OnlyB\n")
             err = try mono(ws); nothing catch e; e end
             @test err isa ScanFailure
             problem = only(err.errors)
-            @test problem.file == config
-            @test occursin("`init` of [profiles.default] imports OnlyB, which is not in [deps] of A's test project", problem.msg)
+            @test problem.file == code && problem.line == 1
+            @test occursin("imports OnlyB, which is not in [deps] of A's test project", problem.msg)
         end
 
         @testset "items of several packages share workers that start the same way" begin
@@ -434,14 +451,14 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         item_text("db1"; opts = "chain=:db") * item_text("db2"; opts = "chain=:db"),
                     "test/qa/Project.toml" => "[deps]\n",
                     "test/qa/qa_test.jl" => item_text("qa"),
-                    "test/TestItems.toml" => "[profiles.ends]\ntest_end = \"nothing\"\n" *
-                        "[profiles.fast]\njulia_args = [\"--check-bounds=yes\"]\n[profiles.withinit]\ninit = \"x = 1\"\n",
+                    "test/TestItems.toml" => "[profiles.ends]\n[profiles.fast]\njulia_args = [\"--check-bounds=yes\"]\n[profiles.withinit]\n",
+                    profile_files("ends"; test_end = "nothing")..., profile_files("withinit"; init = "x = 1")...,
                 ],
                 "B" => [
                     "test/b_test.jl" => item_text("same") * item_text("fast"; opts = "profile=:fast") *
                         item_text("init"; opts = "profile=:withinit") * item_text("db1"; opts = "chain=:db"),
-                    "test/TestItems.toml" => "[profiles.fast]\njulia_args = [\"--check-bounds=no\"]\n" *
-                        "[profiles.withinit]\ninit = \"x = 1\"\n",
+                    "test/TestItems.toml" => "[profiles.fast]\njulia_args = [\"--check-bounds=no\"]\n[profiles.withinit]\n",
+                    profile_files("withinit"; init = "x = 1")...,
                 ],
                 "C" => ["test/c_test.jl" => item_text("c1")];
                 root = nothing,
@@ -485,7 +502,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test order[1:3] == ["A:a3", "A:a1", "B:b2"] && order[end-2:end] == ["A:a4", "B:b1", "B:b4"]
             # B's blocks took longer.
             ps = find_participants(ws)
-            items, owner, _, _, _ = scan_participants(ps)
+            items, owner, _, _ = scan_participants(ps)
             raw = [with_package(it, k) for (it, k) in zip(items, owner)]
             cfgs = [read_config(joinpath(r, "test"); workers = 1) for r in ps.root]
             histories = [History(Dict("a3" => 1.0, "a1" => 1.0, "a4" => 1.0)), History(Dict("b2" => 5.0, "b1" => 2.0, "b4" => 2.0))]
@@ -522,7 +539,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test err isa ArgumentError && occursin("reads each package's own", slashed(err.msg))
             # `workers = "auto"` counts the most threads any package's workers start with.
             rm(joinpath(ws, "test", "TestItems.toml"))
-            write(joinpath(ws, "lib", "B", "test", "TestItems.toml"), "[profiles.wide]\nthreads = \"8\"\n")
+            write(joinpath(ws, "lib", "B", "test", "TestItems.toml"), "[profiles.wide]\njulia_args = [\"--threads=8\"]\n")
             @test mono(ws).plan.cfg.workers == auto_workers("8", 3)
         end
 
@@ -539,14 +556,18 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             write(joinpath(ws, "test", "TestItems.toml"), "[monorepo]\npackages = [\"lib/A\", \"lib/B\"]\n")
             selected(r) = sort!([string(r.plan.packages.name[r.plan.items.package[i]], ":", r.plan.items.name[i])
                                  for i in 1:nitems(r.plan)])
-            # The default group is each package's own.
-            @test selected(mono(ws)) == ["A:a1", "A:a2", "B:b1", "B:b2"]
+            # A call that selects nothing runs every suite whole. The default group of
+            # `runtestsd_mono` is each package's own.
+            @test selected(mono(ws)) == ["A:a1", "A:a2", "A:a3", "B:b1", "B:b2"]
+            @test selected(mono(ws; Runtests.Private.default_group_kwargs("runtestsd_mono", (;))...)) ==
+                ["A:a1", "A:a2", "B:b1", "B:b2"]
             # A group that only A declares leaves B without items, and says so.
             r = mono(ws; group = "gpu")
             @test selected(r) == ["A:a1"]
             @test ("lib/B" => "it declares no group `gpu`") in r.skipped
             withenv("RUNTESTS_GROUP" => "gpu") do
                 @test selected(mono(ws)) == ["A:a1"]
+                @test selected(mono(ws; Runtests.Private.default_group_kwargs("runtestsd_mono", (;))...)) == ["A:a1"]
                 # A name selects whatever group it is in.
                 @test selected(mono(ws; name = "a3")) == ["A:a3"]
             end
@@ -613,7 +634,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 @test length(mono(ws).plan.items.name) == 2
             end
             # Many profiles over several packages fit one plan.
-            many = join("[profiles.p$i]\nthreads = \"1\"\n" for i in 1:60)
+            many = join("[profiles.p$i]\njulia_args = [\"--threads=1\"]\n" for i in 1:60)
             ws = make_workspace(("P$k" => ["test/a_test.jl" => item_text("x"), "test/TestItems.toml" => many] for k in 1:3)...;
                                 root = nothing)
             @test length(mono(ws).plan.profiles) == 3 * 61
@@ -692,11 +713,12 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                     write(joinpath($(repr(logdir)), $(repr(name))), string(Main.SHARED_INIT, '\t', getpid()))
                 end
                 """
-            shared = "[profiles.default]\nmonorepo_default = true\ninit = \"global SHARED_INIT = pwd()\"\n"
+            shared = "[profiles.default]\nmonorepo_default = true\n"
             ws = e2e_workspace("Inherits" => ["test/a_test.jl" => records("a")],
-                               "Copies" => ["test/b_test.jl" => records("b"),
-                                            "test/TestItems.toml" => "[profiles.default]\ninit = \"global SHARED_INIT = pwd()\"\n"];
-                               root = ["test/r_test.jl" => records("r"), "test/TestItems.toml" => shared])
+                               "Copies" => ["test/b_test.jl" => records("b"), "test/TestItems.toml" => "[profiles.default]\n",
+                                            profile_files(; init = "global SHARED_INIT = pwd()")...];
+                               root = ["test/r_test.jl" => records("r"), "test/TestItems.toml" => shared,
+                                       profile_files(; init = "global SHARED_INIT = pwd()")...])
             lines() = [split(read(f, String), '\t') for f in readdir(logdir; join = true)]
             # The same directory, however a system spells it: Windows has short names too.
             in_ws(l) = samefile(l[1], ws) || (println("init ran in ", l[1], ", not ", ws); false)
@@ -719,10 +741,26 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "the call's worker_init is the default of every package, and runs in the workspace root" begin
+            logdir = mktempdir()
+            records(name) = """
+                @testitem $(repr(name)) begin
+                    write(joinpath($(repr(logdir)), $(repr(name))), Main.CALL_INIT)
+                end
+                """
+            ws = e2e_workspace("A" => ["test/a_test.jl" => records("a")], "B" => ["test/b_test.jl" => records("b")])
+            with_runstate_dir() do _
+                states, _, p = run_mono(ws; workers = 2, logs = :issues, monitor = false, worker_init = :(global CALL_INIT = pwd()))
+                @test states == Dict(("A", "a") => PASSED, ("B", "b") => PASSED)
+                # One pool: the code is the same, and it runs in the same directory.
+                @test length(p.pools) == 1
+                @test all(f -> samefile(read(f, String), ws), readdir(logdir; join = true))
+            end
+        end
+
         @testset "a worker's UP line names its profile unless it is the first package's default" begin
             # A's default has an `init`, so B's items get workers of their own.
-            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a"),
-                                       "test/TestItems.toml" => "[profiles.default]\ninit = \"global INITED = true\"\n"],
+            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a"), profile_files(; init = "global INITED = true")...],
                                "B" => ["test/b_test.jl" => item_text("b")])
             with_runstate_dir() do _
                 (states, _, _), output = capture_run(() -> run_mono(ws; workers = 2, logs = :issues, monitor = false))
@@ -895,10 +933,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         [run]
                         test_end_timeout = 2
                         [profiles.slow_end]
-                        test_end = "sleep(10)"
                         [order]
                         first = ["test_end too slow"]
                         """,
+                    profile_files("slow_end"; test_end = "sleep(10)")...,
                     "test/a_test.jl" => """
                         @testitem "reads its own root" skip=!isfile("data.txt") begin
                             @test read("data.txt", String) == "a"
@@ -920,8 +958,8 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         [run]
                         test_end_timeout = 30
                         [profiles.slow_end]
-                        test_end = '''sleep(3); @assert read("data.txt", String) == "b"'''
                         """,
+                    profile_files("slow_end"; test_end = "sleep(3); @assert read(\"data.txt\", String) == \"b\"")...,
                     "test/b_test.jl" => """
                         @testitem "reads its own root" skip=!isfile("data.txt") begin
                             @test read("data.txt", String) == "b"
@@ -1123,7 +1161,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
 
         @testset "a worker that cannot start leaves every run state finished, and passes nothing it did not run" begin
             ws = e2e_workspace(
-                "A" => ["test/a_test.jl" => item_text("a"), "test/TestItems.toml" => "[profiles.default]\ninit = \"error(\\\"no\\\")\"\n"],
+                "A" => ["test/a_test.jl" => item_text("a"), profile_files(; init = "error(\"no\")")...],
                 "B" => ["test/b_test.jl" => item_text("b")],
             )
             with_runstate_dir() do _
@@ -1213,14 +1251,16 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
         end
 
         @testset "chores_mono says which items can share a worker: the groups of profiles, and where each comes from" begin
-            shared = "[profiles.default]\nmonorepo_default = true\ninit = \"global SHARED_INIT = pwd()\"\n"
+            shared = "[profiles.default]\nmonorepo_default = true\n"
             ws = make_workspace(
                 "Takes" => ["test/a_test.jl" => item_text("a")],
-                "Copies" => ["test/b_test.jl" => item_text("b"), "test/TestItems.toml" =>
-                    "[profiles.default]\ninit = \"global SHARED_INIT = pwd()\"\n"],
+                "Copies" => ["test/b_test.jl" => item_text("b"), "test/TestItems.toml" => "[profiles.default]\n",
+                             profile_files(; init = "global SHARED_INIT = pwd()")...],
                 "Differs" => ["test/c_test.jl" => item_text("c"), "test/TestItems.toml" =>
-                    "[profiles.default]\ninit = \"global OTHER = 1\"\nthreads = \"3\"\n\n[profiles.fast]\nenv = { FAST = \"1\" }\n"];
-                root = ["test/r_test.jl" => item_text("r"), "test/TestItems.toml" => shared],
+                    "[profiles.default]\njulia_args = [\"--threads=3\"]\n\n[profiles.fast]\nenv = { FAST = \"1\" }\n",
+                    profile_files(; init = "global OTHER = 1")...];
+                root = ["test/r_test.jl" => item_text("r"), "test/TestItems.toml" => shared,
+                        profile_files(; init = "global SHARED_INIT = pwd()")...],
             )
             groups(ws) = split(chomp(sprint(io -> Runtests.Private.print_worker_groups(io, find_participants(ws)))), '\n')
             config = joinpath("test", "TestItems.toml")
@@ -1228,7 +1268,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 "workers: 3 groups, and an item shares a worker only with the items of its group",
                 "  `default` of Root, Copies and Takes: init expression",
                 "    shared by $config",
-                "    the same in the test/TestItems.toml of Copies, which can leave it out",
+                "    the same in test/TestItems.toml and test/testconfigs/ of Copies, which can leave it out",
                 "  `default` of Differs: threads 3 · init expression",
                 "  `fast` of Differs: FAST=1",
             ]
@@ -1261,7 +1301,8 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         "test/testsetups/ASetup.jl" => "module ASetup\nusing OnlyB\nend\n",
                         "test/runtests.jl" => "using Runtests\nRuntests.runtests(; workers = 2)\n"],
                 "B" => ["test/b_test.jl" => item_text("b"), "test/runtests.jl" => "using B\nusing Runtests\n\nRuntests.runtests()\n"],
-                "C" => ["test/c_test.jl" => item_text("c"), "test/testsetups/Common.jl" => "module Common end\n"],
+                "C" => ["test/c_test.jl" => item_text("c"), "test/testsetups/Common.jl" => "module Common end\n",
+                        "test/runtests.jl" => "using Runtests\nruntestsd()\n"],
                 "D" => ["test/d_test.jl" => item_text("d"), "test/testsetups/Common.jl" => "module Common end\n"];
                 deps = Dict("B" => ["OnlyB"]),
             )
@@ -1277,6 +1318,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test occursin("imports OnlyB, which is not in [deps] of A's test project", out)
             @test occursin("$(joinpath("lib", "A", "test", "runtests.jl")) does more than call", out)
             @test !occursin(joinpath("lib", "B", "test", "runtests.jl"), out)
+            @test !occursin(joinpath("lib", "C", "test", "runtests.jl"), out)
             @test isfile(joinpath(ws, "lib", "A", "test", "testsetups", "ASetup.jl"))
         end
     end

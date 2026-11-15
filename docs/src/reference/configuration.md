@@ -68,6 +68,8 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 | `config` | The path of a file to read in place of `test/TestItems.toml`, relative to the current directory. The file must exist. |
 | `skip_environment` | An [environment directory](@ref environments) that the run does not build, or a vector of them. Each name is the path of the directory from the root of the repository, for example `"test/qa"`, or `"lib/A/test/qa"` in a monorepo. The run records the selected items of the directory as skipped. A run that does not include the package of a named directory accepts the name without an error. A name that is no environment directory is an error. `RUNTESTS_SKIP_ENVIRONMENT` gives the names when the call gives none. See [Skip an environment](@ref skip-environment). |
 | `on_event` | A function that the run calls with a [`Runtests.TestItemEvent`](@ref) when each attempt starts and ends. |
+| `worker_init` | An expression, for example `:(using Plots)`, that is the `init` of the default profile in place of `test/testconfigs/worker_init.jl`. |
+| `test_end` | An expression that is the `test_end` of the default profile in place of `test/testconfigs/test_end.jl`. |
 
 `runtests_mono` also accepts `packages`, a list of package names or directories to include. It rejects `config`, because a combined run reads each package's own configuration file.
 
@@ -90,7 +92,7 @@ On a run of the whole suite, each name must be an item of the suite. A run of a 
 
 ### [groups]
 
-Each key is the name of a group, and each value is a [tag expression](@ref tag-expressions). `all` is reserved and cannot be declared. `default` is what a run selects when nothing else selects. A name that differs from `all` or `default` only in case is an error.
+Each key is the name of a group, and each value is a [tag expression](@ref tag-expressions). `all` is reserved and cannot be declared. `default` is the group that `runtestsd` and `runtestsd_mono` select. A name that differs from `all` or `default` only in case is an error.
 
 ### [monorepo]
 
@@ -105,18 +107,25 @@ An entry that matches no package, or names a directory outside the workspace, is
 
 ### [Profiles](@id profile-keys)
 
-Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<name>`. `[profiles.default]` configures the workers of every item without a `profile`, sandboxed or not.
+Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<name>`. `[profiles.default]` configures the workers of every item without a `profile`, sandboxed or not. The name of a profile is a valid file name on Linux, macOS and Windows, and two names must not differ only in case. The code of a profile is not a key. It is in files of `test/testconfigs/`, as [The code of a profile](@ref profile-code-files) describes.
 
 | Key | Default | Value |
 |:----|:--------|:------|
-| `julia_args` | `[]` | A vector of command-line flags for `julia`, for example `["--check-bounds=yes"]`. |
-| `threads` | the `threads` of the run | The `--threads` value of the workers of the profile. |
+| `julia_args` | `[]` | A vector of command-line flags for `julia`, for example `["--check-bounds=yes"]`. `--threads` or `-t` gives the threads of the workers of the profile, for example `["--threads=4"]`. Without it, the workers get the `threads` of the run. |
 | `env` | `{}` | A table of environment variables for the workers, for example `{ JULIA_DEBUG = "Main" }`. |
-| `init` | none | Julia code, as a string, that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, the `init` of the default profile runs in the process that calls `runtests`, in the same directory. |
-| `test_end` | none | Julia code, as a string, that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure counts toward the item. |
 | `preferences` | none | A TOML file, relative to the configuration file, whose contents go over the `LocalPreferences.toml` of the environment. The file must exist. |
 | `precompile` | the whole environment | The packages that Runtests precompiles for the workers of the profile before they start, each with its dependencies, for example `["MyPackage", "Test"]`. `[]` precompiles none. A worker compiles each other package when an item loads it. A name that is not a package of the environment of the items is an error. See [Precompilation](@ref profile-precompile). |
 | `monorepo_default` | `false` | Only in the `test/TestItems.toml` of a workspace root. `true` shares the profile with the packages of the workspace, in their own runs and in combined runs. See [Share a profile](@ref shared-profiles). |
+
+### [The code of a profile](@id profile-code-files)
+
+| File | Value |
+|:-----|:------|
+| `test/testconfigs/worker_init.jl` | The `init` of the default profile: Julia code that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, it runs in the process that calls `runtests`, in the same directory. |
+| `test/testconfigs/test_end.jl` | The `test_end` of the default profile: Julia code that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure counts toward the item. |
+| `test/testconfigs/<name>/worker_init.jl`, `test/testconfigs/<name>/test_end.jl` | The `init` and the `test_end` of the profile `<name>`, which `[profiles]` must declare. |
+
+Each file is optional. Any other entry of `test/testconfigs/` is an error, except a hidden one. The keywords `worker_init` and `test_end` of `runtests` and `runtests_mono` give the code of the default profile in place of its files. A profile that the workspace shares takes its code from the `test/testconfigs/` of the workspace root.
 
 ## [Environment variables](@id environment-variables)
 

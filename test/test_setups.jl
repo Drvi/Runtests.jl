@@ -18,6 +18,24 @@ end
 setup_caches(name) =
     filter(endswith(".ji"), readdir(joinpath(first(DEPOT_PATH), "compiled", "v$(VERSION.major).$(VERSION.minor)", name)))
 
+@testset "a setup is known by the name of its file, which is one name on every system" begin
+    dir = mktempdir()
+    setups = mkpath(joinpath(dir, "testsetups", "Twice", "src"))
+    setups = dirname(dirname(setups))
+    message() = sprint(showerror, try setup_modules(dir); nothing catch e; e end)
+    write(joinpath(setups, "Twice.jl"), "module Twice end\n")
+    write(joinpath(setups, "Twice", "src", "Twice.jl"), "module Twice end\n")
+    @test occursin("holds the setup `Twice` twice, as `Twice.jl` and as `Twice/`", message())
+    rm(joinpath(setups, "Twice"); recursive = true)
+    write(joinpath(setups, "twice.jl"), "module twice end\n")
+    # Only a system that tells case apart holds both files.
+    if length(readdir(setups)) == 2
+        @test occursin("the setups `Twice` and `twice`, whose names differ only in case", message())
+    else
+        @test keys(setup_modules(dir)) == Set([:Twice])
+    end
+end
+
 @testset "test setups" begin
     @testset "a setup may use any of the package's test-time dependencies" begin
         pkg = fixture("TestDeps.jl")

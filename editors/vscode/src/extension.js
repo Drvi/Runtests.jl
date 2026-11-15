@@ -344,7 +344,7 @@ class Suite {
                         if (t) run.errored(t, new vscode.TestMessage('not in the suite any more'));
                         unknownSeen = true;
                     }
-                    // Queued, but not what the run selected: outside its default group.
+                    // Queued, but not what the run selected: outside the group of RUNTESTS_GROUP.
                     for (const k of model.unselected(targets.map(t => this.keyById.get(t.id)), ev)) {
                         const t = this.byKey.get(k);
                         if (t) run.skipped(t);

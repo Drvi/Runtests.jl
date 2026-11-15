@@ -15,7 +15,7 @@ At the REPL, Runtests reuses an active test project or prepares a test environme
 
 ## Select items
 
-With no arguments, a run selects the whole suite, or the `default` group when the configuration declares one. These calls select a part of the suite:
+With no arguments, a run selects the whole suite, or the group that `RUNTESTS_GROUP` names when the variable is set. These calls select a part of the suite:
 
 ```julia
 Runtests.runtests("test/solver_test.jl")     # one file
@@ -40,13 +40,11 @@ A target of the form `file.jl:line` selects the item that contains that line. Th
 
 ### Select a group
 
-A group is a named tag expression that `test/TestItems.toml` declares under `[groups]`. [Configure runs](@ref groups) tells you how to declare groups. When a call selects nothing else, the run selects a group in this order:
+A group is a named tag expression that `test/TestItems.toml` declares under `[groups]`. [Configure runs](@ref groups) tells you how to declare groups. When a call of `runtests` selects nothing else, it runs the group that the environment variable `RUNTESTS_GROUP` names, if it is set, and otherwise the whole suite. CI jobs use this variable to split a suite.
 
-1. The group that the environment variable `RUNTESTS_GROUP` names, if it is set. CI jobs use this variable to split a suite.
-2. The group named `default`, if `[groups]` declares it.
-3. The whole suite.
+`runtestsd()` runs the group named `default`, or the whole suite when `[groups]` declares no `default`. If `RUNTESTS_GROUP` is set, `runtestsd()` runs that group in place of `default`.
 
-`group = "all"` removes the group restriction; other selections still narrow the run. A path, a line, `name`, `tags` or `group` in the call replaces `RUNTESTS_GROUP` and `default`. Thus an item that you ask for by name runs, whatever its group.
+`group = "all"` removes the group restriction. Other selections still narrow the run. A path, a line, `name`, `tags` or `group` in the call replaces `RUNTESTS_GROUP`. Thus an item that you ask for by name runs, whatever its group.
 
 ### Selections that are errors
 

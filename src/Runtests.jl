@@ -92,9 +92,9 @@ carry all of, or a string expression such as `"!slow"` or `"juliac || serializer
 `group` (the name of a tag expression `[groups]` of `test/TestItems.toml` declares,
 or `"all"`, the whole suite, or `"default"`). The selections a call gives narrow
 together. A call that gives none selects the group `RUNTESTS_GROUP` names, when it is
-set, and otherwise `default`: the group of that name when `[groups]` declares one,
-and the whole suite when it does not. A name, tag or group the suite does not have
-is an error that says the nearest it does.
+set, and otherwise the whole suite, or `default` from [`runtestsd`](@ref): the group of
+that name when `[groups]` declares one, and the whole suite when it does not. A name,
+tag or group the suite does not have is an error that says the nearest it does.
 
 `skip_environment` names environment directories, each by its path from the root of
 the repository (`"test/qa"`, or `"lib/A/test/qa"` in a monorepo), or one of them: the
@@ -103,6 +103,11 @@ items it selected there as skipped. A run that does not include the package of a
 named directory accepts the name, and a name that is no environment directory is an
 error. Also
 `RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, but not `[run]`.
+
+Profile code: `worker_init` and `test_end`, each an expression, as in
+`worker_init = :(using Plots)` or a `quote` block, are the `init` and `test_end` of
+the default profile, in place of `test/testconfigs/worker_init.jl` and
+`test/testconfigs/test_end.jl`. Another profile's code is in its directory there.
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
@@ -167,7 +172,8 @@ end
 # which says itself where they stand. `allow_unknown_names` runs the named items the
 # suite has and leaves the rest out, for an editor, whose tree can be behind the files.
 function prepare(args; name = nothing, tags = nothing, group = nothing, replay = nothing, announce::Bool = true,
-                 expansions::Bool = true, allow_unknown_names::Bool = false, kwargs...)
+                 expansions::Bool = true, allow_unknown_names::Bool = false, worker_init = nothing, test_end = nothing,
+                 kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     named = name !== nothing   # by the caller, not by a replay
@@ -259,6 +265,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     check_skip_environment(cfg.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming,
                            get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
     rs === nothing || (cfg = replayed_config(cfg, rs, target.root))
+    # After a replay's code too: what the call gives wins.
+    call_code!(cfg.profiles, worker_init, test_end)
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
@@ -381,6 +389,9 @@ workspace root's `test/TestItems.toml`; one in another package's `[run]` has no
 effect. The others are each package's own: a keyword or a
 variable gives every package its value. `name`, `tags` and `group` select within each
 package; a group or tag only some packages have is no error. `config` is an error.
+`worker_init` and `test_end` are the code of the default profile of every package, and
+the `init` runs in the workspace root, as the `init` of a profile that the workspace
+shares does.
 
 Before any worker starts, a `using` or `import` written in an item, a setup or a
 profile's `init` or `test_end` that the package's own test environment could not
@@ -416,6 +427,35 @@ function runtests_mono(args...; packages = nothing, name = nothing, tags = nothi
             rm(run.scratch; force = true, recursive = true)
         end
     end
+end
+
+"""
+    runtestsd(args...; kwargs...)
+
+[`runtests`](@ref) with the group `default` of `[groups]` applied, the whole suite
+when `[groups]` declares no `default`. A `name`, `tags` or a path narrows it, as in
+`runtests`, and `group` is an error. A call that selects nothing else runs the group
+`RUNTESTS_GROUP` names in place of `default`, when it is set, as `runtests` runs it in
+place of the whole suite.
+"""
+runtestsd(args...; kwargs...) = runtests(args...; default_group_kwargs("runtestsd", kwargs)...)
+
+"""
+    runtestsd_mono(args...; kwargs...)
+
+[`runtests_mono`](@ref) with the group `default` of each package applied, as
+[`runtestsd`](@ref) applies it to one package.
+"""
+runtestsd_mono(args...; kwargs...) = runtests_mono(args...; default_group_kwargs("runtestsd_mono", kwargs)...)
+
+# The keywords of a call of `caller` with the group `default` among them, which a
+# `group` of the call would contradict.
+function default_group_kwargs(caller::String, kwargs)
+    haskey(kwargs, :group) && throw(ArgumentError(
+        "`$caller` runs the group `$DEFAULT_GROUP`, and the call gives `group = $(repr(kwargs[:group]))`: " *
+            "call `$(replace(caller, "runtestsd" => "runtests"))` with that group"
+    ))
+    return (; kwargs..., group = DefaultGroupCall(caller))
 end
 
 """
@@ -526,6 +566,7 @@ function resolve_target(args)
     whole = false
     narrowing = String[]
     fixtures = joinpath(t.testdir, TESTFIXTURES_DIR)
+    configs = joinpath(t.testdir, TESTCONFIGS_DIR)
     for path in paths
         rstrip_path(path) in (rstrip_path(t.root), rstrip_path(t.testdir)) && (whole = true; continue)
         # Under `test/` too: a package kept there, a fixture say, is a suite of its own.
@@ -540,6 +581,9 @@ function resolve_target(args)
         (rstrip_path(path) == fixtures || startswith(path, joinpath(fixtures, ""))) && throw(ArgumentError(
             "$(path) is in $(joinpath(fixtures, "")), which holds input for the tests and is not read as part of " *
                 "the suite; a package kept there runs as a suite of its own when a path inside it is given alone"
+        ))
+        (rstrip_path(path) == configs || startswith(path, joinpath(configs, ""))) && throw(ArgumentError(
+            "$(path) is in $(joinpath(configs, "")), which holds the code of the profiles and no test items"
         ))
         isdir(path) || is_test_file(path) || throw(
             ArgumentError(
@@ -768,12 +812,12 @@ end
 end # module Private
 
 using Test
-using .Private: @testitem, @testtemplate, runtests, runtestsf, runtests_mono, chores_mono, activate_mono, current_testitem,
+using .Private: @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_mono, runtestsd_mono, chores_mono, activate_mono, current_testitem,
     serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 
-export @testitem, @testtemplate, runtests, runtestsf, chores, runtests_mono, chores_mono
+export @testitem, @testtemplate, runtests, runtestsd, runtestsf, chores, runtests_mono, runtestsd_mono, chores_mono
 
 # Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test

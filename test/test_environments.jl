@@ -119,7 +119,7 @@ end
             # Not environments: what the suite keeps for something else, and hidden.
             "test/testfixtures/Fixture/Project.toml" => "[deps]\n",
             "test/.hidden/Project.toml" => "[deps]\n",
-            "test/TestItems.toml" => "[profiles.fast]\nthreads = \"1\"\n",
+            "test/TestItems.toml" => "[profiles.fast]\njulia_args = [\"--threads=1\"]\n",
         )
         qa = joinpath(dir, "test", "qa")
 
@@ -247,7 +247,7 @@ end
             replayed = env_pkg("EnvReplay",
                                "test/main_tests.jl" => "@testitem \"main\" begin\n    @test true\nend\n",
                                "test/qa/qa_tests.jl" => "@testitem \"qa\" profile=:fast begin\n    @test true\nend\n",
-                               "test/TestItems.toml" => "[profiles.fast]\nthreads = \"1\"\n")
+                               "test/TestItems.toml" => "[profiles.fast]\njulia_args = [\"--threads=1\"]\n")
             with_runstate_dir() do states
                 path = joinpath(states, "recorded.runstate")
                 finish_run_state!(init_run_state(path, plan_of(replayed)))
@@ -441,6 +441,9 @@ end
                     msg = message_of(() -> plan_of(bad; skip_environment = ["test/qa", "test/jet"]))
                     @test occursin("names `test/jet`, which is not an environment directory", msg)
                     @test occursin("this run has `test/qa`", msg)
+                    # Linux tells the case apart, and macOS and Windows do not.
+                    @test occursin("names `test/QA`, which is the environment directory `test/qa` in another case",
+                                   message_of(() -> plan_of(bad; skip_environment = "test/QA")))
                     # A path from `test/`, and a project that is not under a `test/`.
                     @test_throws ArgumentError plan_of(bad; skip_environment = "qa")
                     @test_throws ArgumentError plan_of(bad; skip_environment = "lib/EnvSkippedCore")
@@ -581,7 +584,7 @@ end
             # worker, and this process, where no item runs, does not run it.
             only_qa = env_pkg("EnvInit",
                               "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test isdefined(Main, :EnvInitTools)\nend\n",
-                              "test/TestItems.toml" => "[profiles.default]\ninit = \"using EnvInitTools\"\n")
+                              profile_files(init = "using EnvInitTools")...)
             with_runstate_dir() do _
                 (states, _, _), _ = capture_run(() -> run_states(only_qa; workers = 0, monitor = false))
                 @test states["qa"] === PASSED

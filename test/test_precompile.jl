@@ -184,6 +184,9 @@ end
             @testitem "hushed" profile=:quiet begin
                 @test true
             end
+            @testitem "threaded" profile=:threaded begin
+                @test Threads.nthreads() == 1
+            end
             """,
             "test/TestItems.toml" => """
             [profiles.bounds]
@@ -191,6 +194,10 @@ end
 
             [profiles.quiet]
             julia_args = ["--banner=no"]
+
+            # The number of threads compiles no code differently.
+            [profiles.threaded]
+            julia_args = ["--threads=1"]
             """
         )
         states, _, _ = nothing, nothing, nothing
@@ -201,7 +208,7 @@ end
         line = only(filter(l -> occursin("precompiling the test environment", l),
                            collect(eachsplit(out, '\n'))))
         @test occursin("bounds", line)
-        @test !occursin("quiet", line)
+        @test !occursin("quiet", line) && !occursin("threaded", line)
         @test occursin("1 profile", line)
     end
 

@@ -220,8 +220,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                                 declared("e1", "e2"; opts = "chain=:e profile=:bounds"),
             "test/t_test.jl" => declared("t1", "t2"; opts = "profile=:ends") *
                                 declared("f1", "f2"; opts = "chain=:f profile=:ends"),
-            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n" *
-                                     "[profiles.ends]\ntest_end = \"nothing\"\n",
+            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n[profiles.ends]\n",
+            profile_files("ends"; test_end = "nothing")...,
         )
         starts(p, prof) = Runtests.Private.start_configuration(p.profiles[prof])
         for workers in (1, 2, 3, 5)
@@ -271,8 +271,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/s_test.jl" => declared("s1", "s2", "s3"; opts = "profile=:slow"),
             "test/m_test.jl" => declared(("m$i" for i in 1:10)...; opts = "profile=:many"),
             "test/q_test.jl" => declared("q1"; opts = "profile=:quick"),
-            "test/TestItems.toml" => "[profiles.slow]\nthreads = \"1\"\n[profiles.many]\nthreads = \"2\"\n" *
-                                     "[profiles.quick]\nthreads = \"3\"\n")
+            "test/TestItems.toml" => "[profiles.slow]\njulia_args = [\"--threads=1\"]\n[profiles.many]\njulia_args = [\"--threads=2\"]\n" *
+                                     "[profiles.quick]\njulia_args = [\"--threads=3\"]\n")
         h = History(Dict("s1" => 5.0, "s2" => 5.0, "s3" => 5.0, "q1" => 1.0), Dict{String, Int}())
         names_of(p) = [p.profiles[pool.profile].name for pool in p.pools]
         p = plan_dir(dir; history = h, workers = 1)
@@ -300,7 +300,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         dir = make_pkg("MixedChain",
             "test/a_test.jl" => declared("c1", "c2"; opts = "chain=:c profile=:a"),
             "test/b_test.jl" => declared("b1"; opts = "profile=:b"),
-            "test/TestItems.toml" => "[profiles.a]\nthreads = \"1\"\n[profiles.b]\nthreads = \"2\"\n")
+            "test/TestItems.toml" => "[profiles.a]\njulia_args = [\"--threads=1\"]\n[profiles.b]\njulia_args = [\"--threads=2\"]\n")
         p = plan_dir(dir; history = History(Dict("c1" => 10.0, "b1" => 15.0), Dict{String, Int}()), workers = 1)
         @test [p.profiles[pool.profile].name for pool in p.pools] == [:a, :b]
         # The run counts the chain as the plan does, until the pool has timed items.
@@ -322,8 +322,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/d_test.jl" => declared("d1"; opts = "profile=:dry"),
             "test/l_test.jl" => declared("l1"; opts = "profile=:long"),
             "test/m_test.jl" => declared(("m$i" for i in 1:20)...; opts = "profile=:many"),
-            "test/TestItems.toml" => "[profiles.dry]\nthreads = \"1\"\n[profiles.long]\nthreads = \"2\"\n" *
-                                     "[profiles.many]\nthreads = \"3\"\n")
+            "test/TestItems.toml" => "[profiles.dry]\njulia_args = [\"--threads=1\"]\n[profiles.long]\njulia_args = [\"--threads=2\"]\n" *
+                                     "[profiles.many]\njulia_args = [\"--threads=3\"]\n")
         seconds = Dict("d1" => 1.0, "l1" => 30.0, ("m$i" => 1.0 for i in 1:20)...)
         p = plan_dir(dir; history = History(seconds, Dict{String, Int}()), workers = 4)
         pool_named(name) = findfirst(k -> p.profiles[k.profile].name === name, p.pools)
@@ -350,7 +350,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         dir = make_pkg("LateWorker",
             "test/d_test.jl" => declared("d1"; opts = "profile=:dry"),
             "test/t_test.jl" => declared(("t$i" for i in 1:5)...; opts = "profile=:target"),
-            "test/TestItems.toml" => "[profiles.dry]\nthreads = \"1\"\n[profiles.target]\nthreads = \"2\"\n")
+            "test/TestItems.toml" => "[profiles.dry]\njulia_args = [\"--threads=1\"]\n[profiles.target]\njulia_args = [\"--threads=2\"]\n")
         seconds = Dict("d1" => 1.0, ("t$i" => 4.0 for i in 1:5)...)
         p = plan_dir(dir; history = History(seconds, Dict{String, Int}()), workers = 3)
         target = findfirst(k -> p.profiles[k.profile].name === :target, p.pools)
@@ -376,7 +376,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
             "test/p_test.jl" => declared("p1"; opts = "profile=:tiny"),
             "test/b_test.jl" => declared(("b$i" for i in 1:8)...; opts = "profile=:big"),
-            "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"2\"\n",
+            "test/TestItems.toml" => "[profiles.tiny]\njulia_args = [\"--threads=1\"]\n[profiles.big]\njulia_args = [\"--threads=2\"]\n",
         )
         second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
         known = History(second, Dict{String, Int}())
@@ -389,7 +389,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # Without `big`: default has two slots, `tiny` one.
         solo = make_pkg("RefillTwo", "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
                         "test/p_test.jl" => declared("p1"; opts = "profile=:tiny"),
-                        "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n")
+                        "test/TestItems.toml" => "[profiles.tiny]\njulia_args = [\"--threads=1\"]\n")
         p = plan_dir(solo; workers = 3, history = known)
         s = tiny_slot(p)
         default = pool_named(p, :default)

@@ -65,6 +65,17 @@ end
 
 toml_list(v) = string("[", join(repr.(v), ", "), "]")
 
+# The files of `test/testconfigs/` that give profile `profile` its `init` and its
+# `test_end`, as pairs for `make_pkg` and `write_package`, to splat. `prefix` puts them
+# under the directory of a package, as in `lib/A`.
+function profile_files(profile::AbstractString = "default"; init = nothing, test_end = nothing, prefix = "")
+    dir = joinpath(prefix, "test", "testconfigs", profile == "default" ? "" : profile)
+    files = Pair{String, String}[]
+    init === nothing || push!(files, joinpath(dir, "worker_init.jl") => init)
+    test_end === nothing || push!(files, joinpath(dir, "test_end.jl") => test_end)
+    return files
+end
+
 """
     make_workspace(packages...; root, layout, outside, members) -> workspace root
 

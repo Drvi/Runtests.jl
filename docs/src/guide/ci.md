@@ -42,7 +42,7 @@ steps:
       RUNTESTS_GROUP: ${{ matrix.group }}
 ```
 
-`RUNTESTS_GROUP` applies only when `runtests` selects nothing else. An empty `RUNTESTS_GROUP` counts as unset. Thus a job whose `matrix.group` is empty runs what a run selects by default.
+`RUNTESTS_GROUP` applies only when the call in `test/runtests.jl` selects nothing else. An empty `RUNTESTS_GROUP` counts as unset. Thus a job whose `matrix.group` is empty runs the whole suite, or the group `default` when `test/runtests.jl` calls `runtestsd()`.
 
 ## [Keep the history of runs](@id ci-history)
 

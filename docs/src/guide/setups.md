@@ -4,7 +4,7 @@ A test setup is a module in `test/testsetups/` that test items load with `using`
 
 ## Write a setup
 
-Put the module in `test/testsetups/Name.jl`, or in `test/testsetups/Name/src/Name.jl`:
+Put the module in `test/testsetups/Name.jl`, or in `test/testsetups/Name/src/Name.jl`. The name of the module is the name of its file. Two setups must not have names that differ only in case, because macOS and Windows hold one file for both names:
 
 ```julia
 # test/testsetups/MySetups.jl

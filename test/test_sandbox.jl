@@ -89,7 +89,8 @@ end
             run_states(dir; workers=1, logs=:issues, monitor=false)
         end
         lines = collect(eachsplit(out, '\n'))
-        ups = filter(l -> occursin("· UP ", l), lines)
+        workers = worker_lines(out)
+        ups = filter(l -> occursin("· UP ", l), workers)
         @test length(ups) == 3                      # one pool worker and two sandboxes
         @test count(l -> occursin("· sandbox", l), ups) == 2
         # The pool worker that ran the two ordinary items is not one of them.
@@ -102,7 +103,7 @@ end
         @test any(l -> occursin("· KILL", l) && occursin("solo hangs", l), lines)
         # A killed worker is already gone, so it is not also reported as exiting:
         # one UP per teardown line, three and three.
-        @test count(l -> occursin("· EXIT", l), lines) == 2
+        @test count(l -> occursin("· EXIT", l), workers) == 2
     end
 
     @testset "a slot that has drained its sandboxes takes ordinary work" begin

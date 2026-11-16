@@ -112,7 +112,7 @@ using Runtests: RuntestsWorkers
         _, out = capture_run() do
             run_states(fixture("Basic.jl"); workers=1, logs=:issues, monitor=false)
         end
-        exits = filter(l -> occursin("· EXIT", l), collect(eachsplit(out, '\n')))
+        exits = filter(l -> occursin("· EXIT", l), worker_lines(out))
         @test length(exits) == 1
         @test occursin("6 items", only(exits))
         # A graceful shutdown is not a kill: that word is reserved for a worker
@@ -121,7 +121,7 @@ using Runtests: RuntestsWorkers
         # died on its own — four words, none of them a glance away from another.
         @test !occursin("KILL", out)
         @test !occursin("LOST", out)
-        @test count(l -> occursin("· UP ", l), collect(eachsplit(out, '\n'))) == 1
+        @test count(l -> occursin("· UP ", l), worker_lines(out)) == 1
     end
 
     @testset "the name column is chosen from the names the run will print" begin

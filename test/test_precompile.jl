@@ -657,5 +657,6 @@ end
     @test !isempty(exits)
     @test any(l -> occursin(r"\(\d+ reused\)", l), exits)
     # Its environment is named as a worker's own would name it.
-    @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP   · pid \d+ · env test/qa", l), lines)
+    @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP   · pid \d+ · ", l) &&
+                   occursin("· env $(joinpath("test", "qa"))", l), lines)
 end

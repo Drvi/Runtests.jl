@@ -383,7 +383,7 @@ end
             """)
             write(joinpath(bad, "test", "main_tests.jl"), "@testitem \"main\" begin\nend\n")
             skipped = Dict("main" => PASSED, "qa" => SKIPPED, "qa checked" => SKIPPED)
-            ups(out) = count(l -> occursin("· UP ", l), split(out, '\n'))
+            ups(out) = count(l -> occursin("· UP ", l), worker_lines(out))
             with_runstate_dir() do _
                 # Outside a checkout and a workspace, the root is the package's.
                 @testset "the keyword names the directory by its path from the root" begin
@@ -537,10 +537,11 @@ end
             @testset "the run says which environment, and builds it outside the package" begin
                 @test occursin("env dir: $(joinpath("test", "qa"))", out)
                 # Each worker says whose profile and which environment it is.
-                ups = filter(l -> occursin("· UP ", l), split(out, '\n'))
-                @test any(l -> occursin("· profile default · test environment", l), ups)
-                @test any(l -> occursin("· profile default · environment $(joinpath("test", "qa"))", l), ups)
-                @test any(l -> occursin("· profile tuned · environment $(joinpath("test", "qa"))", l), ups)
+                ups = filter(l -> occursin("· UP ", l), worker_lines(out))
+                # At the end of the line: `env test` is also the start of `env test/qa`.
+                @test any(l -> endswith(l, "· profile default · env test"), ups)
+                @test any(l -> occursin("· profile default · env $(joinpath("test", "qa"))", l), ups)
+                @test any(l -> occursin("· profile tuned · env $(joinpath("test", "qa"))", l), ups)
                 @test occursin("resolving the environment of $(joinpath("test", "qa"))", out)
                 # A profile's project is kept by the profile's index in the plan.
                 project_of(name) = run.profile_projects[findfirst(pr -> pr.name === name && pr.environment == qa, run.plan.profiles)]
@@ -574,8 +575,8 @@ end
             @testset "a run of the test environment's items alone names no profile and no environment" begin
                 (alone, _, _), out3 = capture_run(() -> run_states(dir; workers = 1, monitor = false, name = "main sees the package"))
                 @test alone["main sees the package"] === PASSED
-                ups = filter(l -> occursin("· UP ", l), split(out3, '\n'))
-                @test length(ups) == 1 && !occursin("· profile", only(ups)) && !occursin("environment", only(ups))
+                ups = filter(l -> occursin("· UP ", l), worker_lines(out3))
+                @test length(ups) == 1 && !occursin("· profile", only(ups)) && !occursin("· env ", only(ups))
             end
         end
 

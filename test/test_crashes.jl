@@ -362,7 +362,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     printed = read(log, String)
     again && !hung && @warn "the coordinator did nothing on the first Ctrl-C for 15s, and ended on the second"
     hung && @warn "the coordinator did not end on Ctrl-C; its stderr:\n$out"
-    started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
+    started = [parse(Int, m.captures[1]) for l in worker_lines(printed) for m in eachmatch(r"· pid (\d+)", l)]
     rm(path; force=true)
     return (; got_running, elapsed, out, printed, started)
 end

@@ -506,8 +506,7 @@ end
         end
         # Each sandbox worker announces itself and its teardown, and each ran
         # exactly the one item it was started for.
-        lifecycle = filter(l -> occursin("· UP ", l) || occursin("· EXIT", l),
-                           collect(eachsplit(out[], '\n')))
+        lifecycle = filter(l -> occursin("· UP ", l) || occursin("· EXIT", l), worker_lines(out[]))
         @test count(l -> occursin("· UP ", l), lifecycle) == 2
         @test count(l -> occursin("· EXIT", l), lifecycle) == 2
         @test all(l -> occursin("1 item ", l), filter(l -> occursin("· EXIT", l), lifecycle))

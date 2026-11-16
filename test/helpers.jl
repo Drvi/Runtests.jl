@@ -223,6 +223,12 @@ function echo_captured(output::AbstractString)
     return nothing
 end
 
+# The lines of the run's test workers. A precompile helper prints `UP` and `EXIT`
+# lines as well, under a black square in place of the circle, and only when a cache
+# is stale, so a count of the workers leaves them out.
+worker_lines(output::AbstractString) =
+    filter(l -> startswith(l, Runtests.Private.MARK_WORKER), collect(eachsplit(output, '\n')))
+
 # Fixtures that have to know whether they have run before write marker files; keep
 # them out of a shared tempdir so a test can tell "this ran" from "this ran in
 # some earlier test".

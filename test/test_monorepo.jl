@@ -765,7 +765,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             with_runstate_dir() do _
                 (states, _, _), output = capture_run(() -> run_mono(ws; workers = 2, logs = :issues, monitor = false))
                 @test states == Dict(("A", "a") => PASSED, ("B", "b") => PASSED)
-                ups = filter(l -> occursin(r"\bUP\b", l), split(output, '\n'))
+                ups = filter(l -> occursin(r"\bUP\b", l), worker_lines(output))
                 @test length(ups) == 2
                 @test count(l -> endswith(l, "· profile default of B"), ups) == 1
                 @test count(l -> occursin("profile", l), ups) == 1

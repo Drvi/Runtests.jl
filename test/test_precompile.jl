@@ -362,6 +362,8 @@ end
         @test occursin("broken on purpose", out)
         # Its compile could only have failed too: it is said skipped, not run.
         @test occursin(Regex("COMP · +\\d+/\\d+ · \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
+        # The queue's own count of the run says the same, with what it did compile.
+        @test occursin(r"\[TEST\] precompiled \d+ compiles?( \(\d+ reused\))?, 1 failed, 1 skipped in ", out)
     end
 end
 
@@ -610,7 +612,7 @@ end
     # The name column stops at sixty: a name longer than it — an extension's
     # `Package → PackageExt` is the usual case — pushes every column after it
     # out of place, so the version's own padding would only lengthen the line.
-    u1, u2 = next_uuid(), next_uuid()
+    u1, u2, u3 = next_uuid(), next_uuid(), next_uuid()
     longname = "A" * "b"^70
     dir = make_pkg(
         "PadLog",
@@ -618,7 +620,9 @@ end
         "deps/$longname/src/$longname.jl" => "module $longname\nend\n",
         "deps/Versioned/Project.toml" => "name = \"Versioned\"\nuuid = \"$u2\"\nversion = \"100.200.300\"\n",
         "deps/Versioned/src/Versioned.jl" => "module Versioned\nend\n",
-        "test/Project.toml" => "[deps]\n$longname = \"$u1\"\nVersioned = \"$u2\"\n\n[sources]\n$longname = {path = \"../deps/$longname\"}\nVersioned = {path = \"../deps/Versioned\"}\n",
+        "deps/Dep2/Project.toml" => "name = \"Dep2\"\nuuid = \"$u3\"\nversion = \"0.1.0\"\n",
+        "deps/Dep2/src/Dep2.jl" => "module Dep2\nend\n",
+        "test/Project.toml" => "[deps]\n$longname = \"$u1\"\nVersioned = \"$u2\"\nDep2 = \"$u3\"\n\n[sources]\n$longname = {path = \"../deps/$longname\"}\nVersioned = {path = \"../deps/Versioned\"}\nDep2 = {path = \"../deps/Dep2\"}\n",
         "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
     )
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
@@ -628,6 +632,8 @@ end
     # `v100.200.300` sets the version column: with the padding a shorter version
     # would carry spaces before its `·`. The overflowing name's does not.
     @test occursin(Regex("\"$longname\" · v0\\.1\\.0 · PASS"), line)
+    # A name that fits still has its version padded to the column.
+    @test occursin(r"v0\.1\.0 {2,}· PASS", only(filter(l -> occursin("\"Dep2\"", l), pre)))
 end
 
 @testset "a helper's EXIT counts what it reused as well as what it compiled" begin
@@ -646,7 +652,10 @@ end
     )
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
     @test all(==(PASSED), values(states))
-    exits = filter(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l), collect(eachsplit(out, '\n')))
+    lines = collect(eachsplit(out, '\n'))
+    exits = filter(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l), lines)
     @test !isempty(exits)
     @test any(l -> occursin(r"\(\d+ reused\)", l), exits)
+    # Its environment is named as a worker's own would name it.
+    @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP   · pid \d+ · env test/qa", l), lines)
 end

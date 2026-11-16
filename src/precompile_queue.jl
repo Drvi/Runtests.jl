@@ -638,6 +638,13 @@ function run_queue(run::Run, q::PrecompileQueue)
         # `key` keeps `job` out of this scope: a name bound here is captured by the
         # closures that assign it below, and `run_job` and `helper_line_text` give
         # their `job`s a variable of their own.
+        # TODO: no check protects this. A name bound in `run_queue`'s scope and
+        # assigned inside one of its closures becomes a box every closure shares
+        # — a data race between the queue's tasks — and it surfaced only because
+        # JET happened to flag one instance (`s`) in a boolean context; `job` it
+        # never saw. A lint or test that rejects any variable bound in `run_queue`
+        # and assigned inside a nested closure would make this race-free by
+        # construction.
         key = (q.jobs[i].pkg, q.jobs[i].config)
         prev = get(serialized, key, 0)
         prev == 0 || push!(waits[i], prev)

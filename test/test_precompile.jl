@@ -322,17 +322,31 @@ end
     run_once(dir) = with_runstate_dir(_ -> capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false)))
 
     @testset "the compiles of two environments run at the same time" begin
+        # The test environment compiles in this process and `test/qa` in a helper, which
+        # takes seconds to start on a busy machine. So each compile marks that it started,
+        # and waits until it sees the other's mark: compiled one after the other, the first
+        # would wait out its two minutes and never see the second.
         foreach(f -> rm(joinpath(log, f)), readdir(log))
         t, q = "SlowTest$tag", "SlowQa$tag"
+        mark(name, what) = repr(joinpath(log, "$name.$what"))
+        meet(me, other) = """
+            touch($(mark(me, "started")))
+            let deadline = time() + 120
+                while !isfile($(mark(other, "started"))) && time() < deadline
+                    sleep(0.05)
+                end
+            end
+            isfile($(mark(other, "started"))) && touch($(mark(me, "met")))
+            """
         files = Pair{String, String}[]
-        ut, uq = timed_pkg!(files, t), timed_pkg!(files, q)
+        ut, uq = timed_pkg!(files, t; body = meet(t, q)), timed_pkg!(files, q; body = meet(q, t))
         dir = make_pkg("TwoEnvs$tag", files..., "test/Project.toml" => dep(t, ut, ".."), "test/t_test.jl" => item("t"),
                        "test/qa/Project.toml" => dep(q, uq, "../.."), "test/qa/q_test.jl" => item("q"))
-        (states, _, _), out = run_once(dir)
+        # Slots for both, whatever the machine: one slot alone could never run them together.
+        (states, _, _), out = withenv(() -> run_once(dir), "JULIA_NUM_PRECOMPILE_TASKS" => "4")
         @test all(==(PASSED), values(states))
-        s = spans()
-        # Each started before the other ended.
-        @test s[t][1] < s[q][2] && s[q][1] < s[t][2]
+        # Each saw the other start while it ran.
+        @test isfile(joinpath(log, "$t.met")) && isfile(joinpath(log, "$q.met"))
     end
 
     @testset "a setup compiles once what it loads is compiled, not after the whole environment" begin

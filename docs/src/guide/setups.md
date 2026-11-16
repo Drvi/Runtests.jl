@@ -23,7 +23,7 @@ An item loads it as a package:
 end
 ```
 
-Runtests finds the `using` and `import` statements of the items. Before it starts the workers, it precompiles the setups that the selected items need. It precompiles each setup for each profile whose items load it, with the environment, the preferences and the Julia flags of that profile. It precompiles several setups at the same time. The limit is the same as for `Pkg.precompile`, and the environment variable `JULIA_NUM_PRECOMPILE_TASKS` sets it.
+Runtests finds the `using` and `import` statements of the items. Before it starts the workers, it precompiles the setups that the selected items need. It precompiles each setup for each profile whose items load it, with the environment, the preferences and the Julia flags of that profile. A setup compiles as soon as the packages that it loads are compiled. [Precompilation](@ref precompilation) tells how all compiles share the limit that `JULIA_NUM_PRECOMPILE_TASKS` sets.
 
 ## Top-level code runs at precompilation
 

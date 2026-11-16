@@ -205,13 +205,17 @@ end
         write_setup(dir, other, "using $one"; deps = [one => uone], uuid = uother)
         needs = Runtests.Private.SetupNeed[(; name = Symbol(n), args = ``, flags = Base.CacheFlags(), dir = setups)
                                            for n in (file, filedep, pkg, pkgdep, one, other)]
-        jobs = Runtests.Private.with_load_path(setups) do
-            Runtests.Private.stale_setups(needs, Dict{Symbol, String}())
+        q = Runtests.Private.PrecompileQueue()
+        Runtests.Private.with_load_path(setups) do
+            Runtests.Private.add_setups!(q, something(Base.active_project(), ""), copy(LOAD_PATH), needs,
+                                         Dict{Symbol, String}())
         end
+        jobs = q.jobs
+        Runtests.Private.queue_order!(jobs)
         at(n) = findfirst(j -> j.pkg.name == n, jobs)
-        @test jobs[at(file)].after == [at(filedep)] && isempty(jobs[at(filedep)].after)
-        @test jobs[at(pkg)].after == [at(pkgdep)] && isempty(jobs[at(pkgdep)].after)
-        @test length(jobs[at(one)].after) + length(jobs[at(other)].after) == 1
+        @test jobs[at(file)].deps == [at(filedep)] && isempty(jobs[at(filedep)].deps)
+        @test jobs[at(pkg)].deps == [at(pkgdep)] && isempty(jobs[at(pkgdep)].deps)
+        @test length(jobs[at(one)].deps) + length(jobs[at(other)].deps) == 1
     end
 
     @testset "a setup stays precompiled when it loads another that compiles after it" begin

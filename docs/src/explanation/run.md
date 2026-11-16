@@ -20,6 +20,16 @@ When a package and its `test/Project.toml` belong to the same outermost Julia wo
 
 Runtests keeps resolved environments for the session and rebuilds them when their input files, such as `Project.toml` or a manifest, change. Reusing an environment does not guarantee that all compilation is reusable: changed source or worker flags can require new compiled code. The items in an [environment directory](@ref environments) run in that environment, stacked over the test environment.
 
+## [Precompilation](@id precompilation)
+
+Before it starts the workers, the coordinator compiles what they will load. These are the packages and extensions of each environment that the workers start in, for the Julia flags of each profile. They are also the [setups](@ref setups) that the selected items load, and Runtests, which each worker loads before it connects. Without this step, the first workers would compile the same packages at the same time. A worker whose flags have no cache would compile everything it loads, one package at a time, before its first item.
+
+All these compiles go in one queue. A compile starts when the compiles of what it loads are done and a slot is free, whatever its environment or its flags. Thus a setup starts as soon as the packages that it loads are compiled, and two environments compile at the same time. The number of slots is that of `Pkg.precompile`: `JULIA_NUM_PRECOMPILE_TASKS`, or else one more than the CPU threads, and at most 16.
+
+The coordinator first finds out which caches are fresh, in its own process. As in `Pkg.precompile`, a cache is fresh only together with the caches of the packages it loads. When every cache is fresh, the step starts no process. Otherwise each environment gets a process of its own, which starts the compiles there. Julia has one active project for each process, so one process cannot compile for two environments.
+
+Each compile prints a line with its time. `✓` marks a compile that built a cache. `?` marks a module that cannot be precompiled, which then loads from its source. `✗` marks a failure. A package that fails to compile gives a warning with its output, and the run goes on. The packages that load it are not compiled, and the workers compile what their items load. A setup that fails to compile stops the run, because its items cannot load it.
+
 ## [The plan](@id plan)
 
 Before it starts the items, the coordinator plans the order in which it gives them out. It uses the durations that earlier runs recorded. A run gives out the items in this order:

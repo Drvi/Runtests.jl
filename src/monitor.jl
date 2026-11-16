@@ -528,9 +528,12 @@ function print_status_line(io::IO, m::Monitor)
     run = run_of(m)
     total = nitems(run.plan)
     done = @atomic run.ndone
-    # The same shape as every other line in the log; `w0` is the coordinator.
+    # The same shape as every other line in the log; `w0` is the coordinator. While
+    # the precompile queue has compiles in flight the mark is its white square, and
+    # the line ends with the oldest of them.
     solo = single_process(run.plan)
-    print_line_head(io, MARK_INFO, solo ? nothing : 0, clock_text(m))
+    compiling = oldest_compiling()
+    print_line_head(io, isempty(compiling) ? MARK_INFO : PRECOMPILE_MARK_INFO, solo ? nothing : 0, clock_text(m))
     print_word(io, "INFO")
     print_int(io, done, ndigits(total))
     write(io, UInt8('/'))
@@ -590,6 +593,8 @@ function print_status_line(io::IO, m::Monitor)
     # A producer that takes long is not an item that hangs, and is said apart from one.
     collecting = collecting_item(m)
     collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
+    isempty(compiling) ||
+        (print(io, " · precompiling "); print_clipped(io, compiling, RUNNING_WIDTH))
     return nothing
 end
 

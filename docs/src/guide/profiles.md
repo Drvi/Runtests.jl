@@ -77,7 +77,7 @@ Each item runs the `test_end` of its own profile. Each has its own timeout, `ini
 
 ## [Precompilation](@id profile-precompile)
 
-Before the workers start, Runtests precompiles the environment of each profile for the Julia flags of that profile. A flag that changes how Julia compiles code, for example `--check-bounds=yes`, makes Runtests compile each package of the environment again. For a large environment, this can take longer than the items of the profile.
+Before the workers start, Runtests precompiles the environment of each profile for the Julia flags of that profile, as [Precompilation](@ref precompilation) tells. A flag that changes how Julia compiles code, for example `--check-bounds=yes`, makes Runtests compile each package of the environment again. For a large environment, this can take longer than the items of the profile.
 
 `precompile` names the packages that Runtests precompiles for the profile instead, each with its dependencies:
 

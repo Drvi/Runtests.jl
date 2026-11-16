@@ -140,9 +140,9 @@ end
         pkg = Base.identify_package(name)
         bounds = Base.CacheFlags(Base.CacheFlags(); check_bounds = OTHER_BOUNDS.value)
         for (args, flags) in (`` => Base.CacheFlags(), `$(OTHER_BOUNDS.arg)` => bounds)
-            @test !Runtests.Private.has_fresh_cache(pkg, flags)
-            @test Runtests.Private.compile_setup((; pkg, args, flags, after = Int[])) === nothing
-            @test Runtests.Private.has_fresh_cache(pkg, flags)
+            @test !Runtests.Private.PrecompileHelper.has_fresh_cache(pkg, flags)
+            @test first(Runtests.Private.PrecompileHelper.compile(pkg, args, flags)) === :built
+            @test Runtests.Private.PrecompileHelper.has_fresh_cache(pkg, flags)
         end
     finally
         first(DEPOT_PATH) == depot && popfirst!(DEPOT_PATH)
@@ -273,41 +273,95 @@ end
     end
 end
 
-@testset "one call of the precompiler for the sets of flags that need the same packages" begin
-    # A call has one queue for all its sets of flags, and calls run one after the
-    # other, so the fewest calls that compile nothing unasked leave the fewest free
-    # slots waiting on the last packages of a call.
-    default = `` => Base.CacheFlags()
-    bounds = `--check-bounds=yes` => Base.CacheFlags(Base.CacheFlags(); check_bounds = 1)
-    inline = `--inline=no` => Base.CacheFlags(Base.CacheFlags(); inline = false)
-    need(project, config, whole, names, profiles = String[]) =
-        (; project, config, whole, names = Set{String}(names), subject = "the test environment", profiles = Set{String}(profiles))
-    calls(needs...) = [(c.project, c.configs, c.names, c.profiles) for c in
-                       Runtests.Private.precompile_calls(Runtests.Private.PrecompileNeed[needs...])]
+@testset "the queue's graph is the one Julia's precompiler builds" begin
+    # Read from the manifest alone, so the packages need no source.
+    dir = mktempdir()
+    u = Dict(n => next_uuid() for n in ("A", "B", "C", "D", "E", "F"))
+    write(joinpath(dir, "Project.toml"), "[deps]\n" * join("$n = \"$(u[n])\"\n" for n in ("A", "B", "C", "F")))
+    entry(n, extra = "") = "[[deps.$n]]\nuuid = \"$(u[n])\"\npath = \"$n\"\n$extra\n"
+    write(joinpath(dir, "Manifest.toml"), "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n\n" *
+          entry("A", "weakdeps = [\"B\"]\n\n    [deps.A.extensions]\n    AExt = \"B\"\n") * entry("B") *
+          entry("C", "deps = [\"A\", \"B\"]") * entry("D", "deps = [\"E\"]") * entry("E", "deps = [\"D\"]") *
+          entry("F", "deps = [\"D\"]"))
+    g = Runtests.Private.env_graph(joinpath(dir, "Project.toml"))
+    id(n) = Base.PkgId(Base.UUID(u[n]), n)
+    ext = Base.PkgId(Base.uuid5(Base.UUID(u["A"]), "AExt"), "AExt")
+    # An extension whose package and trigger are both there waits for both.
+    @test g.parent[ext] == id("A") && Set(g.deps[ext]) == Set([id("A"), id("B")])
+    # A package that loads both loads the extension while it compiles, so it waits for it.
+    @test ext in g.deps[id("C")]
+    # D and E wait for each other, and F for them: the precompiler leaves all three out.
+    @test g.circular == Set([id("D"), id("E"), id("F")])
+    # Names compile with what they wait for, and an extension with all it waits for.
+    @test Runtests.Private.compile_set(g, Set(["A"])) == Set([id("A")])
+    @test Runtests.Private.compile_set(g, Set(["C"])) == Set([id("A"), id("B"), id("C"), ext])
+end
 
-    @testset "a project that every set of flags needs whole is one call, this process's flags first" begin
-        @test calls(need("/t", bounds, true, [], ["bounds"]), need("/t", default, true, [])) ==
-            [("/t", [default, bounds], String[], ["bounds"])]
+@testset "one queue compiles every environment and the setups" begin
+    # Packages whose compile takes a while and records when it ran, as the top level of a
+    # module runs while it compiles: the time in a file `<name>.start`, and one `<name>.end`.
+    # A file each, as two processes that append to one file can mix their lines.
+    tag = string(hash(mktempdir()); base = 16)
+    log = mktempdir()
+    stamp(name, what) = "write($(repr(joinpath(log, name * "." * what))), string(time()))"
+    function timed_pkg!(files, name; body = "sleep(2)")
+        uuid = next_uuid()
+        push!(files, "deps/$name/Project.toml" => "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n",
+                     "deps/$name/src/$name.jl" => "module $name\n$(stamp(name, "start"))\n$body\n$(stamp(name, "end"))\nend\n")
+        return uuid
+    end
+    dep(name, uuid, up) = "[deps]\n$name = \"$uuid\"\n\n[sources]\n$name = {path = \"$up/deps/$name\"}\n"
+    spans() = Dict(name => [parse(Float64, read(joinpath(log, "$name.$what"), String)) for what in ("start", "end")]
+                   for name in unique(first.(splitext.(readdir(log)))))
+    item(name) = "@testitem \"$name\" begin\n    @test true\nend\n"
+    run_once(dir) = with_runstate_dir(_ -> capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false)))
+
+    @testset "the compiles of two environments run at the same time" begin
+        foreach(f -> rm(joinpath(log, f)), readdir(log))
+        t, q = "SlowTest$tag", "SlowQa$tag"
+        files = Pair{String, String}[]
+        ut, uq = timed_pkg!(files, t), timed_pkg!(files, q)
+        dir = make_pkg("TwoEnvs$tag", files..., "test/Project.toml" => dep(t, ut, ".."), "test/t_test.jl" => item("t"),
+                       "test/qa/Project.toml" => dep(q, uq, "../.."), "test/qa/q_test.jl" => item("q"))
+        (states, _, _), out = run_once(dir)
+        @test all(==(PASSED), values(states))
+        s = spans()
+        # Each started before the other ended.
+        @test s[t][1] < s[q][2] && s[q][1] < s[t][2]
     end
 
-    @testset "names that the same sets of flags need are one call" begin
-        # A's items run under both sets, B's under the default one.
-        @test calls(need("/u", default, false, ["A", "B", "Runtests"]), need("/u", bounds, false, ["A", "Runtests"], ["bounds"])) ==
-            [("/u", [default, bounds], ["A", "Runtests"], ["bounds"]), ("/u", [default], ["B"], String[])]
+    @testset "a setup compiles once what it loads is compiled, not after the whole environment" begin
+        foreach(f -> rm(joinpath(log, f)), readdir(log))
+        slow, setup = "SlowEnv$tag", "QuickSetup$tag"
+        files = Pair{String, String}[]
+        us = timed_pkg!(files, slow; body = "sleep(4)")
+        dir = make_pkg("SetupEarly$tag", files..., "test/Project.toml" => dep(slow, us, ".."),
+                       "test/testsetups/$setup.jl" => "module $setup\n$(stamp(setup, "start"))\n$(stamp(setup, "end"))\nend\n",
+                       "test/t_test.jl" => "@testitem \"t\" begin\n    using $setup\n    @test true\nend\n")
+        (states, _, _), out = run_once(dir)
+        @test all(==(PASSED), values(states))
+        s = spans()
+        @test s[setup][1] < s[slow][2]
     end
 
-    @testset "never more calls than sets of flags" begin
-        # Seven groups of names for three sets of flags: a call for each set.
-        got = calls(need("/u", default, false, ["A", "B", "D", "R"]), need("/u", bounds, false, ["A", "C", "E", "R"]),
-                    need("/u", inline, false, ["B", "C", "F", "R"]))
-        @test got == [("/u", [default], ["A", "B", "D", "R"], String[]), ("/u", [bounds], ["A", "C", "E", "R"], String[]),
-                      ("/u", [inline], ["B", "C", "F", "R"], String[])]
-    end
-
-    @testset "each project has calls of its own, and a need without names has none" begin
-        got = calls(need("/u", default, false, ["A"]), need("/qa", default, true, [], ["default"]),
-                    need("/qa", bounds, true, [], ["bounds"]), need("/u", bounds, false, []))
-        @test got == [("/qa", [default, bounds], String[], ["bounds", "default"]), ("/u", [default], ["A"], String[])]
+    @testset "a package that fails to compile is said, what waits for it is left, and the run goes on" begin
+        broken, after = "Broken$tag", "AfterBroken$tag"
+        ub, ua = next_uuid(), next_uuid()
+        dir = make_pkg("FailedCompile$tag",
+                       "deps/$broken/Project.toml" => "name = \"$broken\"\nuuid = \"$ub\"\nversion = \"0.1.0\"\n",
+                       "deps/$broken/src/$broken.jl" => "module $broken\nerror(\"broken on purpose\")\nend\n",
+                       "deps/$after/Project.toml" => "name = \"$after\"\nuuid = \"$ua\"\nversion = \"0.1.0\"\n\n" *
+                           dep(broken, ub, "../.."),
+                       "deps/$after/src/$after.jl" => "module $after\nusing $broken\nend\n",
+                       "test/Project.toml" => dep(after, ua, ".."),
+                       "test/t_test.jl" => item("t"))
+        (states, _, _), out = run_once(dir)
+        @test all(==(PASSED), values(states))
+        # A line as a test item's, and its output in the bracket of a failed item.
+        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$broken\" +· v0\\.1\\.0 +· FAIL"), out)
+        @test occursin("broken on purpose", out)
+        # Its compile could only have failed too: it is said skipped, not run.
+        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
     end
 end
 
@@ -335,7 +389,16 @@ end
         end
         """,
         "test/prefs.toml" => "[IdleProfile]\nlevel = 3\n",
-        "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"prefs.toml\"\n"
+        "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"prefs.toml\"\n",
+        # Read as it compiles, as Preferences.jl reads one: a cache built under other
+        # preferences is no good to the profile's project.
+        "src/IdleProfile.jl" => """
+        module IdleProfile
+        const UUID = Base.PkgId(@__MODULE__).uuid
+        Base.record_compiletime_preference(UUID, "level")
+        const LEVEL = get(Base.get_preferences(UUID), "level", 0)
+        end
+        """
     )
     with_runstate_dir() do _
         (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, name = "plain"))
@@ -370,7 +433,7 @@ end
             end
             """
         )
-        cached(n) = Runtests.Private.has_fresh_cache(Base.PkgId(Base.UUID(uuids[n]), n), flags;
+        cached(n) = Runtests.Private.PrecompileHelper.has_fresh_cache(Base.PkgId(Base.UUID(uuids[n]), n), flags;
                                                      sourcepath = joinpath(dir, "deps", n, "src", "$n.jl"))
         return dir, kept, left, cached
     end
@@ -444,11 +507,146 @@ VERSION >= v"1.12" && @testset "a profile's julia arguments compile only the pac
         (states, _, p), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
         @test all(==(PASSED), values(states))
         @test occursin("precompiling the test environment for 1 profile: bounds", out)
-        cached(name, f) = Runtests.Private.has_fresh_cache(
+        cached(name, f) = Runtests.Private.PrecompileHelper.has_fresh_cache(
             Base.PkgId(p.packages.uuid[findfirst(==(name), p.packages.name)], name), f;
             sourcepath = joinpath(ws, "lib", name, "src", "$name.jl"))
         @test cached("A", flags)
         @test cached("B", Base.CacheFlags())
         @test !cached("B", flags)
     end
+end
+
+@testset "the queue's log is one block, and every compile a line" begin
+    # A package with a profile whose julia flags differ: the announcement, the
+    # helper lines and the job lines are asserted against its run's output.
+    dir = make_pkg(
+        "LogShape",
+        "test/t_test.jl" => """
+        @testitem "checked" profile=:bounds begin
+            @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
+        end
+        """,
+        "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n",
+    )
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states))
+    lines = collect(eachsplit(out, '\n'))
+
+    # One bracketed block announces the work: the compiles, the helper processes
+    # they spread over, and the shared ceiling on how many run at once.
+    heads = filter(l -> occursin(r"\[TEST\] precompiling \d+ compile", l), lines)
+    @test length(heads) == 1
+    @test occursin(r"with \d+ worker", only(heads))
+    @test occursin("at most $(Runtests.Private.precompile_tasks()) at once", only(heads))
+
+    # A helper comes up and goes down as a worker does, its square black, and its
+    # UP line is the worker's own: pid, profile, environment, arguments.
+    @test any(l -> occursin(Regex("⬛ w\\d+ · \\d\\d:\\d\\d:\\d\\d · UP   · pid \\d+ · profile bounds · env test(, this environment)? · $(OTHER_BOUNDS.arg)"), l), lines)
+    @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l) && occursin(r"\d+ compiles?", l), lines)
+
+    # On a job line the profile names the flags; the arguments themselves are not
+    # there. Every job has a line, numbered in one count.
+    pre = filter(l -> occursin("COMP", l), lines)
+    @test !isempty(pre)
+    @test !any(l -> occursin(OTHER_BOUNDS.arg, l), pre)
+    @test any(l -> occursin("profile bounds", l), pre)
+    @test all(l -> occursin(r"· \s*\d+/\d+ ·", l), pre)
+    # Every built line carries the resident peak of its helper's compiles, after
+    # its time, as a DONE line carries its worker's.
+    @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+ GiB", l), pre)
+
+    # When the queue ends a line accounts for it: what compiled, what was reused,
+    # and how long the phase took.
+    @test occursin(r"\[TEST\] precompiled \d+ compiles?( \(\d+ reused\))? in [\d.ms]+", out)
+end
+
+@testset "a job already fresh is counted but not listed" begin
+    dir = make_pkg(
+        "FreshLog",
+        "test/t_test.jl" => """
+        @testitem "checked" profile=:bounds begin
+            @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
+        end
+        """,
+        "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n",
+    )
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states))
+    # A change only to the package's source: its compiles run again, and what the
+    # first run compiled for the profile the head counts as reused — REUSED lines
+    # stay off until the run has a verbosity setting for them.
+    open(io -> println(io, "# touched"), joinpath(dir, "src", "FreshLog.jl"), "a")
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states))
+    @test occursin(r"\(\d+ reused\)", out)
+    @test occursin(r"\[TEST\] precompiled \d+ compiles? \(\d+ reused\) in ", out)
+    @test !occursin(r"\bREUSED\b", out)
+    @test !occursin(r"⬜ w\d+ · \d\d:\d\d:\d\d · COMP", out)
+    # Only the compiles number into the total: there is no hole for a reused job.
+    pre = filter(l -> occursin("COMP", l), collect(eachsplit(out, '\n')))
+    total = maximum(l -> parse(Int, match(r"(\d+)/(\d+)", l).captures[2]), pre)
+    @test total == length(pre)
+end
+
+@testset "a run off a terminal says what still compiles" begin
+    # Without a pinned status line there is nothing to see during a long compile,
+    # so a quiet run names what is still compiling after a monitor interval goes
+    # by without a completion. `monitor_interval = 0` asks for it at once.
+    u = next_uuid()
+    dir = make_pkg(
+        "SlowLog",
+        "deps/SlowPkg/Project.toml" => "name = \"SlowPkg\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
+        "deps/SlowPkg/src/SlowPkg.jl" => "module SlowPkg\nsleep(2)\nend\n",
+        "test/Project.toml" => "[deps]\nSlowPkg = \"$u\"\n\n[sources]\nSlowPkg = {path = \"../deps/SlowPkg\"}\n",
+        "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
+    )
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, monitor_interval = 0))
+    @test all(==(PASSED), values(states))
+    @test occursin("still precompiling SlowPkg", out)
+    @test occursin(Regex("COMP · +\\d+/\\d+ · \"SlowPkg\" +· v0\\.1\\.0 +· PASS"), out)
+end
+
+@testset "a name longer than the name column leaves the version unpadded" begin
+    # The name column stops at sixty: a name longer than it — an extension's
+    # `Package → PackageExt` is the usual case — pushes every column after it
+    # out of place, so the version's own padding would only lengthen the line.
+    u1, u2 = next_uuid(), next_uuid()
+    longname = "A" * "b"^70
+    dir = make_pkg(
+        "PadLog",
+        "deps/$longname/Project.toml" => "name = \"$longname\"\nuuid = \"$u1\"\nversion = \"0.1.0\"\n",
+        "deps/$longname/src/$longname.jl" => "module $longname\nend\n",
+        "deps/Versioned/Project.toml" => "name = \"Versioned\"\nuuid = \"$u2\"\nversion = \"100.200.300\"\n",
+        "deps/Versioned/src/Versioned.jl" => "module Versioned\nend\n",
+        "test/Project.toml" => "[deps]\n$longname = \"$u1\"\nVersioned = \"$u2\"\n\n[sources]\n$longname = {path = \"../deps/$longname\"}\nVersioned = {path = \"../deps/Versioned\"}\n",
+        "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
+    )
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states))
+    pre = filter(l -> occursin("COMP", l), collect(eachsplit(out, '\n')))
+    line = only(filter(l -> occursin(longname, l), pre))
+    # `v100.200.300` sets the version column: with the padding a shorter version
+    # would carry spaces before its `·`. The overflowing name's does not.
+    @test occursin(Regex("\"$longname\" · v0\\.1\\.0 · PASS"), line)
+end
+
+@testset "a helper's EXIT counts what it reused as well as what it compiled" begin
+    # `Shared` is a dependency of the test environment and of `test/qa`, so the
+    # queue holds two jobs for its one cache: the first to build wins, and the
+    # other environment's helper answers a job it did not have to compile.
+    u = next_uuid()
+    dir = make_pkg(
+        "ReuseExit",
+        "deps/Shared/Project.toml" => "name = \"Shared\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
+        "deps/Shared/src/Shared.jl" => "module Shared\nend\n",
+        "test/Project.toml" => "[deps]\nShared = \"$u\"\n\n[sources]\nShared = {path = \"../deps/Shared\"}\n",
+        "test/qa/Project.toml" => "[deps]\nShared = \"$u\"\n\n[sources]\nShared = {path = \"../../deps/Shared\"}\n",
+        "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
+        "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test true\nend\n",
+    )
+    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states))
+    exits = filter(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l), collect(eachsplit(out, '\n')))
+    @test !isempty(exits)
+    @test any(l -> occursin(r"\(\d+ reused\)", l), exits)
 end

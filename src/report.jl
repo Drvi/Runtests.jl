@@ -390,13 +390,20 @@ const GUTTER = "  "
 # Every glyph is two columns wide in Unicode's tables and has no variation
 # selector, which keeps the `w1` column in place; 🛠️ and ℹ️ are width 1 in the
 # tables and width 2 in most terminals.
+const MARK_ITEM = "  "   # as wide as a glyph, and blank
 const MARK_RUNNING = "🔵"
 const MARK_PASSED = "🟢"
 const MARK_FAILED = "🔴"
 const MARK_SET_ASIDE = "🟡"
 const MARK_WORKER = "⚫"
-const MARK_ITEM = "  "   # as wide as a glyph, and blank
 const MARK_INFO = "⚪"
+
+const PRECOMPILE_MARK_RUNNING = "🟦"
+const PRECOMPILE_MARK_PASSED = "🟩"
+const PRECOMPILE_MARK_FAILED = "🟥"
+const PRECOMPILE_MARK_UNPRECOMPILABLE = "🟨"
+const PRECOMPILE_MARK_WORKER = "⬛"
+const PRECOMPILE_MARK_INFO = "⬜"
 
 const FIELD = " · "
 const WORKER_STATE_WIDTH = 4   # "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" and "UP" are shorter
@@ -560,6 +567,14 @@ print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) = p
     print(io, text)
 end)
 
+# The same line for a precompile helper: a black square where a test worker's circle
+# sits, so its UP and EXIT lines read as the same lifecycle in another colour.
+print_helper_line(run, id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
+    print_line_head(io, PRECOMPILE_MARK_WORKER, id, clock_now())
+    print_word(io, state)
+    print(io, text)
+end)
+
 """
     item_line(slot_id, i, total, shown, width, attempt, attempts, how) -> String
 
@@ -673,7 +688,9 @@ function print_run_header(run)
     p = run.plan
     head = sprint(io -> print_work(io, p, length(run.slots); seed = p.cfg.seed))
     body = sprint() do io
-        println(io, "env: ", something(Base.active_project(), "none"))
+        # The project's path in the run-state path's colour, as the log paths are.
+        env = something(Base.active_project(), "none")
+        println(io, "env: ", styled(x -> printstyled(x, env; color = :light_black)))
         print_packages(io, p)
         print_startup(io, p.startup)
         print_profiles(io, p)

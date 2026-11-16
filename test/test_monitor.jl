@@ -918,6 +918,25 @@ end
         @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
     end
 
+    @testset "while the queue runs, the line names the oldest compile" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.scratch; force=true, recursive=true)
+        with(Runtests.Private.TTY_OVERRIDE => true) do
+            m = run.monitor = Monitor(run)
+            plain = status_line(m)
+            @test startswith(plain, Runtests.Private.MARK_INFO)
+            @test !occursin("precompiling", plain)
+            Runtests.Private.compiling_started(1, "SomePackage")
+            line = status_line(m)
+            @test startswith(line, Runtests.Private.PRECOMPILE_MARK_INFO)
+            @test occursin("precompiling SomePackage", line)
+            Runtests.Private.compiling_ended(1)
+            @test startswith(status_line(m), Runtests.Private.MARK_INFO)
+            @test isempty(Runtests.Private.compiling_names())
+        end
+    end
+
     @testset "a run that throws before its first item takes the line down" begin
         # A run that falls over before its test phase — a setup that will not
         # compile, an environment that will not resolve — takes the line down too:

@@ -1,12 +1,14 @@
 # A process that compiles packages for the run's precompile queue (`precompile_queue.jl`).
 # Julia's active project and load path are one value for the whole process, and both
 # decide which package a name is, whether a cache is fresh, and the name of the cache
-# file. So each environment the queue compiles in has a process of its own, started
-# with that project and load path. The coordinator decides what compiles when and how
-# many compile at once; this process only answers its requests.
+# file. So each environment the queue compiles in, other than the coordinator's own,
+# has a process of its own, started with that project and load path. The coordinator
+# decides what compiles when and how many compile at once; this process only answers
+# its requests.
 #
 # Base only: it runs in any environment, also one that cannot load Runtests. Runtests
-# includes this file as well, for the checks it makes in its own process.
+# includes this file as well, for the checks and the compiles it makes in its own
+# process.
 module PrecompileHelper
 
 # The protocol, one line a message, fields split by tabs:

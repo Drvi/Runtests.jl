@@ -5,9 +5,10 @@
 # every set of cache flags its workers have. A compile starts as soon as the compiles it
 # waits for are done and one of `precompile_tasks()` slots is free, whatever its
 # project or flags. The active project and the load path are one value for a process,
-# so each environment has a helper process of its own (`precompile_helper.jl`), which
-# this process starts once a job there has work. This process decides what compiles,
-# when, and how many at once, and reports progress and failures.
+# so this process compiles for its own environment, and each other environment has a
+# helper process of its own (`precompile_helper.jl`), which this process starts once a
+# job there has work. This process decides what compiles, when, and how many at once,
+# and reports progress and failures.
 
 include("precompile_helper.jl")
 
@@ -31,31 +32,6 @@ const QueueJob = @NamedTuple{env::Int, pkg::Base.PkgId, config::Int, deps::Vecto
 # project, as a message calls it, and the profiles whose flags or project need it.
 const QueueGroup = @NamedTuple{project::String, subject::String, profiles::Set{String}}
 
-struct PrecompileQueue
-    envs::Vector{QueueEnv}
-    configs::Vector{PrecompileConfig}
-    jobs::Vector{QueueJob}
-    groups::Vector{QueueGroup}
-    # Each job by project, package and configuration: one compile for each, whatever
-    # environment asked for it first.
-    index::Dict{Tuple{String, Base.PkgId, Int}, Int}
-    graphs::Dict{String, Any}
-end
-
-PrecompileQueue() = PrecompileQueue(QueueEnv[], PrecompileConfig[], QueueJob[], QueueGroup[],
-                                    Dict{Tuple{String, Base.PkgId, Int}, Int}(), Dict{String, Any}())
-
-# As many compiles at a time as Julia's own precompiler runs: `JULIA_NUM_PRECOMPILE_TASKS`,
-# or one more than the CPU threads, half of them on Windows, and at most 16.
-function precompile_tasks()
-    # Chosen as the code is compiled: before 1.13 the name does not exist at all.
-    n = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
-    default = min(Sys.iswindows() ? div(n, 2) + 1 : n + 1, 16)
-    return max(1, something(tryparse(Int, get(ENV, "JULIA_NUM_PRECOMPILE_TASKS", "")), default))
-end
-
-### The graph of a project #################################################
-
 """
     EnvGraph
 
@@ -73,6 +49,37 @@ struct EnvGraph
     circular::Set{Base.PkgId}
     versions::Dict{Base.UUID, String}
 end
+
+# A job's key: its project, its package and its cache flags. The flags, not the set of
+# julia arguments that gives them: arguments that compile no code differently, as
+# `--depwarn=error` or coverage before 1.14, give the same cache, which Julia locks for
+# the package and the flags alone.
+const JobKey = Tuple{String, Base.PkgId, Base.CacheFlags}
+
+struct PrecompileQueue
+    envs::Vector{QueueEnv}
+    configs::Vector{PrecompileConfig}
+    jobs::Vector{QueueJob}
+    groups::Vector{QueueGroup}
+    # One compile for each key, whatever environment or arguments asked for it first.
+    index::Dict{JobKey, Int}
+    # The graph of each project file, `nothing` for one that could not be read.
+    graphs::Dict{String, Union{Nothing, EnvGraph}}
+end
+
+PrecompileQueue() = PrecompileQueue(QueueEnv[], PrecompileConfig[], QueueJob[], QueueGroup[],
+                                    Dict{JobKey, Int}(), Dict{String, Union{Nothing, EnvGraph}}())
+
+# As many compiles at a time as Julia's own precompiler runs: `JULIA_NUM_PRECOMPILE_TASKS`,
+# or one more than the CPU threads, half of them on Windows, and at most 16.
+function precompile_tasks()
+    # Chosen as the code is compiled: before 1.13 the name does not exist at all.
+    n = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
+    default = min(Sys.iswindows() ? div(n, 2) + 1 : n + 1, 16)
+    return max(1, something(tryparse(Int, get(ENV, "JULIA_NUM_PRECOMPILE_TASKS", "")), default))
+end
+
+### The graph of a project #################################################
 
 function reach!(seen::Set{Base.UUID}, deps::Dict{Base.UUID, Vector{Base.UUID}}, uuid::Base.UUID)
     uuid in seen && return seen
@@ -217,8 +224,15 @@ function compile_set(g::EnvGraph, names::Union{Nothing, Set{String}})
         push!(keep, p)
         all_deps!(keep, g.deps, p)
     end
-    for ext in keys(g.parent)
-        issubset(all_deps!(Set{Base.PkgId}(), g.deps, ext), keep) && push!(keep, ext)
+    # Until none is added: an extension can wait for another extension.
+    added = true
+    while added
+        added = false
+        for ext in keys(g.parent)
+            (ext in keep || !issubset(all_deps!(Set{Base.PkgId}(), g.deps, ext), keep)) && continue
+            push!(keep, ext)
+            added = true
+        end
     end
     return keep
 end
@@ -265,27 +279,38 @@ end
 # The jobs that compile `names` of `project`, and what they wait for, or all of it
 # (`nothing`), under `config`, in the environment of `project` and `load_path`. What
 # the precompiler cannot read, a run without a project or a project without a manifest,
-# adds nothing.
+# adds nothing. A project whose graph cannot be read adds nothing either, with a
+# warning: the step is work brought forward, and the workers compile what they load.
 function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Vector{String},
                       config::PrecompileConfig, names::Union{Nothing, Set{String}}, group::Int;
                       profiles::Set{String} = Set{String}())
     file = queue_project_file(project)
     file === nothing && return nothing
-    g = get!(() -> env_graph(file), q.graphs, file)::EnvGraph
-    e, c = env_of!(q, project, load_path), config_of!(q, config)
+    g = get!(q.graphs, file) do
+        try
+            env_graph(file)
+        catch e
+            is_interrupt(e) && rethrow()
+            @warn "Runtests: could not read the packages of $(relpath_or_path(file)), so none of them is \
+                   precompiled before the workers start; the workers compile what they load" exception = e
+            nothing
+        end
+    end
+    g === nothing && return nothing
+    e, c, flags = env_of!(q, project, load_path), config_of!(q, config), last(config)
     keep = filter!(p -> !(p in g.circular), compile_set(g, names))
     for pkg in keep
         exts = haskey(g.parent, pkg) ? filter(d -> haskey(g.parent, d), g.triggers[pkg]) : nothing
-        j = add_job!(q, (String(project), pkg, c),
+        j = add_job!(q, (String(project), pkg, flags),
                      (; env = e, pkg, config = c, deps = Int[], strict = !isempty(g.deps[pkg]), exts,
                       kind = :package, group, name = display_name(g, pkg), profiles = Set{String}(),
                       version = graph_version(g, pkg)))
         union!(q.jobs[j].profiles, profiles)
     end
     for pkg in keep
-        job = q.jobs[q.index[(String(project), pkg, c)]]
+        job = q.jobs[q.index[(String(project), pkg, flags)]]
         for d in g.deps[pkg]
-            j = get(q.index, (String(project), d, c), 0)
+            j = get(q.index, (String(project), d, flags), 0)
             (j == 0 || j in job.deps) || push!(job.deps, j)
         end
     end
@@ -316,16 +341,16 @@ function precompile_queue(run::Run, p::Plan, flags_of)
     here, here_path = something(Base.active_project(), ""), copy(LOAD_PATH)
     pkg = RuntestsWorkers.PKGID
     for config in others
-        c = config_of!(q, config)
-        any(((_, k, kc),) -> k == pkg && kc == c, keys(q.index)) && continue
+        flags = last(config)
+        any(((_, k, f),) -> k == pkg && f == flags, keys(q.index)) && continue
         group = group_of!(q, here, string("Runtests for workers started with `", join(first(config).exec, " "), "`"),
                           String[])
         add_project!(q, here, here_path, config, Set(["Runtests"]), group)
         # Not in the project's manifest: the compile process builds what it waits for.
-        haskey(q.index, (here, pkg, c)) && continue
-        add_job!(q, (here, pkg, c), (; env = env_of!(q, here, here_path), pkg, config = c, deps = Int[], strict = false,
-                                    exts = nothing, kind = :runtests, group, name = "Runtests", profiles = Set{String}(),
-                                    version = source_version(pkg)))
+        haskey(q.index, (here, pkg, flags)) && continue
+        add_job!(q, (here, pkg, flags), (; env = env_of!(q, here, here_path), pkg, config = config_of!(q, config),
+                                        deps = Int[], strict = false, exts = nothing, kind = :runtests, group,
+                                        name = "Runtests", profiles = Set{String}(), version = source_version(pkg)))
     end
     once = Dict{Symbol, String}()
     for (; project, load_path, needs) in setup_needs(run, p, flags_of)
@@ -335,26 +360,29 @@ function precompile_queue(run::Run, p::Plan, flags_of)
 end
 
 # The setups of `needs`, loaded in `project` on `load_path`, each after the setups and
-# packages it loads, as far as `setup_dependencies` knows them. A setup compiles without
-# `strict`: a package it loads that no job compiles, the compile process builds.
+# packages it loads, as far as `setup_dependencies` knows them, compiled for the same
+# cache flags. A setup compiles without `strict`: a package it loads that no job
+# compiles, the compile process builds.
 function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vector{String},
                      needs::Vector{SetupNeed}, once::Dict{Symbol, String})
     e = env_of!(q, project, load_path)
     group = group_of!(q, project, "test setups", String[])
     waits = Tuple{Int, Base.PkgId}[]
     in_worker_environment(project, load_path) do
-        for (; name, args, flags, dir) in needs
+        for (; name, args, flags, dir, profiles) in needs
             pkg = Base.identify_package(String(name))
             pkg === nothing && throw(ConfigError("test setup module `$name` is not loadable from $dir"))
             if pkg.uuid === nothing
                 haskey(once, name) && continue
                 once[name] = something(Base.locate_package(pkg), dir)
             end
-            c = config_of!(q, args => flags)
-            key = (String(project), pkg, c)
-            haskey(q.index, key) && continue
-            i = add_job!(q, key, (; env = e, pkg, config = c, deps = Int[], strict = false, exts = nothing,
-                                  kind = :setup, group, name = pkg.name, profiles = Set{String}(),
+            key = (String(project), pkg, flags)
+            if haskey(q.index, key)
+                union!(q.jobs[q.index[key]].profiles, profiles)
+                continue
+            end
+            i = add_job!(q, key, (; env = e, pkg, config = config_of!(q, args => flags), deps = Int[], strict = false,
+                                  exts = nothing, kind = :setup, group, name = pkg.name, profiles = copy(profiles),
                                   version = source_version(pkg)))
             for dep in setup_dependencies(pkg)
                 # Named in the setup's own `[deps]`, or for a setup that is not a package,
@@ -366,7 +394,7 @@ function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vec
     end
     for (i, d) in waits
         job = q.jobs[i]
-        j = get(q.index, (String(project), d, job.config), 0)
+        j = get(q.index, (String(project), d, last(q.configs[job.config])), 0)
         (j == 0 || j == i || j in job.deps) || push!(job.deps, j)
     end
     return nothing
@@ -400,13 +428,14 @@ end
 const HELPER_FILE = joinpath(@__DIR__, "precompile_helper.jl")
 
 # A reply of a helper: its status, the seconds a build took, the fresh cache file or
-# `nothing`, and the output of a compile that did not build.
+# `nothing`, the peak resident size of its compiles, and the output of a compile that
+# did not build.
 const HelperReply = Tuple{String, Float64, Union{Nothing, String}, Float64, String}
 
 # A helper process, the requests it has not answered, by job, the sets of flags it was
-# given, and the jobs whose cache files it was told. `id` numbers the helpers of a run
-# from 1 in the order they start, as the lines of their compiles name them, `w1` and on:
-# `w0` is the coordinator.
+# given, and the jobs whose cache files it was told, each with the set of flags it was
+# told it for. `id` numbers the helpers of a run from 1 in the order they start, as the
+# lines of their compiles name them, `w1` and on: `w0` is the coordinator.
 mutable struct QueueHelper
     const id::Int
     const process::Base.Process
@@ -417,7 +446,7 @@ mutable struct QueueHelper
     const lock::ReentrantLock
     const pending::Dict{Int, Channel{HelperReply}}
     const configs::Set{Int}
-    const told::Set{Int}
+    const told::Set{Tuple{Int, Int}}
     const err::IOBuffer
     @atomic dead::Bool
 end
@@ -447,7 +476,7 @@ function start_helper(id::Integer, env::QueueEnv)
         Int32(0)
     end
     h = QueueHelper(id, proc, pid, RuntestsWorkers.worker_job(pid), time(), ReentrantLock(),
-                    Dict{Int, Channel{HelperReply}}(), Set{Int}(), Set{Int}(), IOBuffer(), false)
+                    Dict{Int, Channel{HelperReply}}(), Set{Int}(), Set{Tuple{Int, Int}}(), IOBuffer(), false)
     @async try
         write(h.err, err)
     catch e
@@ -476,16 +505,22 @@ function read_replies(h::QueueHelper)
     finally
         @lock h.lock begin
             @atomic h.dead = true
-            why = helper_gone(h)
-            foreach(ch -> put!(ch, ("failed", 0.0, nothing, 0.0, why)), values(h.pending))
-            empty!(h.pending)
+            if !isempty(h.pending)
+                why = helper_gone(h)
+                foreach(ch -> put!(ch, ("failed", 0.0, nothing, 0.0, why)), values(h.pending))
+                empty!(h.pending)
+            end
         end
     end
     return nothing
 end
 
-helper_gone(h::QueueHelper) =
-    string("the precompile helper process (pid ", h.pid, ") stopped", (s = strip(String(copy(h.err.data)))) |> isempty ? "" : ":\n" * s)
+# Why a request to `h` failed, with what the helper wrote to its standard error.
+function helper_gone(h::QueueHelper)
+    # A copy, so that the reader of the stream goes on writing where it was.
+    said = strip(String(take!(copy(h.err))))
+    return string("the precompile helper process (pid ", h.pid, ") stopped", isempty(said) ? "" : ":\n" * said)
+end
 
 # The reply of `h` to the build of job `i` of `q`. First `h` is told the cache files of
 # the jobs in `upstream`, all that job `i` waits for, that it was not told already:
@@ -502,9 +537,9 @@ function build!(h::QueueHelper, q::PrecompileQueue, i::Int, upstream, paths::Vec
                 push!(h.configs, job.config)
             end
             for d in upstream
-                (paths[d] === nothing || d in h.told) && continue
+                (paths[d] === nothing || (job.config, d) in h.told) && continue
                 println(h.process.in, string("fresh\t", job.config, '\t', PrecompileHelper.pkgid_field(q.jobs[d].pkg), '\t', paths[d]))
-                push!(h.told, d)
+                push!(h.told, (job.config, d))
             end
             h.pending[i] = ch
             println(h.process.in, string("build\t", i, '\t', job.config, '\t', PrecompileHelper.pkgid_field(job.pkg), '\t',
@@ -516,6 +551,24 @@ function build!(h::QueueHelper, q::PrecompileQueue, i::Int, upstream, paths::Vec
         end
     end
     return take!(ch)
+end
+
+# The build of job `i` of `q` in this process, for a job in its own environment, as a
+# helper answers it (`build!`). `caches` holds the cache files that the compiles of each
+# set of flags are held to, which the jobs in `upstream` and the job itself add to.
+function build_here!(caches::Dict{Int, Dict{Base.PkgId, Vector{String}}}, q::PrecompileQueue, i::Int, upstream,
+                     paths::Vector{Union{Nothing, String}})
+    job = q.jobs[i]
+    cache = get!(Dict{Base.PkgId, Vector{String}}, caches, job.config)
+    for d in upstream
+        paths[d] === nothing || (cache[q.jobs[d].pkg] = [paths[d]])
+    end
+    args, flags = q.configs[job.config]
+    s, seconds, path, _, text = PrecompileHelper.compile(job.pkg, args, flags; strict = job.strict,
+                                                         loadable_exts = job.exts, cachepath_cache = cache)
+    path === nothing || (cache[job.pkg] = [path])
+    # No peak memory: the children of this process are its test workers too.
+    return (String(s), seconds, path, 0.0, text)
 end
 
 # Stops each helper: at the end of its input, which it ends at, or at once (`kill`),
@@ -569,8 +622,8 @@ again, that one replaces the build its cache was made against.
 """
 function fresh_paths(q::PrecompileQueue, order::Vector{Int})
     paths = Vector{Union{Nothing, String}}(nothing, length(q.jobs))
-    caches = Dict{Tuple{String, Int}, Dict{Base.PkgId, Vector{String}}}()
-    verdicts = Dict{Tuple{String, Int}, Dict{Base.StaleCacheKey, Bool}}()
+    caches = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.PkgId, Vector{String}}}()
+    verdicts = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.StaleCacheKey, Bool}}()
     original_project, original_path = Base.active_project(), copy(LOAD_PATH)
     current = 0
     try
@@ -582,9 +635,10 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
                 copy!(LOAD_PATH, env.load_path)
                 current = job.env
             end
-            key = (env.project, job.config)
+            flags = last(q.configs[job.config])
+            key = (env.project, flags)
             cache = get!(Dict{Base.PkgId, Vector{String}}, caches, key)
-            path = PrecompileHelper.freshest_path(job.pkg, last(q.configs[job.config]);
+            path = PrecompileHelper.freshest_path(job.pkg, flags;
                                                   stale_cache = get!(Dict{Base.StaleCacheKey, Bool}, verdicts, key),
                                                   cachepath_cache = cache)
             cache[job.pkg] = path === nothing ? String[] : [path]
@@ -601,11 +655,13 @@ end
     run_queue(run, q) -> (status, texts)
 
 Compile what is stale among the jobs of `q`. Which jobs are fresh is asked first, in
-this process (`fresh_paths`); nothing else starts a helper. Each stale job waits for
-its `deps`, and a `strict` job whose dependency failed is skipped: its compile could
-only fail too. `status` holds `:fresh`, `:built`, `:waited`, `:unprecompilable`,
-`:failed` or `:skipped` for each job, and `texts` the output of each compile that did
-not build.
+this process (`fresh_paths`); nothing else starts a helper. A job in this process's own
+environment, its active project and load path, compiles in this process
+(`build_here!`), and a job in another environment in the helper of that environment.
+Each stale job waits for its `deps`, and a `strict` job whose dependency failed is
+skipped: its compile could only fail too. `status` holds `:fresh`, `:built`, `:waited`,
+`:unprecompilable`, `:failed` or `:skipped` for each job, and `texts` the output of each
+compile that did not build.
 """
 function run_queue(run::Run, q::PrecompileQueue)
     t0 = time()
@@ -615,8 +671,13 @@ function run_queue(run::Run, q::PrecompileQueue)
     work = BitVector(paths[i] === nothing for i in 1:n)
     status, texts = fill(:fresh, n), fill("", n)
     any(work) || return status, texts
-    announce(run, q, work)
-    # Only a job that takes a turn can print: it is numbered into the compiles.
+    # This process's environment among the queue's, or 0 for none.
+    own = something(findfirst(env -> env.project == something(Base.active_project(), "") && env.load_path == LOAD_PATH,
+                              q.envs), 0)
+    # Its hooks are the lock on a cache file, as in a helper.
+    any(i -> work[i] && q.jobs[i].env == own, 1:n) && Base.require(PrecompileHelper.FILEWATCHING)
+    announce(run, q, work, own)
+    # Each job that prints a line is numbered into the compiles (`report`).
     total, ended = count(work), Threads.Atomic{Int}(0)
     width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
     vwidth = maximum((textwidth(version_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
@@ -632,20 +693,14 @@ function run_queue(run::Run, q::PrecompileQueue)
     # it holds no compile slot while it waits; its own freshness check then finds the
     # cache the first built, when that file serves its project too.
     waits = [Int[] for _ in 1:n]
-    serialized = Dict{Tuple{Base.PkgId, Int}, Int}()
+    serialized = Dict{Tuple{Base.PkgId, Base.CacheFlags}, Int}()
     for i in order
         work[i] || continue
-        # `key` keeps `job` out of this scope: a name bound here is captured by the
-        # closures that assign it below, and `run_job` and `helper_line_text` give
-        # their `job`s a variable of their own.
-        # TODO: no check protects this. A name bound in `run_queue`'s scope and
-        # assigned inside one of its closures becomes a box every closure shares
-        # — a data race between the queue's tasks — and it surfaced only because
-        # JET happened to flag one instance (`s`) in a boolean context; `job` it
-        # never saw. A lint or test that rejects any variable bound in `run_queue`
-        # and assigned inside a nested closure would make this race-free by
-        # construction.
-        key = (q.jobs[i].pkg, q.jobs[i].config)
+        # `key` keeps `job` out of this scope: a variable of `run_queue` that one of its
+        # closures assigns is one box that every closure shares, a data race between the
+        # queue's tasks. `run_job` and `helper_line_text` give their `job`s a variable of
+        # their own, and test_precompile.jl checks that `run_queue` makes no box.
+        key = (q.jobs[i].pkg, last(q.configs[q.jobs[i].config]))
         prev = get(serialized, key, 0)
         prev == 0 || push!(waits[i], prev)
         serialized[key] = i
@@ -654,10 +709,12 @@ function run_queue(run::Run, q::PrecompileQueue)
     helpers = Vector{Union{Nothing, QueueHelper}}(nothing, length(q.envs))
     answered = zeros(Int, length(q.envs))
     reused = zeros(Int, length(q.envs))
+    here_caches = Dict{Int, Dict{Base.PkgId, Vector{String}}}()
     helper_lock = ReentrantLock()
     cancelled = Ref(false)
     function report(i, h_id, s, seconds, rss, text)
-        cancelled[] ||
+        # A reused job measured nothing: it prints no line, and so takes no number.
+        (cancelled[] || is_quiet(s)) ||
             report_job(run, q, i, h_id, s, seconds, rss, text, Threads.atomic_add!(ended, 1) + 1, total, width, vwidth)
         last_report[] = time()
         reminded[] = false
@@ -715,25 +772,28 @@ function run_queue(run::Run, q::PrecompileQueue)
             return
         end
         foreach(d -> wait(done[d]), waits[i])
-        h = helper(job.env)
-        if h === nothing
+        # `nothing` for this process's own environment, where the coordinator, `w0`,
+        # compiles itself.
+        h = job.env == own ? nothing : helper(job.env)
+        if cancelled[] || (job.env != own && h === nothing)
             status[i] = :skipped
             report(i, 0, :skipped, 0.0, 0.0, "")
             return
         end
-        s, seconds, path, rss, text = Base.acquire(limit) do
-            compiling_started(i, job.name)
-            try
-                build!(h, q, i, upstream[i], paths)
-            finally
-                compiling_ended(i)
-            end
+        Base.acquire(limit)
+        compiling_started(i, job.name)
+        s, seconds, path, rss, text = try
+            h === nothing ? build_here!(here_caches, q, i, upstream[i], paths) : build!(h, q, i, upstream[i], paths)
+        finally
+            compiling_ended(i)
+            Base.release(limit)
         end
         status[i], paths[i], texts[i] = Symbol(s), path, text
-        answered[h.id] += 1
-        status[i] in (:fresh, :waited) && (reused[h.id] += 1)
-        haskey(COMPILE_STATES, status[i]) &&
-            report(i, h.id, status[i], seconds, rss, text)
+        if h !== nothing
+            answered[h.id] += 1
+            is_quiet(status[i]) && (reused[h.id] += 1)
+        end
+        haskey(COMPILE_STATES, status[i]) && report(i, h === nothing ? 0 : h.id, status[i], seconds, rss, text)
         return
     end
     try
@@ -764,7 +824,7 @@ function run_queue(run::Run, q::PrecompileQueue)
     # What the jobs ended as: a job that waited a build out, or whose cache arrived
     # while it was queued, is a reuse here whatever the scan said at the start.
     nbuilt = count(==(:built), status)
-    nreused = count(in((:fresh, :waited)), status)
+    nreused = count(is_quiet, status)
     extra = String[]
     nfailed = count(==(:failed), status)
     nfailed > 0 && push!(extra, string(nfailed, " failed"))
@@ -786,12 +846,13 @@ end
 
 # What the queue is about to compile, as one bracketed block: each environment under
 # the profiles that need it, then the setups, under a head that counts the compiles,
-# the helper processes they spread over, and how many run at once — the single
-# semaphore (`run_queue`) that bounds compiles across every helper.
-function announce(run::Run, q::PrecompileQueue, work::BitVector)
+# the helper processes they spread over, if any, and how many run at once: the single
+# semaphore (`run_queue`) that bounds the compiles of this process and of every helper.
+# `own` is this process's environment, which needs no helper.
+function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
     lines, setups, envs = String[], String[], Set{Int}()
     for i in eachindex(q.jobs)
-        work[i] && push!(envs, q.jobs[i].env)
+        work[i] && q.jobs[i].env != own && push!(envs, q.jobs[i].env)
     end
     for (g, group) in pairs(q.groups)
         mine = [i for i in eachindex(q.jobs) if work[i] && q.jobs[i].group == g]
@@ -807,7 +868,7 @@ function announce(run::Run, q::PrecompileQueue, work::BitVector)
     fresh = length(q.jobs) - count(work)
     head = string("precompiling ", plural(count(work), "compile"),
                   fresh == 0 ? "" : string(" (", fresh, " reused)"),
-                  " with ", plural(length(envs), "worker"),
+                  isempty(envs) ? "" : string(" with ", plural(length(envs), "worker")),
                   ", at most ", precompile_tasks(), " at once")
     print_label_block(run, head, join(lines, '\n'))
     return nothing
@@ -854,6 +915,7 @@ version_text(job::QueueJob) = isempty(job.version) ? "" : "v" * job.version
 
 # What a line shows for each status of a compile, as a test item's line shows its
 # outcome: a module that cannot be precompiled is set aside, and loads from its source.
+# The run prints no line for a quiet status (`is_quiet`).
 const COMPILE_STATES = Dict(
     :built => ("PASS", PRECOMPILE_MARK_PASSED, :green),
     :fresh => ("REUSED", PRECOMPILE_MARK_INFO, :light_black),
@@ -862,6 +924,10 @@ const COMPILE_STATES = Dict(
     :failed => ("FAIL", PRECOMPILE_MARK_FAILED, :red),
     :unprecompilable => ("SKIP", PRECOMPILE_MARK_UNPRECOMPILABLE, :yellow),
 )
+
+# Whether a job ended as a reuse: it found its cache fresh, or found it built by the
+# compile that it waited for, and so measured nothing.
+is_quiet(status::Symbol) = status === :fresh || status === :waited
 
 # The compiles in flight, as a job name against when each started: the interactive
 # status line names the oldest of them, and the reminder a run off a terminal prints
@@ -875,22 +941,18 @@ oldest_compiling() = @lock COMPILING_LOCK (isempty(COMPILING) ? "" : last(argmin
 compiling_names() = @lock COMPILING_LOCK (sort!(String[last(v) for v in collect(values(COMPILING))]))
 
 """
-    report_job(run, q, i, helper, status, seconds, text, n, total, width, vwidth)
+    report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth)
 
-The line of job `i` of `q`, compiled by helper process `helper`, the `n`th of `total` compiles to end, in the shape of a test
-item's DONE line: its outcome, its time, the largest a compile of the helper has run
-(`rss`), and what it compiled for where that is not the default. A compile that did not
-build follows it with its output, in the bracket a test item's failure has; `width` is
-the name column's, and `vwidth` the version column's.
+The line of job `i` of `q`, compiled by helper process `helper` (`0` for this
+process), the `n`th of `total` compiles to print one, in the shape of a test item's
+DONE line: its outcome, its time, the largest a compile of the helper has run (`rss`,
+`0` for none known), and what it compiled for where that is not the default. A compile
+that did not build follows it with its output, in the bracket a test item's failure
+has; `width` is the name column's, and `vwidth` the version column's.
 """
 function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, status::Symbol, seconds::Float64,
                     rss::Float64, text::AbstractString,
                     n::Integer, total::Integer, width::Integer, vwidth::Integer)
-    # REUSED is kept quiet: a job that found a fresh cache, or found one built by
-    # the process it waited the lock out for, measured nothing. These lines want a
-    # verbosity setting the run does not have yet, so they stay off for now; the
-    # states and their marks are still defined above.
-    status in (:fresh, :waited) && return nothing
     haskey(COMPILE_STATES, status) || return nothing
     word, mark, color = COMPILE_STATES[status]
     shown = repr(q.jobs[i].name)

@@ -1441,11 +1441,13 @@ function profile_flags(prof::Profile, args::Vector{String})
     end
 end
 
-const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String}
+const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String, profiles::Set{String}}
 
 # The setups the items load, by the project they load them in, in the order of the
 # pools: the project, the load path there, and each setup with the julia arguments and
-# cache flags it is loaded under and the directory of setups it comes from.
+# cache flags it is loaded under, the directory of setups it comes from, and the
+# profiles that a line of output names, as `precompile_needs` names them for packages:
+# those with flags or a project of their own.
 function setup_needs(run::Run, p::Plan, flags_of)
     out = @NamedTuple{project::String, load_path::Vector{String}, needs::Vector{SetupNeed}}[]
     for pool in p.pools, u in first(pool.head):last(pool.tail)
@@ -1466,9 +1468,15 @@ function setup_needs(run::Run, p::Plan, flags_of)
         end
         needs = out[k].needs
         args = here ? `` : Cmd(worker_julia_args(run, p.profiles[j]))
+        named = haskey(run.profile_projects, ProfileIdx(j)) || (!here && flags != Base.CacheFlags())
         for i in p.units.span[u], name in setups_of(p.items, i)
-            any(n -> n.name === name && n.flags == flags, needs) && continue
-            push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR)))
+            at = findfirst(n -> n.name === name && n.flags == flags, needs)
+            if at === nothing
+                push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR),
+                              profiles = Set{String}()))
+                at = lastindex(needs)
+            end
+            named && push!(needs[at].profiles, String(p.profiles[j].name))
         end
     end
     return out

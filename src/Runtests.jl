@@ -102,8 +102,7 @@ the repository (`"test/qa"`, or `"lib/A/test/qa"` in a monorepo), or one of them
 run does not build these environments and starts no worker in them, and it records the
 items it selected there as skipped. A run that does not include the package of a
 named directory accepts the name, and a name that is no environment directory is an
-error. Also
-`RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, but not `[run]`.
+error. Also `RUNTESTS_SKIP_ENVIRONMENT`, with commas between the names, but not `[run]`.
 
 Profile code: `worker_init` and `test_end`, each an expression, as in
 `worker_init = :(using Plots)` or a `quote` block, are the `init` and `test_end` of

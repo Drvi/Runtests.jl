@@ -138,8 +138,9 @@ function expansion_clashes(templates::Vector{String})
         o = expansion_of(t)
         name = basename(o)
         listing = get!(() -> isdir(dirname(o)) ? readdir(dirname(o)) : String[], listings, dirname(o))
-        i = findfirst(e -> e != name && fold_name(e) == fold_name(name), [listing; expansions[fold_name(o)]])
-        i === nothing || push!(out, t => [listing; expansions[fold_name(o)]][i])
+        candidates, folded = [listing; expansions[fold_name(o)]], fold_name(name)
+        i = findfirst(e -> e != name && fold_name(e) == folded, candidates)
+        i === nothing || push!(out, t => candidates[i])
     end
     return out
 end

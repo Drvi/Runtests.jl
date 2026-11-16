@@ -276,25 +276,30 @@ end
 @testset "the queue's graph is the one Julia's precompiler builds" begin
     # Read from the manifest alone, so the packages need no source.
     dir = mktempdir()
-    u = Dict(n => next_uuid() for n in ("A", "B", "C", "D", "E", "F"))
-    write(joinpath(dir, "Project.toml"), "[deps]\n" * join("$n = \"$(u[n])\"\n" for n in ("A", "B", "C", "F")))
+    u = Dict(n => next_uuid() for n in ("A", "B", "C", "D", "E", "F", "H"))
+    write(joinpath(dir, "Project.toml"), "[deps]\n" * join("$n = \"$(u[n])\"\n" for n in ("A", "B", "C", "F", "H")))
     entry(n, extra = "") = "[[deps.$n]]\nuuid = \"$(u[n])\"\npath = \"$n\"\n$extra\n"
     write(joinpath(dir, "Manifest.toml"), "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n\n" *
-          entry("A", "weakdeps = [\"B\"]\n\n    [deps.A.extensions]\n    AExt = \"B\"\n") * entry("B") *
-          entry("C", "deps = [\"A\", \"B\"]") * entry("D", "deps = [\"E\"]") * entry("E", "deps = [\"D\"]") *
-          entry("F", "deps = [\"D\"]"))
+          entry("A", "weakdeps = [\"B\", \"H\"]\n\n    [deps.A.extensions]\n    AExt = \"B\"\n    ABHExt = [\"B\", \"H\"]\n") *
+          entry("B") * entry("C", "deps = [\"A\", \"B\"]") * entry("D", "deps = [\"E\"]") * entry("E", "deps = [\"D\"]") *
+          entry("F", "deps = [\"D\"]") * entry("H"))
     g = Runtests.Private.env_graph(joinpath(dir, "Project.toml"))
     id(n) = Base.PkgId(Base.UUID(u[n]), n)
     ext = Base.PkgId(Base.uuid5(Base.UUID(u["A"]), "AExt"), "AExt")
+    wider = Base.PkgId(Base.uuid5(Base.UUID(u["A"]), "ABHExt"), "ABHExt")
     # An extension whose package and trigger are both there waits for both.
     @test g.parent[ext] == id("A") && Set(g.deps[ext]) == Set([id("A"), id("B")])
+    # One whose triggers hold all of another's waits for that one too.
+    @test Set(g.deps[wider]) == Set([id("A"), id("B"), id("H"), ext])
     # A package that loads both loads the extension while it compiles, so it waits for it.
     @test ext in g.deps[id("C")]
     # D and E wait for each other, and F for them: the precompiler leaves all three out.
     @test g.circular == Set([id("D"), id("E"), id("F")])
-    # Names compile with what they wait for, and an extension with all it waits for.
+    # Names compile with what they wait for, and an extension with all it waits for,
+    # also when that is another extension.
     @test Runtests.Private.compile_set(g, Set(["A"])) == Set([id("A")])
     @test Runtests.Private.compile_set(g, Set(["C"])) == Set([id("A"), id("B"), id("C"), ext])
+    @test Runtests.Private.compile_set(g, Set(["A", "B", "H"])) == Set([id("A"), id("B"), id("H"), ext, wider])
 end
 
 @testset "one queue compiles every environment and the setups" begin
@@ -342,6 +347,24 @@ end
         @test all(==(PASSED), values(states))
         s = spans()
         @test s[setup][1] < s[slow][2]
+    end
+
+    @testset "a setup waits for what it loads under julia arguments that leave the cache flags" begin
+        # `--depwarn=no` compiles no code differently: the package and the setup have one
+        # set of cache flags under two sets of arguments, and the setup waits all the same.
+        foreach(f -> rm(joinpath(log, f)), readdir(log))
+        slow, setup = "SlowLoaded$tag", "LoadingSetup$tag"
+        files = Pair{String, String}[]
+        us = timed_pkg!(files, slow)
+        dir = make_pkg("SetupArgs$tag", files..., "test/Project.toml" => dep(slow, us, ".."),
+                       "test/testsetups/$setup.jl" =>
+                           "module $setup\n$(stamp(setup, "start"))\nusing $slow\n$(stamp(setup, "end"))\nend\n",
+                       "test/TestItems.toml" => "[profiles.quiet]\njulia_args = [\"--depwarn=no\"]\n",
+                       "test/t_test.jl" => "@testitem \"t\" profile=:quiet begin\n    using $setup\n    @test true\nend\n")
+        (states, _, _), out = run_once(dir)
+        @test all(==(PASSED), values(states))
+        s = spans()
+        @test s[setup][1] >= s[slow][2]
     end
 
     @testset "a package that fails to compile is said, what waits for it is left, and the run goes on" begin
@@ -519,47 +542,75 @@ VERSION >= v"1.12" && @testset "a profile's julia arguments compile only the pac
 end
 
 @testset "the queue's log is one block, and every compile a line" begin
-    # A package with a profile whose julia flags differ: the announcement, the
-    # helper lines and the job lines are asserted against its run's output.
+    # A package with a profile whose julia flags differ, with items under it in the
+    # test environment and in an environment directory: the announcement, the helper
+    # lines and the job lines are asserted against its run's output.
+    u = next_uuid()
     dir = make_pkg(
         "LogShape",
+        "deps/QaDep/Project.toml" => "name = \"QaDep\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
+        "deps/QaDep/src/QaDep.jl" => "module QaDep\nend\n",
         "test/t_test.jl" => """
         @testitem "checked" profile=:bounds begin
             @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
         end
         """,
+        "test/qa/Project.toml" => "[deps]\nQaDep = \"$u\"\n\n[sources]\nQaDep = {path = \"../../deps/QaDep\"}\n",
+        "test/qa/qa_test.jl" => """
+        @testitem "qa checked" profile=:bounds begin
+            using QaDep
+            @test Base.JLOptions().check_bounds == $(OTHER_BOUNDS.value)
+        end
+        """,
         "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"$(OTHER_BOUNDS.arg)\"]\n",
     )
-    (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    (states, _, _), out = with_runstate_dir(_ -> capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false)))
     @test all(==(PASSED), values(states))
     lines = collect(eachsplit(out, '\n'))
+    qa = joinpath("test", "qa")
 
     # One bracketed block announces the work: the compiles, the helper processes
     # they spread over, and the shared ceiling on how many run at once.
     heads = filter(l -> occursin(r"\[TEST\] precompiling \d+ compile", l), lines)
     @test length(heads) == 1
-    @test occursin(r"with \d+ worker", only(heads))
+    @test occursin("with 1 worker,", only(heads))
     @test occursin("at most $(Runtests.Private.precompile_tasks()) at once", only(heads))
 
-    # A helper comes up and goes down as a worker does, its square black, and its
-    # UP line is the worker's own: pid, profile, environment, arguments.
-    @test any(l -> occursin(Regex("⬛ w\\d+ · \\d\\d:\\d\\d:\\d\\d · UP   · pid \\d+ · profile bounds · env test(, this environment)? · $(OTHER_BOUNDS.arg)"), l), lines)
-    @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l) && occursin(r"\d+ compiles?", l), lines)
+    # The coordinator compiles for its own environment, and the environment directory
+    # has a helper. The helper comes up and goes down as a worker does, its square
+    # black, and its UP line is the worker's own: pid, profile, environment, arguments.
+    ups = filter(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP ", l), lines)
+    @test length(ups) == 1
+    @test occursin(r"^⬛ w1 · \d\d:\d\d:\d\d · UP   · pid \d+ · profile bounds · env ", only(ups))
+    @test endswith(only(ups), "· env $qa · $(OTHER_BOUNDS.arg)")
+    @test any(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l) && occursin(r"\d+ compiles?", l), lines)
 
     # On a job line the profile names the flags; the arguments themselves are not
-    # there. Every job has a line, numbered in one count.
+    # there. The lines are numbered in one count, in the order they are printed.
     pre = filter(l -> occursin("COMP", l), lines)
-    @test !isempty(pre)
     @test !any(l -> occursin(OTHER_BOUNDS.arg, l), pre)
     @test any(l -> occursin("profile bounds", l), pre)
-    @test all(l -> occursin(r"· \s*\d+/\d+ ·", l), pre)
-    # Every built line carries the resident peak of its helper's compiles, after
-    # its time, as a DONE line carries its worker's.
-    @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+ GiB", l), pre)
+    @test [parse(Int, match(r"· \s*(\d+)/\d+ ·", l).captures[1]) for l in pre] == 1:length(pre)
+    here = filter(l -> occursin(r"^\S+ w0 ", l), pre)
+    helper = filter(l -> occursin(r"^\S+ w1 ", l), pre)
+    @test !isempty(here) && !isempty(helper)
+    @test all(l -> occursin("· env $qa", l), helper)
+    # A helper's built line carries the resident peak of its compiles, after its time,
+    # as a DONE line carries its worker's. The children of the coordinator are its test
+    # workers too, so its own lines carry none.
+    @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+ GiB", l), helper)
+    @test !any(l -> occursin("maxrss", l), here)
 
     # When the queue ends a line accounts for it: what compiled, what was reused,
     # and how long the phase took.
     @test occursin(r"\[TEST\] precompiled \d+ compiles?( \(\d+ reused\))? in [\d.ms]+", out)
+end
+
+@testset "the queue's tasks share no variable of `run_queue`" begin
+    # A variable of `run_queue` that one of its closures assigns is one box that every
+    # closure shares, and the queue's tasks would race on it.
+    P = Runtests.Private
+    @test !occursin("Core.Box", string(only(code_lowered(P.run_queue, (P.Run, P.PrecompileQueue)))))
 end
 
 @testset "a job already fresh is counted but not listed" begin
@@ -575,11 +626,13 @@ end
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
     @test all(==(PASSED), values(states))
     # A change only to the package's source: its compiles run again, and what the
-    # first run compiled for the profile the head counts as reused — REUSED lines
-    # stay off until the run has a verbosity setting for them.
+    # first run compiled for the profile the head counts as reused. A reused job
+    # prints no line.
     open(io -> println(io, "# touched"), joinpath(dir, "src", "FreshLog.jl"), "a")
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
     @test all(==(PASSED), values(states))
+    # One environment, the coordinator's own: it compiles there itself, and starts no helper.
+    @test !occursin(Runtests.Private.PRECOMPILE_MARK_WORKER, out)
     @test occursin(r"\(\d+ reused\)", out)
     @test occursin(r"\[TEST\] precompiled \d+ compiles? \(\d+ reused\) in ", out)
     @test !occursin(r"\bREUSED\b", out)

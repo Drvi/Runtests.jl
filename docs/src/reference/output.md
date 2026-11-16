@@ -1,6 +1,34 @@
 # [Output](@id output)
 
-This page describes the output of a run, in five parts. These are the opening block, the lines of the run, the block of a failed item, the closing block and the dry-run plan. The examples come from a small suite. Times and memory depend on the suite and on the machine.
+This page describes the output of a run, in six parts. These are the precompile step, the opening block, the lines of the run, the block of a failed item, the closing block and the dry-run plan. The examples come from small suites. Times and memory depend on the suite and on the machine.
+
+## The precompile step
+
+```text
+┌ [TEST] precompiling 4 compiles (8 reused) with 1 worker, at most 16 at once
+└ precompiling the environment of test/qa for 1 profile: default
+⬛ w1 · 17:31:42 · UP   · pid 48532 · env test/qa
+🟩 w0 · 17:31:43 · COMP · 1/4 · "MyPackage" · v0.1.0 · PASS ·  0.3s
+🟩 w0 · 17:31:43 · COMP · 2/4 · "Helpers"   · v0.2.0 · PASS ·  0.3s
+🟩 w1 · 17:31:43 · COMP · 3/4 · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+⬛ w1 · 17:31:43 · EXIT · pid 48532 · 1 compile (1 reused) · 1.0s
+  [TEST] precompiled 3 compiles (9 reused) in 1.0s
+```
+
+Before the workers start, the run compiles what they will load. [Precompilation](@ref precompilation) tells what it compiles and why. When every cache is fresh, the step prints nothing. Otherwise it starts with a block. The first line counts the compiles, and the caches that are fresh already (`reused`). It also gives the number of helper processes, and how many compiles run at the same time. The other lines name the environments, the profiles and the setups.
+
+The lines of the step have the shape of the lines of the run, with a square for a mark:
+
+| Mark | Meaning |
+|:-----|:--------|
+| ⬛ | A helper process starts (`UP`) or ends (`EXIT`). |
+| 🟩 | A compile built a cache (`PASS`). |
+| 🟨 | A compile made no cache (`SKIP`). The module cannot be precompiled, or a package that it loads failed. |
+| 🟥 | A compile failed (`FAIL`). Its output follows in a block, as for a failed item. |
+
+The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. A `COMP` line gives the position of the compile, the package and its version, the outcome and the time. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A compile that finds its cache built by another compile prints no line. The last line counts what compiled, what was reused, what failed and what was skipped.
+
+On a terminal, the progress line has a white square while the step runs, and it names the oldest compile. In other output, when no compile ends for `monitor_interval` seconds, the run names the compiles that still run.
 
 ## The opening block
 

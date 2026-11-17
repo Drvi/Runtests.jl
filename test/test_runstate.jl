@@ -536,7 +536,7 @@ end
             # `runtestsf` runs exactly those, and then there is nothing left to run.
             write(file, verdicts(true, true))
             ts, out = capture_run(() -> Runtests.runtestsf(pkg; workers = 1, logs = :issues))
-            @test occursin("matching 1 failing item", out)
+            @test occursin("selection: 1 failing item", out)
             @test occursin("ran 1 test item", out)
             @test failing(pkg) == String[]
             # Nothing failing is where the work ends, not a mistake: said, not thrown.
@@ -616,7 +616,7 @@ end
             @test length(left) == keep + 1
             @test failing(pkg) == ["fails", "keeps failing"]
             _, out = capture_run(() -> Runtests.runtestsf(pkg; dry_run = true))
-            @test occursin("matching 2 failing items", out)
+            @test occursin("selection: 2 failing items", out)
         end
     end
 
@@ -988,15 +988,15 @@ end
             capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
             # A name keeps the failing items it matches, and nothing that is not failing.
             _, out = capture_run(() -> Runtests.runtestsf(pkg; name = "fails", dry_run = true))
-            @test occursin("1 test item in 1 file matching 1 failing item", out)
+            @test occursin("1 test item in 1 file · ", out) && occursin("selection: 1 failing item", out)
             _, out = capture_run(() -> Runtests.runtestsf(pkg; name = r"s$", dry_run = true))
-            @test occursin("2 test items in 1 file matching 2 failing items", out)
+            @test occursin("2 test items in 1 file · ", out) && occursin("selection: 2 failing items", out)
             msg = said(() -> capture_run(() -> Runtests.runtestsf(pkg; name = "passes", dry_run = true)))
             @test occursin("none of the 2 failing items matches name = \"passes\": \"errors\", \"fails\"", msg)
             # Tags narrow them too, and a selection that leaves none says so before
             # anything claims to be running.
             _, out = capture_run(() -> Runtests.runtestsf(pkg; tags = :slow, dry_run = true))
-            @test occursin("matching 2 failing items and tags = [:slow]", out)
+            @test occursin("selection: 2 failing items and tags = [:slow]", out)
             out = Ref("")
             msg = said(() -> (out[] = last(capture_run(() -> Runtests.runtestsf(pkg; tags = :fast)))))
             @test occursin("no test items matched 2 failing items and tags = [:fast]", msg)
@@ -1013,7 +1013,7 @@ end
             # `a` fixed, and `b` renamed to `b2`: only `a` is there to run.
             write(joinpath(pkg, "test", "t_test.jl"), suite(true, "b2"))
             _, out = capture_run(() -> Runtests.runtestsf(pkg; workers = 0, logs = :issues, monitor = false))
-            @test occursin("matching 1 failing item", out)
+            @test occursin("selection: 1 failing item", out)
             @test occursin("ran 1 test item", out)
             # `b` is still on record, but not what the suite has, so nothing is left to run.
             @test failing(pkg) == ["b"]
@@ -1177,7 +1177,7 @@ end
             @test !haskey(h.failed, "d") && !haskey(h.failed, "a")
             @test haskey(h.seconds, "d")     # how long it took, from the older run
             _, out = capture_run(() -> Runtests.runtestsf(pkg; replay = base, dry_run = true))
-            @test occursin("matching 1 failing item", out)
+            @test occursin("selection: 1 failing item", out)
             # More replays of what it ran than pruning keeps, `b` failing in each. They
             # hold every verdict it did, so pruning as a run without it does would
             # take it; pointed at, it is never deleted.

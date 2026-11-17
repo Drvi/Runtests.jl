@@ -578,14 +578,13 @@ end
 # Stops helper `h`, once, with the compiles it started. A helper whose environment has no
 # job left has answered every request, and so runs no compile and holds no lock: it is
 # stopped at once, as Julia takes most of a second to exit, and gets an EXIT line, as a
-# test worker does, with what it compiled and reused. A helper stopped by a cancelled
-# queue (`kill`) is part of a run already saying it stopped.
-function stop_helper!(run::Run, h::QueueHelper, answered::Integer, reused::Integer; kill::Bool)
+# test worker does, with what its jobs ended as (`counts_text`). A helper stopped by a
+# cancelled queue (`kill`) is part of a run already saying it stopped.
+function stop_helper!(run::Run, h::QueueHelper, counts::AbstractString; kill::Bool)
     (@atomicswap h.stopped = true) && return nothing
     try
         kill || print_helper_line(run, h.id, "EXIT",
-            string("pid ", h.pid, " · ", plural(answered - reused, "compile"),
-                   reused > 0 ? string(" (", reused, " reused)") : "", " · ", fmt_seconds(time() - h.started_at)))
+            string("pid ", h.pid, " · ", counts, " · ", fmt_seconds(time() - h.started_at)))
         RuntestsWorkers.signal!(h.pid, h.process, Base.SIGKILL)
     catch e
         is_interrupt(e) && rethrow()
@@ -595,6 +594,21 @@ function stop_helper!(run::Run, h::QueueHelper, answered::Integer, reused::Integ
         @atomic QUEUE_PROGRESS.live -= 1
     end
     return nothing
+end
+
+# What the caches of jobs `mine` ended as, for the block that ends the queue and a
+# helper's EXIT line: of the stale ones (`work`), those compiled, those reused because
+# another compile built them first, those failed and those skipped; then those fresh
+# from the start.
+function counts_text(status::Vector{Symbol}, work::BitVector, mine)
+    stale = filter(i -> work[i], collect(mine))
+    built = count(i -> status[i] === :built, stale)
+    reused = count(i -> is_quiet(status[i]), stale)
+    failed = count(i -> status[i] === :failed, stale)
+    skipped = count(i -> status[i] === :skipped || status[i] === :unprecompilable, stale)
+    fresh = length(mine) - length(stale)
+    return string(built, " compiled", reused > 0 ? ", $reused reused" : "", failed > 0 ? ", $failed failed" : "",
+                  skipped > 0 ? ", $skipped skipped" : "", fresh > 0 ? " ($fresh fresh)" : "")
 end
 
 ### Running the queue ######################################################
@@ -683,7 +697,7 @@ function run_queue(run::Run, q::PrecompileQueue)
     # Its hooks are the lock on a cache file, as in a helper.
     any(i -> work[i] && q.jobs[i].env == own, 1:n) && Base.require(PrecompileHelper.FILEWATCHING)
     nhelpers = announce(run, q, work, own)
-    # Each job that prints a line is numbered into the compiles (`report`).
+    # Each stale cache takes a number as its job ends (`report`).
     total = count(work)
     width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
     vwidth = maximum((textwidth(version_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
@@ -708,7 +722,7 @@ function run_queue(run::Run, q::PrecompileQueue)
         work[i] || continue
         # `key` keeps `job` out of this scope: a variable of `run_queue` that one of its
         # closures assigns is one box that every closure shares, a data race between the
-        # queue's tasks. `run_job` and `helper_line_text` give their `job`s a variable of
+        # queue's tasks. `run_job` and `env_text` give their `job`s a variable of
         # their own, and test_precompile.jl checks that `run_queue` makes no box.
         key = (q.jobs[i].pkg, last(q.configs[q.jobs[i].config]))
         prev = get(serialized, key, 0)
@@ -717,8 +731,6 @@ function run_queue(run::Run, q::PrecompileQueue)
     end
     limit = Base.Semaphore(precompile_tasks())
     helpers = Vector{Union{Nothing, QueueHelper}}(nothing, length(q.envs))
-    answered = zeros(Int, length(q.envs))
-    reused = zeros(Int, length(q.envs))
     here_caches = Dict{Int, Dict{Base.PkgId, Vector{String}}}()
     helper_lock = ReentrantLock()
     cancelled = Ref(false)
@@ -728,9 +740,9 @@ function run_queue(run::Run, q::PrecompileQueue)
     redraw() = run.monitor === nothing || (@lock run.printer redraw_status(run.monitor))
     function report(i, h_id, s, seconds, rss, text)
         s === :failed && (@atomic QUEUE_PROGRESS.failed += 1)
-        # A reused job measured nothing: it prints no line, and so takes no number.
-        (cancelled[] || is_quiet(s)) ||
-            report_job(run, q, i, h_id, s, seconds, rss, text, (@atomic QUEUE_PROGRESS.done += 1), total, width, vwidth)
+        k = @atomic QUEUE_PROGRESS.done += 1
+        # A reused job measured nothing: it takes its number, and prints no line.
+        (cancelled[] || is_quiet(s)) || report_job(run, q, i, h_id, s, seconds, rss, text, k, total, width, vwidth)
         last_report[] = time()
         reminded[] = false
         return nothing
@@ -745,25 +757,26 @@ function run_queue(run::Run, q::PrecompileQueue)
             isempty(names) || (say(run, "still precompiling ", join(names, ", ")); reminded[] = true)
         end
     end
-    # What a helper's UP line calls it by, in the shape a test worker's UP line has:
-    # the profiles it compiles for, the environments it serves, then the sets of
-    # julia arguments its compiles run under.
-    function helper_line_text(e, pid)
+    # Every job of environment `e`: its counts take in the caches found fresh at the start.
+    jobs_of(e) = [i for i in 1:n if q.jobs[i].env == e]
+    # What a worker's lines call its jobs among `jobs`, in the shape a test worker's UP
+    # line has: the profiles it compiles for, the environments it serves, then, with
+    # `args`, the sets of julia arguments its compiles run under. This process's own
+    # environment needs no name beyond its own.
+    function env_text(jobs, args::Bool)
         subjects, argsets, profnames = String[], String[], Set{String}()
-        for i in eachindex(q.jobs)
+        for i in jobs
             job = q.jobs[i]
-            (work[i] && job.env == e) || continue
             s = up_subject(q.groups[job.group].subject)
-            s === nothing || (s in subjects || push!(subjects, s))
+            (s === nothing || (job.env == own && s == "this environment") || s in subjects) || push!(subjects, s)
             union!(profnames, job.profiles)
-            args = first(q.configs[job.config]).exec
-            isempty(args) && continue
-            argtext = join(args, ' ')
+            exec = first(q.configs[job.config]).exec
+            (args && !isempty(exec)) || continue
+            argtext = join(exec, ' ')
             argtext in argsets || push!(argsets, argtext)
         end
         named = sort!(collect(setdiff(profnames, (String(DEFAULT_PROFILE),))))
-        return string("pid ", pid,
-                      isempty(named) ? "" :
+        return string(isempty(named) ? "" :
                           string(" · ", length(named) == 1 ? "profile " : "profiles ", join(named, ", ")),
                       isempty(subjects) ? "" : " · " * join(sort!(subjects), ", "),
                       isempty(argsets) ? "" : " · " * join(sort!(argsets), ", "))
@@ -772,7 +785,7 @@ function run_queue(run::Run, q::PrecompileQueue)
     function env_done(e)
         (left[e] -= 1) == 0 || return nothing
         h = helpers[e]
-        (h === nothing || cancelled[]) || stop_helper!(run, h, answered[h.id], reused[h.id]; kill = false)
+        (h === nothing || cancelled[]) || stop_helper!(run, h, counts_text(status, work, jobs_of(e)); kill = false)
         return nothing
     end
     function helper(e)
@@ -782,7 +795,7 @@ function run_queue(run::Run, q::PrecompileQueue)
             h === nothing || return h
             h = helpers[e] = start_helper(count(!isnothing, helpers) + 1, q.envs[e])
             @atomic QUEUE_PROGRESS.live += 1
-            print_helper_line(run, h.id, "UP", helper_line_text(e, h.pid))
+            print_helper_line(run, h.id, "UP", string("pid ", h.pid, env_text(filter(i -> work[i], jobs_of(e)), true)))
             return h
         end
     end
@@ -813,10 +826,6 @@ function run_queue(run::Run, q::PrecompileQueue)
             Base.release(limit)
         end
         status[i], paths[i], texts[i] = Symbol(s), path, text
-        if h !== nothing
-            answered[h.id] += 1
-            is_quiet(status[i]) && (reused[h.id] += 1)
-        end
         haskey(COMPILE_STATES, status[i]) && report(i, h === nothing ? 0 : h.id, status[i], seconds, rss, text)
         is_quiet(status[i]) && redraw()
         return
@@ -861,43 +870,61 @@ function run_queue(run::Run, q::PrecompileQueue)
         try
             # Those still up: all of them when the queue was cancelled.
             shielded() do
-                for h in helpers
-                    h === nothing || stop_helper!(run, h, answered[h.id], reused[h.id]; kill = cancelled[])
+                for (e, h) in pairs(helpers)
+                    h === nothing || stop_helper!(run, h, counts_text(status, work, jobs_of(e)); kill = cancelled[])
                 end
             end
         finally
             queue_ended!()
         end
     end
-    # What the jobs ended as: a job that waited a build out, or whose cache arrived
-    # while it was queued, is a reuse here whatever the scan said at the start.
-    nbuilt = count(==(:built), status)
-    nreused = count(is_quiet, status)
-    extra = String[]
-    nfailed = count(==(:failed), status)
-    nfailed > 0 && push!(extra, string(nfailed, " failed"))
-    nskipped = count(in((:skipped, :unprecompilable)), status)
-    nskipped > 0 && push!(extra, string(nskipped, " skipped"))
-    say(run, "precompiled ", plural(nbuilt, "compile"),
-        nreused > 0 ? " ($nreused reused)" : "",
-        isempty(extra) ? "" : string(", ", join(extra, ", ")),
-        " in ", fmt_seconds(time() - t0))
+    # What the stale caches ended as, and the fresh ones: a job that waited a build out,
+    # or whose cache arrived while it was queued, is a reuse.
+    head = string("precompiled ", plural(total, "stale cache"), ": ", counts_text(status, work, 1:n),
+                  " in ", fmt_seconds(time() - t0))
+    # With helpers, a line for each worker under it, in the order of their numbers, with
+    # every cache of the environments it covers: a helper its own, the coordinator its
+    # own and each that had no helper, all of whose caches its check found fresh. The
+    # counts of the lines add up to the first line's, and a helper's are its EXIT line's.
+    body = IOBuffer()
+    if any(!isnothing, helpers)
+        covered = Dict{Int, Vector{Int}}()
+        for i in 1:n
+            h = helpers[q.jobs[i].env]
+            push!(get!(Vector{Int}, covered, h === nothing ? 0 : h.id), i)
+        end
+        for id in sort!(collect(keys(covered)))
+            println(body, "w", id, " · ", counts_text(status, work, covered[id]), env_text(covered[id], false))
+        end
+    end
+    print_label_block(run, head, String(take!(body)))
     return status, texts
 end
 
-# The text a group of jobs is announced with, or `nothing` for the test environment
-# compiled for no profile in particular: its lines of output say enough.
+# The text a group of jobs is announced with, an environment by the name a worker's UP
+# line gives it, or `nothing` for the test environment compiled for no profile in
+# particular: its lines of output say enough.
 function group_text(g::QueueGroup)
-    isempty(g.profiles) && return g.subject == TEST_ENVIRONMENT ? nothing : g.subject
-    return string(g.subject, " for ", plural(length(g.profiles), "profile"), ": ", join(sort!(collect(g.profiles)), ", "))
+    isempty(g.profiles) && g.subject == TEST_ENVIRONMENT && return nothing
+    name = group_name(g.subject)
+    isempty(g.profiles) && return name
+    return string(name, " for ", plural(length(g.profiles), "profile"), ": ", join(sort!(collect(g.profiles)), ", "))
+end
+
+# A group's subject as an announcement names it: `the env test`, `the env test/qa`, or
+# the subject itself where it is no environment.
+function group_name(subject::AbstractString)
+    subject == TEST_ENVIRONMENT && return "the env test"
+    field = env_field(subject)
+    return field === nothing ? String(subject) : "the " * field
 end
 
 # What the queue is about to compile, as one bracketed block: each environment under
-# the profiles that need it, then the setups, under a head that counts the compiles,
-# the helper processes they spread over, if any, and how many run at once: the single
-# semaphore (`run_queue`) that bounds the compiles of this process and of every helper.
-# `own` is this process's environment, which needs no helper. Returns the number of
-# helpers.
+# the profiles that need it, then the setups, under a head that counts the stale caches
+# and the fresh ones, the helper processes they spread over, if any, and how many
+# compiles run at once: the single semaphore (`run_queue`) that bounds the compiles of
+# this process and of every helper. `own` is this process's environment, which needs
+# no helper. Returns the number of helpers.
 function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
     lines, setups, envs = String[], String[], Set{Int}()
     for i in eachindex(q.jobs)
@@ -915,8 +942,8 @@ function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
     end
     isempty(setups) || push!(lines, string("precompiling ", join(unique!(setups), ", ")))
     fresh = length(q.jobs) - count(work)
-    head = string("precompiling ", plural(count(work), "compile"),
-                  fresh == 0 ? "" : string(" (", fresh, " reused)"),
+    head = string("precompiling ", plural(count(work), "stale cache"),
+                  fresh == 0 ? "" : string(" (", fresh, " fresh)"),
                   isempty(envs) ? "" : string(" with ", plural(length(envs), "worker")),
                   ", at most ", precompile_tasks(), " at once")
     print_label_block(run, head, join(lines, '\n'))
@@ -1025,7 +1052,7 @@ queue_ended!() = (@atomic QUEUE_PROGRESS.total = 0; nothing)
     report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth)
 
 The line of job `i` of `q`, compiled by helper process `helper` (`0` for this
-process), the `n`th of `total` compiles to print one, in the shape of a test item's
+process), the `n`th of `total` stale caches to end, in the shape of a test item's
 DONE line: its outcome, its time, the largest a compile of the helper has run (`rss`,
 `0` for none known), and what it compiled for where that is not the default. A compile
 that did not build follows it with its output, in the bracket a test item's failure
@@ -1064,7 +1091,7 @@ function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, statu
     if status !== :built && !isempty(text)
         body = bracket(text, "Captured logs", "", "", Base.info_color())
         label = string("[", lpad(n, ndigits(total)), "/", total, "] ", word)
-        footer = string("@ ", something(group_text(q.groups[q.jobs[i].group]), TEST_ENVIRONMENT))
+        footer = string("@ ", something(group_text(q.groups[q.jobs[i].group]), group_name(TEST_ENVIRONMENT)))
         line = string(line, "\n", bracket(body, label, join([shown; fields], " · "), footer, color))
     end
     printline(run, line)

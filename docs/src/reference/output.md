@@ -5,17 +5,19 @@ This page describes the output of a run, in six parts. These are the precompile 
 ## The precompile step
 
 ```text
-┌ [TEST] precompiling 4 compiles (8 reused) with 1 worker, at most 16 at once
-└ precompiling the environment of test/qa for 1 profile: default
-⬛ w1 · 17:31:42 · UP   · pid 48532 · env test/qa
-🟩 w0 · 17:31:43 · COMP · 1/4 · "MyPackage" · v0.1.0 · PASS ·  0.3s
-🟩 w0 · 17:31:43 · COMP · 2/4 · "Helpers"   · v0.2.0 · PASS ·  0.3s
-🟩 w1 · 17:31:43 · COMP · 3/4 · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
-⬛ w1 · 17:31:43 · EXIT · pid 48532 · 1 compile (1 reused) · 1.0s
-  [TEST] precompiled 3 compiles (9 reused) in 1.0s
+┌ [TEST] precompiling 4 stale caches (8 fresh) with 1 worker, at most 16 at once
+└ precompiling the env test/qa for 1 profile: default
+⬛ w1 · 12:09:51 · UP   · pid 80184 · env test/qa
+🟩 w0 · 12:09:52 · COMP · 1/4 · "Helpers"   · v0.2.0 · PASS ·  0.2s
+🟩 w1 · 12:09:52 · COMP · 2/4 · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+🟩 w1 · 12:09:52 · COMP · 3/4 · "MyPackage" · v0.1.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+⬛ w1 · 12:09:52 · EXIT · pid 80184 · 2 compiled · 0.9s
+┌ [TEST] precompiled 4 stale caches: 3 compiled, 1 reused (8 fresh) in 0.9s
+│ w0 · 1 compiled, 1 reused (8 fresh) · env test
+└ w1 · 2 compiled · env test/qa
 ```
 
-Before the workers start, the run compiles what they will load. [Precompilation](@ref precompilation) tells what it compiles and why. When every cache is fresh, the step prints nothing. Otherwise it starts with a block. The first line counts the compiles, and the caches that are fresh already (`reused`). It also gives the number of helper processes, and how many compiles run at the same time. The other lines name the environments, the profiles and the setups.
+Before the workers start, the run compiles what they will load. [Precompilation](@ref precompilation) tells what it compiles and why. When every cache is fresh, the step prints nothing. Otherwise it starts with a block. The first line counts the stale caches, which the step compiles, and the caches that are fresh already. It also gives the number of helper processes, and how many compiles run at the same time. The other lines name the environments, the profiles and the setups.
 
 The lines of the step have the shape of the lines of the run, with a square for a mark:
 
@@ -26,9 +28,11 @@ The lines of the step have the shape of the lines of the run, with a square for 
 | 🟨 | A compile made no cache (`SKIP`). The module cannot be precompiled, or a package that it loads failed. |
 | 🟥 | A compile failed (`FAIL`). Its output follows in a block, as for a failed item. |
 
-The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The helpers start with the step, and each one ends when the compiles of its environment are done. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. A `COMP` line gives the position of the compile, the package and its version, the outcome and the time. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A compile that finds its cache built by another compile prints no line. The last line counts what compiled, what was reused, what failed and what was skipped.
+The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The helpers start with the step, and each one ends when the compiles of its environment are done. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. A `COMP` line gives the position of the compile among the stale caches, the package and its version, the outcome and the time. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A stale cache that another compile builds first is reused. It takes its position and prints no line, so the positions of the printed lines can skip a number.
 
-While the step runs, the progress line has a white square. It counts the compiles that printed a line, all compiles of the step and the failed compiles, in place of the items. Its workers are the helper processes of the step, and a step without a helper shows no workers. The line also names the oldest compile that runs. In other output, when no compile ends for `monitor_interval` seconds, the run names the compiles that still run.
+The block at the end splits the stale caches into those compiled, those reused, those failed and those skipped, and gives the fresh caches. When the step had helpers, the block has a line for each worker, with the caches of the environments that it covered. The coordinator also covers each environment that needed no helper. The lines add up to the first line. The `EXIT` line of a helper gives the same counts as its line here.
+
+While the step runs, the progress line has a white square. It counts the stale caches that are done, all stale caches and the failed compiles, in place of the items. Its workers are the helper processes of the step, and a step without a helper shows no workers. The line also names the oldest compile that runs. In other output, when no compile ends for `monitor_interval` seconds, the run names the compiles that still run.
 
 ## The opening block
 
@@ -40,13 +44,11 @@ While the step runs, the progress line has a white square. It counts the compile
 
 The first line gives the versions of Runtests and Julia, and the number of selected items and files. It also gives the seed, the number of workers and their threads. It names these values too, when they apply:
 
-- the selection, for example `matching tags = [:fast]`,
-- the group and what selected it,
 - the Julia flags of the workers that a plain `julia` does not have, for example `--check-bounds=yes -O1`,
 - the environment variables that set configuration values,
 - the source of the `coverage` value.
 
-The `env` line is the path of the test environment. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
+When the call or the environment selects items, a `selection` line comes first. It names what selected them, for example `tags = [:fast]`, or a group with its tags and what asked for it. The `env` line is the path of the test environment. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
 
 ## The lines of the run
 
@@ -93,7 +95,7 @@ The progress line gives these values:
 - the memory and CPU use of the machine,
 - the stage of the run and its time.
 
-While the precompile step runs, the first two values count the compiles in place of the items, and the workers are the helper processes of the step.
+While the precompile step runs, the first two values count the stale caches in place of the items, and the workers are the helper processes of the step. Before the tests start, the line names no test workers.
 
 ## The block of a failed item
 

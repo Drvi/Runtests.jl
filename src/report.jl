@@ -23,6 +23,7 @@ function plan_block(p::Plan, order)
         print_work(io, p, single_process(p) ? 0 : nslots(p))
     end
     body = sprint() do io
+        print_selection(io, p)
         print_packages(io, p)
         print_startup(io, p.startup)
         isempty(p.setups) || println(io, "setups: ", join(("`$s`" for s in p.setups), ", "))
@@ -48,7 +49,6 @@ end
 function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UInt64} = nothing)
     print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
           " in ", plural(length(p.files), "file"))
-    isempty(p.selection) || print(io, " matching ", p.selection)
     # The commit, so a CI log says what to check out to reproduce this run.
     rev = project_revision(p.root)
     isempty(rev) || print(io, " · rev ", first(rev, 10))
@@ -62,6 +62,10 @@ function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UIn
     isempty(flags) || print(io, " · ", join(flags, " "))
     return nothing
 end
+
+# What selected the items of the run, a line of its own in the bracket of a header: a
+# group, with its tags and what asked for it, can be long.
+print_selection(io::IO, p::Plan) = isempty(p.selection) || println(io, "selection: ", p.selection)
 
 # What a profile sets, each said briefly; `threads` is what a profile that sets none
 # runs with, which is not said.
@@ -666,12 +670,6 @@ function print_startup(io::IO, s::Startup)
     return nothing
 end
 
-"""
-    print_run_header(run)
-
-What the call does not show: which Runtests and Julia, how much work, how many
-processes with what given to them, and the environment it resolved to.
-"""
 # The packages of a run of several: each with its items, the isolated ones said so,
 # and what the plan notes of those left out.
 function print_packages(io::IO, p::Plan)
@@ -684,10 +682,17 @@ function print_packages(io::IO, p::Plan)
     return nothing
 end
 
+"""
+    print_run_header(run)
+
+What the call does not show: which Runtests and Julia, how much work, how many
+processes with what given to them, and the environment it resolved to.
+"""
 function print_run_header(run)
     p = run.plan
     head = sprint(io -> print_work(io, p, length(run.slots); seed = p.cfg.seed))
     body = sprint() do io
+        print_selection(io, p)
         # The project's path in the run-state path's colour, as the log paths are.
         env = something(Base.active_project(), "none")
         println(io, "env: ", styled(x -> printstyled(x, env; color = :light_black)))

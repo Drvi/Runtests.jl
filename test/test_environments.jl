@@ -361,7 +361,7 @@ end
                 @test states == Dict("main" => PASSED)
                 @test isempty(run.profile_projects)
                 @test !occursin("resolving the environment", out)
-                @test !occursin("precompiling the environment", out)
+                @test !occursin("precompiling the env ", out)
             end
         end
 
@@ -391,7 +391,7 @@ end
                     @test states == skipped
                     @test isempty(run.profile_projects)
                     @test !occursin("resolving the environment", out)
-                    @test !occursin("precompiling the environment", out)
+                    @test !occursin("precompiling the env ", out)
                     @test !occursin("precompiling Runtests", out)
                     # The test environment's worker is the only one, and each skipped item has a line.
                     @test ups(out) == 1

@@ -205,7 +205,7 @@ end
             states, _, _ = run_states(dir; workers=3, logs=:issues, monitor=false)
         end
         @test all(==(PASSED), values(states))
-        line = only(filter(l -> occursin("precompiling the test environment", l),
+        line = only(filter(l -> occursin("precompiling the env test", l),
                            collect(eachsplit(out, '\n'))))
         @test occursin("bounds", line)
         @test !occursin("quiet", line) && !occursin("threaded", line)
@@ -245,7 +245,7 @@ end
             states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
             @test all(==(PASSED), values(states))
         end
-        @test !occursin("precompiling the test environment", out)
+        @test !occursin("precompiling the env test", out)
     end
 
     @testset "a run whose test environment is ready leaves the depot's manifest usage log alone" begin
@@ -415,7 +415,7 @@ end
         # Its compile could only have failed too: it is said skipped, not run.
         @test occursin(Regex("COMP · +\\d+/\\d+ · \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
         # The queue's own count of the run says the same, with what it did compile.
-        @test occursin(r"\[TEST\] precompiled \d+ compiles?( \(\d+ reused\))?, 1 failed, 1 skipped in ", out)
+        @test occursin(r"\[TEST\] precompiled \d+ stale caches?: \d+ compiled(, \d+ reused)?, 1 failed, 1 skipped( \(\d+ fresh\))? in ", out)
     end
 end
 
@@ -426,7 +426,7 @@ end
     with_runstate_dir() do _
         (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, coverage = true))
         @test all(==(PASSED), values(states))
-        @test occursin("precompiling the test environment for 1 profile: default", out) == (VERSION >= v"1.14-")
+        @test occursin("precompiling the env test for 1 profile: default", out) == (VERSION >= v"1.14-")
     end
 end
 
@@ -457,10 +457,10 @@ end
     with_runstate_dir() do _
         (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, name = "plain"))
         @test states == Dict("plain" => PASSED)
-        @test !occursin("precompiling the test environment", out)
+        @test !occursin("precompiling the env test", out)
         (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
         @test all(==(PASSED), values(states))
-        @test occursin("precompiling the test environment for 1 profile: tuned", out)
+        @test occursin("precompiling the env test for 1 profile: tuned", out)
     end
 end
 
@@ -496,7 +496,7 @@ end
         value, out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
         return value, replace(out, '\\' => '/')
     end
-    stage = "precompiling the environment of test/qa for 1 profile: bounds"
+    stage = "precompiling the env test/qa for 1 profile: bounds"
 
     with_runstate_dir() do _
         @testset "an empty list compiles Runtests only, and the workers what the items load" begin
@@ -560,7 +560,7 @@ VERSION >= v"1.12" && @testset "a profile's julia arguments compile only the pac
     with_runstate_dir() do _
         (states, _, p), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
         @test all(==(PASSED), values(states))
-        @test occursin("precompiling the test environment for 1 profile: bounds", out)
+        @test occursin("precompiling the env test for 1 profile: bounds", out)
         cached(name, f) = Runtests.Private.PrecompileHelper.has_fresh_cache(
             Base.PkgId(p.packages.uuid[findfirst(==(name), p.packages.name)], name), f;
             sourcepath = joinpath(ws, "lib", name, "src", "$name.jl"))
@@ -598,9 +598,9 @@ end
     lines = collect(eachsplit(out, '\n'))
     qa = joinpath("test", "qa")
 
-    # One bracketed block announces the work: the compiles, the helper processes
+    # One bracketed block announces the work: the stale caches, the helper processes
     # they spread over, and the shared ceiling on how many run at once.
-    heads = filter(l -> occursin(r"\[TEST\] precompiling \d+ compile", l), lines)
+    heads = filter(l -> occursin(r"\[TEST\] precompiling \d+ stale cache", l), lines)
     @test length(heads) == 1
     @test occursin("with 1 worker,", only(heads))
     @test occursin("at most $(Runtests.Private.precompile_tasks()) at once", only(heads))
@@ -612,14 +612,16 @@ end
     @test length(ups) == 1
     @test occursin(r"^⬛ w1 · \d\d:\d\d:\d\d · UP   · pid \d+ · profile bounds · env ", only(ups))
     @test endswith(only(ups), "· env $qa · $(OTHER_BOUNDS.arg)")
-    @test any(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l) && occursin(r"\d+ compiles?", l), lines)
+    @test any(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l) && occursin(r"· \d+ compiled", l), lines)
 
     # On a job line the profile names the flags; the arguments themselves are not
-    # there. The lines are numbered in one count, in the order they are printed.
+    # there. Each stale cache takes a number as it ends, in one count; a reused one
+    # prints no line.
     pre = filter(l -> occursin("COMP", l), lines)
     @test !any(l -> occursin(OTHER_BOUNDS.arg, l), pre)
     @test any(l -> occursin("profile bounds", l), pre)
-    @test [parse(Int, match(r"· \s*(\d+)/\d+ ·", l).captures[1]) for l in pre] == 1:length(pre)
+    numbers = [parse(Int, match(r"· \s*(\d+)/(\d+) ·", l).captures[1]) for l in pre]
+    @test issorted(numbers; lt = <=) && last(numbers) <= parse(Int, match(r"precompiling (\d+) stale", only(heads))[1])
     here = filter(l -> occursin(r"^\S+ w0 ", l), pre)
     helper = filter(l -> occursin(r"^\S+ w1 ", l), pre)
     @test !isempty(here) && !isempty(helper)
@@ -630,9 +632,23 @@ end
     @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+ GiB", l), helper)
     @test !any(l -> occursin("maxrss", l), here)
 
-    # When the queue ends a line accounts for it: what compiled, what was reused,
-    # and how long the phase took.
-    @test occursin(r"\[TEST\] precompiled \d+ compiles?( \(\d+ reused\))? in [\d.ms]+", out)
+    # When the queue ends a line accounts for it: the stale caches as the announcement
+    # counted them, what of them compiled and what was reused, the fresh ones, and how
+    # long the phase took.
+    stale = parse(Int, match(r"precompiling (\d+) stale", only(heads))[1])
+    @test occursin(Regex("\\[TEST\\] precompiled $stale stale caches?: \\d+ compiled(, \\d+ reused)?( \\(\\d+ fresh\\))? in [\\d.ms]+"), out)
+    # With a helper, a line for each worker under it: the coordinator, then the helper
+    # with what it compiled for. Their counts add up to the first line's.
+    at = findfirst(l -> occursin(r"\[TEST\] precompiled ", l), lines)
+    @test startswith(lines[at], "┌")
+    w0, w1 = lines[at + 1], lines[at + 2]
+    @test occursin(r"^│ w0 · \d+ compiled", w0)
+    @test occursin(r"^└ w1 · \d+ compiled", w1) && endswith(w1, "· profile bounds · env $qa")
+    count_of(l, what) = (r = match(Regex("(\\d+) $what"), l); r === nothing ? 0 : parse(Int, r[1]))
+    for what in ("compiled", "reused", "fresh")
+        @test count_of(w0, what) + count_of(w1, what) == count_of(lines[at], what)
+    end
+    @test count_of(lines[at], "compiled") + count_of(lines[at], "reused") == stale
 end
 
 @testset "the queue's tasks share no variable of `run_queue`" begin
@@ -655,18 +671,20 @@ end
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
     @test all(==(PASSED), values(states))
     # A change only to the package's source: its compiles run again, and what the
-    # first run compiled for the profile the head counts as reused. A reused job
+    # first run compiled for the profile the head counts as fresh. A fresh cache
     # prints no line.
     open(io -> println(io, "# touched"), joinpath(dir, "src", "FreshLog.jl"), "a")
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
     @test all(==(PASSED), values(states))
-    # One environment, the coordinator's own: it compiles there itself, and starts no helper.
+    # One environment, the coordinator's own: it compiles there itself, and starts no
+    # helper. Its one line says all, with no line for the coordinator under it.
     @test !occursin(Runtests.Private.PRECOMPILE_MARK_WORKER, out)
-    @test occursin(r"\(\d+ reused\)", out)
-    @test occursin(r"\[TEST\] precompiled \d+ compiles? \(\d+ reused\) in ", out)
+    @test !occursin(r"[│└] w0 · ", out)
+    @test occursin(r"\[TEST\] precompiling \d+ stale caches? \(\d+ fresh\)", out)
+    @test occursin(r"\[TEST\] precompiled \d+ stale caches?: \d+ compiled \(\d+ fresh\) in ", out)
     @test !occursin(r"\bREUSED\b", out)
     @test !occursin(r"⬜ w\d+ · \d\d:\d\d:\d\d · COMP", out)
-    # Only the compiles number into the total: there is no hole for a reused job.
+    # Only the stale caches number into the total: a fresh one takes no number.
     pre = filter(l -> occursin("COMP", l), collect(eachsplit(out, '\n')))
     total = maximum(l -> parse(Int, match(r"(\d+)/(\d+)", l).captures[2]), pre)
     @test total == length(pre)
@@ -737,7 +755,7 @@ end
     lines = collect(eachsplit(out, '\n'))
     exits = filter(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · EXIT", l), lines)
     @test !isempty(exits)
-    @test any(l -> occursin(r"\(\d+ reused\)", l), exits)
+    @test any(l -> occursin(r"\d+ compiled, \d+ reused", l), exits)
     # Its environment is named as a worker's own would name it.
     @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP   · pid \d+ · ", l) &&
                    occursin("· env $(joinpath("test", "qa"))", l), lines)

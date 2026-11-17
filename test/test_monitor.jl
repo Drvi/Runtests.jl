@@ -928,10 +928,16 @@ end
             m = run.monitor = Monitor(run)
             items = string("INFO · ", lpad(@atomic(run.ndone), ndigits(nitems(p))), "/", nitems(p), " · ",
                            @atomic(run.nonpass), " failed")
+            # No test worker runs before the tests: the line names them from then on.
+            P.set_phase!(m, P.PHASE_SETUP)
             plain = status_line(m)
             @test startswith(plain, P.MARK_INFO)
             @test occursin(items, plain_text(plain))
             @test !occursin("precompiling", plain)
+            @test !occursin("workers", plain)
+            P.set_phase!(m, P.PHASE_TEST)
+            @test occursin(r" · \d+/1 workers", status_line(m))
+            P.set_phase!(m, P.PHASE_SETUP)
             # From before the first compile until the helpers are down, with a compile in
             # flight or not: the white square, and the compiles counted in place of the
             # items. No test worker runs yet, so a queue without helpers names no workers.

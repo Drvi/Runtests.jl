@@ -558,7 +558,8 @@ function print_status_line(io::IO, m::Monitor)
         # No test worker runs yet: the workers are the queue's helpers, if it has any.
         helpers = @atomic QUEUE_PROGRESS.helpers
         helpers > 0 && print_workers(io, @atomic(QUEUE_PROGRESS.live), helpers)
-    elseif !solo
+    elseif !solo && (@atomic m.phase) !== PHASE_SETUP
+        # The test workers, from the stage that starts them on.
         print_workers(io, count(sl -> (@atomic sl.worker) !== nothing, run.slots), length(run.slots))
     end
     if PER_PROCESS_OK[] && s.total_rss > 0

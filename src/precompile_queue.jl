@@ -678,7 +678,7 @@ function run_queue(run::Run, q::PrecompileQueue)
     any(i -> work[i] && q.jobs[i].env == own, 1:n) && Base.require(PrecompileHelper.FILEWATCHING)
     announce(run, q, work, own)
     # Each job that prints a line is numbered into the compiles (`report`).
-    total, ended = count(work), Threads.Atomic{Int}(0)
+    total = count(work)
     width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
     vwidth = maximum((textwidth(version_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
     # When the last completion was reported: the reminder a run off a terminal prints
@@ -713,9 +713,10 @@ function run_queue(run::Run, q::PrecompileQueue)
     helper_lock = ReentrantLock()
     cancelled = Ref(false)
     function report(i, h_id, s, seconds, rss, text)
+        s === :failed && (@atomic QUEUE_PROGRESS.failed += 1)
         # A reused job measured nothing: it prints no line, and so takes no number.
         (cancelled[] || is_quiet(s)) ||
-            report_job(run, q, i, h_id, s, seconds, rss, text, Threads.atomic_add!(ended, 1) + 1, total, width, vwidth)
+            report_job(run, q, i, h_id, s, seconds, rss, text, (@atomic QUEUE_PROGRESS.done += 1), total, width, vwidth)
         last_report[] = time()
         reminded[] = false
         return nothing
@@ -796,6 +797,8 @@ function run_queue(run::Run, q::PrecompileQueue)
         haskey(COMPILE_STATES, status[i]) && report(i, h === nothing ? 0 : h.id, status[i], seconds, rss, text)
         return
     end
+    # From here until the helpers are down, the progress line counts the compiles.
+    queue_started!(total)
     try
         @sync for i in order
             work[i] || continue
@@ -819,7 +822,11 @@ function run_queue(run::Run, q::PrecompileQueue)
     finally
         watching[] = false
         @lock COMPILING_LOCK empty!(COMPILING)
-        shielded(() -> stop_helpers!(run, helpers, answered, reused; kill = cancelled[]))
+        try
+            shielded(() -> stop_helpers!(run, helpers, answered, reused; kill = cancelled[]))
+        finally
+            queue_ended!()
+        end
     end
     # What the jobs ended as: a job that waited a build out, or whose cache arrived
     # while it was queued, is a reuse here whatever the scan said at the start.
@@ -939,6 +946,26 @@ compiling_started(i::Integer, name::AbstractString) = (@lock COMPILING_LOCK COMP
 compiling_ended(i::Integer) = (@lock COMPILING_LOCK delete!(COMPILING, i); nothing)
 oldest_compiling() = @lock COMPILING_LOCK (isempty(COMPILING) ? "" : last(argmin(first, collect(values(COMPILING)))))
 compiling_names() = @lock COMPILING_LOCK (sort!(String[last(v) for v in collect(values(COMPILING))]))
+
+# The counts of the queue that runs, which the progress line shows in place of the
+# items' while the queue runs: the compiles that printed a line, as their lines number
+# them (`report_job`), the compiles that failed, and all compiles of the queue. `total`
+# is 0 while no queue runs.
+mutable struct QueueProgress
+    @atomic done::Int
+    @atomic failed::Int
+    @atomic total::Int
+end
+const QUEUE_PROGRESS = QueueProgress(0, 0, 0)
+
+# `total` last: a reader that sees it nonzero sees the counts of this queue.
+function queue_started!(total::Integer)
+    @atomic QUEUE_PROGRESS.done = 0
+    @atomic QUEUE_PROGRESS.failed = 0
+    @atomic QUEUE_PROGRESS.total = total
+    return nothing
+end
+queue_ended!() = (@atomic QUEUE_PROGRESS.total = 0; nothing)
 
 """
     report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth)

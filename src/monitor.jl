@@ -526,21 +526,23 @@ function print_status_line(io::IO, m::Monitor)
     r = @atomic m.reading
     s = r.sample
     run = run_of(m)
-    total = nitems(run.plan)
-    done = @atomic run.ndone
-    # The same shape as every other line in the log; `w0` is the coordinator. While
-    # the precompile queue has compiles in flight the mark is its white square, and
-    # the line ends with the oldest of them.
+    # While the precompile queue runs, the line counts its compiles and their failures
+    # in place of the items', under its white square, and ends with the oldest compile
+    # in flight.
+    queued = @atomic QUEUE_PROGRESS.total
+    total = queued > 0 ? queued : nitems(run.plan)
+    done = queued > 0 ? (@atomic QUEUE_PROGRESS.done) : (@atomic run.ndone)
+    failed = queued > 0 ? (@atomic QUEUE_PROGRESS.failed) : (@atomic run.nonpass)
+    # The same shape as every other line in the log; `w0` is the coordinator.
     solo = single_process(run.plan)
-    compiling = oldest_compiling()
-    print_line_head(io, isempty(compiling) ? MARK_INFO : PRECOMPILE_MARK_INFO, solo ? nothing : 0, clock_text(m))
+    print_line_head(io, queued > 0 ? PRECOMPILE_MARK_INFO : MARK_INFO, solo ? nothing : 0, clock_text(m))
     print_word(io, "INFO")
     print_int(io, done, ndigits(total))
     write(io, UInt8('/'))
     print_int(io, total)
     print(io, FIELD)
     # Unpadded: on a healthy run it is one digit.
-    print_int(io, @atomic run.nonpass)
+    print_int(io, failed)
     print(io, " failed")
     if !solo
         print(io, FIELD)
@@ -593,6 +595,7 @@ function print_status_line(io::IO, m::Monitor)
     # A producer that takes long is not an item that hangs, and is said apart from one.
     collecting = collecting_item(m)
     collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
+    compiling = oldest_compiling()
     isempty(compiling) ||
         (print(io, " · precompiling "); print_clipped(io, compiling, RUNNING_WIDTH))
     return nothing

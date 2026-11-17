@@ -918,22 +918,39 @@ end
         @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
     end
 
-    @testset "while the queue runs, the line names the oldest compile" begin
+    @testset "while the queue runs, the line counts its compiles and names the oldest" begin
+        P = Runtests.Private
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=false)
         run = execute(p, target)
         rm(run.scratch; force=true, recursive=true)
-        with(Runtests.Private.TTY_OVERRIDE => true) do
+        plain_text(line) = replace(line, r"\e\[[0-9;]*m" => "")
+        with(P.TTY_OVERRIDE => true) do
             m = run.monitor = Monitor(run)
+            items = string("INFO · ", lpad(@atomic(run.ndone), ndigits(nitems(p))), "/", nitems(p), " · ",
+                           @atomic(run.nonpass), " failed")
             plain = status_line(m)
-            @test startswith(plain, Runtests.Private.MARK_INFO)
+            @test startswith(plain, P.MARK_INFO)
+            @test occursin(items, plain_text(plain))
             @test !occursin("precompiling", plain)
-            Runtests.Private.compiling_started(1, "SomePackage")
+            # From before the first compile until the helpers are down, with a compile in
+            # flight or not: the white square, and the compiles counted in place of the items.
+            P.queue_started!(12)
+            @atomic P.QUEUE_PROGRESS.done += 3
+            @atomic P.QUEUE_PROGRESS.failed += 1
+            between = status_line(m)
+            @test startswith(between, P.PRECOMPILE_MARK_INFO)
+            @test occursin("INFO ·  3/12 · 1 failed", plain_text(between))
+            @test !occursin("precompiling", between)
+            P.compiling_started(1, "SomePackage")
             line = status_line(m)
-            @test startswith(line, Runtests.Private.PRECOMPILE_MARK_INFO)
+            @test startswith(line, P.PRECOMPILE_MARK_INFO)
             @test occursin("precompiling SomePackage", line)
-            Runtests.Private.compiling_ended(1)
-            @test startswith(status_line(m), Runtests.Private.MARK_INFO)
-            @test isempty(Runtests.Private.compiling_names())
+            P.compiling_ended(1)
+            P.queue_ended!()
+            after = status_line(m)
+            @test startswith(after, P.MARK_INFO)
+            @test occursin(items, plain_text(after))
+            @test isempty(P.compiling_names())
         end
     end
 

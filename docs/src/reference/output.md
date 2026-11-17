@@ -28,7 +28,7 @@ The lines of the step have the shape of the lines of the run, with a square for 
 
 The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. A `COMP` line gives the position of the compile, the package and its version, the outcome and the time. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A compile that finds its cache built by another compile prints no line. The last line counts what compiled, what was reused, what failed and what was skipped.
 
-On a terminal, the progress line has a white square while the step runs, and it names the oldest compile. In other output, when no compile ends for `monitor_interval` seconds, the run names the compiles that still run.
+While the step runs, the progress line has a white square. It counts the compiles that printed a line, all compiles of the step and the failed compiles, in place of the items. It also names the oldest compile that runs. In other output, when no compile ends for `monitor_interval` seconds, the run names the compiles that still run.
 
 ## The opening block
 
@@ -92,6 +92,8 @@ The progress line gives these values:
 - the memory of the processes of the run, and of the largest of them,
 - the memory and CPU use of the machine,
 - the stage of the run and its time.
+
+While the precompile step runs, the first two values count the compiles in place of the items.
 
 ## The block of a failed item
 

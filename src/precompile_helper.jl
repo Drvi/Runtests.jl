@@ -121,8 +121,11 @@ function freshest_path(pkg::Base.PkgId, flags::Base.CacheFlags;
     isempty(cachepaths) && return nothing
     try
         # 1.13 renamed the function; before, `compilecache_path` takes the same keywords.
+        # From 1.13 the checksum of each image file is left out: reading every image is
+        # most of the cost of the check, and Julia checks it when a worker loads the image.
         @static if isdefined(Base, :compilecache_freshest_path)
-            return Base.compilecache_freshest_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache, cachepaths, flags)
+            return Base.compilecache_freshest_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache, cachepaths, flags,
+                                                   verify_checksums = false)
         else
             return Base.compilecache_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache, cachepaths, flags)
         end

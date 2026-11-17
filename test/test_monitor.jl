@@ -933,14 +933,20 @@ end
             @test occursin(items, plain_text(plain))
             @test !occursin("precompiling", plain)
             # From before the first compile until the helpers are down, with a compile in
-            # flight or not: the white square, and the compiles counted in place of the items.
-            P.queue_started!(12)
+            # flight or not: the white square, and the compiles counted in place of the
+            # items. No test worker runs yet, so a queue without helpers names no workers.
+            P.queue_started!(12, 0)
             @atomic P.QUEUE_PROGRESS.done += 3
             @atomic P.QUEUE_PROGRESS.failed += 1
             between = status_line(m)
             @test startswith(between, P.PRECOMPILE_MARK_INFO)
-            @test occursin("INFO ·  3/12 · 1 failed", plain_text(between))
+            @test occursin("INFO ·  3/12 · 1 failed · ", plain_text(between))
+            @test !occursin("workers", between)
             @test !occursin("precompiling", between)
+            # A queue with helpers counts them as the workers: those up, of all it has.
+            P.queue_started!(12, 2)
+            @atomic P.QUEUE_PROGRESS.live += 1
+            @test occursin("INFO ·  0/12 · 0 failed · 1/2 workers · ", plain_text(status_line(m)))
             P.compiling_started(1, "SomePackage")
             line = status_line(m)
             @test startswith(line, P.PRECOMPILE_MARK_INFO)

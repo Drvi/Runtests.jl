@@ -133,10 +133,13 @@ function env_graph(project_file::AbstractString)
             deps[ext] = filter(!Base.in_sysimage, loaded_by)
         end
     end
-    # An extension whose triggers hold all of another's loads that one too.
+    # An extension whose triggers hold all of another's loads that one too. Compared as
+    # sets, kept beside the lists, which every pair of extensions would build again.
+    sets = Dict(e => Set(t) for (e, t) in triggers)
     for a in keys(parent), b in keys(parent)
-        if triggers[a] ⊋ triggers[b]
+        if sets[a] ⊋ sets[b]
             push!(triggers[a], b)
+            push!(sets[a], b)
             push!(deps[a], b)
         end
     end
@@ -148,10 +151,10 @@ function env_graph(project_file::AbstractString)
         changed = false
         indirect = Dict(p => all_deps!(Set{Base.PkgId}(), deps, p) for p in keys(deps))
         for ext in keys(parent)
-            loads = Dict(p => !haskey(parent, p) && issubset(deps[ext], indirect[p]) && !(p in deps[ext])
-                         for p in keys(deps))
-            for (p, l) in loads
-                (l && !any(d -> get(loads, d, false), deps[p]) && !(ext in deps[p])) || continue
+            loaders = Set{Base.PkgId}(p for p in keys(deps)
+                                      if !haskey(parent, p) && !(p in deps[ext]) && issubset(deps[ext], indirect[p]))
+            for p in loaders
+                (!any(in(loaders), deps[p]) && !(ext in deps[p])) || continue
                 push!(deps[p], ext)
                 changed = true
             end
@@ -449,6 +452,7 @@ mutable struct QueueHelper
     const told::Set{Tuple{Int, Int}}
     const err::IOBuffer
     @atomic dead::Bool
+    @atomic stopped::Bool
 end
 
 """
@@ -476,7 +480,7 @@ function start_helper(id::Integer, env::QueueEnv)
         Int32(0)
     end
     h = QueueHelper(id, proc, pid, RuntestsWorkers.worker_job(pid), time(), ReentrantLock(),
-                    Dict{Int, Channel{HelperReply}}(), Set{Int}(), Set{Tuple{Int, Int}}(), IOBuffer(), false)
+                    Dict{Int, Channel{HelperReply}}(), Set{Int}(), Set{Tuple{Int, Int}}(), IOBuffer(), false, false)
     @async try
         write(h.err, err)
     catch e
@@ -571,29 +575,24 @@ function build_here!(caches::Dict{Int, Dict{Base.PkgId, Vector{String}}}, q::Pre
     return (String(s), seconds, path, 0.0, text)
 end
 
-# Stops each helper: at the end of its input, which it ends at, or at once (`kill`),
-# with the compiles it started. A helper that exits on its own gets an EXIT line, as
-# a test worker's does; a killed one is part of a run already saying it stopped.
-function stop_helpers!(run::Run, helpers::Vector{Union{Nothing, QueueHelper}}, answered::Vector{Int},
-                       reused::Vector{Int}; kill::Bool)
-    for h in helpers
-        h === nothing && continue
-        try
-            if !kill
-                close(h.process.in)
-                RuntestsWorkers.wait_exit(h.process, 10)
-                print_helper_line(run, h.id, "EXIT",
-                    string("pid ", h.pid, " · ", plural(answered[h.id] - reused[h.id], "compile"),
-                           reused[h.id] > 0 ? string(" (", reused[h.id], " reused)") : "",
-                           " · ", fmt_seconds(time() - h.started_at)))
-            end
-            RuntestsWorkers.signal!(h.pid, h.process, Base.SIGKILL)
-        catch e
-            is_interrupt(e) && rethrow()
-        finally
-            RuntestsWorkers.end_job!(h.job)
-            RuntestsWorkers.untrack!(h.process)
-        end
+# Stops helper `h`, once, with the compiles it started. A helper whose environment has no
+# job left has answered every request, and so runs no compile and holds no lock: it is
+# stopped at once, as Julia takes most of a second to exit, and gets an EXIT line, as a
+# test worker does, with what it compiled and reused. A helper stopped by a cancelled
+# queue (`kill`) is part of a run already saying it stopped.
+function stop_helper!(run::Run, h::QueueHelper, answered::Integer, reused::Integer; kill::Bool)
+    (@atomicswap h.stopped = true) && return nothing
+    try
+        kill || print_helper_line(run, h.id, "EXIT",
+            string("pid ", h.pid, " · ", plural(answered - reused, "compile"),
+                   reused > 0 ? string(" (", reused, " reused)") : "", " · ", fmt_seconds(time() - h.started_at)))
+        RuntestsWorkers.signal!(h.pid, h.process, Base.SIGKILL)
+    catch e
+        is_interrupt(e) && rethrow()
+    finally
+        RuntestsWorkers.end_job!(h.job)
+        RuntestsWorkers.untrack!(h.process)
+        @atomic QUEUE_PROGRESS.live -= 1
     end
     return nothing
 end
@@ -624,7 +623,7 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
     paths = Vector{Union{Nothing, String}}(nothing, length(q.jobs))
     caches = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.PkgId, Vector{String}}}()
     verdicts = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.StaleCacheKey, Bool}}()
-    original_project, original_path = Base.active_project(), copy(LOAD_PATH)
+    original_project, original_path, original_cache = Base.active_project(), copy(LOAD_PATH), Base.LOADING_CACHE[]
     current = 0
     try
         for i in order
@@ -633,6 +632,12 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
             if job.env != current
                 Base.set_active_project(isempty(env.project) ? nothing : env.project)
                 copy!(LOAD_PATH, env.load_path)
+                # The lookups of projects and manifests, kept for one environment, as
+                # Julia's precompiler keeps them: without it each check of a dependency
+                # reads them again, a third of the time on a large environment. Cleared
+                # first: a new cache takes its load path from the cache in place.
+                Base.LOADING_CACHE[] = nothing
+                Base.LOADING_CACHE[] = Base.LoadingCache()
                 current = job.env
             end
             flags = last(q.configs[job.config])
@@ -645,6 +650,7 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
             paths[i] = path
         end
     finally
+        Base.LOADING_CACHE[] = original_cache
         copy!(LOAD_PATH, original_path)
         Base.set_active_project(original_project)
     end
@@ -676,7 +682,7 @@ function run_queue(run::Run, q::PrecompileQueue)
                               q.envs), 0)
     # Its hooks are the lock on a cache file, as in a helper.
     any(i -> work[i] && q.jobs[i].env == own, 1:n) && Base.require(PrecompileHelper.FILEWATCHING)
-    announce(run, q, work, own)
+    nhelpers = announce(run, q, work, own)
     # Each job that prints a line is numbered into the compiles (`report`).
     total = count(work)
     width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
@@ -687,6 +693,10 @@ function run_queue(run::Run, q::PrecompileQueue)
     upstream = upstream_jobs(q.jobs, order)
     done = [Base.Event() for _ in 1:n]
     foreach(i -> work[i] || notify(done[i]), 1:n)
+    # The jobs of each environment that have not ended: a helper stops when its
+    # environment has none left (`env_done`).
+    left = zeros(Int, length(q.envs))
+    foreach(i -> work[i] && (left[q.jobs[i].env] += 1), 1:n)
     # Julia serializes a package's compiles on a pidfile lock it shares across every
     # project and set of preferences: two jobs of one (package, flags) cannot compile
     # at the same time anyway. The later one is chained to wait on `done` instead, so
@@ -712,6 +722,10 @@ function run_queue(run::Run, q::PrecompileQueue)
     here_caches = Dict{Int, Dict{Base.PkgId, Vector{String}}}()
     helper_lock = ReentrantLock()
     cancelled = Ref(false)
+    # The pinned line drawn again at once when a compile starts, and when one ends
+    # without a line of its own: until the monitor's next turn, half a second later, it
+    # would name a compile that ended, or none while the next one already runs.
+    redraw() = run.monitor === nothing || (@lock run.printer redraw_status(run.monitor))
     function report(i, h_id, s, seconds, rss, text)
         s === :failed && (@atomic QUEUE_PROGRESS.failed += 1)
         # A reused job measured nothing: it prints no line, and so takes no number.
@@ -754,12 +768,20 @@ function run_queue(run::Run, q::PrecompileQueue)
                       isempty(subjects) ? "" : " · " * join(sort!(subjects), ", "),
                       isempty(argsets) ? "" : " · " * join(sort!(argsets), ", "))
     end
+    # A job of environment `e` ended: its helper stops when it was the last one.
+    function env_done(e)
+        (left[e] -= 1) == 0 || return nothing
+        h = helpers[e]
+        (h === nothing || cancelled[]) || stop_helper!(run, h, answered[h.id], reused[h.id]; kill = false)
+        return nothing
+    end
     function helper(e)
         @lock helper_lock begin
             cancelled[] && return nothing
             h = helpers[e]
             h === nothing || return h
             h = helpers[e] = start_helper(count(!isnothing, helpers) + 1, q.envs[e])
+            @atomic QUEUE_PROGRESS.live += 1
             print_helper_line(run, h.id, "UP", helper_line_text(e, h.pid))
             return h
         end
@@ -783,6 +805,7 @@ function run_queue(run::Run, q::PrecompileQueue)
         end
         Base.acquire(limit)
         compiling_started(i, job.name)
+        redraw()
         s, seconds, path, rss, text = try
             h === nothing ? build_here!(here_caches, q, i, upstream[i], paths) : build!(h, q, i, upstream[i], paths)
         finally
@@ -795,11 +818,23 @@ function run_queue(run::Run, q::PrecompileQueue)
             is_quiet(status[i]) && (reused[h.id] += 1)
         end
         haskey(COMPILE_STATES, status[i]) && report(i, h === nothing ? 0 : h.id, status[i], seconds, rss, text)
+        is_quiet(status[i]) && redraw()
         return
     end
     # From here until the helpers are down, the progress line counts the compiles.
-    queue_started!(total)
+    queue_started!(total, nhelpers)
     try
+        # Every helper starts at once, and is up by the time its first job has waited
+        # for the compiles it waits for, which can be another environment's. A helper
+        # that does not start fails the jobs of its environment, each as it comes.
+        for e in eachindex(q.envs)
+            (e != own && left[e] > 0) || continue
+            try
+                helper(e)
+            catch err
+                is_interrupt(err) && rethrow()
+            end
+        end
         @sync for i in order
             work[i] || continue
             @async try
@@ -814,6 +849,7 @@ function run_queue(run::Run, q::PrecompileQueue)
                 report(i, 0, :failed, 0.0, 0.0, texts[i])
             finally
                 notify(done[i])
+                env_done(q.jobs[i].env)
             end
         end
     catch
@@ -823,7 +859,12 @@ function run_queue(run::Run, q::PrecompileQueue)
         watching[] = false
         @lock COMPILING_LOCK empty!(COMPILING)
         try
-            shielded(() -> stop_helpers!(run, helpers, answered, reused; kill = cancelled[]))
+            # Those still up: all of them when the queue was cancelled.
+            shielded() do
+                for h in helpers
+                    h === nothing || stop_helper!(run, h, answered[h.id], reused[h.id]; kill = cancelled[])
+                end
+            end
         finally
             queue_ended!()
         end
@@ -855,7 +896,8 @@ end
 # the profiles that need it, then the setups, under a head that counts the compiles,
 # the helper processes they spread over, if any, and how many run at once: the single
 # semaphore (`run_queue`) that bounds the compiles of this process and of every helper.
-# `own` is this process's environment, which needs no helper.
+# `own` is this process's environment, which needs no helper. Returns the number of
+# helpers.
 function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
     lines, setups, envs = String[], String[], Set{Int}()
     for i in eachindex(q.jobs)
@@ -878,7 +920,7 @@ function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
                   isempty(envs) ? "" : string(" with ", plural(length(envs), "worker")),
                   ", at most ", precompile_tasks(), " at once")
     print_label_block(run, head, join(lines, '\n'))
-    return nothing
+    return length(envs)
 end
 
 # A group's subject as a worker's UP line calls its environment — `env test`,
@@ -944,24 +986,36 @@ const COMPILING = Dict{Int, Tuple{Float64, String}}()
 const COMPILING_LOCK = ReentrantLock()
 compiling_started(i::Integer, name::AbstractString) = (@lock COMPILING_LOCK COMPILING[i] = (time(), name); nothing)
 compiling_ended(i::Integer) = (@lock COMPILING_LOCK delete!(COMPILING, i); nothing)
-oldest_compiling() = @lock COMPILING_LOCK (isempty(COMPILING) ? "" : last(argmin(first, collect(values(COMPILING)))))
+function oldest_compiling()
+    @lock COMPILING_LOCK begin
+        oldest, name = Inf, ""
+        for (t, n) in values(COMPILING)
+            t < oldest && ((oldest, name) = (t, n))
+        end
+        return name
+    end
+end
 compiling_names() = @lock COMPILING_LOCK (sort!(String[last(v) for v in collect(values(COMPILING))]))
 
 # The counts of the queue that runs, which the progress line shows in place of the
 # items' while the queue runs: the compiles that printed a line, as their lines number
-# them (`report_job`), the compiles that failed, and all compiles of the queue. `total`
-# is 0 while no queue runs.
+# them (`report_job`), the compiles that failed, all compiles of the queue, and its
+# helper processes, those up and all it has. `total` is 0 while no queue runs.
 mutable struct QueueProgress
     @atomic done::Int
     @atomic failed::Int
+    @atomic live::Int
+    @atomic helpers::Int
     @atomic total::Int
 end
-const QUEUE_PROGRESS = QueueProgress(0, 0, 0)
+const QUEUE_PROGRESS = QueueProgress(0, 0, 0, 0, 0)
 
 # `total` last: a reader that sees it nonzero sees the counts of this queue.
-function queue_started!(total::Integer)
+function queue_started!(total::Integer, helpers::Integer)
     @atomic QUEUE_PROGRESS.done = 0
     @atomic QUEUE_PROGRESS.failed = 0
+    @atomic QUEUE_PROGRESS.live = 0
+    @atomic QUEUE_PROGRESS.helpers = helpers
     @atomic QUEUE_PROGRESS.total = total
     return nothing
 end

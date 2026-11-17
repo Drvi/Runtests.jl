@@ -512,6 +512,16 @@ const TOTAL_WIDTH = 4     # "1.1G", "612M"
 const BYTES_WIDTH = 5     # "12.3G"
 const RUNNING_WIDTH = 28
 
+# The workers field of the progress line: those up, of all there are.
+function print_workers(io::IO, up::Integer, all::Integer)
+    print(io, FIELD)
+    print_int(io, up)
+    write(io, UInt8('/'))
+    print_int(io, all)
+    print(io, " workers")
+    return nothing
+end
+
 """
     print_status_line(io, m)
 
@@ -544,12 +554,12 @@ function print_status_line(io::IO, m::Monitor)
     # Unpadded: on a healthy run it is one digit.
     print_int(io, failed)
     print(io, " failed")
-    if !solo
-        print(io, FIELD)
-        print_int(io, count(sl -> (@atomic sl.worker) !== nothing, run.slots))
-        write(io, UInt8('/'))
-        print_int(io, length(run.slots))
-        print(io, " workers")
+    if queued > 0
+        # No test worker runs yet: the workers are the queue's helpers, if it has any.
+        helpers = @atomic QUEUE_PROGRESS.helpers
+        helpers > 0 && print_workers(io, @atomic(QUEUE_PROGRESS.live), helpers)
+    elseif !solo
+        print_workers(io, count(sl -> (@atomic sl.worker) !== nothing, run.slots), length(run.slots))
     end
     if PER_PROCESS_OK[] && s.total_rss > 0
         if solo

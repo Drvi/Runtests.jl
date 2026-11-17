@@ -363,6 +363,21 @@ end
         @test s[setup][1] < s[slow][2]
     end
 
+    @testset "a helper ends when its environment is done, not with the queue" begin
+        foreach(f -> rm(joinpath(log, f)), readdir(log))
+        slow, quick = "SlowHere$tag", "QuickQa$tag"
+        files = Pair{String, String}[]
+        us, uq = timed_pkg!(files, slow; body = "sleep(4)"), timed_pkg!(files, quick; body = "")
+        dir = make_pkg("EarlyExit$tag", files..., "test/Project.toml" => dep(slow, us, ".."), "test/t_test.jl" => item("t"),
+                       "test/qa/Project.toml" => dep(quick, uq, "../.."), "test/qa/q_test.jl" => item("q"))
+        (states, _, _), out = run_once(dir)
+        @test all(==(PASSED), values(states))
+        lines = collect(eachsplit(out, '\n'))
+        exit_at = findfirst(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l), lines)
+        slow_at = findfirst(l -> occursin(Regex("COMP · +\\d+/\\d+ · \"$slow\""), l), lines)
+        @test exit_at !== nothing && slow_at !== nothing && exit_at < slow_at
+    end
+
     @testset "a setup waits for what it loads under julia arguments that leave the cache flags" begin
         # `--depwarn=no` compiles no code differently: the package and the setup have one
         # set of cache flags under two sets of arguments, and the setup waits all the same.
@@ -726,4 +741,7 @@ end
     # Its environment is named as a worker's own would name it.
     @test any(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP   · pid \d+ · ", l) &&
                    occursin("· env $(joinpath("test", "qa"))", l), lines)
+    # Every job there waits for a compile of the test environment, and the helper starts
+    # with the queue all the same, not after them.
+    @test findfirst(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP ", l), lines) < findfirst(l -> occursin("COMP ·", l), lines)
 end

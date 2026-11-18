@@ -593,6 +593,9 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     wanted = Dict{String, Set{String}}()
     item_keys === nothing || foreach(((pkg, it),) -> push!(get!(Set{String}, wanted, pkg), it), item_keys)
     called = name !== nothing || tags !== nothing || group !== nothing || !isempty(chosen) || item_keys !== nothing
+    # The call's own seed, before a replay's recorded one joins the settings: only the
+    # call's is every item's.
+    seeded = haskey(kwargs, :seed)
     replayed = replay === nothing ? nothing : replay_records(String(replay), ps; announce)
     if replayed !== nothing
         # The run's settings as recorded, under the call's.
@@ -606,10 +609,18 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     gsel, lacking, group_name = mono_groups([read_groups(path, toml) for (path, toml) in configs],
                                             [path for (path, _) in configs], group, selected)
     # A replay runs what each run state recorded, narrowed by what the call selects,
-    # as `prepare` narrows it. A package that no key names is not read.
-    names_of_package(k) = item_keys !== nothing ? get(wanted, ps.name[k], nothing) :
-        replayed === nothing || replayed.records[k] === nothing || name isa FailingItems ? name :
-        replayed_names((it.name for it in replayed.records[k].items), name)
+    # as `prepare` narrows it, keys included. A package that no key names is not read.
+    # Failing items, which come with their seeds, are the base's and the later runs',
+    # and are not narrowed, as `runtestsf`'s are not.
+    function names_of_package(k)
+        recorded = replayed === nothing || replayed.records[k] === nothing ? nothing : replayed.records[k].items
+        if item_keys !== nothing
+            keys = get(wanted, ps.name[k], nothing)
+            return keys === nothing || recorded === nothing || item_seeds !== nothing ? keys :
+                intersect(keys, Set{String}(it.name for it in recorded))
+        end
+        return recorded === nothing || name isa FailingItems ? name : replayed_names((it.name for it in recorded), name)
+    end
     package_names = [names_of_package(k) for k in 1:n]
     # A replayed package none of whose recorded items the call selects runs nothing.
     unselected = [names isa AbstractSet && isempty(names) for names in package_names]
@@ -627,6 +638,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     naming = naming_root(workspace)
     environment_names = [String[] for _ in 1:n]
     reasons = Union{Nothing, String}[nothing for _ in 1:n]
+    scanned = falses(n)
     for k in 1:n
         if replayed !== nothing && replayed.records[k] === nothing
             reasons[k] = replayed.why[k]
@@ -655,6 +667,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             append!(errors, e.errors)
             continue
         end
+        scanned[k] = true
         gsel[k] === nothing || check_tags_exist(Filter(; group = gsel[k]), tags_k)
         union!(all_tags, tags_k)
         isempty(its) && (reasons[k] = "no item matches the selection")
@@ -680,12 +693,13 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     files_seconds = time() - t_files
 
     # What a replay's packages recorded and the checkout no longer has, or has changed:
-    # said once for all of them, by package, as `prepare` says it.
+    # said once for all of them, by package, as `prepare` says it. A package scanned and
+    # left with no item, all of whose recorded items are renamed, says so too.
     if replayed !== nothing
         gone, changed = String[], String[]
         for k in 1:n
             rs = replayed.records[k]
-            (rs === nothing || reasons[k] !== nothing) && continue
+            (rs === nothing || !scanned[k]) && continue
             selection = package_names[k]
             selection isa AbstractSet && append!(gone, string(ps.name[k], " ", repr(m)) for m in sort!(collect(setdiff(selection, suite_names[k]))))
             append!(changed, string(ps.name[k], " ", repr(m)) for m in changed_since(rs, (it for it in items if it.package == k)))
@@ -718,13 +732,13 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     end
     if replayed !== nothing
         run_cfg, cfgs = replayed_configs(run_cfg, cfgs, [replayed.records[k] for k in kept], ps.root[kept], replayed.given,
-                                         haskey(kwargs, :seed) && !haskey(recorded_settings(replayed.given), :seed))
+                                         seeded)
         check_replayed_environments(items, [replayed.records[k] for k in kept], ps.root[kept])
     end
     # The code a call gives is every package's, and runs in the workspace root, as a
     # shared default's does, so that the packages can share workers.
     foreach(cfg -> call_code!(cfg.profiles, worker_init, test_end; dir = workspace), cfgs)
-    if item_seeds !== nothing && !haskey(kwargs, :seed)
+    if item_seeds !== nothing && !seeded
         for (j, k) in enumerate(kept), ((pkg, n), seed) in item_seeds
             pkg == ps.name[k] && (cfgs[j].item_seeds[n] = seed)
         end

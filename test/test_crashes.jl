@@ -454,3 +454,117 @@ Sys.iswindows() ||
     @test !occursin("out-of-memory", r.printed)
     @test !occursin("LOST", r.printed)
 end
+
+"""
+    exit_during(; on_event, stall_editor, deadline) -> NamedTuple
+
+Run two items that each sleep for ten minutes, "first" and "second", on two workers,
+in a coordinator of its own, and have a task of its main thread call `exit` once the
+file `when` names is there. `on_event` is the code of the run's `on_event`, which
+can make that file; with `stall_editor`, the run's editor stream makes it as it
+writes the `item_started` of "second", and then waits a minute holding the stream.
+Returns how long the coordinator took to end after `exit` was called, at most
+`deadline` seconds, what it printed, and the run state it left.
+"""
+function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline = 60)
+    tmp = mktempdir()
+    when = joinpath(tmp, "exit_now")
+    called = joinpath(tmp, "exit_called")
+    runs = mktempdir()
+    script = """
+    using Runtests
+    include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
+    const P = Runtests.Private
+    const WHEN = $(repr(when))
+    dir = make_pkg("ExitDuring", "test/t_test.jl" => \"\"\"
+        @testitem "first" begin
+            sleep(600)
+        end
+        @testitem "second" begin
+            sleep(600)
+        end
+        \"\"\")
+    struct StallingIO <: IO end
+    function Base.unsafe_write(::StallingIO, p::Ptr{UInt8}, n::UInt)
+        line = unsafe_string(p, n)
+        if occursin("item_started", line) && occursin("\\"second\\"", line)
+            touch(WHEN)
+            sleep(60)
+        end
+        return n
+    end
+    Base.flush(::StallingIO) = nothing
+    @async begin
+        while !isfile(WHEN)
+            sleep(0.05)
+        end
+        touch($(repr(called)))
+        exit(0)
+    end
+    stream = $(stall_editor ? "P.EventStream(StallingIO())" : "nothing")
+    P.with(P.EVENTS => stream) do
+        P.exclusively() do
+            p, target = P.prepare((dir,); workers = 2, logs = :issues, monitor = false)
+            P.execute(p, target; on_event = $on_event)
+        end
+    end
+    """
+    path = joinpath(tmp, "run.jl")
+    write(path, script)
+    log = Base.BufferStream()
+    proc = run(pipeline(setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
+                               "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":"),
+                               "RUNTESTS_RUNSTATE_DIR" => runs);
+                        stdout = log, stderr = log); wait = false)
+    timedwait(() -> isfile(called) || process_exited(proc), 600)
+    t0 = time()
+    ended = timedwait(() -> process_exited(proc), deadline) === :ok
+    elapsed = time() - t0
+    ended || (kill(proc, Base.SIGKILL); wait(proc))
+    close(log)
+    printed = read(log, String)
+    files = [joinpath(r, f) for (r, _, fs) in walkdir(runs) for f in fs if f == "run.runstate"]
+    rs = length(files) == 1 ? read_run_state(only(files)) : nothing
+    return (; called = isfile(called), ended, elapsed, printed, rs)
+end
+
+# The facts the run state gives each item: its status and the states of its attempts.
+item_record(rs, name) = let i = findfirst(it -> it.name == name, rs.items)
+    (rs.statuses[i].state, [e.state for e in rs.events if e.kind === :attempt && e.item == i])
+end
+
+@testset "an exit closes the run whatever its tasks hold" begin
+    ENDING_EXITED = Runtests.Private.ENDING_EXITED
+    @testset "an editor stream held by a task the exit stops" begin
+        # The exit hook records the items in flight in the run state alone: telling the
+        # editor would wait for the stream the stalled writer holds.
+        r = exit_during(; stall_editor = true)
+        @test r.called && r.ended
+        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
+        @test item_record(r.rs, "first") == (CANCELLED, [CANCELLED])
+        r.ended || @info "the coordinator did not end; it printed:\n$(r.printed)"
+    end
+    @testset "a callback of `on_event` waiting as its attempt starts" begin
+        # The slot holds its item before anything is told the attempt began, so the
+        # exit records it.
+        r = exit_during(; on_event = """ev -> (ev.kind === :started && ev.name == "first" && (touch(WHEN); sleep(60)); nothing)""")
+        @test r.called && r.ended
+        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
+        @test item_record(r.rs, "first") == (CANCELLED, [CANCELLED])
+    end
+    @testset "a run's thread that does not let go" begin
+        # The hold gives up after two seconds: the run state is closed with its ending,
+        # which says what an item it leaves running means.
+        r = exit_during(; on_event = """ev -> begin
+                if ev.kind === :started && ev.name == "first"
+                    touch(WHEN)
+                    t = time()
+                    while time() - t < 8
+                    end
+                end
+                nothing
+            end""")
+        @test r.called && r.ended && r.elapsed < 30
+        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
+    end
+end

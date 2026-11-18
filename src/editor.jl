@@ -4,7 +4,7 @@
 # goes to stderr, so nothing but events reaches the stream. What a command holds is
 # read in `command!`, and what an event holds is where it is emitted.
 
-const PROTOCOL_VERSION = 3
+const PROTOCOL_VERSION = 4
 
 # An item as the protocol names it: its package and its name, which together tell
 # apart the items of a server of several packages.
@@ -70,16 +70,20 @@ function event_item_started(run, i::ItemIdx, attempt::Integer, slot::Integer, pi
     return nothing
 end
 
-function event_item_finished(run, i::ItemIdx, state::ItemState, attempt::Integer, slot::Integer, note::AbstractString)
+# The attempt as the statuses hold it, while they hold it (`record!`), and the item's
+# verdict once it ended: its `state` but for an attempt that decided nothing after one
+# that did.
+function event_item_finished(run, i::ItemIdx, state::ItemState, attempt::Integer, slot::Integer, note::AbstractString;
+                             verdict::ItemState = state)
     p = run.plan
     st = run.statuses
     ts = st.testsets[i]
     failures = ts === nothing ? [] : [failure_json(p, r) for r in collect_failures(ts)]
-    log = item_logpath(run, i)
+    log = item_log(run, i, max(attempt, 1))
     emit(run.events, "item_finished"; id = run.events.run_id, item_json(p, i)...,
          attempt = Int(attempt), attempts = attempts_for(p, p.items.unit[i]), worker = Int(slot),
-         pid = Int(st.pid[i]), state = state_name(state), elapsed = st.elapsed[i], compile = st.compile[i],
-         note = String(note), log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)
+         pid = Int(st.pid[i]), state = state_name(state), verdict = state_name(verdict), elapsed = st.elapsed[i],
+         compile = st.compile[i], note = String(note), log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)
     return nothing
 end
 

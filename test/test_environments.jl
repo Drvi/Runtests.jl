@@ -561,6 +561,16 @@ end
                 @test sort(readdir(qa)) == before
             end
 
+            @testset "the run state keeps each profile's environment, two of one name included" begin
+                rs = read_run_state(only(runstate_files(dir)))
+                env_of(j) = rs.worker_environments[rs.profile_environments[j]]
+                main = findfirst(pr -> pr.name === :default && pr.environment != qa, run.plan.profiles)
+                inqa = findfirst(pr -> pr.name === :default && pr.environment == qa, run.plan.profiles)
+                @test rs.profile_environments[main] != rs.profile_environments[inqa]
+                @test occursin("mode = \"env\"", env_of(inqa).preferences)
+                @test !occursin("mode", env_of(main).preferences)
+            end
+
             @testset "a replay runs them in the environment of this checkout" begin
                 rs = read_run_state(only(runstate_files(dir)))
                 replayed = plan_of(dir; replay = rs.path)

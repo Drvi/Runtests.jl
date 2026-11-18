@@ -201,6 +201,13 @@ test('an outcome says what to show, and where', () => {
     assert.equal(model.outcome({ state: 'skipped', elapsed: 0, note: '', failures: [] }).kind, 'skipped');
 });
 
+test('an attempt that decided nothing leaves the item the result it had', () => {
+    // Failed, then skipped on the retry: the item stays failed.
+    assert.equal(model.settles({ state: 'skipped', verdict: 'failed' }), false);
+    assert.equal(model.settles({ state: 'skipped', verdict: 'skipped' }), true);
+    assert.equal(model.settles({ state: 'failed', verdict: 'failed' }), true);
+});
+
 test('output gets the line ends a terminal wants', () => {
     assert.equal(model.crlf('a\nb\r\nc'), 'a\r\nb\r\nc');
 });

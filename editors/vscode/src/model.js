@@ -104,6 +104,16 @@ function outcome(ev) {
     }
 }
 
+/**
+ * Whether an `item_finished` event settles the item's result: an attempt that was skipped
+ * or cancelled after one that decided the item leaves it that attempt's result, which
+ * its `verdict` names.
+ * @param {{state: string, verdict: string}} ev
+ */
+function settles(ev) {
+    return ev.verdict === ev.state;
+}
+
 function withFallback(messages, ev) {
     if (messages.length > 0) return messages;
     return [{ text: ev.note || STATE_WORDS[ev.state] || ev.state, file: null, line: 0 }];
@@ -423,6 +433,6 @@ function configProblem(combined, config) {
 }
 
 module.exports = {
-    keyOf, itemKey, keyObject, groupByFile, groupByPackage, selectedKeys, outcome, crlf, plain, unselected,
+    keyOf, itemKey, keyObject, groupByFile, groupByPackage, selectedKeys, outcome, settles, crlf, plain, unselected,
     parseToml, workspaceMembers, isMonorepo, isCombined, declaresRuntests, serverEnvironment, folderChange, configProblem,
 };

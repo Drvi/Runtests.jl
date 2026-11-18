@@ -420,6 +420,137 @@ end
             @test rs.statuses[1].state === FAILED && rs.statuses[1].attempt == 1
             @test "fails, then is stopped" in Runtests.Private.failing_items(stopped)
         end
+        # An interrupt from `on_event` as the skip is told: the run state holds the
+        # failure before anything is told of the skip.
+        foreach(f -> rm(joinpath(marks, f)), readdir(marks))
+        with_runstate_dir() do _
+            on_event(ev) = (ev.kind === :finished && ev.state === :skipped && throw(InterruptException()); nothing)
+            thrown = try
+                capture_run() do
+                    exclusively() do
+                        p, target = prepare((dir,); workers = 1, name = "fails, then skips", logs = :issues, monitor = false)
+                        execute(p, target; on_event)
+                    end
+                end
+                nothing
+            catch e
+                e
+            end
+            @test thrown isa InterruptException
+            rs = Runtests.Private.read_run_state(only(Runtests.Private.runstate_files(dir)))
+            @test rs.cancelled && attempts(rs, 1) == [FAILED, SKIPPED]
+            @test rs.statuses[1].state === FAILED && rs.statuses[1].attempt == 1
+            @test Runtests.Private.failing_items(dir) == ["fails, then skips"]
+        end
+    end
+
+    @testset "a chain's member that a stopped retry does not reach keeps its failure" begin
+        # The chain fails, and its retry is under way when another item's failfast stops
+        # the run: the member the retry never reached is failed, in memory as on disk.
+        marks = mktempdir()
+        retrying = joinpath(marks, "retrying")
+        dir = make_pkg("StoppedChainRetry", "test/t_test.jl" => """
+            @testitem "first" chain=:c retries=1 begin
+                if isfile($(repr(joinpath(marks, "failed_once"))))
+                    touch($(repr(retrying)))
+                    sleep(2)
+                    @test true
+                else
+                    touch($(repr(joinpath(marks, "failed_once"))))
+                    @test false
+                end
+            end
+            @testitem "second" chain=:c begin
+                @test false
+            end
+            @testitem "stops the run" begin
+                while !isfile($(repr(retrying)))
+                    sleep(0.05)
+                end
+                @test false
+            end
+            """)
+        with_runstate_dir() do _
+            (states, run, p), _ = capture_run(() -> run_states(dir; workers = 2, failfast = true, logs = :issues, monitor = false))
+            @test states["second"] === FAILED && run.statuses.attempt[findfirst(==("second"), p.items.name)] == 1
+            rs = Runtests.Private.read_run_state(run.runstate.path)
+            @test rs.statuses[findfirst(it -> it.name == "second", rs.items)].state === FAILED
+        end
+    end
+
+    @testset "a chain retries for the member that failed, whatever another member's retry did" begin
+        # The setup passes, then skips on the retry: the member that failed still gets
+        # the attempts it asks for, and passes on its third.
+        marks = mktempdir()
+        count_to(name, n) = "(m = $(repr(joinpath(marks, name))); k = isfile(m) ? parse(Int, read(m, String)) : 0; " *
+                            "write(m, string(k + 1)); k + 1 >= $n)"
+        dir = make_pkg("ChainRetries", "test/t_test.jl" => """
+            @testitem "setup" chain=:c retries=2 skip=isfile($(repr(joinpath(marks, "setup_ran")))) begin
+                touch($(repr(joinpath(marks, "setup_ran"))))
+                @test true
+            end
+            @testitem "flaky" chain=:c retries=2 begin
+                @test $(count_to("flaky", 3))
+            end
+            """)
+        with_runstate_dir() do _
+            (states, run, p), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+            @test states["setup"] === PASSED && states["flaky"] === PASSED
+            @test run.statuses.attempt[findfirst(==("flaky"), p.items.name)] == 3
+        end
+    end
+
+    @testset "an attempt is reported with what its `test_end` printed" begin
+        dir = make_pkg("HookOutput", profile_files(; test_end = "println(\"HOOK OUTPUT\")")...,
+            "test/t_test.jl" => """
+            @testitem "prints" begin
+                println("BODY OUTPUT")
+                @test true
+            end
+            @testitem "quiet" begin
+                @test true
+            end
+            """)
+        for workers in (0, 1)
+            with_runstate_dir() do _
+                buf = IOBuffer()
+                (states, _, _), out = capture_run() do
+                    Runtests.Private.with(Runtests.Private.EVENTS => Runtests.Private.EventStream(buf)) do
+                        run_states(dir; workers, logs = :batched, monitor = false)
+                    end
+                end
+                @test states["prints"] === PASSED && states["quiet"] === PASSED
+                @test occursin("BODY OUTPUT", out) && occursin("HOOK OUTPUT", out)
+                # A quiet body's log is the hook's: an editor is given it.
+                quiet = only(l for l in split(String(take!(buf)), '\n') if occursin("item_finished", l) && occursin("\"quiet\"", l))
+                @test !occursin("\"log\":null", quiet)
+            end
+        end
+    end
+
+    @testset "a worker lost in a hook after a chain's member leaves the rest of the chain broken" begin
+        # The member's own verdict stands, is not tried again, and the members after it,
+        # which lost the state they relied on, are broken rather than never run.
+        for (lost_after, expected) in (("one", Dict("one" => PASSED, "two" => BROKEN_CHAIN, "three" => BROKEN_CHAIN)),
+                                       ("three", Dict("one" => PASSED, "two" => PASSED, "three" => PASSED)))
+            dir = make_pkg("HookLoss" * lost_after, profile_files(; test_end = """
+                    Main.Runtests.current_testitem().name == $(repr(lost_after)) && ccall(:abort, Cvoid, ())
+                    """)...,
+                "test/t_test.jl" => join(("""
+                    @testitem $(repr(n)) chain=:c retries=1 begin
+                        @test true
+                    end
+                    """ for n in ("one", "two", "three")), "\n"))
+            with_runstate_dir() do _
+                (states, run, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+                @test states == expected
+                @test all(<=(1), run.statuses.attempt)
+                @test !occursin("internal", out)
+                rs = Runtests.Private.read_run_state(run.runstate.path)
+                @test [st.state for st in rs.statuses] == [expected[it.name] for it in rs.items]
+                @test Runtests.Private.failing_items(dir) == sort!([n for (n, s) in expected if s === BROKEN_CHAIN])
+            end
+        end
     end
 
     @testset "a second run in the same process is refused, and the first goes on" begin

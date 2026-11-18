@@ -135,7 +135,7 @@ state that cannot be opened is done without, as in a run of one package, and the
 others are written.
 """
 function open_runstate_set(p::Plan, start::Float64, runid::AbstractString; worktree::AbstractString = "unknown",
-                           worker_projects::Vector{Dict{Symbol, String}} = [Dict{Symbol, String}() for _ in p.packages.name])
+                           worker_projects::Vector{Vector{String}} = [String[] for _ in p.packages.name])
     n = length(p.packages)
     plans = Plan[package_plan(p, k) for k in 1:n]
     workspace = p.root
@@ -202,6 +202,7 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
     end
     records = Union{Nothing, RunStateRecord}[]
     why = String[]
+    exported = exported_siblings(path, ps.name, id)
     for k in eachindex(ps.root)
         rel = rel_slash(ps.root[k], ps.workspace)
         if !haskey(recorded, rel)
@@ -210,7 +211,7 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
         end
         project = project_id(ps.root[k])
         rs = get(given.meta, "project_id", "") == project ? given :
-            something(exported_sibling(path, ps.name[k], project, id), findfirst_record(ps.root[k], id), Some(nothing))
+            something(get(exported, project, nothing), findfirst_record(ps.root[k], id), Some(nothing))
         push!(records, rs)
         push!(why, rs === nothing ? "its run state of the replayed run is gone" : "")
     end
@@ -231,20 +232,25 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
     return (; given, records, why, gone)
 end
 
-# The run state of the combined run `id` for the package called `name`, of project
-# `project`, that an export beside `path` holds, or `nothing`. `RUNTESTS_ARTIFACT_DIR`
-# keeps each package's run in a directory of the package's name, so a record copied from
-# there, from CI say, has its run's other packages beside it, and no history needs them.
-function exported_sibling(path::AbstractString, name::AbstractString, project::AbstractString, id::AbstractString)
-    dir = joinpath(dirname(dirname(dirname(abspath(record_path(path))))), name)
-    isdir(dir) || return nothing
-    for d in readdir(dir; join = true)
-        endswith(d, RUNDATA_EXT) || continue
-        rs = read_run_state(joinpath(d, RUNSTATE_FILE))
-        rs === nothing && continue
-        get(rs.meta, "combined_run", "") == id && get(rs.meta, "project_id", "") == project && return rs
+# The run states of the combined run `id` that the files beside `path` hold, by project,
+# for packages called `names`, read once for all of them. `RUNTESTS_ARTIFACT_DIR` keeps
+# each package's run in a directory of the package's name, and a killed job's recovery
+# step (see the CI guide) copies the run directories side by side. Either way a record
+# copied from there has its run's other packages beside it, and no history needs them.
+function exported_siblings(path::AbstractString, names, id::AbstractString)
+    bundle = dirname(abspath(record_path(path)))
+    dirs = unique!([dirname(bundle); [joinpath(dirname(dirname(bundle)), name) for name in names]])
+    found = Dict{String, RunStateRecord}()
+    for dir in dirs
+        isdir(dir) || continue
+        for d in readdir(dir; join = true)
+            endswith(d, RUNDATA_EXT) || continue
+            rs = read_run_state(joinpath(d, RUNSTATE_FILE))
+            (rs === nothing || get(rs.meta, "combined_run", "") != id) && continue
+            get!(found, get(rs.meta, "project_id", ""), rs)
+        end
     end
-    return nothing
+    return found
 end
 
 # The run state of the combined run `id` in the run state directory of the package at

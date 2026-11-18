@@ -14,7 +14,7 @@ julia --project=<an environment with Runtests> -e 'using Runtests; Runtests.serv
 
 `Runtests.serve_mono("<workspace root>")` serves the packages of a workspace, as [`runtests_mono`](@ref monorepos) runs them. Its listing holds the items of every package, and each run is a combined run. Two items of two packages can have the same name, so an item is known by its key: the name of its package and its own name.
 
-`serve_mono` reads each package's own configuration file and has no `config` argument. The protocol version is `3`, and the `hello` event gives it. An editor should check that version before sending a selection: earlier versions use different item identifiers. A change that can break an editor written against the protocol increases the version.
+`serve_mono` reads each package's own configuration file and has no `config` argument. The protocol version is `4`, and the `hello` event gives it. An editor should check that version before sending a selection: earlier versions use different item identifiers, and before version 4 the `state` of `item_finished` is the state of the item, not of the attempt. A change that can break an editor written against the protocol increases the version.
 
 ## Commands
 
@@ -105,13 +105,14 @@ It has the fields of `item_started`, and these:
 
 | Field | Meaning |
 |:------|:--------|
-| `state` | `passed`, `failed`, `errored`, `timedout`, `skipped`, `broken_chain` or `cancelled`. |
+| `state` | The state of this attempt: `passed`, `failed`, `errored`, `timedout`, `skipped`, `broken_chain` or `cancelled`. |
+| `verdict` | The state of the item after this attempt. It is `state`, except after an attempt that is `skipped` or `cancelled` when an earlier attempt decided the item. Then it is the state of that earlier attempt. |
 | `elapsed`, `compile` | Seconds, as the item measured them. For an outcome that the run decided, the time that the item held its worker. |
 | `note` | What the run says about the attempt, for example that a retry follows. Often empty. |
 | `log` | The file with captured item output, or `null` when no nonempty log exists. With `logs = "eager"`, output goes to stderr without a per-item log. |
 | `failures` | Each failed or erroring test: `kind` (`fail` or `error`), `message` as `Test` shows it, `file` and `line`. |
 
-An item that is retried, or that runs again with its chain, has an `item_started` and an `item_finished` for each attempt. The latest is its current state, and the last one before `run_finished` is its outcome.
+An item that is retried, or that runs again with its chain, has an `item_started` and an `item_finished` for each attempt. The `verdict` of the latest is its current state, and the `verdict` of the last one before `run_finished` is its outcome. The other fields describe the attempt.
 
 `item_finished` reports the verdict before [failure-artifact producers](@ref evidence) finish. Wait for `run_finished` before copying the complete run bundle.
 

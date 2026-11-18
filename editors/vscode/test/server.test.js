@@ -139,7 +139,7 @@ test('a server of another protocol gets no command, and says why', async () => {
         `console.log(JSON.stringify({ event: 'hello', protocol: 2 }));\n` +
         `process.stdin.on('data', d => require('node:fs').appendFileSync(${JSON.stringify(received)}, d));\n`);
     const old = new RuntestsServer({ julia: process.execPath, juliaArgs: [path.join(fake, 'server.js')], environment: fake, root: fake });
-    await assert.rejects(old.list(), /editor protocol 2, and this extension speaks protocol 3/);
+    await assert.rejects(old.list(), /editor protocol 2, and this extension speaks protocol 4/);
     const end = await old.run(keys(['passes']), {}, false, () => assert.fail('no event of a run'));
     assert.equal(end.event, 'error');
     assert.match(end.message, /editor protocol 2/);

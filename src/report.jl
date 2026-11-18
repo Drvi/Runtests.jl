@@ -68,42 +68,58 @@ end
 print_selection(io::IO, p::Plan) = isempty(p.selection) || println(io, "selection: ", p.selection)
 
 # What a profile sets, each said briefly; `threads` is what a profile that sets none
-# runs with, which is not said. A preferences file is named from `root`.
-function profile_parts(prof::Profile, threads::AbstractString, root::AbstractString = "")
+# runs with, which is not said. A preferences file is named from `root`. With `detail`,
+# for profiles of one name that differ: the file of each expression, and the packages
+# the run precompiles for its workers.
+function profile_parts(prof::Profile, threads::AbstractString, root::AbstractString = ""; detail::Bool = false)
     parts = String[]
+    from(path) = isempty(root) ? path : relpath_or_path(path, root)
     isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
     (isempty(prof.threads) || prof.threads == threads) || push!(parts, string("threads ", prof.threads))
     isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
-    isempty(prof.preferences) ||
-        push!(parts, string("preferences ", isempty(root) ? prof.preferences : relpath_or_path(prof.preferences, root)))
-    isempty(prof.init.args) || push!(parts, "init expression")
-    isempty(prof.test_end.args) || push!(parts, "test end expression")
+    isempty(prof.preferences) || push!(parts, string("preferences ", from(prof.preferences)))
+    for (ex, what) in ((prof.init, "init expression"), (prof.test_end, "test end expression"))
+        isempty(ex.args) && continue
+        at = findfirst(a -> a isa LineNumberNode && a.file !== nothing, ex.args)
+        push!(parts, detail && at !== nothing ? string(what, " of ", from(string(ex.args[at].file))) : what)
+    end
+    detail && prof.precompile !== nothing &&
+        push!(parts, isempty(prof.precompile) ? "precompiles nothing" : string("precompiles ", join(prof.precompile, ", ")))
     return parts
 end
+
+# What tells two profiles' settings apart, as their workers get them: an expression by
+# its code, wherever it was written.
+profile_settings(prof::Profile) =
+    (prof.julia_args, prof.threads, prof.env, prof.preferences, Base.remove_linenums!(copy(prof.init)),
+     Base.remove_linenums!(copy(prof.test_end)), prof.precompile)
 
 # Only profiles that actually change something are worth a line, one each however
 # many environments they run in, and the environment directories the items run in one
 # more. In a run of several packages, a name whose settings differ between packages
-# has a line for each settings, with the packages that have them.
+# has a line for each settings, with the packages that have them, in enough detail to
+# tell them apart.
 function print_profiles(io::IO, p::Plan)
     names = Symbol[]
-    settings = Dict{Symbol, Vector{Pair{Vector{String}, Vector{String}}}}()   # parts => packages
+    groups = Dict{Symbol, Vector{Tuple{Any, Int, Vector{String}}}}()   # (settings, a profile, packages)
     for (j, prof) in pairs(p.profiles)
-        haskey(settings, prof.name) || (push!(names, prof.name); settings[prof.name] = [])
-        parts = profile_parts(prof, p.profiles[1].threads, p.root)
+        haskey(groups, prof.name) || (push!(names, prof.name); groups[prof.name] = [])
+        key = profile_settings(prof)
         package = p.packages.name[p.profile_package[j]]
-        same = settings[prof.name]
-        k = findfirst(s -> s.first == parts, same)
-        k === nothing ? push!(same, parts => [package]) : (package in same[k].second || push!(same[k].second, package))
+        same = groups[prof.name]
+        k = findfirst(g -> isequal(g[1], key), same)
+        k === nothing ? push!(same, (key, j, [package])) : (package in same[k][3] || push!(same[k][3], package))
     end
+    threads = p.profiles[1].threads
     for name in names
-        same = settings[name]
+        same = groups[name]
         if length(same) == 1
-            parts = only(same).first
+            parts = profile_parts(p.profiles[only(same)[2]], threads, p.root)
             isempty(parts) || println(io, "profile `", name, "`: ", join(parts, " · "))
             continue
         end
-        for (parts, packages) in same
+        for (_, j, packages) in same
+            parts = profile_parts(p.profiles[j], threads, p.root; detail = true)
             println(io, "profile `", name, "` of ", join(packages, ", "), ": ",
                     isempty(parts) ? "nothing of its own" : join(parts, " · "))
         end
@@ -643,13 +659,15 @@ styled() do io
     # name is what identifies the item, and a shortened one still does.
     print(io, shown)
     pad_to(io, width, textwidth(shown))
-    if attempt > 1
-        print(io, FIELD, "retry "); print_int(io, attempt - 1); print(io, " of "); print_int(io, max(attempts - 1, 1))
-    end
+    # After the outcome on a DONE line, which keeps the outcome in its column.
+    retry() = attempt > 1 &&
+        (print(io, FIELD, "retry "); print_int(io, attempt - 1); print(io, " of "); print_int(io, max(attempts - 1, 1)))
+    done || retry()
     print(io, FIELD)
     if done
         pct = how.elapsed_ns > 0 ? round(Int, 100 * how.compile_ns / how.elapsed_ns) : 0
         print_colored(io, short_state(how.state), STATE_WIDTH, state_color(how.state))
+        retry()
         # Rounded to a tenth, as `fmt_gib` rounds, then written without a string.
         print(io, FIELD); print_1dp(io, round(how.elapsed_ns / 1.0e9; digits = 1), TIME_WIDTH - 1)
         print(io, "s ("); print_int(io, pct, 2); print(io, "% compile)")

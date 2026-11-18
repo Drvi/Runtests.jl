@@ -384,6 +384,7 @@ class Suite {
     }
 
     finish(run, item, ev) {
+        if (!model.settles(ev)) return;
         const o = model.outcome(ev);
         const messages = o.messages.map(m => {
             const msg = new vscode.TestMessage(m.text);

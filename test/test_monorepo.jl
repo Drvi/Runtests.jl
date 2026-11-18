@@ -620,6 +620,14 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test occursin("profile `tuned` of Alpha, Delta: --check-bounds=yes\n", out)
             @test occursin("profile `tuned` of Beta: --check-bounds=no\n", out)
             @test occursin("profile `tuned` of Gamma: preferences lib/Gamma/test/prefs.toml\n", out)
+            # Two `init` expressions, which read the same in brief: each line says which,
+            # and what the run precompiles for its workers.
+            ws = make_workspace(tuned("Alpha", "precompile = []", profile_files("tuned"; init = "x = 1")...),
+                                tuned("Beta", "", profile_files("tuned"; init = "x = 2")...); root = nothing)
+            out = slashed(sprint(Runtests.Private.print_profiles, mono(ws).plan))
+            @test occursin("profile `tuned` of Alpha: init expression of lib/Alpha/test/testconfigs/tuned/worker_init.jl" *
+                           " · precompiles nothing\n", out)
+            @test occursin("profile `tuned` of Beta: init expression of lib/Beta/test/testconfigs/tuned/worker_init.jl\n", out)
         end
 
         @testset "a DONE line keeps the item and its outcome inside the terminal, the package column counted" begin
@@ -633,10 +641,15 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             for columns in (80, 120)
                 shown, column = P.item_names(p, P.name_width(p.items.name; columns, reserved = P.line_reserved(p)))
                 for i in 1:nitems(p)
-                    line = P.item_line(P.nslots(p), i, nitems(p), shown[i], column, 1, 1, done;
-                                       package = p.packages.name[p.items.package[i]], package_width = textwidth(pkg))
-                    plain = replace(line, r"\e\[[0-9;]*m" => "")
-                    @test textwidth(plain[1:last(findfirst("PASS", plain))]) <= columns
+                    # A retry's line has its outcome where the first attempt's has it.
+                    ends = map((1, 2)) do attempt
+                        line = P.item_line(P.nslots(p), i, nitems(p), shown[i], column, attempt, 2, done;
+                                           package = p.packages.name[p.items.package[i]], package_width = textwidth(pkg))
+                        plain = replace(line, r"\e\[[0-9;]*m" => "")
+                        attempt == 2 && @test occursin("PASS · retry 1 of 1", plain)
+                        textwidth(plain[1:last(findfirst("PASS", plain))])
+                    end
+                    @test ends[1] == ends[2] <= columns
                 end
             end
         end
@@ -879,6 +892,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                     "test/testsetups/ASetup.jl" => "module ASetup\nx = 1\nend\n",
                     "test/LocalPreferences.toml" => "[Foo]\nlevel = 1\n",
                     "test/qa/Project.toml" => "[deps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n",
+                    "test/qa/LocalPreferences.toml" => "[Foo]\nsite = \"qa\"\n",
                     "test/qa/qa_test.jl" => """
                         @testitem "qa" begin
                             @test occursin("runtests_environment_", Base.active_project())
@@ -901,8 +915,13 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 isolated = ["lib/C"],
             )
             with_runstate_dir() do _
-                states, _, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false)
+                states, run, p = run_mono(ws; workers = 1, logs = :issues, monitor = false)
                 @test states == Dict(("A", "a") => PASSED, ("A", "qa") => PASSED, ("C", "c") => PASSED)
+                # A's two `default` profiles, its own and its environment directory's, each
+                # have the environment their workers started in.
+                rs = read_run_state(run.runstate.files[findfirst(==("A"), p.packages.name)].path)
+                @test length(rs.profile_environments) == 2 && allunique(rs.profile_environments)
+                @test count(e -> occursin("site = \"qa\"", e.preferences), rs.worker_environments) == 1
             end
         end
 
@@ -928,8 +947,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # The same name in the run of A alone. A run without A, B's own or a combined
                 # run of B, builds no environment of A anyway and accepts the name: one list
                 # serves the CI job of each package.
-                states, _, _ = run_states(joinpath(ws, "lib", "A"); workers = 1, logs = :issues, monitor = false, skip_environment = skip)
+                states, run, _ = run_states(joinpath(ws, "lib", "A"); workers = 1, logs = :issues, monitor = false, skip_environment = skip)
                 @test states == Dict("a" => PASSED, "qa" => SKIPPED)
+                # The skipped environment started no worker, and has no environment recorded.
+                @test sort(read_run_state(run.runstate.path).profile_environments) == [0, 1]
                 states, _, _ = run_states(joinpath(ws, "lib", "B"); workers = 1, logs = :issues, monitor = false, skip_environment = skip)
                 @test states == Dict("b" => PASSED, "qa of B" => PASSED)
                 states, _, _ = run_mono(ws; packages = ["B"], workers = 1, logs = :issues, monitor = false, skip_environment = skip)
@@ -1260,6 +1281,16 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 @test sort!([(r.plan.packages.name[r.plan.items.package[i]], r.plan.items.name[i]) for i in 1:nitems(r.plan)]) ==
                       [("A", "a"), ("B", "b")]
                 @test !any(startswith("partial replay"), r.plan.notes)
+                # As a killed job's recovery step copies them: each run directory side by side.
+                flat = mktempdir()
+                for name in ("A", "B"), d in filter(endswith(".rundata"), readdir(joinpath(artifacts, name); join = true))
+                    cp(d, joinpath(flat, basename(d)))
+                end
+                given = only(d for d in readdir(flat; join = true) if basename(d) == basename(exported))
+                r = mono(ws; replay = joinpath(given, "run.runstate"))
+                @test sort!([(r.plan.packages.name[r.plan.items.package[i]], r.plan.items.name[i]) for i in 1:nitems(r.plan)]) ==
+                      [("A", "a"), ("B", "b")]
+                @test !any(startswith("partial replay"), r.plan.notes)
             end
         end
 
@@ -1289,6 +1320,16 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # A deliberate narrowing replays less, and says nothing is missing.
                 r = mono(ws; replay = a_record, packages = ["B"])
                 @test selected(r.plan) == [("B", "b1")] && !any(startswith("partial replay"), r.plan.notes)
+                # An editor's keys narrow the recorded items as a name does: one the run
+                # did not record stays out.
+                r = mono(ws; replay = b_record, item_keys = [("A", "a1"), ("A", "a2")])
+                @test selected(r.plan) == [("A", "a1")]
+                # B's recorded item renamed since: B gives no item, and the replay says
+                # which recorded item is gone.
+                b_tests = joinpath(ws, "lib", "B", "test", "b_test.jl")
+                write(b_tests, item_text("b1 renamed") * item_text("b2"))
+                @test_logs (:warn, r"no longer have.*B \"b1\""s) match_mode = :any mono(ws; replay = a_record)
+                write(b_tests, item_text("b1") * item_text("b2"))
                 # A moved environment directory: the item runs in this checkout's, and the
                 # replay says where it ran before.
                 mv(joinpath(ws, "lib", "A", "test", "qa"), joinpath(ws, "lib", "A", "test", "qa2"))
@@ -1309,6 +1350,21 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                                                           getfield(single, f) for f in fieldnames(Runtests.Private.RunStateRecord))...)
                 err = try Runtests.Private.check_replayed_environments(RawItem[], [broken], [joinpath(ws, "lib", "A")]); nothing catch e; e end
                 @test err isa ConfigError && occursin("records 1 environment directory for 2 test items", slashed(err.msg))
+            end
+        end
+
+        @testset "a combined replay given a seed draws every item from it, a recorded seed of its own aside" begin
+            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
+            with_runstate_dir() do _
+                # As an editor reruns a failure: `a` with the seed it failed with.
+                _, run, _ = run_mono(ws; workers = 1, item_keys = [("A", "a"), ("B", "b")],
+                                     item_seeds = Dict(("A", "a") => UInt64(5)), logs = :issues, monitor = false)
+                record = first(f.path for f in run.runstate.files)
+                seed_of(p, name) = p.items.seed[findfirst(==(name), p.items.name)]
+                r = mono(ws; replay = record)
+                @test seed_of(r.plan, "a") == 5 && seed_of(r.plan, "b") == r.plan.cfg.seed != 5
+                r = mono(ws; replay = record, seed = 99)
+                @test r.plan.cfg.seed == 99 && seed_of(r.plan, "a") == 99 && seed_of(r.plan, "b") == 99
             end
         end
 

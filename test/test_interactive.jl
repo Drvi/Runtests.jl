@@ -433,6 +433,21 @@ end
         end
     end
 
+    @testset "a skip after a failure leaves the failure, as in a run" begin
+        with_activated(DEPS) do _
+            log = tempname()
+            withenv("RUNTESTS_ATTEMPTS" => log) do
+                ts, _ = capture_run() do
+                    @testitem "paste fails, then skips" retries=1 sandbox=true skip=isfile(ENV["RUNTESTS_ATTEMPTS"]) begin
+                        touch(ENV["RUNTESTS_ATTEMPTS"])
+                        @test false
+                    end
+                end
+                @test state_of(ts) === FAILED
+            end
+        end
+    end
+
     @testset "a sandbox that never finishes reports the timeout" begin
         with_activated(DEPS) do _
             ex = :(@testitem "paste overruns" timeout=2 sandbox=true begin

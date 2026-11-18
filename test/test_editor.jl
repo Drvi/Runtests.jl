@@ -237,6 +237,25 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         end
     end
 
+    @testset "an attempt that decides nothing is said as it went, beside the verdict it leaves" begin
+        marker = mktempdir()
+        ran = joinpath(marker, "ran")
+        dir = make_pkg("ServedRetry", "test/a_test.jl" => item("fails, then skips", "touch($(repr(ran)))\n    @test false";
+                                                             opts = "retries=1 skip=isfile($(repr(ran)))"))
+        with_runstate_dir() do _
+            s = open_session(dir)
+            @test next_event(s)["event"] == "hello"
+            send(s, (; id = 1, command = "run", options = (; workers = 1)))
+            seen = events_until(e -> e["event"] == "run_finished", s)
+            ends = [e for e in seen if e["event"] == "item_finished"]
+            @test [(e["attempt"], e["state"], e["verdict"]) for e in ends] == [(1, "failed", "failed"), (2, "skipped", "failed")]
+            # The skip's own facts: no failure of its own.
+            @test isempty(last(ends)["failures"])
+            @test last(seen)["state"] == "failed"
+            close_session(s)
+        end
+    end
+
     @testset "a run asked for while this process runs another is refused, and leaves that one be" begin
         beside = make_pkg("ServedBeside", "test/t_test.jl" => item("takes a while", "sleep(3)\n    @test true"))
         dir = make_pkg("ServedAfter", "test/a_test.jl" => item("passes"))

@@ -328,6 +328,18 @@ end
         finish_run_state!(rsf)
         rs = read_run_state(path)
         @test rs.truncated && rs.statuses[1].state === FAILED && rs.complete && rs.end_unix > 0
+        # A retry's verdict is found among the item's events, beside a worker's events
+        # and an event of no item the file has; one without its own is not.
+        for (events, truncated) in (([(1, FAILED, 1), (1, PASSED, 2)], false), ([(1, FAILED, 1), (1, FAILED, 2)], true),
+                                    ([(99, PASSED, 2), (0, PASSED, 2), (1, PASSED, 2)], false), ([(99, PASSED, 2)], true))
+            path = joinpath(mktempdir(), "run.runstate")
+            rsf = init_run_state(path, p)
+            write_status!(rsf, 1, PASSED, 2, 1; elapsed = 1.0)
+            Runtests.Private.append_event!(rsf, Runtests.Private.EVENT_WORKER_UP, 0, 1, 42, 0.0, 1.0)
+            foreach(((i, state, attempt),) -> attempt_event(rsf, i, state, attempt), events)
+            finish_run_state!(rsf)
+            @test read_run_state(path).truncated == truncated
+        end
     end
 
     @testset "a garbled file never throws" begin
@@ -1293,6 +1305,31 @@ end
             @test failing(pkg) == String[]
         end
     end
+    Sys.which("git") === nothing ||
+    @testset "a working tree is clean when a checkout of its commit gives back the run's code" begin
+        state = Runtests.Private.worktree_state
+        repo = mktempdir()
+        git(args...) = run(pipeline(`git -C $repo $args`; stdout = devnull, stderr = devnull))
+        git("init", "-q")
+        pkg = mkpath(joinpath(repo, "lib", "P"))
+        mkpath(joinpath(pkg, "test"))
+        write(joinpath(pkg, "test", "a_test.jl"), "")
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a")
+        @test state(pkg) == "clean"
+        # Notes and logs nobody added are no code of the run.
+        write(joinpath(pkg, "notes.md"), "")
+        @test state(pkg) == "clean"
+        # A test file nobody added is, as is one elsewhere in the repository that git
+        # tracks and that changed.
+        write(joinpath(pkg, "test", "b_test.jl"), "")
+        @test state(pkg) == "dirty"
+        @test state(mkpath(joinpath(repo, "lib", "Q"))) == "clean"
+        rm(joinpath(pkg, "test", "b_test.jl"))
+        write(joinpath(pkg, "test", "a_test.jl"), "# changed")
+        @test state(mkpath(joinpath(repo, "lib", "Q"))) == "dirty"
+    end
+
     @testset "the commit is read straight out of .git" begin
         sha = "0123456789abcdef0123456789abcdef01234567"
         dir = mktempdir()
@@ -1430,6 +1467,14 @@ end
             # with it, and finds the failure there.
             _, out = capture_run(() -> Runtests.runtestsf(dir; replay = path, dry_run = true))
             @test occursin("1 test item", out) && occursin("\"q\"", out)
+            # The pinned item is renamed since, and the checkout pins it by its new name:
+            # a replay of another item runs, in the order the recording had for those
+            # still here.
+            write(joinpath(dir, "test", "a_test.jl"),
+                  "@testitem \"a\" begin\n    @test true\nend\n@testitem \"b2\" begin\n    @test true\nend\n")
+            write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"b2\"]\n")
+            (replayed, _), _ = capture_run(() -> prepare((dir,); replay = path, name = "a"))
+            @test replayed.items.name == ["a"] && isempty(replayed.cfg.order_first)
         end
     end
 
@@ -1539,7 +1584,7 @@ end
                 @test occursin("replaying ", out)
                 @test prepare((pkg,); replay=recorded, retries=0)[1].cfg.retries == 0   # the call still wins
                 _, out = capture_run(() -> run_states(pkg; replay=recorded, logs=:issues, monitor=false))
-                @test occursin("the environment matches the one the run state was recorded in", out)
+                @test occursin("the test environment matches the one the run state was recorded in", out)
                 draws = [read(f, String) for f in readdir(jdir; join=true)]
                 @test length(draws) == 2 && draws[1] == draws[2]
             end
@@ -1734,17 +1779,61 @@ end
         @test occursin("stopped without saying how the run ended", sprint(show, MIME"text/plain"(), rs))
     end
 
-    @testset "the ending is written at once, and the first one said is kept" begin
+    @testset "the ending is written at once, the first one said is kept, and the end comes at the close" begin
         p = a_plan()
         path = joinpath(mktempdir(), "run.runstate")
         rsf = init_run_state(path, p)
         P.mark_ending!(rsf, P.ENDING_FAILFAST)
-        # Readable while the run winds down, with when it ended.
+        # Readable while the run winds down: how it ended, but not yet when, and still
+        # live, since its other workers can write for a while yet.
         rs = read_run_state(path)
-        @test rs.ending === P.ENDING_FAILFAST && rs.end_unix >= rs.start_unix > 0
+        @test rs.ending === P.ENDING_FAILFAST && rs.complete && !rs.closed && rs.end_unix == 0
+        @test P.is_live(rs)
+        stopped = time()
+        sleep(0.2)
+        P.append_event!(rsf, P.EVENT_ATTEMPT, UInt8(PASSED), 1, 0, 0.0, 1.0; item = 1, attempt = 1)
         finish_run_state!(rsf, P.ENDING_INTERRUPTED)
-        @test read_run_state(path).ending === P.ENDING_FAILFAST
-        @test occursin("stopped after a failure (failfast)", sprint(show, MIME"text/plain"(), read_run_state(path)))
+        rs = read_run_state(path)
+        @test rs.ending === P.ENDING_FAILFAST && rs.closed && !P.is_live(rs)
+        # Its end is after the last event, not when the ending was said.
+        @test rs.end_unix > stopped + 0.1
+        @test occursin("stopped after a failure (failfast)", sprint(show, MIME"text/plain"(), rs))
+    end
+
+    @testset "a run stopped by failfast is live until its last item is done, and ends after it" begin
+        marker = joinpath(mktempdir(), "slow_started")
+        dir = make_pkg("FailfastLive", "test/t_test.jl" => """
+            @testitem "fails" begin
+                while !isfile($(repr(marker)))
+                    sleep(0.05)
+                end
+                @test false
+            end
+            @testitem "slow" begin
+                touch($(repr(marker)))
+                sleep(3)
+                @test true
+            end
+            """)
+        with_runstate_dir() do _
+            seen = Ref{Any}(nothing)
+            # As the slow item ends, after failfast stopped the run: read as a pruner would.
+            on_event(ev) = ev.kind === :finished && ev.name == "slow" &&
+                (seen[] = read_run_state(joinpath(dirname(ev.events_dir), "run.runstate")); nothing)
+            capture_run() do
+                exclusively() do
+                    p, target = prepare((dir,); workers = 2, failfast = true, logs = :issues, monitor = false)
+                    run = execute(p, target; on_event)
+                    rm(run.scratch; force = true, recursive = true)
+                end
+            end
+            rs = seen[]
+            @test rs !== nothing && rs.ending === Runtests.Private.ENDING_FAILFAST
+            @test !rs.closed && Runtests.Private.is_live(rs)
+            final = read_run_state(rs.path)
+            @test final.closed && !Runtests.Private.is_live(final)
+            @test final.end_unix - final.start_unix >= maximum(e -> e.t1, final.events)
+        end
     end
 
     @testset "a run records how it ended" begin

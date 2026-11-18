@@ -313,13 +313,16 @@ struct Statuses
     rss_mb::Vector{Float32}
     # While a retry runs, the verdict of the latest attempt that decided one (`Decided`).
     decided::Vector{Any}
+    # The latest attempt whose outcome is recorded, 0 for none: a skip after a failure
+    # leaves `attempt` at the failure's, and is recorded all the same.
+    recorded::Vector{Int8}
 end
 
 Statuses(n::Integer) = Statuses(
     falses(n), falses(n), fill(UNSEEN, n), zeros(Float32, n), zeros(Int8, n), fill(SlotIdx(0), n),
     zeros(Int32, n), zeros(Int16, n), zeros(Float32, n), zeros(Float32, n),
     Vector{Any}(nothing, n), zeros(UInt8, n), zeros(Float32, n), zeros(Float32, n), zeros(Float32, n),
-    Vector{Any}(nothing, n)
+    Vector{Any}(nothing, n), zeros(Int8, n)
 )
 
 # A verdict an attempt decided: passed, failed, errored, timed out or broken. A skip or
@@ -491,7 +494,10 @@ function in_default_pool(f)
             caught = e
         end
     end
-    return fetch_result(t)
+    # What it threw, alone, as a run in this task would throw it: thrown while the
+    # `TaskFailedException` is handled, Julia would print both.
+    istaskfailed(t) && throw(t.result)
+    return fetch(t)
 end
 
 function execute_here(p::Plan, target, on_event)
@@ -600,10 +606,12 @@ function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
     end
 end
 
-# The project each profile of package `k` starts its workers in, by profile name, for
-# the package's run state to keep a snapshot of.
-worker_projects(run::Run, k::Integer) = Dict{Symbol, String}(
-    run.plan.profiles[j].name => worker_project(run, j) for j in eachindex(run.plan.profiles) if run.plan.profile_package[j] == k)
+# The project each profile of package `k` starts its workers in, in the order of the
+# package's plan (`package_plan`), for the package's run state to keep a snapshot of.
+# Empty for an environment the run skips, which starts no worker.
+worker_projects(run::Run, k::Integer) = String[
+    skips_environment(run.plan, j) ? "" : worker_project(run, j)
+    for j in eachindex(run.plan.profiles) if run.plan.profile_package[j] == k]
 
 # Why a run stopped before it opened its run state, as `setup-<run>.log` in
 # `RUNTESTS_ARTIFACT_DIR`, where its directory would have been copied. A run that
@@ -905,8 +913,14 @@ function check_replayed_environment(run::Run)
     end
     # Its path is the recording machine's, and its source may differ under the same one.
     isempty(by_path) || say(run, "tracked by path, so not compared with the recorded run: ", join(by_path, ", "))
-    isempty(diffs) && return say(run, "the environment matches the one the run state was recorded in")
-    @warn "Runtests: the environment differs from the one the run state was recorded in:\n" *
+    # The test environment's manifest is what the run state compares by. A profile with
+    # a project of its own, as one of an environment directory has, has a snapshot of
+    # its own in the run state, which this does not compare.
+    own = length(run.profile_projects)
+    own == 0 || say(run, "not compared with the recorded run: the environments of ", plural(own, "profile"),
+                    " with a project of their own")
+    isempty(diffs) && return say(run, "the test environment matches the one the run state was recorded in")
+    @warn "Runtests: the test environment differs from the one the run state was recorded in:\n" *
         join(("  " * d for d in first(diffs, 40)), "\n") * (length(diffs) > 40 ? "\n  …" : "")
     return nothing
 end
@@ -947,7 +961,7 @@ code_text(c) = c === nothing ? "absent" :
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
 function open_runstate(p::Plan, start::Float64; worktree::AbstractString = "unknown",
-                       worker_projects::AbstractDict{Symbol, String} = Dict{Symbol, String}())
+                       worker_projects::Vector{String} = String[])
     path = nothing
     try
         path = new_runstate_path(p.root)
@@ -1777,24 +1791,30 @@ function check_finished(run::Run)
 end
 
 """
-    record_stopped_item!(run, slot)
+    record_stopped_item!(run, slot; observe = true)
 
 Record the item this slot was running when the run was stopped: it neither failed
-nor finished, and is counted with the items the run never reached.
+nor finished, and is counted with the items the run never reached. With `observe =
+false`, from the exit hook, the outcome goes to the statuses and the run state only,
+and not to the report, an editor or `on_event`, whose locks a task the exit froze may
+hold.
 """
-function record_stopped_item!(run::Run, slot::Slot)
+function record_stopped_item!(run::Run, slot::Slot; observe::Bool = true)
     i = @atomic slot.current
     i == ItemIdx(0) && return nothing
     attempt = max(@atomic(slot.attempt), Int8(1))
     # The slot may have recorded this attempt already, on its way out of a dispatch
     # that failed for a reason of its own; an earlier attempt's outcome is no reason
     # to leave this one unrecorded.
-    st = run.statuses
-    if !(st.state[i] !== UNSEEN && st.attempt[i] >= attempt)
-        if @atomic run.stalled
-            record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
+    if run.statuses.recorded[i] < attempt
+        state, note = (@atomic run.stalled) ? (TIMEDOUT, STALLED_NOTE) : (CANCELLED, "the run was stopped")
+        if observe
+            record_error!(run, i, slot, attempt, state, note)
         else
-            record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+            ended = time()
+            kept, _, _ = persist_attempt!(run, i, slot.id, attempt, state, error_testset(run, i, note, ended),
+                                          RuntestsWorkers.PerfStats(), true; ended)
+            kept === nothing || restore_decided!(run, i, kept)
         end
     end
     @atomic slot.current = ItemIdx(0)
@@ -2272,8 +2292,11 @@ function report_unfinished_run()
     run = @atomicswap LIVE_RUN.run = nothing
     run === nothing && return nothing
     # The run's tasks, on a thread other than this one, would go on while this closes
-    # the run, and record and say again what this records and says.
+    # the run, and record and say again what this records and says. A task that runs
+    # on there for longer than the hold waits leaves them running: then the items in
+    # flight stay `running` in the run state, which its ending explains.
     hold = RuntestsWorkers.hold_thread(run.thread)
+    held = hold === nothing || hold[] == 1
     try
         # First, before anything here can let a slot run: one that found its worker
         # dead would report a death nothing explains, and blame the OOM killer.
@@ -2293,8 +2316,10 @@ function report_unfinished_run()
         # event loop, or on its lock held by a task the exit froze.
         @atomic run.on_event = nothing
         # Nothing unwound, so the slots never recorded what they were holding.
-        # They are frozen where they were, and each still names its item.
-        foreach(slot -> record_stopped_item!(run, slot), run.slots)
+        # They are frozen where they were, and each still names its item. Only the
+        # run state is told: the report, an editor and `on_event` each take a lock
+        # that a frozen task may hold.
+        held && foreach(slot -> record_stopped_item!(run, slot; observe = false), run.slots)
         finish_run_state!(run.runstate, ENDING_EXITED; exiting = true)
         export_run!(run)
         if trylock(run.printer)
@@ -2379,12 +2404,19 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
     for attempt in 1:max_attempts
         broken = run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
         note_attempt!(run, slot, u)
+        # Every item that ran passed, and its worker was lost in a `test_end`: the rest
+        # of a chain lost the state it relied on. Another attempt would run again what
+        # passed, so the unit ends here.
+        settled = broken && !has_non_pass(run, u)
+        settled && mark_remaining_broken!(run, u, Int8(attempt))
         has_non_pass(run, u) || return nothing
-        # An item that this attempt skipped or cancelled holds an earlier attempt's
-        # verdict (`record!`): another attempt would decide no more, so this is the last.
-        # One this attempt did not reach, a chain cut short, holds no verdict at all.
+        # Another attempt only for an item that failed in this one. An item this attempt
+        # skipped or cancelled holds an earlier attempt's verdict (`record!`), which
+        # another attempt would not change.
         st = run.statuses
-        if attempt == max_attempts || any(i -> is_decisive(st.state[i]) && st.attempt[i] < attempt, p.units.span[u])
+        failed_now = any(i -> is_decisive(st.state[i]) && is_non_pass(st.state[i]) && st.attempt[i] == attempt,
+                         p.units.span[u])
+        if settled || attempt == max_attempts || !failed_now
             # Out of attempts. A chain cut short by a dead worker has lost the state
             # its remaining items relied on, so they are recorded as broken.
             broken && mark_remaining_broken!(run, u, Int8(attempt))
@@ -2449,20 +2481,21 @@ function reset_unit!(run::Run, u::UnitIdx)
 end
 
 # An attempt that decided nothing after one that did: the item takes back that
-# attempt's verdict, in this process and in its status row.
+# attempt's verdict in this process. Its status row holds it already (`write_decided_row`).
 function restore_decided!(run::Run, i::ItemIdx, d::Decided)
     st = run.statuses
     set_state!(run, i, d.state)
     st.attempt[i], st.slot[i], st.synthetic[i], st.artifacts[i] = d.attempt, d.slot, d.synthetic, d.artifacts
     st.pid[i], st.seq[i], st.start[i], st.elapsed[i], st.compile[i] = d.pid, d.seq, d.start, d.elapsed, d.compile
     st.recompile[i], st.alloc_mb[i], st.rss_mb[i], st.testsets[i] = d.recompile, d.alloc_mb, d.rss_mb, d.testset
-    write_status!(
-        run.runstate, i, d.state, d.attempt, d.slot;
-        start_off = d.start, elapsed = d.elapsed, compile = d.compile, recompile = d.recompile,
-        alloc_mb = d.alloc_mb, peak_rss_mb = d.rss_mb, pid = d.pid
-    )
     return nothing
 end
+
+write_decided_row(run::Run, i::ItemIdx, d::Decided) = write_status!(
+    run.runstate, i, d.state, d.attempt, d.slot;
+    start_off = d.start, elapsed = d.elapsed, compile = d.compile, recompile = d.recompile,
+    alloc_mb = d.alloc_mb, peak_rss_mb = d.rss_mb, pid = d.pid
+)
 
 # Every write of an item's state goes through here, so that `run.nonpass`, which
 # the status line reads from other threads, is always the count of the states.
@@ -2488,12 +2521,27 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
     exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
     for i in p.units.span[u]
         # Every item is unseen when the loop reaches it: `reset_unit!` puts them
-        # back before each retry.
-        is_cancelled(run.queues) && (set_state!(run, i, CANCELLED); continue)
+        # back before each retry. One a stopped run does not reach keeps the verdict
+        # of an earlier attempt, which its status row still holds.
+        if is_cancelled(run.queues)
+            d = run.statuses.decided[i]
+            run.statuses.decided[i] = nothing
+            d === nothing ? set_state!(run, i, CANCELLED) : restore_decided!(run, i, d::Decided)
+            continue
+        end
         attempt_item!(run, slot, i, target, attempt, max_attempts) || return true
     end
     exclusive && stop_worker!(run, slot)
     return false
+end
+
+# The slot holds the item from before anything is told the attempt began until its
+# outcome is recorded: a stop that unwinds through it, or an exit while `on_event` is
+# told, leaves the item for `record_stopped_item!`.
+function hold_item!(slot::Slot, i::ItemIdx, attempt::Int8)
+    @atomic slot.attempt = attempt
+    @atomic slot.current = i
+    return nothing
 end
 
 # When and in which process an attempt began, marked running before it is sent:
@@ -2520,15 +2568,16 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     catch e
         is_interrupt(e) && rethrow()
         run.statuses.seq[i] = 0
+        hold_item!(slot, i, attempt)
         began!(run, i, slot.id, attempt, 0)
         record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
+        @atomic slot.current = ItemIdx(0)
         return false
     end
     spec = item_spec(run, i, slot, attempt)
     run.statuses.seq[i] = Int16(min(slot.worker_items + 1, typemax(Int16)))
+    hold_item!(slot, i, attempt)
     began!(run, i, slot.id, attempt, w.pid)
-    @atomic slot.attempt = attempt
-    @atomic slot.current = i
     result = try
         dispatch(run, w, spec, item_timeout(p, i))
     catch e
@@ -2543,9 +2592,11 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     end
     slot.worker_items += 1
     # The body's verdict is the item's, recorded before the profile's `test_end` runs on
-    # the same worker. The slot still holds the item, whose output the hook's joins.
-    record_result!(run, i, slot, attempt, result, max_attempts)
+    # the same worker. The slot still holds the item, whose output the hook's joins, and
+    # the attempt is reported with that output.
+    recorded = persist_result!(run, i, slot, attempt, result, max_attempts)
     survived = run_test_end!(run, slot, i, attempt, spec, result, w)
+    observe_attempt!(run, recorded)
     @atomic slot.current = ItemIdx(0)
     if !survived
         # The hook took the worker: no producer can run, and what the attempt wrote goes
@@ -2579,11 +2630,8 @@ end
 # nothing times out, and no worker to lose, so the unit always goes on.
 function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_attempts::Int)
     spec = item_spec(run, i, slot, attempt)
+    hold_item!(slot, i, attempt)
     began!(run, i, slot.id, attempt, getpid())
-    # The slot holds the item until its outcome is recorded: a stop that unwinds through
-    # it leaves the item for `record_stopped_item!`.
-    @atomic slot.attempt = attempt
-    @atomic slot.current = i
     printline(run, item_line(run, nothing, i, attempt, nothing))
     res = try
         r = run_item(spec)
@@ -2601,9 +2649,11 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
         @atomic slot.current = ItemIdx(0)
         return true
     end
-    # The body's verdict is the item's, recorded before the profile's `test_end` runs.
-    record_result!(run, i, slot, attempt, res, max_attempts)
+    # The body's verdict is the item's, recorded before the profile's `test_end` runs, and
+    # reported with what the hook printed.
+    recorded = persist_result!(run, i, slot, attempt, res, max_attempts)
     run_test_end!(run, slot, i, attempt, spec, res, nothing)
+    observe_attempt!(run, recorded)
     @atomic slot.current = ItemIdx(0)
     finish_attempt!(run, slot, i, attempt, res, nothing)
     return true
@@ -2866,14 +2916,6 @@ function retry_note(attempt::Integer, max_attempts::Integer, cancelled::Bool, ne
     return string("no retries left (", retries, " of ", retries, " used)")
 end
 
-"""
-    record!(run, i, slot, attempt, state, testset, stats, synthetic, note)
-
-Everything that follows from one attempt's outcome, in one place: the item's
-status in memory and on disk, the count of finished items, and the item's report.
-`synthetic` says the run decided the outcome rather than the item — a timeout, a
-dead worker, a chain cut short — and `testset` then holds a single error saying so.
-"""
 # Why attempt `attempt` at item `i` was skipped, in its log: the run's `note`, as for an
 # environment the run skips, or else the item's own `skip`.
 function note_skip(run::Run, i::ItemIdx, attempt::Int8, note::AbstractString)
@@ -2888,10 +2930,61 @@ function note_skip(run::Run, i::ItemIdx, attempt::Int8, note::AbstractString)
     return nothing
 end
 
+"""
+    record!(run, i, slot, attempt, state, testset, stats, synthetic, note)
+
+Everything that follows from one attempt's outcome, in one place: the item's
+status in memory and on disk, the count of finished items, and the item's report.
+`synthetic` says the run decided the outcome rather than the item — a timeout, a
+dead worker, a chain cut short — and `testset` then holds a single error saying so.
+The run state has the outcome before anything is told of it (`persist_attempt!`): the
+report, an editor and `on_event` can each stop the run.
+"""
 function record!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
         testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool,
         note::AbstractString; ended::Float64 = time(), artifacts::UInt8 = 0x00
+    )
+    kept, elapsed, n = persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic; ended, artifacts)
+    observe_attempt!(run, (; i, slot, attempt, state, stats, synthetic, note, ended, elapsed, n, kept))
+    return nothing
+end
+
+# Everything that is told of an attempt once it is recorded: the report, the attempt's
+# log for a skip, `on_event` and an editor, from the statuses, which hold the attempt
+# until the item takes back an earlier verdict.
+function observe_attempt!(run::Run, o)
+    (; i, slot, attempt, state, stats, synthetic, note, ended, elapsed, n, kept) = o
+    try
+        report_item!(run, i, state, n, note)
+        # After the item's report, which shows its log: the reason is for whoever reads
+        # the run's directory later, and a skip has no block to show it in.
+        state === SKIPPED && note_skip(run, i, attempt, note)
+        tell_on_event(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
+        # An editor shows the item's verdict, which is this attempt's unless it decided nothing.
+        run.events === nothing ||
+            event_item_finished(run, i, state, attempt, slot, note; verdict = kept === nothing ? state : kept.state)
+    finally
+        kept === nothing || restore_decided!(run, i, kept::Decided)
+    end
+    return nothing
+end
+
+"""
+    persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic; ended, artifacts)
+        -> (kept, elapsed, n)
+
+An attempt's outcome in the statuses and in the run state: its status row and its
+attempt event. A skip or a cancel after an attempt that decided the item leaves it
+that verdict, `kept`: its row holds that verdict from here, and the statuses hold
+this attempt until the caller takes the verdict back (`restore_decided!`). `elapsed`
+is the attempt's time, and `n` how many items are finished. Takes no lock that
+reporting does, so the exit hook can use it.
+"""
+function persist_attempt!(
+        run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
+        testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool;
+        ended::Float64 = time(), artifacts::UInt8 = 0x00
     )
     (state === UNSEEN || state === RUNNING) && error("Runtests internal error: item $i recorded as $state")
     st = run.statuses
@@ -2899,6 +2992,7 @@ function record!(
     st.synthetic[i] = synthetic
     st.artifacts[i] = artifacts
     st.attempt[i] = attempt
+    st.recorded[i] = attempt
     st.slot[i] = slot
     # An outcome the item reported took what the item measured; one the run decided
     # took as long as the item held its worker.
@@ -2912,28 +3006,22 @@ function record!(
     # What the run prints of a failure, kept beside the item's output for whoever
     # reads the run state later; a cancel or a skip has nothing of its own to say.
     is_non_pass(state) && state !== CANCELLED && write_failure_report(run, i, attempt, testset)
-    # A skip or a cancel after an attempt that decided the item leaves it that verdict:
-    # this attempt still has its event, its line and its callback.
     kept = is_decisive(state) ? nothing : st.decided[i]
     st.decided[i] = nothing
-    kept === nothing && write_status!(
-        run.runstate, i, state, attempt, slot;
-        start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],
-        recompile = st.recompile[i], alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i], pid = st.pid[i]
-    )
+    if kept === nothing
+        write_status!(
+            run.runstate, i, state, attempt, slot;
+            start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],
+            recompile = st.recompile[i], alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i], pid = st.pid[i]
+        )
+    else
+        write_decided_row(run, i, kept::Decided)
+    end
     append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0;
                   item = i, attempt, seq = st.seq[i], compile = st.compile[i], recompile = st.recompile[i],
                   alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i])
     @atomic run.last_finish = time()
-    report_item!(run, i, state, count_done!(run, i), note)
-    # After the item's report, which shows its log: the reason is for whoever reads the
-    # run's directory later, and a skip has no block to show it in.
-    state === SKIPPED && note_skip(run, i, attempt, note)
-    tell_on_event(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
-    kept === nothing || restore_decided!(run, i, kept::Decided)
-    # An editor shows the item's verdict, which is this attempt's unless it decided nothing.
-    run.events === nothing || event_item_finished(run, i, st.state[i], st.attempt[i], slot, note)
-    return nothing
+    return kept, elapsed, count_done!(run, i)
 end
 
 """
@@ -3026,7 +3114,10 @@ function tell_on_event(
     return nothing
 end
 
-function record_result!(
+# The body's outcome, in the statuses and the run state, as soon as the body ended. What
+# is told of it (`observe_attempt!`) waits for the profile's `test_end`, which writes to
+# the attempt's log as well.
+function persist_result!(
         run::Run, i::ItemIdx, slot::Slot, attempt::Int8, res::ItemResult,
         max_attempts::Int = 1
     )
@@ -3034,8 +3125,10 @@ function record_result!(
     # retries configured explains itself.
     note = (is_non_pass(res.state) && max_attempts > 1) ?
         retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, run.plan.items.unit[i])) : ""
-    record!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false, note; artifacts = res.artifacts)
-    return nothing
+    ended = time()
+    kept, elapsed, n = persist_attempt!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false;
+                                        ended, artifacts = res.artifacts)
+    return (; i, slot = slot.id, attempt, state = res.state, stats = res.stats, synthetic = false, note, ended, elapsed, n, kept)
 end
 
 # Where a unit's next attempt runs after one that failed with its process intact: a

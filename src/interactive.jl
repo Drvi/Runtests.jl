@@ -330,6 +330,9 @@ function run_sandboxed(item::RawItem, target)
     # place for their evidence.
     seed = rand(RandomDevice(), UInt64)
     prefix = interactive_artifacts_prefix()
+    # The latest attempt that decided the item: a skip after it leaves the item its
+    # verdict, as in a run.
+    decided = nothing
     for attempt in 1:attempts
         w = sandbox_worker(prof, target, relay)
         try
@@ -343,6 +346,7 @@ function run_sandboxed(item::RawItem, target)
                 timeout === nothing ? fetch(fut) :
                 fetch_within(fut, timeout, TimeoutException(timeout, "test item", item.name, "its own timeout=$timeout"))
             )::ItemResult
+            is_decisive(result.state) && (decided = result)
             # The body's verdict is the item's, as in a run: the profile's `test_end` runs
             # after it, and what goes wrong there is said.
             if session_test_end(w, spec, prof, limits.test_end_timeout_s, result)
@@ -369,7 +373,7 @@ function run_sandboxed(item::RawItem, target)
         end
     end
     # Every attempt sets it or throws, and the last one never goes round again.
-    result = result::ItemResult
+    result = something(decided, result)::ItemResult
     # In a run the coordinator prints results; here this process is the coordinator.
     print_interactive_result(result)
     return result

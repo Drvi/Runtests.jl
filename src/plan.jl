@@ -283,6 +283,13 @@ function validate_order(raw, packages::Packages)
     for k in eachindex(packages.name)
         cfg = packages.cfg[k]
         names = union!(Set(packages.suite_names[k]), (it.name for it in raw if it.package == k))
+        # A replay hands its items out in the order the recording did, which can name
+        # items renamed or deleted since: the replay says which, and the order applies
+        # to those still here. The checkout's own `[order]` does not apply to it.
+        if !isempty(cfg.replayed_from)
+            filter!(in(names), cfg.order_first)
+            filter!(in(names), cfg.order_last)
+        end
         missing_ = String[]
         for n in Iterators.flatten((cfg.order_first, cfg.order_last))
             n in names || push!(missing_, n)

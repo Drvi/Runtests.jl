@@ -25,8 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         # 1.11 is the lowest version [compat] claims; 1.12 is where most of the
-        # version checks in the code switch over; '1' is the current stable.
-        version: ['1.11', '1.12', '1']
+        # version checks in the code switch over; '1' is the current stable; 'pre'
+        # is the newest prerelease.
+        version: ['1.11', '1.12', '1', 'pre']
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest

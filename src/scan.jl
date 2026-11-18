@@ -173,7 +173,7 @@ function check_skip_environment(names::Vector{String}, known::Vector{String}, ro
                                    "in another case. Give the name as the directory has it"))
     end
     elsewhere(n) = "test" in split(dirname(n), '/') && exists_exactly(root, split(n, '/')...) &&
-        project_file_in(joinpath(root, n)) !== nothing
+        project_file(joinpath(root, n)) !== nothing
     unknown = String[n for n in names if !(n in known) && !elsewhere(n)]
     isempty(unknown) && return nothing
     throw(err(string(
@@ -196,7 +196,7 @@ function environment_of(path::AbstractString, testdir::AbstractString)
     dir = dirname(path)
     (startswith(dir, joinpath(testdir, "")) && suite_reads(testdir, dir)) || return ""
     while dir != testdir
-        project_file_in(dir) === nothing || return dir
+        project_file(dir) === nothing || return dir
         dir = dirname(dir)
     end
     return ""
@@ -234,7 +234,7 @@ files run in it as in any environment.
 """
 packages_among(environments::Vector{String}) =
     Pair{String, String}[dir => name for dir in environments
-                         for name in (project_name_of(something(project_file_in(dir), "")),) if name isa String]
+                         for name in (project_name_of(something(project_file(dir), "")),) if name isa String]
 
 # `Pkg.test` runs this one, so it belongs at the top of `test/` and nowhere else.
 const RUNTESTS_FILE = "runtests.jl"

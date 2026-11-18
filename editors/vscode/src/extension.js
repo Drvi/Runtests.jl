@@ -58,12 +58,15 @@ function activate(context) {
         await Promise.all([...suites.values()].map(s => s.refresh()));
     };
 
+    // The requests of `runtests.runFailed`: each item runs as `runtestsf` runs it, with
+    // the seed it failed with, which the server reads from the same record it lists.
+    const failingRequests = new WeakSet();
     const runProfile = ctrl.createRunProfile('Run', vscode.TestRunProfileKind.Run, async (request, token) => {
         const run = ctrl.createTestRun(request);
         try {
             for (const suite of suites.values()) {
                 if (token.isCancellationRequested) break;
-                await suite.run(request, run, token);
+                await suite.run(request, run, token, failingRequests.has(request));
             }
         } finally {
             run.end();
@@ -86,8 +89,10 @@ function activate(context) {
                 return;
             }
             const source = new vscode.CancellationTokenSource();
+            const request = new vscode.TestRunRequest(items, undefined, runProfile);
+            failingRequests.add(request);
             try {
-                await runProfile.runHandler(new vscode.TestRunRequest(items, undefined, runProfile), source.token);
+                await runProfile.runHandler(request, source.token);
             } finally {
                 source.dispose();
             }
@@ -304,7 +309,7 @@ class Suite {
         return model.selectedKeys(include, exclude, this.under, this.all ?? []);
     }
 
-    async run(request, run, token) {
+    async run(request, run, token, failing = false) {
         if (!this.all) await this.refresh();
         const keys = this.keysFor(request);
         if (keys === undefined || (keys !== null && keys.length === 0)) return;
@@ -320,13 +325,13 @@ class Suite {
                 for (const t of targets) run.skipped(t);
                 return;
             }
-            await this.runOnServer(keys, run, token, targets);
+            await this.runOnServer(keys, run, token, targets, failing);
         } finally {
             done();
         }
     }
 
-    async runOnServer(keys, run, token, targets) {
+    async runOnServer(keys, run, token, targets, failing = false) {
         const server = this.ensureServer();
         const options = vscode.workspace.getConfiguration('runtests', this.folder).get('run.options') ?? {};
         // Stopped from wherever it was started, and from the run's own Stop.
@@ -336,7 +341,7 @@ class Suite {
         let unknownSeen = false;
         const settled = new Set();
         try {
-            const end = await server.run(keys, options, ev => {
+            const end = await server.run(keys, options, failing, ev => {
                 const item = ev.name !== undefined ? this.byKey.get(model.itemKey(ev)) : undefined;
                 if (ev.event === 'run_started') {
                     for (const k of ev.unknown) {

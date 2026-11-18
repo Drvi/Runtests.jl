@@ -339,6 +339,11 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
         return nothing
     end
     item_keys = keys_ === nothing ? nothing : Tuple{String, String}[(k["package"], k["name"]) for k in keys_]
+    failing = get(cmd, "failing", false)
+    if !(failing isa Bool)
+        emit_error(s.stream, "`failing` is `true` or `false`, got $(json(failing))"; id)
+        return nothing
+    end
     options = get(Dict{String, Any}, cmd, "options")
     if !(options isa Dict{String, Any})
         emit_error(s.stream, "`options` is an object, got $(json(options))"; id)
@@ -363,8 +368,8 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
     # From here the process is the run's, released by its task when it ends.
     started = false
     try
-        p, target, unknown = s.combined ? prepare_for_editor_mono(s, item_keys, kwargs) :
-            prepare_for_editor(s, names, item_keys, kwargs)
+        p, target, unknown = s.combined ? prepare_for_editor_mono(s, item_keys, kwargs; failing) :
+            prepare_for_editor(s, names, item_keys, kwargs; failing)
         emit(s.stream, "run_started"; id, items = [item_key(p.packages.name[p.items.package[i]], p.items.name[i]) for i in 1:nitems(p)],
              workers = single_process(p) ? 0 : nslots(p), seed = seed_text(p.cfg.seed),
              unknown = [item_key(pkg, n) for (pkg, n) in unknown])
@@ -380,12 +385,25 @@ end
 
 # The plan of a run of the one package served: its items of `names`, and of the keys
 # of `item_keys` that are its own. The keys asked for that it has no item of are
-# returned as unknown.
-function prepare_for_editor(s::Session, names, item_keys, kwargs)
+# returned as unknown. With `failing`, only those of them that are failing run, each
+# with the seed it failed with unless the run is given one, as `runtestsf` runs them:
+# the names and their seeds come from one reading of the run states.
+function prepare_for_editor(s::Session, names, item_keys, kwargs; failing::Bool = false)
     package = something(project_name_of(joinpath(s.root, "Project.toml")), "")
     wanted = names === nothing && item_keys === nothing ? nothing :
         Set{String}([something(names, String[]); [n for (pkg, n) in something(item_keys, Tuple{String, String}[]) if pkg == package]])
-    p, target = prepare((s.root,); name = wanted, announce = false, allow_unknown_names = true, s.config, kwargs...)
+    if failing
+        facts = failing_facts(s.root)
+        chosen = Set{String}(n for n in keys(facts) if wanted === nothing || n in wanted)
+        isempty(chosen) && throw(NoTestsError("no test item asked for is failing"))
+        wanted = FailingItems(chosen, Dict(n => facts[n].seed for n in chosen))
+    end
+    p, target = try
+        prepare((s.root,); name = wanted, announce = false, allow_unknown_names = true, s.config, kwargs...)
+    catch e
+        e isa NothingFailing || rethrow()
+        throw(NoTestsError("no test item asked for is failing"))
+    end
     suite = Set(p.suite_names)
     unknown = Tuple{String, String}[(package, n) for n in something(names, String[]) if !(n in suite)]
     for (pkg, n) in something(item_keys, Tuple{String, String}[])
@@ -395,9 +413,21 @@ function prepare_for_editor(s::Session, names, item_keys, kwargs)
 end
 
 # The plan of a combined run of the workspace served: every package's items, or those
-# of `item_keys`.
-function prepare_for_editor_mono(s::Session, item_keys, kwargs)
-    r = prepare_mono((s.root,); item_keys, announce = false, kwargs...)
+# of `item_keys`. With `failing`, only those of them that are failing, each with the seed
+# it failed with, as in `prepare_for_editor`.
+function prepare_for_editor_mono(s::Session, item_keys, kwargs; failing::Bool = false)
+    seeds = nothing
+    if failing
+        ps = find_participants(s.root)
+        seeds = Dict{Tuple{String, String}, UInt64}()
+        for k in eachindex(ps.name), (n, f) in failing_facts(ps.root[k])
+            key = (ps.name[k], n)
+            (item_keys === nothing || key in item_keys) && (seeds[key] = f.seed)
+        end
+        isempty(seeds) && throw(NoTestsError("no test item asked for is failing"))
+        item_keys = sort!(collect(keys(seeds)))
+    end
+    r = prepare_mono((s.root,); item_keys, item_seeds = seeds, announce = false, kwargs...)
     p = r.plan
     project = something(project_file(p.root), joinpath(p.root, "Project.toml"))
     return p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)), r.unknown

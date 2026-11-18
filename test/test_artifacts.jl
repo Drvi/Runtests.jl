@@ -233,12 +233,14 @@ function check_art_run(states, run, p, out, marks)
         @test art_read(produced("calls what it defined", "later.txt")) == "defined in the item"
         @test art_read(produced("calls what it defined", "shown.txt"; k = 2)) == "Note: kept"
         @test isfile(produced("in a sandbox", "pid.txt"))
-        # A `test_end` that fails is the attempt failing.
-        @test states["fails in test_end"] === FAILED
-        @test isfile(produced("fails in test_end", "after test_end"))
+        # A `test_end` that fails leaves the verdict to the body, which passed: its
+        # producer never runs, and the hook's failure has a line of its own.
+        @test states["fails in test_end"] === PASSED
+        @test !ispath(dir("fails in test_end"))
+        @test occursin(r"HOOK · test_end of profile `default` after \"fails in test_end\" · 1 did not pass: Test Failed", out)
         # Only what opted in has a directory.
-        listed = filter(n -> endswith(n, ".artifacts"), readdir(dirname(run.artifacts_prefix)))
-        @test length(listed) == 12
+        listed = filter(n -> endswith(n, ".artifacts"), readdir(dirname(run.artifacts_prefixes[1])))
+        @test length(listed) == 11
     end
 
     @testset "a producer that fails is reported beside the evidence, and changes no verdict" begin
@@ -252,7 +254,7 @@ function check_art_run(states, run, p, out, marks)
         @test occursin("collected: 3 producers, 2 failed", log)
         @test isfile(produced("producers that fail", "third"; k = 3))
         # Paths in it are the bundle's own, so a copy elsewhere reads the same.
-        @test !occursin(dirname(run.artifacts_prefix), log)
+        @test !occursin(dirname(run.artifacts_prefixes[1]), log)
     end
 
     @testset "registering is for the item's body alone" begin
@@ -276,7 +278,7 @@ function check_art_run(states, run, p, out, marks)
         plain(text) = replace(text, r"\e\[[0-9;]*m" => "")
         @test occursin("artifacts: $(dir("fails an assertion"))", plain(out))
         closing = plain(Runtests.Private.conclusion_text(run))
-        @test occursin("artifacts of 12 failed attempts:", closing)
+        @test occursin("artifacts of 11 failed attempts:", closing)
         @test occursin("\"passes on a retry\" attempt 1: $(dir("passes on a retry"))", closing)
     end
 end

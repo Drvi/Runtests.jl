@@ -571,10 +571,12 @@ with the call's own winning.
 `item_keys`, pairs of a package's name and an item's name, selects those items, as an
 editor asks for them: keys the workspace has no item of are returned in `unknown`
 when at least one key matches; if none matches, the selection is an error.
+`item_seeds` gives items of those keys a seed of their own, the one each failed with,
+unless the call gives `seed`.
 """
 function prepare_mono(paths = (); packages = nothing, name = nothing, tags = nothing, group = nothing,
                       replay = nothing, item_keys::Union{Nothing, Vector{Tuple{String, String}}} = nothing,
-                      announce::Bool = true, expansions::Bool = true, worker_init = nothing, test_end = nothing,
+                      item_seeds::Union{Nothing, Dict{Tuple{String, String}, UInt64}} = nothing, announce::Bool = true, expansions::Bool = true, worker_init = nothing, test_end = nothing,
                       kwargs...)
     haskey(kwargs, :config) && throw(ArgumentError(
         "`config` names a file to read in place of one package's test/TestItems.toml, and a combined run reads " *
@@ -603,13 +605,16 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
         (replayed !== nothing && !called)
     gsel, lacking, group_name = mono_groups([read_groups(path, toml) for (path, toml) in configs],
                                             [path for (path, _) in configs], group, selected)
-    # A replay that the call does not narrow runs what each run state recorded.
-    # A package that no key names is not read.
+    # A replay runs what each run state recorded, narrowed by what the call selects,
+    # as `prepare` narrows it. A package that no key names is not read.
     names_of_package(k) = item_keys !== nothing ? get(wanted, ps.name[k], nothing) :
-        replayed === nothing || called || replayed.records[k] === nothing ? name :
-        Set{String}(it.name for it in replayed.records[k].items)
-    filters = [Filter(; name = names_of_package(k), tags, paths = narrowing[k], line = isempty(narrowing[k]) ? 0 : line,
-                      group = gsel[k]) for k in 1:n]
+        replayed === nothing || replayed.records[k] === nothing || name isa FailingItems ? name :
+        replayed_names((it.name for it in replayed.records[k].items), name)
+    package_names = [names_of_package(k) for k in 1:n]
+    # A replayed package none of whose recorded items the call selects runs nothing.
+    unselected = [names isa AbstractSet && isempty(names) for names in package_names]
+    filters = [Filter(; name = unselected[k] ? nothing : package_names[k], tags, paths = narrowing[k],
+                      line = isempty(narrowing[k]) ? 0 : line, group = gsel[k]) for k in 1:n]
     setups = [setup_modules(joinpath(ps.root[k], "test")) for k in 1:n]
 
     announce && println(stdout, label_prefix(), "reading the test files of ", plural(n, "package"), " under ",
@@ -628,6 +633,9 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             continue
         elseif item_keys !== nothing && !haskey(wanted, ps.name[k])
             reasons[k] = "none of its items was asked for"
+            continue
+        elseif unselected[k]
+            reasons[k] = "none of the items it recorded is selected"
             continue
         elseif lacking[k]
             reasons[k] = "it declares no group `$group_name`"
@@ -665,12 +673,28 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
         ))
     end
     isempty(items) && throw(NoTestsError("no test items matched " * description * name_hint(filters[1].name, all_names)))
-    if name !== nothing
+    if name !== nothing && replayed === nothing
         hint = name_hint(filters[1].name, all_names)
         isempty(hint) || throw(NoTestsError("not every name given is a test item" * hint))
     end
     files_seconds = time() - t_files
 
+    # What a replay's packages recorded and the checkout no longer has, or has changed:
+    # said once for all of them, by package, as `prepare` says it.
+    if replayed !== nothing
+        gone, changed = String[], String[]
+        for k in 1:n
+            rs = replayed.records[k]
+            (rs === nothing || reasons[k] !== nothing) && continue
+            selection = package_names[k]
+            selection isa AbstractSet && append!(gone, string(ps.name[k], " ", repr(m)) for m in sort!(collect(setdiff(selection, suite_names[k]))))
+            append!(changed, string(ps.name[k], " ", repr(m)) for m in changed_since(rs, (it for it in items if it.package == k)))
+        end
+        isempty(gone) || @warn "Runtests: the run states recorded $(plural(length(gone), "test item")) the packages " *
+            "no longer have, renamed or deleted since, which cannot run again: " * listed(gone)
+        isempty(changed) || @warn "Runtests: $(plural(length(changed), "test item")) changed since the replayed run, " *
+            "and run as the checkout has them now: " * listed(changed)
+    end
     # The packages that give items, renumbered in their order.
     kept = [k for k in 1:n if reasons[k] === nothing]
     renumber = zeros(Int32, n); renumber[kept] = 1:length(kept)
@@ -700,6 +724,11 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     # The code a call gives is every package's, and runs in the workspace root, as a
     # shared default's does, so that the packages can share workers.
     foreach(cfg -> call_code!(cfg.profiles, worker_init, test_end; dir = workspace), cfgs)
+    if item_seeds !== nothing && !haskey(kwargs, :seed)
+        for (j, k) in enumerate(kept), ((pkg, n), seed) in item_seeds
+            pkg == ps.name[k] && (cfgs[j].item_seeds[n] = seed)
+        end
+    end
     sub = Participants(workspace, ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], ps.skipped)
     # Of the packages that run: one that gives no item shares no worker and no load path.
     check_setup_names(sub, setups[kept])
@@ -707,11 +736,11 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
                                [c.profiles for c in cfgs], setups[kept])
     isempty(problems) || throw(ScanFailure(problems))
     histories = History[history(ps.root[k]) for k in kept]
-    full = name === nothing && tags === nothing && all(g -> g === nothing, gsel) && isempty(chosen)
+    full = name === nothing && tags === nothing && all(g -> g === nothing, gsel) && isempty(chosen) && item_keys === nothing
     p = plan(items, run_cfg; histories, root = workspace,
              packages = Packages(ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], cfgs,
                                  [sort(suite_names[k]) for k in kept]),
-             strict_order = full, selection = full ? "" : description, suite_names = all_names)
+             selection = full ? "" : description, suite_names = all_names)
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
     skipped = [ps.skipped; [rel_slash(ps.root[k], workspace) => reasons[k] for k in 1:n if reasons[k] !== nothing]]
@@ -726,11 +755,11 @@ end
 # `file.jl:line` among them, 0 for none.
 function mono_paths(paths)
     isempty(paths) && return first(monorepo_workspace(nothing)), String[], Int32(0)
-    abs = String[]; line = Int32(0)
+    abs = String[]; line = Int32(0); line_arg = ""
     for a in paths
         a isa AbstractString || throw(ArgumentError("a combined run takes paths, got $(repr(a))"))
         path, ln = split_line_suffix(String(a))
-        ln == 0 || (line = ln)
+        ln == 0 || (line = ln; line_arg = String(a))
         p = abspath(path)
         ispath(p) || throw(ArgumentError("no such file or directory: $p"))
         push!(abs, p)
@@ -746,6 +775,7 @@ function mono_paths(paths)
     for p in abs
         within(realpath(p), workspace) || throw(ArgumentError("$p is not in the workspace at $workspace"))
     end
+    line == 0 || check_target_line(first_, line, line_arg, workspace)
     # The workspace root itself is all of it.
     any(p -> rstrip_path(realpath(p)) == workspace, abs) && return workspace, String[], line
     return workspace, String[realpath(p) for p in abs], line
@@ -1133,7 +1163,7 @@ function print_worker_groups(io::IO, ps::Participants)
     for members in groups
         names = unique!([m[2] for m in members])
         who(name) = string("`", name, "` of ", and([of(m[1]) for m in members if m[2] === name]))
-        parts = profile_parts(members[1][4], "")
+        parts = profile_parts(members[1][4], "", ps.workspace)
         println(io, "  ", who(names[1]), ": ", isempty(parts) ? "sets nothing" : join(parts, " · "))
         foreach(name -> println(io, "    with ", who(name)), names[2:end])
         any(m -> m[3] !== :own, members) && println(io, "    shared by ", relpath_or_path(root_path, ps.workspace))

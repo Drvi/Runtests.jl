@@ -13,7 +13,7 @@ failures with the output of the items that had them, and the summary. `logs` in
 
 **Run Failed Tests**, in the Test Explorer's toolbar, runs what is failing, as
 `Runtests.runtestsf()` does: every item whose last run, from the editor, the terminal or
-CI, did not pass it. Each item keeps its own verdict, so running one of several
+CI, did not pass it, each with the seed it failed with. Each item keeps its own verdict, so running one of several
 failures leaves the others failing. VS Code's own *Rerun Failed Tests* knows only the
 runs of this window.
 

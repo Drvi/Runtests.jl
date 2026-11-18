@@ -104,7 +104,7 @@ function has_fresh_cache(pkg::Base.PkgId, flags::Base.CacheFlags;
     end
 end
 """
-    freshest_path(pkg, flags; stale_cache, cachepath_cache) -> Union{Nothing, String}
+    freshest_path(pkg, flags; stale_cache, cachepath_cache, found, flag_bytes) -> Union{Nothing, String}
 
 The cache file of `pkg` that a new process with cache flags `flags` loads, in this
 process's environment, or `nothing`. A dependency in `cachepath_cache` must be loaded
@@ -112,12 +112,23 @@ from one of the files it holds for it, as Julia's precompiler holds each depende
 the file it found or built: a cache built against another build of a dependency is not
 fresh, though both files are. `stale_cache` holds the verdicts on single files, for
 checks that build nothing in between. A package whose source cannot be found has none.
+`found` (each package's cache files) and `flag_bytes` (each file's flags) keep what such
+checks read once, as `stale_cache` does.
 """
 function freshest_path(pkg::Base.PkgId, flags::Base.CacheFlags;
                        stale_cache::Dict{Base.StaleCacheKey, Bool} = Dict{Base.StaleCacheKey, Bool}(),
-                       cachepath_cache::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}())
-    # The package's own files from the depot, whatever `cachepath_cache` holds for it.
-    cachepaths = Base.find_all_in_cache_path(pkg)
+                       cachepath_cache::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}(),
+                       found::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}(),
+                       flag_bytes::Dict{String, Int} = Dict{String, Int}())
+    # The package's own files from the depot, whatever `cachepath_cache` holds for it,
+    # built for `flags`: Julia's check rejects a file of other flags only once it has
+    # parsed the whole of its header, most of what a check costs, again for every set
+    # of flags a run asks for.
+    requested = Base._cacheflag_to_uint8(flags)
+    cachepaths = filter(get!(() -> Base.find_all_in_cache_path(pkg), found, pkg)) do path
+        actual = get!(() -> cache_flags_byte(path), flag_bytes, path)
+        actual < 0 || ccall(:jl_match_cache_flags, UInt8, (UInt8, UInt8), requested, UInt8(actual)) != 0
+    end
     isempty(cachepaths) && return nothing
     try
         # 1.13 renamed the function; before, `compilecache_path` takes the same keywords.
@@ -132,6 +143,20 @@ function freshest_path(pkg::Base.PkgId, flags::Base.CacheFlags;
     catch e
         e isa InterruptException && rethrow()
         return nothing
+    end
+end
+
+# The flags a cache file was built for: the byte that follows the header Julia checks
+# first, which is all of the header a file of other flags needs read. -1 for a file that
+# does not say, left for Julia's own check to judge.
+function cache_flags_byte(path::String)
+    try
+        return open(path) do io
+            iszero(Base.isvalid_cache_header(io)) ? -1 : Int(read(io, UInt8))
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        return -1
     end
 end
 

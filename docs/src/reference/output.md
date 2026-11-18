@@ -80,7 +80,7 @@ Each line starts with a mark, the worker and the time. The worker is `w1`, `w2` 
 
 | Mark | Meaning |
 |:-----|:--------|
-| ⚫ | A worker starts (`UP`) or ends (`EXIT`). |
+| ⚫ | A worker starts (`UP`) or ends (`EXIT`), a timeout ends it (`KILL`), it dies (`LOST`), or the `test_end` of a profile did not complete cleanly (`HOOK`). |
 | 🔵 | An item starts (`RUN`). |
 | 🟢 | An item passed. |
 | 🔴 | An item failed, errored or timed out. |
@@ -89,7 +89,7 @@ Each line starts with a mark, the worker and the time. The worker is `w1`, `w2` 
 
 An `UP` line gives the process ID and the threads of the worker. It also says `sandbox` for the process of a sandboxed item, and gives the Julia flags of its profile. When an item of the run uses a profile other than `default`, the line names the profile of every worker. In a combined run, the line names the profile with its package, for example `profile default of B`. There, only the default profile of the first package has no name on the line. That package is the workspace root when the root has tests. When the run uses an environment directory, the line names the environment of the worker.
 
-A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and the most memory that the worker held.
+A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and the most memory that the worker held. The outcome is the result of the body of the item. A `HOOK` line after it names the `test_end` of a profile that failed, errored or timed out, with the item, the attempt and the cause. The details go in the log of the attempt. The outcome of the item does not change.
 
 ### The progress line
 

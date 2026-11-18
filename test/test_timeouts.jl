@@ -114,37 +114,74 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         (states, _, _), out = capture_run() do
             run_states(dir; workers=1, logs=:issues, monitor=false, test_end_timeout=2)
         end
-        @test states["fine on its own"] === TIMEDOUT
-        @test occursin("`test_end` expression", out)
+        # The body passed, and that is the verdict; the hook that hung has a line, and
+        # its worker was ended.
+        @test states["fine on its own"] === PASSED
+        @test occursin(r"KILL · pid \d+ · the `test_end` expression of profile `default`", out)
+        @test occursin(r"HOOK · test_end of profile `default` after \"fine on its own\" · the `test_end` expression", out)
         @test !occursin("test item \"fine on its own\" timed out", out)
     end
 
-    @testset "what a test_end expression finds is the item's result" begin
-        # On a worker and in this process: the two paths run the same two blocks.
+    @testset "the body's verdict is the item's, whatever its test_end does" begin
+        # A body that passes and one that fails, each under a `test_end` that passes, fails
+        # an assertion, throws or outlasts its limit. The verdict is the body's: in memory,
+        # in the run state and for the next `runtestsf`. Retries follow it too, and a hook
+        # in trouble has a line of its own.
+        hooks = ["ok" => "@test true", "asserts" => "@test 1 == 2", "throws" => "error(\"hook broke\")", "hangs" => "sleep(60)"]
+        items = join(("@testitem \"$body, $h\" profile=:$h retries=1 begin\n    @test $(body == "passes")\nend\n"
+                      for (h, _) in hooks for body in ("passes", "fails")))
+        dir = make_pkg("HookMatrix",
+            "test/TestItems.toml" => "[run]\ntest_end_timeout = 2\n" * join(("\n[profiles.$h]\n" for (h, _) in hooks)),
+            "test/t_test.jl" => items,
+            (f for (h, code) in hooks for f in profile_files(h; test_end = code))...)
+        with_runstate_dir() do _
+            (states, run, p), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+            rs = Runtests.Private.read_run_state(run.runstate.path)
+            for (h, _) in hooks, body in ("passes", "fails")
+                name = "$body, $h"
+                i = findfirst(==(name), p.items.name)
+                verdict = body == "passes" ? PASSED : FAILED
+                @test states[name] === verdict && rs.statuses[i].state === verdict
+                # Only a body that failed is tried again.
+                @test run.statuses.attempt[i] == (body == "passes" ? 1 : 2)
+                said = occursin("HOOK · test_end of profile `$h` after \"$name\"", out)
+                @test said == (h != "ok")
+            end
+            @test occursin("· 1 did not pass: Test Failed", out)
+            @test occursin("· 1 did not pass: Error During Test", out)
+            @test Runtests.Private.failing_items(dir) == sort(["fails, $h" for (h, _) in hooks])
+        end
+    end
+
+    @testset "what a test_end expression finds is said, and in the attempt's log" begin
+        # On a worker and in this process: the item's result is its body's alone, and the
+        # hook's failure has a line and a place in the attempt's log.
         for workers in (0, 1)
             dir = make_pkg(
                 "EndFails",
                 "test/t_test.jl" => """@testitem "passes on its own" begin\n    @test true\nend\n""",
                 profile_files(test_end = "@test 1 == 2")...
             )
-            states, run, _ = run_states(dir; workers, logs=:issues, monitor=false)
-            @test states["passes on its own"] === FAILED
-            failures = collect_failures(run.statuses.testsets[1])
-            @test any(r -> occursin("1 == 2", sprint(show, r)), failures)
+            (states, run, _), out = capture_run(() -> run_states(dir; workers, logs=:issues, monitor=false))
+            @test states["passes on its own"] === PASSED
+            @test isempty(collect_failures(run.statuses.testsets[1]))
+            @test occursin("HOOK · test_end of profile `default` after \"passes on its own\" · 1 did not pass", out)
+            @test occursin("1 == 2", read(Runtests.Private.item_log(run, 1, 1), String))
         end
     end
 
-    @testset "what a test_end expression checks counts when it passes too" begin
+    @testset "what a test_end expression checks adds nothing to the item's result" begin
         for workers in (0, 1)
             dir = make_pkg(
                 "EndPasses",
-                "test/t_test.jl" => """@testitem "checked twice" begin\n    @test true\nend\n""",
+                "test/t_test.jl" => """@testitem "checked once" begin\n    @test true\nend\n""",
                 profile_files(test_end = "@test 1 == 1")...
             )
-            states, run, _ = run_states(dir; workers, logs=:issues, monitor=false)
-            @test states["checked twice"] === PASSED
+            (states, run, _), out = capture_run(() -> run_states(dir; workers, logs=:issues, monitor=false))
+            @test states["checked once"] === PASSED
             tc = Test.get_test_counts(run.statuses.testsets[1])
-            @test tc.passes + tc.cumulative_passes == 2
+            @test tc.passes + tc.cumulative_passes == 1
+            @test !occursin("HOOK", out)
         end
     end
 

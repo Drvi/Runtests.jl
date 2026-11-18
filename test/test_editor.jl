@@ -319,6 +319,35 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         end
     end
 
+    @testset "a run of the failing items draws the numbers each failed with, as runtestsf does" begin
+        # Two items fail, each under a seed of its own; `failing` runs them, each with its
+        # seed, and a seed given in `options` is every item's.
+        marks = mktempdir()
+        drawing(name) = item(name, "open(io -> println(io, rand(UInt64)), $(repr(joinpath(marks, name))), \"a\")\n    @test false")
+        dir = make_pkg("ServedFailing", "test/a_test.jl" => string(drawing("a"), drawing("b"), item("c")))
+        with_runstate_dir() do _
+            s = open_session(dir)
+            next_event(s)
+            started(seen) = only(e for e in seen if e["event"] == "run_started")
+            names(e) = sort([k["name"] for k in e["items"]])
+            draws(name) = readlines(joinpath(marks, name))
+            send(s, (; id = 1, command = "run"))
+            events_until(e -> e["event"] == "run_finished", s)
+            send(s, (; id = 2, command = "run", failing = true))
+            @test names(started(events_until(e -> e["event"] == "run_finished", s))) == ["a", "b"]
+            @test draws("a")[2] == draws("a")[1] && draws("b")[2] == draws("b")[1]
+            @test draws("a")[1] != draws("b")[1]
+            send(s, (; id = 3, command = "run", failing = true, options = (; seed = 7)))
+            events_until(e -> e["event"] == "run_finished", s)
+            @test draws("a")[3] != draws("a")[1]
+            # Among the items asked for, none is failing: said, not run.
+            send(s, (; id = 4, command = "run", failing = true, items = [(; package = "ServedFailing", name = "c")]))
+            e = next_event(s)
+            @test e["event"] == "error" && occursin("no test item asked for is failing", e["message"])
+            close_session(s)
+        end
+    end
+
     @testset "a cancel stops the run at once and takes its workers with it" begin
         dir = make_pkg("Cancelled", "test/a_test.jl" => join((item("slow $i", "sleep(600)") for i in 1:3)))
         with_runstate_dir() do _

@@ -68,26 +68,45 @@ end
 print_selection(io::IO, p::Plan) = isempty(p.selection) || println(io, "selection: ", p.selection)
 
 # What a profile sets, each said briefly; `threads` is what a profile that sets none
-# runs with, which is not said.
-function profile_parts(prof::Profile, threads::AbstractString)
+# runs with, which is not said. A preferences file is named from `root`.
+function profile_parts(prof::Profile, threads::AbstractString, root::AbstractString = "")
     parts = String[]
     isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
     (isempty(prof.threads) || prof.threads == threads) || push!(parts, string("threads ", prof.threads))
     isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
+    isempty(prof.preferences) ||
+        push!(parts, string("preferences ", isempty(root) ? prof.preferences : relpath_or_path(prof.preferences, root)))
     isempty(prof.init.args) || push!(parts, "init expression")
     isempty(prof.test_end.args) || push!(parts, "test end expression")
     return parts
 end
 
 # Only profiles that actually change something are worth a line, one each however
-# many environments they run in, and the environment directories the items run in one more.
+# many environments they run in, and the environment directories the items run in one
+# more. In a run of several packages, a name whose settings differ between packages
+# has a line for each settings, with the packages that have them.
 function print_profiles(io::IO, p::Plan)
-    seen = Set{Symbol}()
-    for prof in p.profiles
-        prof.name in seen && continue
-        push!(seen, prof.name)
-        parts = profile_parts(prof, p.profiles[1].threads)
-        isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
+    names = Symbol[]
+    settings = Dict{Symbol, Vector{Pair{Vector{String}, Vector{String}}}}()   # parts => packages
+    for (j, prof) in pairs(p.profiles)
+        haskey(settings, prof.name) || (push!(names, prof.name); settings[prof.name] = [])
+        parts = profile_parts(prof, p.profiles[1].threads, p.root)
+        package = p.packages.name[p.profile_package[j]]
+        same = settings[prof.name]
+        k = findfirst(s -> s.first == parts, same)
+        k === nothing ? push!(same, parts => [package]) : (package in same[k].second || push!(same[k].second, package))
+    end
+    for name in names
+        same = settings[name]
+        if length(same) == 1
+            parts = only(same).first
+            isempty(parts) || println(io, "profile `", name, "`: ", join(parts, " · "))
+            continue
+        end
+        for (parts, packages) in same
+            println(io, "profile `", name, "` of ", join(packages, ", "), ": ",
+                    isempty(parts) ? "nothing of its own" : join(parts, " · "))
+        end
     end
     envs = unique!(String[string(relpath_or_path(prof.environment, p.root), skips_environment(p, j) ? " (skipped)" : "")
                           for (j, prof) in pairs(p.profiles) if !isempty(prof.environment)])
@@ -307,7 +326,7 @@ function print_plan_table(io::IO, p::Plan, order)
     solo = single_process(p)
     rows = [i for (_, _, i) in order.items]
     workers = [string("w", s) for (_, s, _) in order.items]
-    shown, column = item_names(p, name_width(it.name))
+    shown, column = item_names(p, run_name_width(p))
     names = [shown[i] for i in rows]
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
@@ -456,19 +475,20 @@ const NAME_OUTLIER_SHARE = 10
 const NAME_OUTLIER_ALLOWANCE = 2
 # ...but covers a tail that is this close, rather than leave it to overflow.
 const NAME_TAIL_SLACK = 8
-# What the rest of a DONE line takes at its widest.
+# What the rest of a DONE line takes at its widest, for a caller that knows no plan.
 const LINE_RESERVED = 82
 
 """
-    name_width(names; columns = 0) -> Int
+    name_width(names; columns = 0, reserved = LINE_RESERVED) -> Int
 
 One width for the name column for the whole run, so the columns after it stay put:
 the widest name once the allowed outliers are set aside, extended through the
 names above it while each is within `NAME_TAIL_SLACK`. Two thousand ten-character
 names and two of sixty get a ten-wide column and two long lines. `columns` is the
-terminal's width, or `0` when there is none.
+terminal's width, or `0` when there is none, and `reserved` what the rest of the line
+must keep on it (`line_reserved`).
 """
-function name_width(names; columns::Integer = 0)
+function name_width(names; columns::Integer = 0, reserved::Integer = LINE_RESERVED)
     isempty(names) && return MIN_NAME_WIDTH
     widths = sort!([quoted_width(n) for n in names])
     n = length(widths)
@@ -480,9 +500,25 @@ function name_width(names; columns::Integer = 0)
     end
     # The floor is on the budget, not the answer: names all eight wide want an
     # eight-wide column, not a floor's worth of blanks after each.
-    budget = columns > 0 ? clamp(columns - LINE_RESERVED, MIN_NAME_WIDTH, MAX_NAME_WIDTH) : MAX_NAME_WIDTH
+    budget = columns > 0 ? clamp(columns - reserved, MIN_NAME_WIDTH, MAX_NAME_WIDTH) : MAX_NAME_WIDTH
     return min(wanted, budget)
 end
+
+# What a DONE line of plan `p` takes besides its name, up to and with its outcome: the
+# mark, the worker, the time, the word, the count, the package of a run of several,
+# and the outcome. What follows, the time and memory it took, may wrap on a narrow
+# terminal; the item and how it went stay on the line.
+function line_reserved(p::Plan)
+    worker = single_process(p) ? 0 : slot_label_width(nslots(p)) + length(FIELD)
+    count = 2 * ndigits(nitems(p)) + 1 + length(FIELD)
+    package = is_combined(p) ? maximum(textwidth, p.packages.name) + length(FIELD) : 0
+    return 3 + worker + 8 + length(FIELD) + WORKER_STATE_WIDTH + length(FIELD) + count + package +
+           length(FIELD) + STATE_WIDTH
+end
+
+# The name column of plan `p`'s lines, and of its plan as a dry run prints it, for the
+# terminal the run writes to.
+run_name_width(p::Plan) = name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY), reserved = line_reserved(p))
 
 # The wall clock as lines write it, formatted once a second: `strftime` builds a
 # string per call, and there are two lines for every item. Lines come from several
@@ -565,19 +601,20 @@ styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool, size
 # A line the run says about itself.
 say(run, parts...) = printline(run, string(label_prefix(), parts...))
 
-print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
-    print_line_head(io, MARK_WORKER, slot_id, clock_now())
+# A line of a worker's life, `UP`, `EXIT` and the like, under `mark`.
+lifecycle_line(run, mark::AbstractString, id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
+    print_line_head(io, mark, id, clock_now())
     print_word(io, state)
     print(io, text)
 end)
 
+print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) =
+    lifecycle_line(run, MARK_WORKER, slot_id, state, text)
+
 # The same line for a precompile helper: a black square where a test worker's circle
 # sits, so its UP and EXIT lines read as the same lifecycle in another colour.
-print_helper_line(run, id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
-    print_line_head(io, PRECOMPILE_MARK_WORKER, id, clock_now())
-    print_word(io, state)
-    print(io, text)
-end)
+print_helper_line(run, id, state::AbstractString, text::AbstractString) =
+    lifecycle_line(run, PRECOMPILE_MARK_WORKER, id, state, text)
 
 """
     item_line(slot_id, i, total, shown, width, attempt, attempts, how) -> String

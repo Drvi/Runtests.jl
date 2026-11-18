@@ -126,7 +126,7 @@ end)
             write(file, declared("one"))
             p, _ = prepare((dir,); announce = false)
             stopped = record_in(runs, "1000003-1")
-            finish_run_state!(init_run_state(stopped, p); cancelled = true)
+            finish_run_state!(init_run_state(stopped, p), Runtests.Private.ENDING_INTERRUPTED)
             useful = recorded_runs(runs, dir, 3; after = 3)
             # Among the newest twenty they stay, whatever they hold: another branch
             # may have `gone`.

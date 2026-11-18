@@ -345,6 +345,15 @@ end
                 @test occursin("could not build the environment of $(joinpath("test", "qa"))", sprint(showerror, err))
                 @test isempty(runstate_files(bad))
                 @test live_worker_processes() == 0
+                # With somewhere for a job's artifacts, why it stopped is kept there, as no
+                # directory of the run is.
+                artifacts = mktempdir()
+                withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
+                    @test_throws ConfigError capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                end
+                logs = filter(startswith("setup-"), readdir(artifacts))
+                @test length(logs) == 1
+                @test occursin("could not build the environment", read(joinpath(artifacts, only(logs)), String))
             end
         end
 

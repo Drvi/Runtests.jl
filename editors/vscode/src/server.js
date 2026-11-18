@@ -128,11 +128,12 @@ class RuntestsServer extends EventEmitter {
 
     /**
      * Run the items of `keys` (`model.keyOf`; every item when null), handing each of
-     * the run's events to `onEvent` as it comes. Resolves with the event that ends it:
+     * the run's events to `onEvent` as it comes. With `failing`, only the failing ones
+     * run, each with the seed it failed with, as `runtestsf` runs them. Resolves with the event that ends it:
      * `run_finished`, an `error` when the run or the server could not start, or `exit`
      * when the server died.
      */
-    async run(keys, options, onEvent) {
+    async run(keys, options, failing, onEvent) {
         const waiting = { cancelled: false };
         this.waiting = waiting;
         try {
@@ -156,6 +157,7 @@ class RuntestsServer extends EventEmitter {
             });
             const command = { id, command: 'run', options: options ?? {} };
             if (keys !== null) command.items = keys.map(keyObject);
+            if (failing) command.failing = true;
             this.send(command);
             // The server reads commands in order, so it cancels this run as it would
             // one already going, and says what did not run.

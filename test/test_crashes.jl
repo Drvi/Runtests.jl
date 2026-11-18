@@ -103,10 +103,12 @@ end
                     run_states(dir; workers=1, logs=:issues, monitor=false, retries=1)
                 end
             end
-            @test states["the item"] === ERRORED
-            @test run.statuses.attempt[1] == 2
-            @test occursin("`test_end` expression of profile `default` did not complete", out)
-            # The item itself ran and passed both times; it is not blamed for it.
+            # The item ran and passed: that is its verdict, and nothing retries it. The
+            # hook that took its worker has lines of its own.
+            @test states["the item"] === PASSED
+            @test run.statuses.attempt[1] == 1
+            @test occursin("died in the `test_end` after \"the item\"", out)
+            @test occursin(r"HOOK · test_end of profile `default` after \"the item\" · the worker died", out)
             @test !occursin("the worker running this item died", out)
         end
     end
@@ -125,9 +127,9 @@ end
             states, _, _ = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 run_states(dir; workers=1, logs=:issues, monitor=false)
             end
-            # One of them lost its worker; the other ran on the replacement.
-            @test count(==(PASSED), values(states)) == 1
-            @test count(==(ERRORED), values(states)) == 1
+            # The first item's hook lost its worker, which its verdict does not show; the
+            # other ran on the replacement.
+            @test all(==(PASSED), values(states))
         end
     end
 

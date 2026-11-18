@@ -290,6 +290,32 @@ function sandbox_worker(prof, target, redirect_fn)
     )
 end
 
+# A pasted item's `test_end` on its worker `w` after its verdict `result`, within
+# `seconds`. As in a run, it never changes the verdict: what goes wrong is said. Returns
+# whether the worker is still fit to use: one past its limit is ended.
+function session_test_end(w::RuntestsWorkers.Worker, spec::ItemSpec, prof::Profile, seconds::Real, result::ItemResult)
+    (isempty(prof.test_end.args) || result.state === SKIPPED) && return true
+    endres = try
+        fetch_within(
+            RuntestsWorkers.remote_end(w, spec, prof.test_end), seconds,
+            TimeoutException(seconds, "the `test_end` expression of profile `$(prof.name)`", "", "test_end_timeout")
+        )::ItemResult
+    catch e
+        is_interrupt(e) && rethrow()
+        if e isa TimeoutException
+            RuntestsWorkers.terminate!(w, :timeout)
+            wait(w)
+            say_session_test_end(prof, sprint(showerror, e), "")
+            return false
+        end
+        msg = e isa RuntestsWorkers.RemoteException ? e.msg : sprint(showerror, e)
+        say_session_test_end(prof, string("did not complete: ", first(eachsplit(msg, '\n'))), msg)
+        return !w.terminated
+    end
+    is_non_pass(endres.state) && say_session_test_end(prof, test_end_failures(endres.testset)...)
+    return true
+end
+
 function run_sandboxed(item::RawItem, target)
     prof = interactive_profile(item, target)
     # The limits a run holds the profile's own code to; without a project, a run's defaults.
@@ -317,15 +343,16 @@ function run_sandboxed(item::RawItem, target)
                 timeout === nothing ? fetch(fut) :
                 fetch_within(fut, timeout, TimeoutException(timeout, "test item", item.name, "its own timeout=$timeout"))
             )::ItemResult
-            # What the profile's `test_end` records counts, as it does in a run.
-            if !isempty(prof.test_end.args) && result.state !== SKIPPED
-                endres = fetch_within(
-                    RuntestsWorkers.remote_end(w, spec, prof.test_end), limits.test_end_timeout_s,
-                    TimeoutException(limits.test_end_timeout_s, "the `test_end` expression of profile `$(prof.name)`", "", "test_end_timeout")
-                )::ItemResult
-                result = merge_test_end(result, endres)
+            # The body's verdict is the item's, as in a run: the profile's `test_end` runs
+            # after it, and what goes wrong there is said.
+            if session_test_end(w, spec, prof, limits.test_end_timeout_s, result)
+                print_evidence(finish_here!(spec, result; worker = w, limit = limits.artifacts_timeout_s))
+            elseif is_non_pass(result.state)
+                dir = artifacts_path(prefix, 1, attempt)
+                isfile(artifacts_log_path(dir)) && note_evidence(dir, "not collected: the worker was ended in the " *
+                                                                      "profile's `test_end`, so the producers did not run")
+                (isdir(dir) || isfile(artifacts_log_path(dir))) && print_evidence(dir)
             end
-            print_evidence(finish_here!(spec, result; worker = w, limit = limits.artifacts_timeout_s))
             (!is_non_pass(result.state) || attempt == attempts) && break
         catch e
             e isa TimeoutException || rethrow()

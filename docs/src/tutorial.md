@@ -148,6 +148,12 @@ Runtests reads the earlier run states to find the failing items, and runs `"circ
   [TEST] no test item is failing in the recorded runs
 ```
 
+The fix can also be in the code of the package. Each run starts new workers, and they load the package from its files, so `runtestsf()` runs your change. Under `workers = 0`, the items run in your Julia session instead. The session keeps the version of the package that it loaded first. After a change to `src/`, give a worker, so that a new process loads the changed code:
+
+```julia
+Runtests.runtestsf(workers = 1)
+```
+
 ## Select items
 
 You can run a part of the suite. These calls select by tag, by name and by file:
@@ -169,6 +175,8 @@ Runtests.runtests(dry_run = true)
   1 ·     w1 · "circle area" · test/area_tests.jl:1 · 0.5s
   2 ·     w2 · "square area" · test/area_tests.jl:6 · 0.4s · fast
 ```
+
+A run starts new and changed items first. An item is changed when its own text changed. A change to the code of the package, to a fixture or to a setup does not change the items that use it. After such a change, run the file, the tag or the whole suite that tests the code.
 
 The `est` column shows each item's most recent recorded duration. The most recent
 run may not have selected every item. [Run tests](guide/running.md) tells you all

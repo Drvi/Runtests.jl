@@ -16,9 +16,18 @@
 #   items       n_items x 32 B: name, file, line, unit, source hash, seed
 #   environment the test environment's Manifest.toml, zlib-compressed: its length,
 #               the compressed length, then the compressed bytes
+#   workers     each distinct environment the profiles' workers start in: project,
+#               manifest (compressed, or the one above) and LocalPreferences.toml;
+#               then each profile's, by index
+#   policies    each distinct policy of an item as the run resolved it: timeout,
+#               retries, failfast and skip; then each item's, by index
 #   statuses    n_items x 32 B, fixed stride, overwritten in place
 #   memory      fixed block, rewritten whenever a peak is set
-#   events      32 B each, appended: attempts and worker events of this record
+#   events      48 B each, appended: attempts, with what each measured, and worker
+#               events of this record
+#
+# The header says how the run ended (`RunEnding`), written as soon as the run knows,
+# and what each item was left in is read against it (`verdict`).
 #
 # After the run starts only the statuses, the memory block, the events and the
 # header's flags and end time are written, which keeps a crash from corrupting
@@ -39,19 +48,46 @@ using CRC32c: crc32c
 using Zlib_jll: libz
 
 const RS_MAGIC = 0x544e5552   # "RUNT" on disk
-const RS_VERSION = UInt32(8)
+const RS_VERSION = UInt32(1)
 # 40 bytes of counts and times, then nine section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
 const RS_STATUS_BYTES = 32
 const RS_MEMORY_BYTES = 64
-const RS_EVENT_BYTES = 32
+const RS_EVENT_BYTES = 48
 
-const RS_FLAG_COMPLETE = UInt32(1) << 0
 const RS_FLAG_DRY_RUN = UInt32(1) << 1
-const RS_FLAG_CANCELLED = UInt32(1) << 2
-# The run ended before its first item: its setup failed, or it was stopped there.
-const RS_FLAG_ABORTED = UInt32(1) << 3
+
+"""
+    RunEnding
+
+How a run ended, as the header of its run state records it. The coordinator writes it
+as soon as it knows, before what it does to stop (`mark_ending!`), because what each
+item was left in means something different under each: an item left running in a run
+stopped by Ctrl-C did not fail, one left running in a run stopped as hung did.
+`ENDING_NONE` is a run still going, or one whose coordinator died before it could say.
+"""
+@enum RunEnding::UInt8 begin
+    ENDING_NONE = 0
+    ENDING_FINISHED = 1       # every item it selected ran to a verdict
+    ENDING_FAILFAST = 2       # stopped after a failure, under `failfast`
+    ENDING_INTERRUPTED = 3    # stopped by an interrupt: Ctrl-C, or an item that threw one
+    ENDING_STALLED = 4        # stopped as hung: no item finished for longer than one may take
+    ENDING_EXITED = 5         # the process exited while the run went on
+    ENDING_INIT_FAILED = 6    # a profile's `init` failed, as it would on every worker of it
+    ENDING_START_FAILED = 7   # a worker could not be started
+    ENDING_SETUP_FAILED = 8   # ended before its first item: its setup failed
+    ENDING_ERRORED = 9        # stopped by an error of the run itself
+end
+
+# The words a run state's description gives an ending.
+const ENDING_WORDS = Dict(
+    ENDING_FINISHED => "finished", ENDING_FAILFAST => "stopped after a failure (failfast)",
+    ENDING_INTERRUPTED => "interrupted", ENDING_STALLED => "stopped as hung",
+    ENDING_EXITED => "stopped as its process exited", ENDING_INIT_FAILED => "stopped: a profile's init failed",
+    ENDING_START_FAILED => "stopped: a worker could not start", ENDING_SETUP_FAILED => "ended before its first item",
+    ENDING_ERRORED => "stopped by an error of the run",
+)
 
 const EVENT_ATTEMPT = UInt8(1)       # an attempt at an item ended
 const EVENT_WORKER_UP = UInt8(2)     # a worker process started
@@ -116,7 +152,8 @@ struct Header
     n_items::UInt32
     n_units::UInt32
     n_profiles::UInt16
-    pad::UInt16
+    ending::UInt8      # `RunEnding`; rewritten in place as the run learns how it ends
+    pad::UInt8
     start_unix::Float64
     end_unix::Float64
     off_strings::UInt32
@@ -128,6 +165,8 @@ struct Header
     off_memory::UInt32
     off_events::UInt32
     off_environment::UInt32
+    off_workers::UInt32
+    off_policies::UInt32
 end
 @assert sizeof(Header) <= RS_HEADER_BYTES
 
@@ -187,8 +226,24 @@ struct EventRecord
     t1::Float32   # when it ended; for a worker's start, when its process was up
     exitcode::Int32
     signal::Int32
+    # For an attempt, what it measured, as its status row holds the last attempt's:
+    # a retry writes over the row, and the event keeps each attempt's.
+    compile::Float32
+    recompile::Float32
+    alloc_mb::Float32
+    peak_rss_mb::Float32
 end
 @assert sizeof(EventRecord) == RS_EVENT_BYTES
+
+# One item policy as the run resolved it, the skip expression's text by its index in
+# the strings.
+struct PolicyRecord
+    timeout_s::Int32
+    skip::UInt32
+    retries::Int8
+    failfast::Int8
+    pad::UInt16
+end
 
 struct RunStateFile
     io::IOStream
@@ -203,6 +258,8 @@ struct RunStateFile
     event_ref::Base.RefValue{EventRecord}
     # Keeps the file's modification time fresh while the run lasts; see `is_live`.
     heartbeat::Base.RefValue{Union{Nothing, Tuple{Timer, Task}}}
+    # How the run ended, once it is known: the first reason given is the one kept.
+    ending::Base.RefValue{RunEnding}
 end
 
 # How often a running run writes its file at the least, and how long a file goes
@@ -320,15 +377,17 @@ function environment_manifest()
 end
 
 """
-    init_run_state(path, plan; dry_run=false, start=time(), meta=[]) -> RunStateFile
+    init_run_state(path, plan; dry_run=false, start=time(), meta=[], worker_projects=Dict()) -> RunStateFile
 
 Write everything that is known before the run starts, including a full status
 section of `unseen` records, so that every later write is an overwrite at a
 known offset. `start` is the moment every offset in the file counts from. `meta`
-adds to what `run_meta` records.
+adds to what `run_meta` records. `worker_projects` names, by profile, the project its
+workers start in, which the file keeps a snapshot of.
 """
 function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, start::Float64 = time(),
-                        meta::Vector{Pair{String, String}} = Pair{String, String}[])
+                        meta::Vector{Pair{String, String}} = Pair{String, String}[],
+                        worker_projects::AbstractDict{Symbol, String} = Dict{Symbol, String}())
     mkpath(dirname(path))
     io = open(path, "w+")
     strings = StringTable()
@@ -382,6 +441,12 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         write_record(items, iref)
     end
 
+    manifest = Vector{UInt8}(environment_manifest())
+    workers = IOBuffer()
+    write_workers!(workers, strings, p, worker_projects, manifest)
+    policies = IOBuffer()
+    write_policies!(policies, strings, p)
+
     pairs_ = [run_meta(p); meta]
     meta = IOBuffer()
     write(meta, UInt32(length(pairs_)))
@@ -392,7 +457,6 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     strbuf = IOBuffer()
     write_strings(strbuf, strings)
 
-    manifest = Vector{UInt8}(environment_manifest())
     packed = isempty(manifest) ? UInt8[] : zlib_compress(manifest)
     environment = IOBuffer()
     write(environment, UInt32(length(manifest)), UInt32(length(packed)), packed)
@@ -403,18 +467,21 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     off_units = off_profiles + UInt32(profiles.size)
     off_items = off_units + UInt32(units.size)
     off_environment = off_items + UInt32(items.size)
-    off_status = off_environment + UInt32(environment.size)
+    off_workers = off_environment + UInt32(environment.size)
+    off_policies = off_workers + UInt32(workers.size)
+    off_status = off_policies + UInt32(policies.size)
     off_memory = off_status + UInt32(RS_STATUS_BYTES * nitems(p))
     off_events = off_memory + UInt32(RS_MEMORY_BYTES)
 
     write_record(io, Ref(Header(
         RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), nitems(p), length(p.units),
-        length(p.profiles), 0, start, 0.0, off_strings, off_meta, off_profiles, off_units,
-        off_items, off_status, off_memory, off_events, off_environment
+        length(p.profiles), UInt8(ENDING_NONE), 0, start, 0.0, off_strings, off_meta, off_profiles, off_units,
+        off_items, off_status, off_memory, off_events, off_environment, off_workers, off_policies
     )))
     write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
     write(io, take!(strbuf)); write(io, take!(meta)); write(io, take!(profiles))
     write(io, take!(units)); write(io, take!(items)); write(io, take!(environment))
+    write(io, take!(workers)); write(io, take!(policies))
     blank = Ref{StatusRecord}()
     for _ in 1:nitems(p)
         write_status_record(
@@ -425,10 +492,74 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     flush(io)
     rsf = RunStateFile(
         io, String(path), off_status, off_memory, UInt32(nitems(p)),
-        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{Union{Nothing, Tuple{Timer, Task}}}(nothing)
+        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{Union{Nothing, Tuple{Timer, Task}}}(nothing),
+        Ref(ENDING_NONE)
     )
     rsf.heartbeat[] = start_heartbeat(rsf)
     return rsf
+end
+
+# Each distinct environment that the profiles' workers start in (`worker_projects`, by
+# profile): its project, its manifest, compressed, and its `LocalPreferences.toml`; then
+# each profile's, by index from 1, 0 for one without a project. A manifest that is the
+# run's own (`run_manifest`) is not stored twice: its length is written as `typemax`.
+function write_workers!(io::IO, strings::StringTable, p::Plan, worker_projects::AbstractDict{Symbol, String},
+                        run_manifest::Vector{UInt8})
+    snapshots = Tuple{String, Vector{UInt8}, String}[]
+    index = UInt32[]
+    for prof in p.profiles
+        project = get(worker_projects, prof.name, "")
+        file = isempty(project) ? nothing : isdir(project) ? project_file(project) : String(project)
+        if file === nothing || !isfile(file)
+            push!(index, UInt32(0))
+            continue
+        end
+        manifest = Base.project_file_manifest_path(file)
+        snapshot = (read_text(file), Vector{UInt8}(read_text(manifest)), read_text(joinpath(dirname(file), "LocalPreferences.toml")))
+        k = findfirst(==(snapshot), snapshots)
+        k === nothing && (push!(snapshots, snapshot); k = length(snapshots))
+        push!(index, UInt32(k))
+    end
+    write(io, UInt32(length(snapshots)))
+    for (project, manifest, preferences) in snapshots
+        write(io, intern!(strings, project), intern!(strings, preferences))
+        if !isempty(manifest) && manifest == run_manifest
+            write(io, typemax(UInt32), UInt32(0))
+        else
+            packed = isempty(manifest) ? UInt8[] : zlib_compress(manifest)
+            write(io, UInt32(length(manifest)), UInt32(length(packed)), packed)
+        end
+    end
+    write(io, UInt32(length(index)))
+    foreach(k -> write(io, k), index)
+    return nothing
+end
+
+# Each item's policy as the run resolved it: its timeout in seconds, its retries, whether
+# a failure of it stops the run, and its skip expression, each distinct one once; then
+# each item's, by index from 1.
+function write_policies!(io::IO, strings::StringTable, p::Plan)
+    table = Dict{PolicyRecord, UInt32}()
+    order = PolicyRecord[]
+    index = Vector{UInt32}(undef, nitems(p))
+    for i in 1:nitems(p)
+        skip = p.items.skip[i]
+        r = PolicyRecord(Int32(item_timeout(p, ItemIdx(i))), intern!(strings, skip isa Expr ? expr_text(skip) : string(skip)),
+                         Int8(attempts_for(p, p.items.unit[i]) - 1), Int8(item_failfast(p, i)), UInt16(0))
+        index[i] = get!(table, r) do
+            push!(order, r)
+            UInt32(length(order))
+        end
+    end
+    write(io, UInt32(length(order)))
+    ref = Ref{PolicyRecord}()
+    for r in order
+        ref[] = r
+        write_record(io, ref)
+    end
+    write(io, UInt32(length(index)))
+    foreach(k -> write(io, k), index)
+    return nothing
 end
 
 # While the run lasts, its file is written at least every `HEARTBEAT_S`: the magic
@@ -507,12 +638,13 @@ end
 function append_event!(
         rsf::Union{Nothing, RunStateFile}, kind::UInt8, state::Integer, slot::Integer, pid::Integer,
         t0::Real, t1::Real; item::Integer = 0, attempt::Integer = 0, exitcode::Integer = 0, signal::Integer = 0,
-        seq::Integer = 0
+        seq::Integer = 0, compile::Real = 0, recompile::Real = 0, alloc_mb::Real = 0, peak_rss_mb::Real = 0
     )
     update!(rsf, -1) do io
         rsf.event_ref[] = EventRecord(
             kind, UInt8(state), Int8(attempt), 0x00, Int16(slot), Int16(seq), Int32(item), Int32(pid),
-            Float32(t0), Float32(t1), Int32(exitcode), Int32(signal)
+            Float32(t0), Float32(t1), Int32(exitcode), Int32(signal), Float32(compile), Float32(recompile),
+            Float32(alloc_mb), Float32(peak_rss_mb)
         )
         write_record(io, rsf.event_ref)
     end
@@ -524,22 +656,37 @@ write_memory!(rsf::Union{Nothing, RunStateFile}, m) = update!(rsf, rsf === nothi
     write(io, Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak))
 end
 
-# `exiting`, from the exit hook, which waits neither on a task nor on the event loop:
-# there the beat's timer is left running, since closing a timer waits for the event
-# loop to close it, and the beat ends at its next tick, finding the file closed.
-# Stopped and waited for otherwise, so that nothing is written once this returns.
-# `aborted` for a run that ended before its first item.
-function finish_run_state!(rsf::Union{Nothing, RunStateFile}; cancelled::Bool = false, exiting::Bool = false,
-                           aborted::Bool = false)
+"""
+    mark_ending!(rsf, ending)
+
+Say how the run ended, the first time it is said: the end time, then the ending, each
+written through, so that a reader that sees the ending sees when the run ended. Called
+as soon as the run knows, before it stops its workers or records what they were
+running: the ending alone says what each item left running or unseen means, which is
+more than any one item's record does.
+"""
+function mark_ending!(rsf::Union{Nothing, RunStateFile}, ending::RunEnding)
+    rsf === nothing && return nothing
+    first = @lock rsf.lock (rsf.ending[] === ENDING_NONE ? (rsf.ending[] = ending; true) : false)
+    first || return nothing
+    update!(io -> write(io, time()), rsf, header_offset(:end_unix))
+    update!(io -> write(io, UInt8(ending)), rsf, header_offset(:ending))
+    return nothing
+end
+
+# The run is over: its ending said, if nothing said it before (`mark_ending!`), and the
+# file closed. `exiting`, from the exit hook, which waits neither on a task nor on the
+# event loop: there the beat's timer is left running, since closing a timer waits for
+# the event loop to close it, and the beat ends at its next tick, finding the file
+# closed. Stopped and waited for otherwise, so that nothing is written once this returns.
+function finish_run_state!(rsf::Union{Nothing, RunStateFile}, ending::RunEnding = ENDING_FINISHED; exiting::Bool = false)
     rsf === nothing && return nothing
     beating = rsf.heartbeat[]
     if beating !== nothing
         rsf.heartbeat[] = nothing
         exiting || (close(first(beating)); wait(last(beating)))
     end
-    flags = RS_FLAG_COMPLETE | (cancelled ? RS_FLAG_CANCELLED : UInt32(0)) | (aborted ? RS_FLAG_ABORTED : UInt32(0))
-    update!(io -> write(io, flags), rsf, header_offset(:flags))
-    update!(io -> write(io, time()), rsf, header_offset(:end_unix))
+    mark_ending!(rsf, ending)
     @lock rsf.lock close(rsf.io)
     return nothing
 end
@@ -598,15 +745,37 @@ struct RunStateEvent
     t1::Float32
     exitcode::Int32
     signal::Int32
+    # What an attempt measured.
+    compile::Float32
+    recompile::Float32
+    alloc_mb::Float32
+    peak_rss_mb::Float32
+end
+
+# An environment that a profile's workers started in, as the run recorded it.
+struct WorkerEnvironment
+    project::String
+    manifest_bytes::Int                 # the manifest's length, inflated
+    manifest_zlib::Vector{UInt8}
+    preferences::String                 # its LocalPreferences.toml
+end
+
+# An item's policy as the run resolved it.
+struct ItemPolicy
+    timeout_s::Int32
+    retries::Int8
+    failfast::Bool
+    skip::String
 end
 
 struct RunStateRecord
     path::String
     version::UInt32
-    complete::Bool
+    complete::Bool      # its ending is said: `ending` is not `ENDING_NONE`
     dry_run::Bool
-    cancelled::Bool
-    aborted::Bool       # ended before its first item; see `RS_FLAG_ABORTED`
+    cancelled::Bool     # stopped before every item it selected ran: failfast, an interrupt and the like
+    aborted::Bool       # ended before its first item: `ENDING_SETUP_FAILED`
+    ending::RunEnding
     start_unix::Float64
     end_unix::Float64
     meta::Dict{String, String}
@@ -620,6 +789,11 @@ struct RunStateRecord
     memory::@NamedTuple{peak_total_mb::Float32, peak_total_at::Float32, peak_single_mb::Float32,
         peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32, nprocs_peak::Int32}
     events::Vector{RunStateEvent}
+    # Each distinct environment of the profiles' workers, each profile's index into them
+    # (0 for none), and each item's policy.
+    worker_environments::Vector{WorkerEnvironment}
+    profile_environments::Vector{Int}
+    policies::Vector{ItemPolicy}
     truncated::Bool
     mtime::Float64      # when the file was last written, as it was read; see `is_live`
 end
@@ -730,8 +904,18 @@ function read_run_state(path::AbstractString)
         manifest_bytes = Int(read(io, UInt32))
         manifest_zlib = read(io, bounded(read(io, UInt32), total))
 
-        statuses = sizehint!(RunStateStatus[], n_items)
+        # A file cut short in them still gives what comes before, as it does further on.
         truncated = false
+        worker_environments, profile_environments, policies = try
+            (read_workers_section(seek(io, Int(h.off_workers)), strings, total, manifest_bytes, manifest_zlib)...,
+             read_policies_section(seek(io, Int(h.off_policies)), strings, total))
+        catch e
+            e isa EOFError || rethrow()
+            truncated = true
+            (WorkerEnvironment[], Int[], ItemPolicy[])
+        end
+
+        statuses = sizehint!(RunStateStatus[], n_items)
         for i in 1:n_items
             at = Int(h.off_status) + (i - 1) * RS_STATUS_BYTES
             if at + RS_STATUS_BYTES > total
@@ -763,14 +947,24 @@ function read_run_state(path::AbstractString)
                 e.kind == EVENT_WORKER_DOWN ? :worker_down : :unknown
             state = kind === :attempt && e.state <= UInt8(CANCELLED) ? ItemState(e.state) : UNSEEN
             ended_by = kind === :worker_down ? worker_end(e.state) : :none
-            push!(events, RunStateEvent(kind, state, ended_by, e.attempt, e.seq, e.slot, e.item, e.pid, e.t0, e.t1, e.exitcode, e.signal))
+            push!(events, RunStateEvent(kind, state, ended_by, e.attempt, e.seq, e.slot, e.item, e.pid, e.t0, e.t1,
+                                        e.exitcode, e.signal, recorded(e.compile), recorded(e.recompile),
+                                        recorded(e.alloc_mb), recorded(e.peak_rss_mb)))
             at += RS_EVENT_BYTES
         end
+        # Part of an event, which a writer stopped while appending it left.
+        at < total && (truncated = true)
+        # A verdict whose attempt has no event of the same outcome: the writer stopped
+        # between the two writes of a completion. The verdict is kept, and the evidence
+        # for it said to be incomplete.
+        truncated |= !verdicts_have_events(statuses, events)
+        ending = h.ending <= UInt8(typemax(RunEnding)) ? RunEnding(h.ending) : ENDING_NONE
         return RunStateRecord(
-            String(path), h.version, h.flags & RS_FLAG_COMPLETE != 0,
-            h.flags & RS_FLAG_DRY_RUN != 0, h.flags & RS_FLAG_CANCELLED != 0, h.flags & RS_FLAG_ABORTED != 0,
+            String(path), h.version, ending !== ENDING_NONE, h.flags & RS_FLAG_DRY_RUN != 0,
+            !(ending in (ENDING_NONE, ENDING_FINISHED, ENDING_SETUP_FAILED)), ending === ENDING_SETUP_FAILED, ending,
             h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
-            units, items, statuses, memory, events, truncated, written
+            units, items, statuses, memory, events, worker_environments, profile_environments, policies,
+            truncated, written
         )
     catch e
         is_interrupt(e) && rethrow()
@@ -781,6 +975,48 @@ function read_run_state(path::AbstractString)
         @debug "Runtests: could not read run state $(path)" exception = (e, catch_backtrace())
         return nothing
     end
+end
+
+# The workers section at `io`'s position (`write_workers!`). A manifest written as the
+# run's own takes the environment section's.
+function read_workers_section(io::IO, strings, total::Integer, run_bytes::Int, run_zlib::Vector{UInt8})
+    envs = map(1:bounded(read(io, UInt32), total)) do _
+        project, preferences = lookup(strings, read(io, UInt32)), lookup(strings, read(io, UInt32))
+        len = read(io, UInt32)
+        packed = read(io, bounded(read(io, UInt32), total))
+        len == typemax(UInt32) ? WorkerEnvironment(project, run_bytes, run_zlib, preferences) :
+            WorkerEnvironment(project, Int(len), packed, preferences)
+    end
+    index = Int[Int(read(io, UInt32)) for _ in 1:bounded(read(io, UInt32), total)]
+    return envs, index
+end
+
+# The policies section at `io`'s position (`write_policies!`): each item's policy.
+function read_policies_section(io::IO, strings, total::Integer)
+    table = map(1:bounded(read(io, UInt32), total)) do _
+        r = read_record(io, PolicyRecord)
+        ItemPolicy(r.timeout_s, r.retries, r.failfast != 0, lookup(strings, r.skip))
+    end
+    return ItemPolicy[table[read(io, UInt32)] for _ in 1:bounded(read(io, UInt32), total)]
+end
+
+# The manifest of a recorded worker environment, as `recorded_manifest` gives the run's.
+recorded_manifest(env::WorkerEnvironment) = env.manifest_bytes == 0 ? "" :
+    try
+        String(zlib_uncompress(env.manifest_zlib, env.manifest_bytes))
+    catch e
+        is_interrupt(e) && rethrow()
+        ""
+    end
+
+# Whether every item's recorded verdict has the event of its attempt with that outcome.
+function verdicts_have_events(statuses::Vector{RunStateStatus}, events::Vector{RunStateEvent})
+    attempts = Set{Tuple{Int32, Int8, ItemState}}((e.item, e.attempt, e.state) for e in events if e.kind === :attempt)
+    for (i, st) in pairs(statuses)
+        (st.state === UNSEEN || st.state === RUNNING) && continue
+        (Int32(i), st.attempt, st.state) in attempts || return false
+    end
+    return true
 end
 
 """
@@ -900,14 +1136,16 @@ end
 # not pass, what each worker did before it ended, and how to run it again.
 function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     m(k) = get(rs.meta, k, "")
-    println(io, "Runtests run state ", rs.path, rs.complete ? "" : " (incomplete: the run did not finish)")
+    println(io, "Runtests run state ", rs.path, rs.complete ? "" :
+        is_live(rs) ? " (still running)" : " (incomplete: its coordinator stopped without saying how the run ended)")
     took = rs.end_unix > rs.start_unix ? string(", took ", fmt_seconds(rs.end_unix - rs.start_unix)) : ""
     # A damaged file's start is no time a clock can show.
     started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
-    println(io, "  started ", started, took, rs.cancelled ? ", cancelled" : "", rs.aborted ? ", ended before its first item" : "")
+    println(io, "  started ", started, took, rs.complete ? string(", ", ENDING_WORDS[rs.ending]) : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
+        m("worktree") == "dirty" ? " with uncommitted changes" : "",
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
     # Split at the spaces they were joined with: a damaged file's text need not be valid
     # UTF-8, and `split` at whitespace asks each character what it is.
@@ -1228,10 +1466,19 @@ function warn_other_formats(dir::AbstractString, others::Integer)
     return nothing
 end
 
+# The run states that one call reads what is failing and its history from, read once
+# (`with_runs_read`): what `runtestsf` selects and the plan that runs it see the same
+# files, read once. Pruning, after the run, reads them again with the run's own among them.
+const RUNS_READ = ScopedValue{Union{Nothing, Pair{String, Vector{Pair{String, RunStateRecord}}}}}(nothing)
+
+# `f()`, with the run states of the project at `root` read once for it.
+with_runs_read(f, root::AbstractString) = with(f, RUNS_READ => (String(root) => project_runs(root)))
+
 # `project_runs`, with `base` among them, when there is one, wherever its file is:
 # the run state a replay names.
 function runs_with(root::AbstractString, base::Union{Nothing, RunStateRecord})
-    runs = project_runs(root)
+    read = RUNS_READ[]
+    runs = read !== nothing && read.first == root ? copy(read.second) : project_runs(root)
     (base === nothing || any(((f, _),) -> samefile(f, base.path), runs)) && return runs
     push!(runs, base.path => base)
     return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
@@ -1248,6 +1495,10 @@ since_base(runs, base::Union{Nothing, RunStateRecord}) =
 function verdict(rs::RunStateRecord, i::Integer)
     state = i <= length(rs.statuses) ? rs.statuses[i].state : UNSEEN
     (state === UNSEEN || state === CANCELLED || state === SKIPPED) && return nothing
+    # Left running, as the run's ending says it: hung in a run stopped as hung, and the
+    # first suspect of a coordinator that died without saying; stopped, and no verdict,
+    # in a run stopped any other way.
+    state === RUNNING && return rs.ending in (ENDING_STALLED, ENDING_NONE) ? true : nothing
     return state !== PASSED
 end
 
@@ -1300,7 +1551,9 @@ function item_facts(runs::Vector{Pair{String, RunStateRecord}}; base::Union{Noth
                     v, state, at, ended, seed = Int8(found), st.state, rs.start_unix, st.start_off + st.elapsed, it.seed
                 end
                 selected_at = rs.start_unix
-                unreached = rs.cancelled && (st.state === UNSEEN || st.state === CANCELLED)
+                # Never reached, or stopped before it ran to a verdict, in a run that is over,
+                # whichever way it ended: a coordinator that died stopped it too.
+                unreached = st.state === UNSEEN || st.state === CANCELLED || (st.state === RUNNING && found === nothing)
             end
             facts[it.name] = ItemFacts(v, state, at, ended, seed, seconds, hash, selected_at, unreached)
         end
@@ -1322,6 +1575,8 @@ newest verdict stays, which is also what a replay's base is read against: the
 verdicts after the base, newest first.
 """
 function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates; names = nothing)
+    # Nothing to weigh: the facts of every item need not be built to keep every run.
+    isempty(candidates) && return String[]
     kept = copy(runs)
     now = kept_facts(item_facts(kept), names)
     out = String[]
@@ -1576,6 +1831,26 @@ function repository_root(dir::AbstractString)
         parent = dirname(d)
         parent == d && return nothing
         d = parent
+    end
+end
+
+"""
+    worktree_state(root) -> String
+
+Whether the files that git tracks in the repository holding `root` are as its last
+commit has them: `"clean"`, `"dirty"`, or `"unknown"` without git or a repository. A run
+records it beside its revision: a dirty run ran code that the revision does not give back.
+It runs `git`, so a run asks it in the background while it makes its environments ready.
+"""
+function worktree_state(root::AbstractString)
+    repo = repository_root(root)
+    (repo === nothing || Sys.which("git") === nothing) && return "unknown"
+    try
+        out = read(pipeline(`git -C $repo status --porcelain --untracked-files=no`; stderr = devnull), String)
+        return isempty(out) ? "clean" : "dirty"
+    catch e
+        is_interrupt(e) && rethrow()
+        return "unknown"
     end
 end
 

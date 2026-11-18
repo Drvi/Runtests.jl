@@ -313,10 +313,11 @@ end)
         end
     end
 
-    @testset "[order] is strict on the whole suite only, as it is under any selection" begin
+    @testset "[order] names items of the suite, whatever the selection" begin
+        # A pin that no item of the suite has is a mistake under any selection.
         ordered = make_pkg("GroupOrdered", "test/a_test.jl" => GROUPED,
                            "test/TestItems.toml" => GROUPS * "\n[order]\nfirst = [\"no such item\"]\n")
-        @test selected(ordered; group = "default") == ["core one", "core slow", "untagged"]
+        @test thrown(() -> selected(ordered; group = "default")) isa ConfigError
         @test thrown(() -> selected(ordered; group = "all")) isa ConfigError
         @test thrown(() -> selected(ordered)) isa ConfigError
         # A pin outside the group's items is no error and no item.

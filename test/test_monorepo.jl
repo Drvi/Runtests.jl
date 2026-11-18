@@ -583,6 +583,9 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             a, b = joinpath(ws, "lib/A/test/a_test.jl"), joinpath(ws, "lib/B/test")
             @test selected(prepare_mono((a, b); announce = false, group = "all")) == ["A:a1", "A:a2", "A:a3", "B:b1", "B:b2"]
             @test selected(prepare_mono(("$a:5",); announce = false)) == ["A:a2"]
+            # A line the file does not have is refused, as a run of the package refuses it.
+            err = try prepare_mono(("$a:999",); announce = false); nothing catch e; e end
+            @test err isa ArgumentError && occursin("so there is no line 999", err.msg)
             err = try prepare_mono((joinpath(ws, "lib/Skipped/test/s_test.jl"),); announce = false); nothing catch e; e end
             @test err isa ArgumentError && occursin("is in lib/Skipped, which does not take part", slashed(err.msg))
             err = try mono(ws; name = "zzz"); nothing catch e; e end
@@ -592,6 +595,50 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             r = mono(ws; item_keys = [("A", "a2"), ("Z", "x"), ("B", "nope")])
             @test selected(r) == ["A:a2"] && r.unknown == [("B", "nope"), ("Z", "x")]
             @test ("lib/B" => "no item matches the selection") in r.skipped
+        end
+
+        @testset "an [order] pin that the selection leaves out is no mistake, and a misspelled one is" begin
+            ws = make_workspace("A" => ["test/a_test.jl" => item_text("a1") * item_text("a2"),
+                                        "test/TestItems.toml" => "[order]\nfirst = [\"a1\"]\n"],
+                                "B" => ["test/b_test.jl" => item_text("b")]; root = nothing)
+            sel(r) = [(r.plan.packages.name[r.plan.items.package[i]], r.plan.items.name[i]) for i in 1:nitems(r.plan)]
+            @test sel(mono(ws; item_keys = [("A", "a2")])) == [("A", "a2")]
+            @test sel(mono(ws; name = "a2")) == [("A", "a2")]
+            write(joinpath(ws, "lib", "A", "test", "TestItems.toml"), "[order]\nfirst = [\"a3\"]\n")
+            err = try mono(ws; item_keys = [("A", "a2")]); nothing catch e; e end
+            @test err isa ConfigError && occursin("names test items that do not exist", err.msg)
+        end
+
+        @testset "a profile whose settings differ between packages has a line for each, with its packages" begin
+            tuned(pkg, settings, files...) = pkg => ["test/t_test.jl" => item_text(lowercase(pkg); opts = "profile=:tuned"),
+                                                     "test/TestItems.toml" => "[profiles.tuned]\n$settings\n", files...]
+            ws = make_workspace(tuned("Alpha", "julia_args = [\"--check-bounds=yes\"]"),
+                                tuned("Beta", "julia_args = [\"--check-bounds=no\"]"),
+                                tuned("Gamma", "preferences = \"prefs.toml\"", "test/prefs.toml" => "[Gamma]\nk = 1\n"),
+                                tuned("Delta", "julia_args = [\"--check-bounds=yes\"]"); root = nothing)
+            out = slashed(sprint(Runtests.Private.print_profiles, mono(ws).plan))
+            @test occursin("profile `tuned` of Alpha, Delta: --check-bounds=yes\n", out)
+            @test occursin("profile `tuned` of Beta: --check-bounds=no\n", out)
+            @test occursin("profile `tuned` of Gamma: preferences lib/Gamma/test/prefs.toml\n", out)
+        end
+
+        @testset "a DONE line keeps the item and its outcome inside the terminal, the package column counted" begin
+            pkg, long = "P" * "a"^23, "x"^70
+            ws = make_workspace(pkg => ["test/t_test.jl" => item_text(long) * item_text("short")],
+                                "B" => ["test/b_test.jl" => item_text("b")]; root = nothing)
+            p = mono(ws; workers = 8).plan
+            P = Runtests.Private
+            P.SLOT_LABEL_WIDTH[] = P.slot_label_width(P.nslots(p))
+            done = (; state = PASSED, elapsed_ns = 1.0e9, compile_ns = 0.0, maxrss = 2^30)
+            for columns in (80, 120)
+                shown, column = P.item_names(p, P.name_width(p.items.name; columns, reserved = P.line_reserved(p)))
+                for i in 1:nitems(p)
+                    line = P.item_line(P.nslots(p), i, nitems(p), shown[i], column, 1, 1, done;
+                                       package = p.packages.name[p.items.package[i]], package_width = textwidth(pkg))
+                    plain = replace(line, r"\e\[[0-9;]*m" => "")
+                    @test textwidth(plain[1:last(findfirst("PASS", plain))]) <= columns
+                end
+            end
         end
 
         @testset "what stops a combined plan before it is made" begin
@@ -894,6 +941,27 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "an isolated package's profile with preferences still finds the workspace's packages" begin
+            # A's test project is a member of the workspace, whose root holds its manifest:
+            # the profile's copy of the project takes that one, as Julia reads it.
+            ws = e2e_workspace(
+                "A" => ["test/a_test.jl" => """
+                            @testitem "a" profile=:tuned begin
+                                using A
+                                @test get(Base.get_preferences(Base.PkgId(A).uuid), "mode", "unset") == "fast"
+                            end
+                            """,
+                        "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"prefs.toml\"\n",
+                        "test/prefs.toml" => "[A]\nmode = \"fast\"\n"],
+                "B" => ["test/b_test.jl" => item_text("b")];
+                isolated = ["lib/A"],
+            )
+            with_runstate_dir() do _
+                states, _, _ = run_mono(ws; workers = 1, logs = :issues, monitor = false)
+                @test states == Dict(("A", "a") => PASSED, ("B", "b") => PASSED)
+            end
+        end
+
         @testset "the setups of an isolated package are precompiled for its own workers" begin
             # C's setup is on the load path of C's workers only. Its item asks, before it
             # loads the setup, whether its worker has a cache to load. A name no earlier
@@ -1043,7 +1111,9 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             with_runstate_dir() do _
                 states, run, p = run_mono(ws; workers = 1, logs = :issues, monitor = false)
                 @test states[("A", "reads its own root")] === PASSED && states[("B", "reads its own root")] === PASSED
-                @test states[("A", "test_end too slow")] === TIMEDOUT
+                # A's `test_end` outlasts A's limit: its worker is ended, and the body's
+                # verdict stands.
+                @test states[("A", "test_end too slow")] === PASSED
                 @test states[("B", "test_end within its own limit")] === PASSED
                 @test states[("A", "throws")] in (FAILED, ERRORED)
                 @test states[("Root", "after an error")] === PASSED
@@ -1176,6 +1246,23 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "a combined run's export replays whole, with no history beside it" begin
+            # As on another machine than the one that ran it: what `RUNTESTS_ARTIFACT_DIR`
+            # kept of each package, and no run state in the history.
+            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
+            artifacts = mktempdir()
+            withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
+                with_runstate_dir(_ -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+            end
+            with_runstate_dir() do _
+                exported = only(filter(endswith(".rundata"), readdir(joinpath(artifacts, "A"); join = true)))
+                r = mono(ws; replay = joinpath(exported, "run.runstate"))
+                @test sort!([(r.plan.packages.name[r.plan.items.package[i]], r.plan.items.name[i]) for i in 1:nitems(r.plan)]) ==
+                      [("A", "a"), ("B", "b")]
+                @test !any(startswith("partial replay"), r.plan.notes)
+            end
+        end
+
         @testset "a combined run is replayed from any of its run states" begin
             ws = e2e_workspace(
                 "A" => ["test/a_test.jl" => item_text("a1") * item_text("a2"),
@@ -1195,6 +1282,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 @test selected(r.plan) == [("A", "a1"), ("A", "qa1"), ("B", "b1")]
                 @test r.plan.cfg.seed == 7 && all(i -> item_cfg(r.plan, i).timeout_s == 123, 1:nitems(r.plan))
                 @test r.plan.cfg.replayed_from == b_record
+                # What the call selects narrows the recorded items: items it also matches,
+                # which the run did not record, stay out.
+                r = mono(ws; replay = b_record, name = r"^a")
+                @test selected(r.plan) == [("A", "a1")]
                 # A deliberate narrowing replays less, and says nothing is missing.
                 r = mono(ws; replay = a_record, packages = ["B"])
                 @test selected(r.plan) == [("B", "b1")] && !any(startswith("partial replay"), r.plan.notes)

@@ -368,6 +368,60 @@ end
         @test all(st -> st.state === FAILED, rs.statuses)
     end
 
+    @testset "a retry that decides nothing leaves the verdict of the attempt before it" begin
+        # A skip, or a stop of the run, decides no verdict: the item keeps its failure, in
+        # memory, in its run state and for the next `runtestsf`, and is not tried again.
+        # Every attempt keeps its event. A retry that passes decides the item.
+        marks = mktempdir()
+        once(name) = "(m = $(repr(joinpath(marks, name))); first = !isfile(m); first && touch(m); first)"
+        attempts(rs, i) = [e.state for e in rs.events if e.kind === :attempt && e.item == i]
+        dir = make_pkg("UndecidedRetry", "test/t_test.jl" => """
+            @testitem "fails, then skips" retries=2 skip=isfile($(repr(joinpath(marks, "skip_my_retry")))) begin
+                touch($(repr(joinpath(marks, "skip_my_retry"))))
+                @test false
+            end
+            @testitem "fails, then passes" retries=1 begin
+                @test !$(once("passed_once"))
+            end
+            """)
+        for workers in (1, 0)
+            foreach(f -> rm(joinpath(marks, f)), readdir(marks))
+            with_runstate_dir() do _
+                (states, run, p), _ = capture_run(() -> run_states(dir; workers, logs = :issues, monitor = false))
+                skips, passes = findfirst(==("fails, then skips"), p.items.name), findfirst(==("fails, then passes"), p.items.name)
+                @test states["fails, then skips"] === FAILED && run.statuses.attempt[skips] == 1
+                @test states["fails, then passes"] === PASSED
+                @test run.nonpass == 1
+                rs = Runtests.Private.read_run_state(run.runstate.path)
+                @test rs.statuses[skips].state === FAILED && rs.statuses[skips].attempt == 1
+                @test attempts(rs, skips) == [FAILED, SKIPPED]
+                @test rs.statuses[passes].state === PASSED && attempts(rs, passes) == [FAILED, PASSED]
+                @test Runtests.Private.failing_items(dir) == ["fails, then skips"]
+            end
+        end
+        # A stop while the retry runs: the retry interrupts the run. (Another item's
+        # failfast lets an attempt in flight finish, and decides by it.)
+        stopped = make_pkg("StoppedRetry", "test/t_test.jl" => """
+            @testitem "fails, then is stopped" retries=1 begin
+                $(once("failed_once")) || throw(InterruptException())
+                @test false
+            end
+            """)
+        with_runstate_dir() do _
+            thrown = try
+                capture_run(() -> run_states(stopped; workers = 0, logs = :issues, monitor = false))
+                nothing
+            catch e
+                e
+            end
+            @test thrown isa InterruptException
+            rs = Runtests.Private.read_run_state(only(Runtests.Private.runstate_files(stopped)))
+            @test rs.cancelled && attempts(rs, 1) == [FAILED, CANCELLED]
+            @test rs.statuses[1].state === FAILED && rs.statuses[1].attempt == 1
+            @test "fails, then is stopped" in Runtests.Private.failing_items(stopped)
+        end
+    end
+
     @testset "a second run in the same process is refused, and the first goes on" begin
         dir = make_pkg("OneAtATime", "test/t_test.jl" => """
             @testitem "takes a while" begin
@@ -559,7 +613,7 @@ end
         states, _, _ = run_states(dir; workers = 1, logs = :issues, monitor = false,
                                   worker_init = :(global FROM = :call), test_end = :(@test true))
         @test states["sees the call's init"] === PASSED
-        # The files alone: the item fails, in its body and in its `test_end`.
+        # The files alone: the body sees the file's `init`, and fails.
         states, _, _ = run_states(dir; workers = 1, logs = :issues, monitor = false)
         @test states["sees the call's init"] === FAILED
         @test_throws ArgumentError run_states(dir; workers = 1, logs = :issues, monitor = false, worker_init = "global FROM = 1")

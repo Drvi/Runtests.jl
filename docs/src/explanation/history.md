@@ -6,6 +6,7 @@ This page explains how Runtests remembers runs. A standalone run writes one run 
 
 A run writes its run states while it goes on, and prints their directory paths at the end. Even an interrupted run leaves a record of the items it completed. Each run state records these facts for its package:
 
+- How the run ended.
 - The outcome, the duration and the compilation time of each item, and every attempt.
 - Each start and exit of a worker, with whether the worker timed out, crashed, or got a signal from outside.
 - The commit, the Julia version and build, and the machine.
@@ -23,7 +24,9 @@ Only the run states in the run state directory count for the plan and for the fa
 
 For each item, the latest completed verdict decides whether the item is failing. The latest recorded duration of the item goes into the plan. A run that is still in progress gives durations at once. Its verdicts count for the failures and for the order only when it finishes, or when Runtests declares it dead.
 
-Failed tests, errors, timeouts, a chain cut short by a lost worker, and an item left running when its coordinator died count as failures. A skip, an explicit cancellation, or a run that never reached the item leaves the previous verdict unchanged. A later passing retry replaces the failure for `runtestsf`; the earlier attempt's evidence still remains in that run's logs.
+A run state records how its run ended. The run finished, or one of these stopped it: a failure under `failfast`, an interrupt, a stall, the exit of its process, a failed `init` of a profile, a worker that could not start, its setup, or an error of the run itself. The run writes its ending as soon as it knows it, before it stops its workers. A run state without an ending is of a run in progress, or of a run whose coordinator died.
+
+The ending tells what an item that did not finish means. Failed tests, errors, timeouts and a chain cut short by a lost worker count as failures. An item left running counts as a failure when its run stopped as hung, or when its coordinator died. In a run that stopped in another way, an item left running has no verdict. A skip, a cancellation, or a run that never reached the item leaves the previous verdict unchanged, and the next run starts such an item early. A later passing retry replaces the failure for `runtestsf`. The evidence of the earlier attempt still remains in the logs of that run.
 
 ## Where run states live
 

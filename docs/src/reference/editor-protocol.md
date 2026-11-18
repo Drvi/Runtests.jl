@@ -23,7 +23,7 @@ Every command is an object with a `command` field. It can have an `id` of any JS
 | Command | Fields | Answer |
 |:--------|:-------|:-------|
 | `list` | none | `items`, or `error`. |
-| `run` | `items`: item keys, each an object with `package` and `name`. `names`: exact item names for `serve` only; `serve_mono` rejects it. Without either selection, the run uses its default selection. `options`: an object of configuration values. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
+| `run` | `items`: item keys, each an object with `package` and `name`. `names`: exact item names for `serve` only; `serve_mono` rejects it. Without either selection, the run uses its default selection. `failing`: `true` runs only the failing items of the selection, each with the seed it failed with, as `Runtests.runtestsf()` runs them. `options`: an object of configuration values. A `seed` in `options` is the seed of every item. | `run_started`, then `item_started` and `item_finished` for each attempt, then `run_finished`. Or `error`. |
 | `cancel` | none | No separate acknowledgement: the run ends with `run_finished`, `state` `cancelled`, and the original `run` ID. An `error` when nothing runs carries the `cancel` ID. |
 | `shutdown` | none | `bye`, without an ID. |
 

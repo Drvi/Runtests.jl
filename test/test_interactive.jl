@@ -43,6 +43,19 @@ const DEPS = fixture("TestDeps.jl")
         @test !is_activated()
     end
 
+    @testset "a call with no path after activate runs the activated package" begin
+        # The active project is the package's generated test environment, which holds no
+        # tests: a run, a dry run and a failure check go to the package itself.
+        dir = make_pkg("ActivatedTarget", "test/a_test.jl" => "@testitem \"the activated item\" begin\n    @test true\nend\n")
+        with_activated(dir) do _
+            @test realpath(Runtests.Private.resolve_target(()).root) == realpath(dir)
+            _, out = capture_run(() -> Runtests.runtests(; dry_run = true))
+            @test occursin("\"the activated item\"", out)
+            # A path given is the path given.
+            @test realpath(Runtests.Private.resolve_target((DEPS,)).root) == realpath(DEPS)
+        end
+    end
+
     @testset "a pasted item runs, and its results come back" begin
         with_activated(DEPS) do _
             ts, out = capture_run() do
@@ -291,23 +304,25 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
-    @testset "a pasted profile's test_end counts, and a skipped item runs none" begin
+    @testset "a pasted profile's test_end is said, not counted, and a skipped item runs none" begin
         dir = make_pkg("PastedEnd", "test/TestItems.toml" => "[profiles.checked]\n",
                        profile_files("checked"; test_end = "@test false")...)
         with_activated(dir) do _
-            failed, _ = capture_run() do
+            passed, out = capture_run() do
                 @testitem "pasted checked" profile=:checked begin
                     @test true
                 end
             end
-            skipped, _ = capture_run() do
+            skipped, skipped_out = capture_run() do
                 @testitem "pasted checked skip" profile=:checked skip=true begin
                     @test true
                 end
             end
-            @test state_of(failed) === Runtests.Private.FAILED
-            @test length(collect_failures(failed)) == 1
-            @test isempty(collect_failures(skipped))   # the hook's `@test false` never ran
+            # As in a run, the result is the body's, and the hook's failure is said.
+            @test state_of(passed) === PASSED
+            @test isempty(collect_failures(passed))
+            @test occursin("test_end of profile `checked`: 1 did not pass: Test Failed", out)
+            @test !occursin("test_end of profile", skipped_out)   # the hook never ran
         end
     end
 
@@ -429,8 +444,9 @@ end
     end
 
     @testset "a profile's init and test_end are held to their limits" begin
-        # As in a run: a hook past `init_timeout` or `test_end_timeout` stops the item
-        # instead of holding the session for as long as it takes.
+        # As in a run: a hook past `init_timeout` or `test_end_timeout` is stopped instead
+        # of holding the session for as long as it takes. A late `init` stops the item; a
+        # late `test_end` leaves it the body's result.
         dir = make_pkg("PastedHooks", "test/TestItems.toml" => """
             [run]
             init_timeout = 2
@@ -442,13 +458,18 @@ end
             """,
             profile_files("slow_init"; init = "sleep(60)")..., profile_files("slow_end"; test_end = "sleep(60)")...)
         with_activated(dir) do _
-            for profile in (:slow_init, :slow_end)
-                ex = :(@testitem $("pasted $profile") profile=$(QuoteNode(profile)) begin
-                    @test true
-                end)
-                took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
-                @test took < 40
+            ex(profile) = :(@testitem $("pasted $profile") profile=$(QuoteNode(profile)) begin
+                @test true
+            end)
+            took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex(:slow_init))
+            @test took < 40
+            # A `test_end` past its limit is ended and said; the body's result stands.
+            took = @elapsed begin
+                ts, out = capture_run(() -> Core.eval(Main, ex(:slow_end)))
             end
+            @test took < 40
+            @test state_of(ts) === PASSED
+            @test occursin("test_end of profile `slow_end`: the `test_end` expression of profile `slow_end`", out)
         end
     end
 end

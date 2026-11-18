@@ -8,7 +8,7 @@ The extension shows test items in the Test Explorer of VS Code and runs them the
 
 The output of a run goes to the Test Results panel. It is the output that Runtests writes in a terminal, with colors. The `logs` value in `runtests.run.options` controls which item output the panel shows, as it does for `runtests`.
 
-The Run Failed Tests button in the toolbar of the Test Explorer runs what `Runtests.runtestsf()` runs. These are the items whose last run did not pass them, from the editor, the terminal or CI. The Rerun Failed Tests command of VS Code knows only the runs of this window.
+The Run Failed Tests button in the toolbar of the Test Explorer runs what `Runtests.runtestsf()` runs. These are the items whose last run did not pass them, from the editor, the terminal or CI. Each item runs with the seed that it failed with, as in `runtestsf`. The Rerun Failed Tests command of VS Code knows only the runs of this window.
 
 ### Install the extension
 

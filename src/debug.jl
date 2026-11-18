@@ -51,8 +51,10 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
     target = interactive_target()
     target === nothing &&
         throw(ConfigError("Runtests.debug looks for test items in a package, and there is no package here"))
-    failure = name === nothing ? last_failure(target) : nothing
-    item = find_item(target, failure === nothing ? name : failure.name)
+    # Read once: what is failing is of the items the suite still has, and the item is one of them.
+    items = suite_items(target)
+    failure = name === nothing ? last_failure(target, items) : nothing
+    item = find_item(target, failure === nothing ? name : failure.name, items)
     # The profile a run would give the item, `[profiles.default]` included.
     prof = interactive_profile(item, target)
     # A failing item is stepped into with the seed it failed with, named or not.
@@ -70,14 +72,12 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
             package = something(project_name_of(target.project), "")
             spec = interactive_spec(item, target, 1, item_seed(run_seed, package, item.name))
             say(item, target, 1, nothing)
-            # The item's testset prints its own summary as it finishes; a `test_end`
-            # that then fails is nested under it, and said here.
+            # The item's testset prints its own summary as it finishes, and is its verdict:
+            # a `test_end` that then fails is said under it, as a run says it.
             result = run_item(spec; printing = true, enter)
-            n = length(result.testset.results)
-            result = with_test_end(result, spec, prof.test_end)
-            for ts in result.testset.results[(n + 1):end], r in collect_failures(ts)
-                show(stdout, r)
-                println(stdout)
+            if !isempty(prof.test_end.args) && result.state !== SKIPPED
+                endres = RuntestsWorkers.run_test_end(spec, prof.test_end)
+                is_non_pass(endres.state) && say_session_test_end(prof, test_end_failures(endres.testset)...)
             end
             say(item, target, 1, outcome(result))
             print_evidence(finish_here!(spec, result))
@@ -100,7 +100,7 @@ newest run that has one, the item that finished last. `others` are the rest, mos
 recent first, and `seed` is the one the item failed with. Throws when no run is
 recorded or no item is failing.
 """
-function last_failure(target)
+function last_failure(target, items::Vector{RawItem} = suite_items(target))
     runs = project_runs(target.root)
     any(((_, rs),) -> !rs.dry_run && !rs.aborted && !is_live(rs), runs) || throw(
         NoTestsError(
@@ -108,7 +108,7 @@ function last_failure(target)
                 "run its tests first, or name an item: `Runtests.debug(\"name\")`"
         )
     )
-    suite = suite_item_names(target)
+    suite = Set(it.name for it in items)
     failed = [(n, f) for (n, f) in item_facts(runs) if is_failing(f) && f.state in STEPPABLE && n in suite]
     isempty(failed) && throw(
         NoTestsError(
@@ -120,11 +120,16 @@ function last_failure(target)
     return (; name = first(failed)[1], others = [n for (n, _) in failed[2:end]], seed = first(failed)[2].seed)
 end
 
-# The one item `what` picks from the whole suite, read the way a run reads it: an
-# exact name first, then a `Regex` matched against the names, or a path.
-function find_item(target, what::Union{String, Regex})
+# The whole suite, read the way a run reads it: a suite that does not parse throws here
+# as it would there.
+function suite_items(target)
     files, strays, templates, environments = walk_test_dir(target.testdir)
-    items = scan(files, Filter(), setup_modules(target.testdir); strays, templates, environments)
+    return scan(files, Filter(), setup_modules(target.testdir); strays, templates, environments)
+end
+
+# The one item `what` picks from the suite's `items`: an exact name first, then a
+# `Regex` matched against the names, or a path.
+function find_item(target, what::Union{String, Regex}, items::Vector{RawItem} = suite_items(target))
     if what isa String
         i = findfirst(it -> it.name == what, items)
         i === nothing || return items[i]

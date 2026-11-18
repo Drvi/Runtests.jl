@@ -67,7 +67,7 @@ The keywords `worker_init` and `test_end` of `runtests` give the code of the def
 runtests(worker_init = :(using Plots), test_end = quote GC.gc(true) end)
 ```
 
-Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. A failure in `test_end` counts toward the result of the item.
+Each item runs the `test_end` of its own profile. Each has its own timeout, `init_timeout` and `test_end_timeout`, and this time does not count toward the timeout of the item. The result of the item is the result of its body. A failure, an error or a timeout in `test_end` does not change it, and does not start a retry. The run prints a `HOOK` line for the problem and writes the details in the log of the attempt. After a timeout, the run ends the worker and starts a new one for the next item.
 
 `init` runs at the top level of `Main` of the worker. Under `workers = 0`, the `init` of the default profile runs in `Main` of the process that calls `runtests`, and the run warns about it. Items run in modules of their own, and do not see what `init` defines or imports. Thus a `worker_init.jl` that holds `using Plots` loads Plots before the first item, and an item that uses Plots must still import it. `test_end` runs in a new module of its own, with `Test` and the package in scope. It does not see the variables of the item. [Where code runs](@ref where-code-runs) gives the details.
 

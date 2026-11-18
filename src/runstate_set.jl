@@ -121,7 +121,9 @@ function append_event!(set::RunStateSet, kind::UInt8, state::Integer, slot::Inte
 end
 
 write_memory!(set::RunStateSet, m) = (foreach(f -> write_memory!(f, m), set.files); nothing)
-finish_run_state!(set::RunStateSet; kwargs...) = (foreach(f -> finish_run_state!(f; kwargs...), set.files); nothing)
+finish_run_state!(set::RunStateSet, ending::RunEnding = ENDING_FINISHED; kwargs...) =
+    (foreach(f -> finish_run_state!(f, ending; kwargs...), set.files); nothing)
+mark_ending!(set::RunStateSet, ending::RunEnding) = (foreach(f -> mark_ending!(f, ending), set.files); nothing)
 
 """
     open_runstate_set(p, start, runid) -> RunStateSet
@@ -132,7 +134,8 @@ items' environment directories, which link the package records for replay. A run
 state that cannot be opened is done without, as in a run of one package, and the
 others are written.
 """
-function open_runstate_set(p::Plan, start::Float64, runid::AbstractString)
+function open_runstate_set(p::Plan, start::Float64, runid::AbstractString; worktree::AbstractString = "unknown",
+                           worker_projects::Vector{Dict{Symbol, String}} = [Dict{Symbol, String}() for _ in p.packages.name])
     n = length(p.packages)
     plans = Plan[package_plan(p, k) for k in 1:n]
     workspace = p.root
@@ -142,11 +145,12 @@ function open_runstate_set(p::Plan, start::Float64, runid::AbstractString)
     for k in 1:n
         environments = join((environment_of_item(p, i) for i in 1:nitems(p) if p.items.package[i] == k), '\n')
         meta = ["combined_run" => String(runid), "participants" => participants,
-                "isolated" => string(p.packages.isolated[k]), "environments" => environments]
+                "isolated" => string(p.packages.isolated[k]), "environments" => environments,
+                "worktree" => String(worktree)]
         path = nothing
         file = try
             path = new_runstate_path(p.packages.root[k])
-            init_run_state(path, plans[k]; start, meta)
+            init_run_state(path, plans[k]; start, meta, worker_projects = worker_projects[k])
         catch e
             is_interrupt(e) && rethrow()
             path === nothing || remove_runstate(path)
@@ -206,7 +210,7 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
         end
         project = project_id(ps.root[k])
         rs = get(given.meta, "project_id", "") == project ? given :
-            something(findfirst_record(ps.root[k], id), Some(nothing))
+            something(exported_sibling(path, ps.name[k], project, id), findfirst_record(ps.root[k], id), Some(nothing))
         push!(records, rs)
         push!(why, rs === nothing ? "its run state of the replayed run is gone" : "")
     end
@@ -221,9 +225,26 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
     announce && println(
         stdout, label_prefix(), "replaying the combined run of ", basename(path), ": ",
         plural(count(!isnothing, records), "package"), " · seed ", m("seed"), " · recorded with julia ", m("julia"),
-        " on ", m("machine"), isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
+        " on ", m("machine"), isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10)),
+        m("worktree") == "dirty" ? " with uncommitted changes" : ""
     )
     return (; given, records, why, gone)
+end
+
+# The run state of the combined run `id` for the package called `name`, of project
+# `project`, that an export beside `path` holds, or `nothing`. `RUNTESTS_ARTIFACT_DIR`
+# keeps each package's run in a directory of the package's name, so a record copied from
+# there, from CI say, has its run's other packages beside it, and no history needs them.
+function exported_sibling(path::AbstractString, name::AbstractString, project::AbstractString, id::AbstractString)
+    dir = joinpath(dirname(dirname(dirname(abspath(record_path(path))))), name)
+    isdir(dir) || return nothing
+    for d in readdir(dir; join = true)
+        endswith(d, RUNDATA_EXT) || continue
+        rs = read_run_state(joinpath(d, RUNSTATE_FILE))
+        rs === nothing && continue
+        get(rs.meta, "combined_run", "") == id && get(rs.meta, "project_id", "") == project && return rs
+    end
+    return nothing
 end
 
 # The run state of the combined run `id` in the run state directory of the package at

@@ -118,7 +118,7 @@ end
             @test timedwait(() -> is_live(read_run_state(rsf.path)), 10) === :ok
             # The exit hook waits on no task: the beats end on their own, after the file
             # has said how the run ended.
-            finish_run_state!(rsf; cancelled = true, exiting = true)
+            finish_run_state!(rsf, Runtests.Private.ENDING_EXITED; exiting = true)
             rs = read_run_state(rsf.path)
             @test rs.complete && rs.cancelled && !is_live(rs)
             @test timedwait(() -> istaskdone(beats), 10) === :ok && !istaskfailed(beats)

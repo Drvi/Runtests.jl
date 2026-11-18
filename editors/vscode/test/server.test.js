@@ -73,7 +73,7 @@ test('the listing holds every item, where it is', async () => {
 
 test('a run reports each item as it goes, a failure where it is', { timeout: 240_000 }, async () => {
     const events = [];
-    const end = await server.run(keys(['passes', 'fails']), { workers: 1 }, ev => events.push(ev));
+    const end = await server.run(keys(['passes', 'fails']), { workers: 1 }, false, ev => events.push(ev));
     assert.equal(end.event, 'run_finished');
     assert.equal(end.state, 'failed');
     const kinds = events.map(e => e.event);
@@ -89,15 +89,23 @@ test('a run reports each item as it goes, a failure where it is', { timeout: 240
     assert.deepEqual((await server.list()).failed, [{ package: 'Served', name: 'fails' }]);
 });
 
+test('a run of the failing items runs only those', { timeout: 240_000 }, async () => {
+    const events = [];
+    const end = await server.run(keys(['passes', 'fails']), { workers: 1 }, true, ev => events.push(ev));
+    assert.equal(end.event, 'run_finished');
+    const started = events.find(e => e.event === 'run_started');
+    assert.deepEqual(started.items, [{ package: 'Served', name: 'fails' }]);
+});
+
 test('a run that cannot start ends with its error', { timeout: 120_000 }, async () => {
-    const end = await server.run(keys(['no such item']), {}, () => {});
+    const end = await server.run(keys(['no such item']), {}, false, () => {});
     assert.equal(end.event, 'error');
     assert.match(end.message, /no test items matched/);
 });
 
 test('a cancel stops a run at once', { timeout: 240_000 }, async () => {
     let cancelledAt = null;
-    const end = await server.run(keys(['slow 1', 'slow 2']), { workers: 2 }, ev => {
+    const end = await server.run(keys(['slow 1', 'slow 2']), { workers: 2 }, false, ev => {
         if (ev.event === 'item_started' && cancelledAt === null) {
             cancelledAt = Date.now();
             server.cancel();
@@ -112,7 +120,7 @@ test('a cancel while the server starts stops the run it waits for', { timeout: 2
     const starting = serve();
     try {
         const events = [];
-        const run = starting.run(keys(['passes']), { workers: 1 }, ev => events.push(ev.event));
+        const run = starting.run(keys(['passes']), { workers: 1 }, false, ev => events.push(ev.event));
         starting.cancel();
         const end = await run;
         assert.equal(end.event, 'run_finished');
@@ -132,7 +140,7 @@ test('a server of another protocol gets no command, and says why', async () => {
         `process.stdin.on('data', d => require('node:fs').appendFileSync(${JSON.stringify(received)}, d));\n`);
     const old = new RuntestsServer({ julia: process.execPath, juliaArgs: [path.join(fake, 'server.js')], environment: fake, root: fake });
     await assert.rejects(old.list(), /editor protocol 2, and this extension speaks protocol 3/);
-    const end = await old.run(keys(['passes']), {}, () => assert.fail('no event of a run'));
+    const end = await old.run(keys(['passes']), {}, false, () => assert.fail('no event of a run'));
     assert.equal(end.event, 'error');
     assert.match(end.message, /editor protocol 2/);
     assert.equal(fs.existsSync(received), false);

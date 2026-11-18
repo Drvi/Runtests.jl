@@ -41,7 +41,7 @@ The same parser reads it as reads a test file. Thus a keyword that is an error i
 The keywords behave as follows at the REPL:
 
 - `skip` and `failfast` apply.
-- `sandbox` and `profile` apply. Runtests starts a worker for the item, with the profile and the environment that a run gives it. Without `profile`, the worker uses `[profiles.default]`. The worker gets the flags, the environment variables, the preferences, the `init` and the `test_end` of the profile. A failure in `test_end` counts.
+- `sandbox` and `profile` apply. Runtests starts a worker for the item, with the profile and the environment that a run gives it. Without `profile`, the worker uses `[profiles.default]`. The worker gets the flags, the environment variables, the preferences, the `init` and the `test_end` of the profile. A failure in `test_end` is printed under the result of the item, and does not change it.
 - An item from a file in an [environment directory](@ref environments) also gets a worker, in that environment.
 - `timeout`, `retries` and `chain` need a run around the item. Runtests ignores them with a warning. An item with a worker of its own is the exception: it keeps its `timeout` and `retries`.
 - `tags` have no effect.

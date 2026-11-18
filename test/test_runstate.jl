@@ -22,7 +22,7 @@ function record_run(dir, pkg, n, outcomes; whole = false, cancelled = false)
         state, elapsed = outcomes[p.items.name[i]]
         write_status!(rsf, i, state, 1, 1; elapsed)
     end
-    finish_run_state!(rsf; cancelled)
+    finish_run_state!(rsf, cancelled ? Runtests.Private.ENDING_INTERRUPTED : Runtests.Private.ENDING_FINISHED)
     return path
 end
 
@@ -301,6 +301,35 @@ end
         @test true    # reaching here is the assertion
     end
 
+    @testset "a completion the writer did not finish is read as incomplete evidence" begin
+        # A completion writes the verdict, then its event: stopped between the two, or
+        # part of the way through the event, the file still reads, verdict and all, and
+        # says it is incomplete.
+        p = a_plan()
+        attempt_event(rsf, i, state, attempt) = Runtests.Private.append_event!(
+            rsf, Runtests.Private.EVENT_ATTEMPT, UInt8(state), 1, 0, 0.0, 1.0; item = i, attempt)
+        path = joinpath(mktempdir(), "run.runstate")
+        rsf = init_run_state(path, p)
+        write_status!(rsf, 1, FAILED, 1, 1; elapsed = 1.0)
+        attempt_event(rsf, 1, FAILED, 1)
+        finish_run_state!(rsf)
+        whole = read_run_state(path)
+        @test !whole.truncated && length(whole.events) == 1
+        # Part of the event: the verdict reads, the event does not.
+        cut = joinpath(mktempdir(), "cut.runstate")
+        write(cut, read(path)[1:(end - 3)])
+        rs = read_run_state(cut)
+        @test rs.truncated && isempty(rs.events) && rs.statuses[1].state === FAILED
+        # A verdict whose event was never written.
+        path = joinpath(mktempdir(), "run.runstate")
+        rsf = init_run_state(path, p)
+        write_status!(rsf, 1, FAILED, 2, 1; elapsed = 1.0)
+        attempt_event(rsf, 1, FAILED, 1)
+        finish_run_state!(rsf)
+        rs = read_run_state(path)
+        @test rs.truncated && rs.statuses[1].state === FAILED && rs.complete && rs.end_unix > 0
+    end
+
     @testset "a garbled file never throws" begin
         p = a_plan()
         path = joinpath(mktempdir(), "run.runstate")
@@ -530,7 +559,7 @@ end
             @test failing(pkg) == ["b"]
             # A run that stopped before reaching anything says nothing about any of it.
             p, _ = prepare((pkg,); workers = 1)
-            finish_run_state!(init_run_state(new_runstate_path(pkg), p); cancelled = true)
+            finish_run_state!(init_run_state(new_runstate_path(pkg), p), Runtests.Private.ENDING_INTERRUPTED)
             @test failing(pkg) == ["b"]
             @test failing(pkg; names = Set(["a", "c"])) == String[]
             # `runtestsf` runs exactly those, and then there is nothing left to run.
@@ -782,7 +811,7 @@ end
                             if n == 3 && !other
                                 live = (path, rsf)
                             else
-                                finish_run_state!(rsf; cancelled = whole && rand(rng) < 0.5)
+                                finish_run_state!(rsf, whole && rand(rng) < 0.5 ? Runtests.Private.ENDING_INTERRUPTED : Runtests.Private.ENDING_FINISHED)
                             end
                         end
                         suite = Set(filter(_ -> rand(rng) < 0.75, names))
@@ -1150,6 +1179,47 @@ end
         end
     end
 
+    @testset "a failure rerun reads the run states once, for what is failing and for its plan" begin
+        # What `runtestsf` selects and the history its plan takes are of the same files:
+        # a run state that appears meanwhile is the next call's.
+        with_runstate_dir() do dir
+            pkg = make_pkg("ReadOnce", "test/t_test.jl" => "@testitem \"x\" begin\n    @test false\nend\n")
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
+            recorded = only(runstate_files(pkg))
+            seen = Runtests.Private.with_runs_read(pkg) do
+                copy = record_in(dir, "9999999999999999-1")
+                mkpath(dirname(copy))
+                cp(recorded, copy)
+                length(Runtests.Private.runs_with(pkg, nothing))
+            end
+            @test seen == 1
+            @test length(Runtests.Private.runs_with(pkg, nothing)) == 2
+            # Nothing to weigh for pruning is decided without building any item's facts.
+            @test Runtests.Private.removable_runs(Runtests.Private.project_runs(pkg), String[]) == String[]
+        end
+    end
+
+    @testset "what a replay's call selects narrows the items it recorded" begin
+        # A recording of one item, replayed with a tag or a name that an item it did not
+        # record also has, runs the one item.
+        pkg = make_pkg("ReplayNarrows", "test/t_test.jl" => """
+            @testitem "one" tags=[:t] begin
+                @test true
+            end
+            @testitem "two" tags=[:t] begin
+                @test true
+            end
+            """)
+        with_runstate_dir() do _
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, name = "one"))
+            recorded = only(runstate_files(pkg))
+            p, _ = prepare((pkg,); replay = recorded, tags = [:t], announce = false)
+            @test p.items.name == ["one"]
+            p, _ = prepare((pkg,); replay = recorded, name = r"o", announce = false)
+            @test p.items.name == ["one"]
+        end
+    end
+
     @testset "the run state a replay names is the base for what is failing, and is never deleted" begin
         suite(failing...) = join(("@testitem \"$n\" begin\n    @test $(!(n in failing))\nend\n" for n in ("a", "b", "c", "d")))
         pkg = make_pkg("ReplayBase", "test/t_test.jl" => suite("a", "d"))
@@ -1476,19 +1546,30 @@ end
         end
     end
 
-    @testset "a manifest is read as package versions" begin
+    @testset "a manifest is read as each package's code, and compared by it" begin
         m = Runtests.Private.manifest_versions("""
         manifest_format = "2.0"
         [[deps.Foo]]
         uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
         version = "1.2.3"
+        git-tree-sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         [[deps.Local]]
         path = "/elsewhere"
         uuid = "5b0c2a4e-7f3d-4e21-9c55-3a1f0e6d7b90"
         [[deps.Test]]
         uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
         """)
-        @test m == Dict("Foo" => "1.2.3", "Local" => "path", "Test" => "stdlib")
+        @test m["Foo"] == (; uuid = "7876af07-990d-54b4-ab0e-23690620f79a", version = "1.2.3",
+                           tree = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path = false)
+        @test m["Local"].path && !m["Test"].path && isempty(m["Test"].version)
+        same = Runtests.Private.same_code
+        @test same(m["Foo"], m["Foo"]) && same(m["Test"], m["Test"])
+        # The same version from another source tree is other code, as is a package of
+        # the same name and another UUID, and one that is not there.
+        @test !same(m["Foo"], merge(m["Foo"], (; tree = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")))
+        @test !same(m["Foo"], merge(m["Foo"], (; uuid = "1b2c3d4e-0000-4000-8000-000000000000")))
+        @test !same(m["Foo"], nothing)
+        @test Runtests.Private.code_text(m["Foo"]) == "1.2.3 (tree aaaaaaaaaa)"
     end
 
     @testset "a run state lying next to the project does not change the next run" begin
@@ -1498,6 +1579,190 @@ end
             # What the caller asked for, not what the last run happened to record.
             p, _ = prepare((dir,); workers=1, threads="2,1")
             @test p.profiles[1].threads == "2,1"
+        end
+    end
+end
+
+@testset "a run stopped in this process says how it ended" begin
+    @testset "an item that throws an interrupt cancels the run, and is not its failure" begin
+        # What finished before it keeps its verdict; the item it was running is recorded
+        # as stopped, and the next `runtestsf` does not blame it.
+        dir = make_pkg("InterruptsHere",
+            "test/TestItems.toml" => "[order]\nfirst = [\"passes\", \"fails\", \"interrupts\"]\n",
+            "test/t_test.jl" => """
+                @testitem "passes" begin
+                    @test true
+                end
+                @testitem "fails" begin
+                    @test false
+                end
+                @testitem "interrupts" begin
+                    throw(InterruptException())
+                end
+                @testitem "never" begin
+                    @test true
+                end
+                """)
+        with_runstate_dir() do _
+            thrown = try
+                capture_run(() -> Runtests.Private.exclusively(() -> begin
+                    p, target = prepare((dir,); workers = 0, logs = :issues, monitor = false)
+                    execute(p, target)
+                end))
+                nothing
+            catch e
+                e
+            end
+            @test thrown isa InterruptException
+            rs = read_run_state(only(runstate_files(dir)))
+            @test rs.complete && rs.cancelled && !rs.aborted && rs.ending === Runtests.Private.ENDING_INTERRUPTED
+            state(name) = rs.statuses[findfirst(it -> it.name == name, rs.items)].state
+            @test (state("passes"), state("fails"), state("interrupts"), state("never")) ==
+                  (PASSED, FAILED, Runtests.Private.CANCELLED, UNSEEN)
+            @test Runtests.Private.failing_items(dir) == ["fails"]
+        end
+    end
+
+    @testset "an init that throws in this process ends the run as setup does" begin
+        dir = make_pkg("InitThrowsHere", "test/t_test.jl" => "@testitem \"a\" begin\n    @test true\nend\n",
+                       profile_files(; init = "error(\"init broke\")")...)
+        with_runstate_dir() do _
+            @test_throws ErrorException capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+            path = only(runstate_files(dir))
+            rs = read_run_state(path)
+            @test rs.complete && rs.aborted && !rs.cancelled && rs.ending === Runtests.Private.ENDING_SETUP_FAILED
+            @test all(st -> st.state === UNSEEN, rs.statuses)
+            @test occursin("init broke", read(joinpath(Runtests.Private.rundata_dir(path), "setup.log"), String))
+        end
+    end
+end
+
+@testset "a run state keeps what replaying and diagnosing an attempt need" begin
+    @testset "each attempt keeps what it measured, which a retry does not write over" begin
+        marks = mktempdir()
+        dir = make_pkg("MeasuredAttempts", "test/t_test.jl" => """
+            @testitem "fails once" retries=1 begin
+                m = $(repr(joinpath(marks, "once")))
+                first = !isfile(m)
+                first && touch(m)
+                x = zeros(10^6)
+                @test !first
+            end
+            """)
+        with_runstate_dir() do _
+            (_, run, _), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+            rs = read_run_state(run.runstate.path)
+            attempts = [e for e in rs.events if e.kind === :attempt]
+            @test [e.state for e in attempts] == [FAILED, PASSED]
+            @test all(e -> e.alloc_mb > 0 && e.peak_rss_mb > 0, attempts)
+        end
+    end
+
+    @testset "each item's policy and each profile's environment, as the run resolved them" begin
+        dir = make_pkg("Snapshots",
+            "test/TestItems.toml" => "[run]\ntimeout = 600\n\n[profiles.tuned]\npreferences = \"prefs.toml\"\n",
+            "test/prefs.toml" => "[Snapshots]\nmode = \"fast\"\n",
+            "test/t_test.jl" => """
+                @testitem "plain" begin
+                    @test true
+                end
+                @testitem "own" timeout=30 retries=2 failfast=true skip=(1 > 2) profile=:tuned begin
+                    @test true
+                end
+                @testitem "skipped" skip=(1 < 2) begin
+                    @test true
+                end
+                """)
+        with_runstate_dir() do _
+            (_, run, p), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+            rs = read_run_state(run.runstate.path)
+            plain, own = (rs.policies[findfirst(it -> it.name == n, rs.items)] for n in ("plain", "own"))
+            @test (plain.timeout_s, plain.retries, plain.failfast, plain.skip) == (600, 0, false, "false")
+            @test (own.timeout_s, own.retries, own.failfast, own.skip) == (30, 2, true, "1 > 2")
+            # The default profile's workers start in the test environment, whose manifest
+            # is the run's own; `tuned`'s in a copy of it with the profile's preferences.
+            env(name) = rs.worker_environments[rs.profile_environments[findfirst(==(name), [prof.name for prof in p.profiles])]]
+            @test Runtests.Private.recorded_manifest(env(:default)) == Runtests.Private.recorded_manifest(rs)
+            @test occursin("mode = \"fast\"", env(:tuned).preferences)
+            @test !occursin("mode", env(:default).preferences)
+            # A skip says why in its attempt's log.
+            skipped = findfirst(==("skipped"), p.items.name)
+            @test occursin("skipped: its `skip` expression, `1 < 2`, was true",
+                           read(Runtests.Private.item_log(run, skipped, 1), String))
+        end
+    end
+end
+
+@testset "a run state says how its run ended, and its items read against it" begin
+    P = Runtests.Private
+    @testset "an item left running or unseen means what the run's ending says" begin
+        p = a_plan()
+        a, b = p.items.name[1], p.items.name[2]
+        # `a` left running and `b` never reached, in a run that ended as `ending`, or,
+        # for `nothing`, whose coordinator died before it could say.
+        function left(ending)
+            path = joinpath(mktempdir(), "run.runstate")
+            rsf = init_run_state(path, p)
+            write_status!(rsf, 1, RUNNING, 1, 1)
+            if ending === nothing
+                dead = joinpath(mktempdir(), "run.runstate")
+                cp(path, dead)
+                finish_run_state!(rsf)
+                f = Base.Filesystem.open(dead, Base.Filesystem.JL_O_WRONLY)
+                then = time() - P.LIVE_S - 60
+                Base.Filesystem.futime(f, then, then)
+                close(f)
+                path = dead
+            else
+                finish_run_state!(rsf, ending)
+            end
+            rs = read_run_state(path)
+            return rs, P.item_facts([path => rs])
+        end
+        # Stopped by Ctrl-C: the item it was running did not fail, and neither ran.
+        rs, f = left(P.ENDING_INTERRUPTED)
+        @test rs.ending === P.ENDING_INTERRUPTED && rs.complete && rs.cancelled
+        @test !P.is_failing(f[a]) && f[a].unreached && f[b].unreached
+        # Stopped as hung: the item left running is the one that hung.
+        rs, f = left(P.ENDING_STALLED)
+        @test P.is_failing(f[a]) && !f[a].unreached && f[b].unreached
+        # A coordinator that died: the item it was running is the first suspect, and the
+        # one it never reached is as unreached as in a run that was stopped.
+        rs, f = left(nothing)
+        @test rs.ending === P.ENDING_NONE && !rs.complete && !P.is_live(rs)
+        @test P.is_failing(f[a]) && f[b].unreached
+        @test occursin("stopped without saying how the run ended", sprint(show, MIME"text/plain"(), rs))
+    end
+
+    @testset "the ending is written at once, and the first one said is kept" begin
+        p = a_plan()
+        path = joinpath(mktempdir(), "run.runstate")
+        rsf = init_run_state(path, p)
+        P.mark_ending!(rsf, P.ENDING_FAILFAST)
+        # Readable while the run winds down, with when it ended.
+        rs = read_run_state(path)
+        @test rs.ending === P.ENDING_FAILFAST && rs.end_unix >= rs.start_unix > 0
+        finish_run_state!(rsf, P.ENDING_INTERRUPTED)
+        @test read_run_state(path).ending === P.ENDING_FAILFAST
+        @test occursin("stopped after a failure (failfast)", sprint(show, MIME"text/plain"(), read_run_state(path)))
+    end
+
+    @testset "a run records how it ended" begin
+        dir = make_pkg("Endings", "test/t_test.jl" => """
+            @testitem "fails" begin
+                @test false
+            end
+            @testitem "passes" begin
+                @test true
+            end
+            """, "test/TestItems.toml" => "[order]\nfirst = [\"fails\"]\n")
+        with_runstate_dir() do _
+            (_, run, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+            @test read_run_state(run.runstate.path).ending === P.ENDING_FINISHED
+            (_, run, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false, failfast = true))
+            rs = read_run_state(run.runstate.path)
+            @test rs.ending === P.ENDING_FAILFAST && rs.cancelled
+            @test rs.statuses[findfirst(it -> it.name == "passes", rs.items)].state === UNSEEN
         end
     end
 end

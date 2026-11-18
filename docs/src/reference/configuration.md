@@ -122,7 +122,7 @@ Each profile is a table `[profiles.<name>]`. An item uses it with `profile = :<n
 | File | Value |
 |:-----|:------|
 | `test/testconfigs/worker_init.jl` | The `init` of the default profile: Julia code that runs once in each worker before its first item, at the top level of `Main`. Items do not see what it defines or imports. It runs in the root of the package, or in the workspace root for a [shared profile](@ref shared-profiles). Under `workers = 0`, it runs in the process that calls `runtests`, in the same directory. |
-| `test/testconfigs/test_end.jl` | The `test_end` of the default profile: Julia code that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure counts toward the item. |
+| `test/testconfigs/test_end.jl` | The `test_end` of the default profile: Julia code that runs after each item, in a new module with `Test` and the package in scope. It does not see the variables of the item. A failure does not change the result of the item: the run prints a `HOOK` line for it. |
 | `test/testconfigs/<name>/worker_init.jl`, `test/testconfigs/<name>/test_end.jl` | The `init` and the `test_end` of the profile `<name>`, which `[profiles]` must declare. |
 
 Each file is optional. Any other entry of `test/testconfigs/` is an error, except a hidden one. The keywords `worker_init` and `test_end` of `runtests` and `runtests_mono` give the code of the default profile in place of its files. A profile that the workspace shares takes its code from the `test/testconfigs/` of the workspace root.

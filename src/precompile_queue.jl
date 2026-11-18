@@ -201,7 +201,7 @@ end
 function source_version(pkg::Base.PkgId)
     path = Base.locate_package(pkg)
     path === nothing && return ""
-    project = project_file_in(dirname(dirname(path)))
+    project = project_file(dirname(dirname(path)))
     project === nothing && return ""
     return string(get(parse_project(project), "version", ""))
 end
@@ -287,7 +287,7 @@ end
 
 # The project file of `project`, a file or a directory, or `nothing` for none.
 queue_project_file(project::AbstractString) =
-    isempty(project) ? nothing : isdir(project) ? project_file_in(project) : isfile(project) ? String(project) : nothing
+    isempty(project) ? nothing : isdir(project) ? project_file(project) : isfile(project) ? String(project) : nothing
 
 function add_job!(q::PrecompileQueue, key, job::NamedTuple)
     haskey(q.index, key) && return q.index[key]
@@ -356,7 +356,7 @@ end
 function named_packages(p::Plan)
     named = Set{String}(p.packages.name)
     for root in p.packages.root, dir in (root, joinpath(root, "test"))
-        file = project_file_in(dir)
+        file = project_file(dir)
         file === nothing && continue
         toml = parse_project(file)
         for section in ("deps", "weakdeps", "extras")
@@ -693,6 +693,9 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
     paths = Vector{Union{Nothing, String}}(nothing, length(q.jobs))
     caches = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.PkgId, Vector{String}}}()
     verdicts = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.StaleCacheKey, Bool}}()
+    # The depot's cache files of each package, and the flags each was built for: the
+    # same whatever the environment and the flags asked for.
+    found, flag_bytes = Dict{Base.PkgId, Vector{String}}(), Dict{String, Int}()
     original_project, original_path, original_cache = Base.active_project(), copy(LOAD_PATH), Base.LOADING_CACHE[]
     current = 0
     try
@@ -715,7 +718,7 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
             cache = get!(Dict{Base.PkgId, Vector{String}}, caches, key)
             path = PrecompileHelper.freshest_path(job.pkg, flags;
                                                   stale_cache = get!(Dict{Base.StaleCacheKey, Bool}, verdicts, key),
-                                                  cachepath_cache = cache)
+                                                  cachepath_cache = cache, found, flag_bytes)
             cache[job.pkg] = path === nothing ? String[] : [path]
             paths[i] = path
         end

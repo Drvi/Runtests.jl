@@ -91,6 +91,29 @@ The example uses these variables:
 - `RUNTESTS_HOST` is the name of the machine in the run states.
 - `RUNTESTS_ARTIFACT_DIR` is a directory into which each run copies its own directory when it ends. The run also copies it after a failure or an interrupt.
 
+### A job that is killed
+
+A run that is killed, for example at the time limit of its step or by the system when memory runs out, cannot copy its directory. Its directory in `RUNTESTS_RUNSTATE_DIR` still holds what it wrote up to then: its run state, its logs and the evidence of each failure. These two steps collect it. The first step goes after the restore of the cache and before the tests. It marks when the job started, so that the second step leaves out the run states that the cache restored:
+
+```yaml
+- shell: bash
+  run: mkdir -p "${{ runner.temp }}/runtests" && touch "${{ runner.temp }}/runtests/.job-start"
+```
+
+The second step goes before the upload step. It copies each run directory that this job wrote and that the run did not copy itself:
+
+```yaml
+- if: failure() || cancelled()
+  shell: bash
+  run: |
+    out="${{ runner.temp }}/runtests-artifact"
+    mkdir -p "$out"
+    find "${{ runner.temp }}/runtests" -maxdepth 1 -name '*.rundata' -newer "${{ runner.temp }}/runtests/.job-start" |
+      while read -r d; do [ -e "$out/$(basename "$d")" ] || cp -R "$d" "$out/"; done
+```
+
+Give the upload step the same condition, `failure() || cancelled()`, so that it also runs after a cancel.
+
 ### The cache
 
 The cache holds the run states and not the logs, because the next job plans from the run states only. Use these rules for the cache:

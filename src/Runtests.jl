@@ -189,11 +189,16 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
         end
     end
     !seeded && name isa FailingItems && merge!(item_seeds, name.seeds)
-    recorded = nothing         # the items a replay runs again, when the call selects none itself
+    recorded = nothing         # the items a replay runs again
     if rs !== nothing
-        # The items and settings it recorded, under whatever the call says itself.
-        selected = name !== nothing || tags !== nothing || group !== nothing || !isempty(target.paths) || target.line != 0
-        selected || (name = recorded = Set(it.name for it in rs.items))
+        # The items and settings it recorded, under whatever the call says itself. What
+        # the call selects narrows the recorded items; the failing items of
+        # `runtestsf(replay = …)` are the base's and the later runs', and are not narrowed.
+        if !(name isa FailingItems)
+            name = recorded = replayed_names((it.name for it in rs.items), name)
+            isempty(recorded) && throw(NoTestsError("none of the $(plural(length(rs.items), "test item")) the run state " *
+                                                    "recorded matches the name given"))
+        end
         kwargs = merge(recorded_settings(rs), kwargs)
     end
     # Read before the test files: the group decides what is selected from them.
@@ -241,15 +246,17 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target) * name_hint(filter.name, suite_names)))
     # One unknown name beside known ones would be left out without a word. A failing
     # item the suite no longer has is left out on purpose.
-    if named && !allow_unknown_names && !(name isa FailingItems)
+    if named && recorded === nothing && !allow_unknown_names && !(name isa FailingItems)
         hint = name_hint(filter.name, suite_names)
         isempty(hint) || throw(NoTestsError("not every name given is a test item" * hint))
     end
     if recorded !== nothing
         gone = sort!(collect(setdiff(recorded, suite_names)))
         isempty(gone) || @warn "Runtests: the run state recorded $(plural(length(gone), "test item")) the suite " *
-            "no longer has, renamed or deleted since, which cannot run again: " *
-            join(repr.(first(gone, 20)), ", ") * (length(gone) > 20 ? ", …" : "")
+            "no longer has, renamed or deleted since, which cannot run again: " * listed(repr.(gone))
+        changed = changed_since(rs, items)
+        isempty(changed) || @warn "Runtests: $(plural(length(changed), "test item")) changed since the replayed run, " *
+            "and run as the checkout has them now: " * listed(repr.(changed))
     end
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
@@ -270,7 +277,6 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
         items, cfg; history = history(target.root; base = rs), root = target.root,
-        strict_order = is_full_run(filter, target),
         selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
     p.startup.files = files_seconds
@@ -304,7 +310,8 @@ function read_replay(path::String, target; announce::Bool = true)
     announce && println(
         stdout, label_prefix(), "replaying ", basename(run_location(rs.path)), ": ", plural(length(rs.items), "test item"),
         " · seed ", m("seed"), " · recorded with julia ", m("julia"), " on ", m("machine"),
-        isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
+        isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10)),
+        m("worktree") == "dirty" ? " with uncommitted changes" : ""
     )
     return rs
 end
@@ -478,6 +485,11 @@ matches is an error.
 """
 function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
     target = resolve_target(args)
+    return with_runs_read(() -> run_failing(target, args; replay, name, kwargs...), target.root)
+end
+
+# `runtestsf` itself, under its one reading of the run states (`with_runs_read`).
+function run_failing(target, args; replay, name, kwargs...)
     base = replay === nothing ? nothing : read_replay(String(replay), target; announce = false)
     # Every item failing on record. The run reads the suite once, and leaves out of
     # these the items it no longer has; reading it here as well doubled the time
@@ -516,14 +528,8 @@ function warn_packages(environments::Vector{String})
     return nothing
 end
 
-# Every item's name in the suite, read as a run reads it: a suite that does not parse
-# throws here as it would there.
-function suite_item_names(target)
-    files, strays, templates, environments = walk_test_dir(target.testdir)
-    names = String[]
-    scan(files, Filter(), setup_modules(target.testdir); strays, templates, suite_names = names, environments)
-    return Set(names)
-end
+# Every item's name in the suite, read as a run reads it (`suite_items`).
+suite_item_names(target) = Set{String}(it.name for it in suite_items(target))
 
 """
     Target
@@ -598,13 +604,17 @@ function resolve_target(args)
         "a `file.jl:line` target picks the item at that line, so it is given without other " *
         "files or directories: got $(join(map(repr, args), ", "))"
     ))
-    if line != 0
-        n = countlines(only(narrowing))
-        line <= n || throw(ArgumentError(
-            "`$line_arg`: $(relpath_or_path(only(narrowing), t.root)) has $(plural(n, "line")), so there is no line $line"
-        ))
-    end
+    line == 0 || check_target_line(only(narrowing), line, line_arg, t.root)
     return Target(t.root, t.project, t.testdir, whole ? String[] : narrowing, line)
+end
+
+# A `file.jl:line` target (`arg`) names a line that `file` has.
+function check_target_line(file::AbstractString, line::Integer, arg::AbstractString, root::AbstractString)
+    n = countlines(file)
+    line <= n || throw(ArgumentError(
+        "`$arg`: $(relpath_or_path(file, root)) has $(plural(n, "line")), so there is no line $line"
+    ))
+    return nothing
 end
 
 rstrip_path(p::AbstractString) = rstrip(p, PATH_SEPARATORS)
@@ -625,13 +635,34 @@ function split_line_suffix(path::AbstractString)
     return String(m[1]::AbstractString), line
 end
 
+# The items of `items` whose source differs from what run state `rs` recorded of them,
+# by the hash of each: a replay runs them as the checkout has them, so that a fix can be
+# checked against the run that failed, and says so once.
+function changed_since(rs::RunStateRecord, items)
+    recorded = Dict(it.name => it.hash for it in rs.items)
+    return sort!([it.name for it in items if (h = get(recorded, it.name, UInt32(0))) != 0 && h != it.hash])
+end
+
+# At most twenty of `names`, and how many more there are.
+listed(names) = join(first(names, 20), ", ") * (length(names) > 20 ? string(", and ", length(names) - 20, " more") : "")
+
+# The items a replay runs: those its run state recorded, narrowed by a `name` the call
+# gives. Tags, a group and paths narrow them as they narrow any run.
+replayed_names(recorded, name) = name === nothing ? Set{String}(recorded) :
+    (want = Filter(; name).name; Set{String}(n for n in recorded if matches_name(want, n)))
+
 # Not the active project: under `Pkg.test` that is a temporary environment, and the
-# package is where the `runtests.jl` being evaluated is.
+# package is where the `runtests.jl` being evaluated is; after `activate`, it is the
+# package's generated test environment, and the package is the one activated.
 function default_search_dir()
     source = get(task_local_storage(), :SOURCE_PATH, nothing)
     if source !== nothing && basename(String(source)) == "runtests.jl"
         return dirname(abspath(String(source)))
     end
+    # A package that `activate` readied: the active project is its generated test
+    # environment now, not the package.
+    state = ACTIVATION[]
+    state === nothing || state.participants !== nothing || return state.target.root
     proj = Base.active_project()
     return proj === nothing ? pwd() : dirname(proj)
 end
@@ -680,7 +711,7 @@ function is_test_environment(dir::AbstractString, p::AbstractString)
         parent == testdir && return false
         testdir = parent
     end
-    project_file_in(dirname(testdir)) === nothing && return false
+    project_file(dirname(testdir)) === nothing && return false
     project_name_of(p) === nothing && return true
     return suite_reads(testdir, rstrip_path(dir))
 end

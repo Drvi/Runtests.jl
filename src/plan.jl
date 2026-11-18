@@ -213,7 +213,7 @@ History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::C
     History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known))
 
 """
-    plan(raw, cfg; history, histories, root, packages, strict_order, selection, suite_names) -> Plan
+    plan(raw, cfg; history, histories, root, packages, selection, suite_names) -> Plan
 
 Validate, group into units and pools by worker start configuration, put each pool's
 units in the order they are handed out, and cut its body into one stretch per initial
@@ -222,15 +222,13 @@ its own configuration, and `histories` holds what earlier runs of each measured.
 """
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(), histories::Vector{History} = [history],
-        root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = "",
+        root::AbstractString = "", selection::AbstractString = "",
         suite_names::Vector{String} = String[it.name for it in raw], packages::Packages = single_package(cfg, root, suite_names)
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
     length(histories) == length(packages) || throw(DimensionMismatch("one history per package"))
     validate_profiles(raw, packages)
-    # Only a full run can tell a typo in [order] from an item the filter removed,
-    # so the check is strict there and permissive under a filter.
-    strict_order && validate_order(raw, packages)
+    validate_order(raw, packages)
 
     profiles, profile_package, profile_idx = profile_table(packages, raw)
     units = build_units(raw, profile_idx, histories)
@@ -279,11 +277,12 @@ function validate_profiles(raw, packages::Packages)
     end))
 end
 
-# Each package's `[order]` names items of its own suite.
+# Each package's `[order]` names items of its own suite, which a selection that leaves
+# them out does not make a mistake: those that run are put in order.
 function validate_order(raw, packages::Packages)
     for k in eachindex(packages.name)
         cfg = packages.cfg[k]
-        names = Set(it.name for it in raw if it.package == k)
+        names = union!(Set(packages.suite_names[k]), (it.name for it in raw if it.package == k))
         missing_ = String[]
         for n in Iterators.flatten((cfg.order_first, cfg.order_last))
             n in names || push!(missing_, n)

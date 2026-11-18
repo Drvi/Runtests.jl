@@ -726,7 +726,7 @@ end
         """)
         dir = joinpath(env, "runtests_profile_tuned")
         mkpath(dir)
-        Runtests.Private.copy_env_files(dir, env)
+        Runtests.Private.copy_env_files(dir, joinpath(env, "Project.toml"))
 
         manifest = Runtests.Private.TOML.parsefile(joinpath(dir, "Manifest.toml"))
         paths = Dict(name => only(entries)["path"] for (name, entries) in manifest["deps"])
@@ -749,6 +749,44 @@ end
         # A `[sources]` path is read relative to the project file, so it moves too.
         sources = Runtests.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["sources"]
         @test realpath(sources["Outside"]["path"]) == realpath(outside)
+    end
+
+    @testset "a profile's project takes the manifest Julia reads for the environment" begin
+        TOML = Runtests.Private.TOML
+        uuid = "11111111-0000-4000-8000-000000000009"
+        entry(path) = "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n\n[[deps.Dep]]\nuuid = \"$uuid\"\npath = \"$path\"\nversion = \"0.1.0\"\n"
+        copied_path(dir) = only(TOML.parsefile(joinpath(dir, "Manifest.toml"))["deps"]["Dep"])["path"]
+        # A versioned manifest is read before `Manifest.toml`, and there is none of that.
+        base = mktempdir()
+        dep = mkpath(joinpath(base, "Dep"))
+        env = mkpath(joinpath(base, "env"))
+        write(joinpath(env, "Project.toml"), "[deps]\nDep = \"$uuid\"\n")
+        versioned = joinpath(env, "Manifest-v$(VERSION.major).$(VERSION.minor).toml")
+        write(versioned, entry("../Dep"))
+        dir = mktempdir()
+        Runtests.Private.copy_env_files(dir, joinpath(env, "Project.toml"))
+        @test realpath(copied_path(dir)) == realpath(dep)
+        # An environment directory's copy is stale once that manifest changes.
+        prof = Runtests.Private.Profile(:qa; environment = env)
+        before = Runtests.Private.environment_stamp(dir, prof, base)
+        sleep(1.1)   # past the resolution of a file's modification time
+        write(versioned, entry("../Dep") * "\n")
+        @test Runtests.Private.environment_stamp(dir, prof, base) != before
+        # A member of a workspace reads the root's manifest, with the root's paths.
+        if VERSION >= v"1.12"
+            ws = mktempdir()
+            vendored = mkpath(joinpath(ws, "vendor", "Dep"))
+            write(joinpath(ws, "Project.toml"), "[workspace]\nprojects = [\"member\"]\n")
+            write(joinpath(mkpath(joinpath(ws, "member")), "Project.toml"), "[deps]\nDep = \"$uuid\"\n")
+            write(joinpath(ws, "Manifest.toml"), entry("vendor/Dep"))
+            Runtests.Private.copy_env_files(dir, joinpath(ws, "member", "Project.toml"))
+            @test realpath(copied_path(dir)) == realpath(vendored)
+            # And a project without a manifest leaves none from an earlier copy.
+            alone = mktempdir()
+            write(joinpath(alone, "Project.toml"), "[deps]\n")
+            Runtests.Private.copy_env_files(dir, joinpath(alone, "Project.toml"))
+            @test !isfile(joinpath(dir, "Manifest.toml"))
+        end
     end
 
     @testset "a profile's project is never written into the package" begin

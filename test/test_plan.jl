@@ -8,10 +8,10 @@ const TESTDIR = joinpath(PKG, "test")
 
 read_items(; filter=Filter()) = scan(discover(TESTDIR), filter, setup_modules(TESTDIR))
 
-function make_plan(; filter=Filter(), history=History(), strict_order=true, kwargs...)
+function make_plan(; filter=Filter(), history=History(), kwargs...)
     items = read_items(; filter)
     cfg = read_config(TESTDIR; nunits=length(items), kwargs...)
-    return plan(items, cfg; history, root=PKG, strict_order)
+    return plan(items, cfg; history, root=PKG)
 end
 
 # The order items would run in if the workers' queues were concatenated.
@@ -58,7 +58,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test first(dispatch_order(p)) == "slow thing"
     end
 
-    @testset "[order] naming a missing item is an error on a full run" begin
+    @testset "[order] naming an item the suite does not have is an error, whatever the selection" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "test", "a_test.jl"), """@testitem "real" begin\n @test true\n end\n""")
         write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"raal\"]\n")
@@ -68,8 +68,16 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test err isa ConfigError
         @test occursin("do not exist", sprint(showerror, err))
         @test occursin("did you mean", sprint(showerror, err))   # near-match suggestion
-        # ...but a filtered run must not fail just because the pinned item was filtered out
-        @test plan(items, cfg; root=dir, strict_order=false) isa Runtests.Private.Plan
+        # A selection of other items does not hide the mistake.
+        err = try; plan(items, cfg; root=dir, suite_names=["real"]); catch e; e; end
+        @test err isa ConfigError
+        # A pinned item the selection leaves out is no mistake: the rest run, in order.
+        write(joinpath(dir, "test", "a_test.jl"), """@testitem "real" begin\n end\n@testitem "other" begin\n end\n""")
+        write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"real\"]\n")
+        all_items = scan(discover(joinpath(dir, "test")), Filter(), Dict{Symbol,String}())
+        others = filter(it -> it.name == "other", all_items)
+        p = plan(others, read_config(joinpath(dir, "test")); root=dir, suite_names=["real", "other"])
+        @test dispatch_order(p) == ["other"]
     end
 
     @testset "an unknown profile is an error naming the items" begin

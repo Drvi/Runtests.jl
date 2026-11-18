@@ -72,7 +72,7 @@ Workers, items and the run itself each print lines of one shape:
 ⚪ w0 · 14:52:16 · INFO · 0/6 · 0 failed · 0/2 workers · tree mem 920M (max 920M) · child max 449M · mem 82% · cpu  5.5/18 · testing 0s
 ⚫ w1 · 14:52:16 · UP   · pid 35898 · threads 2,1
 🔵 w1 · 14:52:16 · RUN  · 1/6 · "slow thing" · at test/sub/b_test.jl:9
-🟢 w1 · 14:52:16 · DONE · 1/6 · "slow thing" · PASS ·  0.0s (94% compile) · maxrss 0.3 GiB
+🟢 w1 · 14:52:16 · DONE · 1/6 · "slow thing" · PASS ·  0.0s (94% compile) · tree max 0.3 GiB
 ⚫ w1 · 14:52:16 · EXIT · pid 35898 · 3 items · 0.3s
 ```
 
@@ -89,7 +89,7 @@ Each line starts with a mark, the worker and the time. The worker is `w1`, `w2` 
 
 An `UP` line gives the process ID and the threads of the worker. It also says `sandbox` for the process of a sandboxed item, and gives the Julia flags of its profile. When an item of the run uses a profile other than `default`, the line names the profile of every worker. In a combined run, the line names the profile with its package, for example `profile default of B`. There, only the default profile of the first package has no name on the line. That package is the workspace root when the root has tests. When the run uses an environment directory, the line names the environment of the worker.
 
-A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and the most memory that the worker held. The outcome is the result of the body of the item. A `HOOK` line after it names the `test_end` of a profile that failed, errored or timed out, with the item, the attempt and the cause. The details go in the log of the attempt. The outcome of the item does not change.
+A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and memory. `tree max` is the most memory that the worker and the processes it started held together while the item ran. The run samples it five times a second, so a shorter item gets the memory at the last sample. `maxrss` is given in its place with `monitor = false`, or for an item that runs in the process of the run: it is the most memory that the process held since it started. The outcome is the result of the body of the item. A `HOOK` line after it names the `test_end` of a profile that failed, errored or timed out, with the item, the attempt and the cause. The details go in the log of the attempt. The outcome of the item does not change.
 
 ### The progress line
 
@@ -116,7 +116,7 @@ While the precompile step runs, the first two values count the stale caches in p
 An item that did not pass gets a block with its results, right after its `DONE` line:
 
 ```text
-🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · maxrss 0.3 GiB
+🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · tree max 0.3 GiB
 ┌ [1/1] FAIL "fails"
 │ Test Failed at test/faults_test.jl:6
 │   Expression: 1 == 2

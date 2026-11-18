@@ -3,7 +3,7 @@
 # leaves the answer behind. Best effort: if the monitor throws, it switches itself
 # off, says so once, and the tests carry on.
 
-using .Platform: process_rss, process_tree, machine_memory, cpu_load, cpu_count,
+using .Platform: process_rss, process_tree, child_lister, machine_memory, cpu_load, cpu_count,
     cpu_ticks, process_cpu_seconds, ensure_checked!, PER_PROCESS_OK
 
 # The scan is over before the monitor exists. Resolving the environment and
@@ -144,6 +144,12 @@ struct Reading
     phase_entered::Float64       # when the sample's stage began
     worker_peak::Vector{Int64}   # per slot, the largest its worker was sampled at; a copy
     worker_pid::Vector{Int32}    # and whose peak that is; a copy
+    # Per slot, copies: its worker's tree, the worker and the processes under it, summed
+    # at this sample; the largest that sum was over the attempt the slot held; and which
+    # attempt that is (`attempt_key`).
+    tree_rss::Vector{Int64}
+    attempt_peak::Vector{Int64}
+    attempt_key::Vector{Int64}
 end
 
 mutable struct Monitor
@@ -175,6 +181,12 @@ mutable struct Monitor
     # both; others read the peaks through `reading`.
     const worker_peak::Vector{Int64}
     const worker_pid::Vector{Int32}
+    # Per slot, its worker's tree at the newest sample, and its peak over the attempt
+    # `attempt_key` names: an attempt the slot holds for longer than a sample starts a
+    # new peak. Written by the monitor's task alone, as the two above are.
+    const tree_rss::Vector{Int64}
+    const attempt_peak::Vector{Int64}
+    const attempt_key::Vector{Int64}
     # Where the status line is assembled, reused for the same reason. `lineio`
     # carries the colour setting into it: written to the buffer directly, every
     # `printstyled` in the line would come out plain.
@@ -238,10 +250,11 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     @atomic phase_stats(stats, PHASE_SETUP).entered = entered
     n = nslots(run.plan)
     return Monitor(
-        run, stats, fill(Sample(), RING_SAMPLES), 0, Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n)),
+        run, stats, fill(Sample(), RING_SAMPLES), 0,
+        Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
         nothing, false, false,
         PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
-        zeros(Int64, n), zeros(Int32, n), linebuf,
+        zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n), linebuf,
         IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
     )
@@ -282,6 +295,26 @@ function memory_note(m::Union{Nothing, Monitor}, slot::Integer, pid::Integer)
         peak > 0 ? string(" · peak rss ", fmt_bytes(peak)) : "",
         s.machine_total > 0 ? string(" · machine ", round(Int, 100 * s.machine_used / s.machine_total), "% in use") : ""
     )
+end
+
+# Which attempt a slot holds, as one number: 0 for none.
+attempt_key(i::Integer, attempt::Integer) = i == 0 ? Int64(0) : (Int64(i) << 8) | Int64(attempt & 0xff)
+
+"""
+    attempt_tree_rss(m, slot, i, attempt, pid) -> Int64
+
+The most memory that the worker `pid` of `slot` and the processes under it held
+together while the slot's attempt `attempt` at item `i` ran, as the monitor sampled
+them: the largest sum over the samples of the attempt, or, for an attempt shorter than
+the time between two samples, the sum at the newest sample of that worker. 0 without a
+monitor or a sample of that worker.
+"""
+function attempt_tree_rss(m::Union{Nothing, Monitor}, slot::Integer, i::Integer, attempt::Integer, pid::Integer)
+    m === nothing && return Int64(0)
+    r = @atomic m.reading
+    checkbounds(Bool, r.attempt_key, slot) || return Int64(0)
+    r.attempt_key[slot] == attempt_key(i, attempt) && r.attempt_peak[slot] > 0 && return r.attempt_peak[slot]
+    return r.worker_pid[slot] == pid ? r.tree_rss[slot] : Int64(0)
 end
 
 # Stamped by the run's own task as it enters a stage: one writer per field.
@@ -367,9 +400,12 @@ function sample!(m::Monitor)
     total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0; nworkers = 0
     if PER_PROCESS_OK[]
         roots = tree_roots(m)
-        for pid in process_tree(roots)
+        children = child_lister()
+        rss_of = Dict{Int32, Int64}()
+        for pid in process_tree(roots; children)
             rss = process_rss(pid)
             rss <= 0 && continue
+            rss_of[pid] = rss
             nprocs += 1
             # Every root but this process is a worker.
             pid != first(roots) && pid in roots && (nworkers += 1)
@@ -378,14 +414,30 @@ function sample!(m::Monitor)
         end
         for slot in run_of(m).slots
             w = @atomic slot.worker
-            w === nothing && continue
+            if w === nothing
+                m.tree_rss[slot.id] = 0
+                continue
+            end
             pid = Int32(w.pid)
             if m.worker_pid[slot.id] != pid
                 m.worker_pid[slot.id] = pid
                 m.worker_peak[slot.id] = 0
             end
-            rss = process_rss(pid)
+            rss = get(rss_of, pid, Int64(0))
             rss > m.worker_peak[slot.id] && (m.worker_peak[slot.id] = rss)
+            # The worker with what it started, such as a build, so that an item's memory
+            # is what running it took.
+            tree = Int64(0)
+            for p in process_tree((pid,); children)
+                tree += get(rss_of, p, Int64(0))
+            end
+            m.tree_rss[slot.id] = tree
+            key = attempt_key(@atomic(slot.current), @atomic(slot.attempt))
+            if key != m.attempt_key[slot.id]
+                m.attempt_key[slot.id] = key
+                m.attempt_peak[slot.id] = 0
+            end
+            key == 0 || tree <= m.attempt_peak[slot.id] || (m.attempt_peak[slot.id] = tree)
         end
     end
     load1 = Float32(cpu_load())
@@ -399,7 +451,8 @@ function sample!(m::Monitor)
     update_stats!(m, s)
     st = m.stats
     @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes,
-                                (@atomic phase_stats(st, phase).entered), copy(m.worker_peak), copy(m.worker_pid))
+                                (@atomic phase_stats(st, phase).entered), copy(m.worker_peak), copy(m.worker_pid),
+                                copy(m.tree_rss), copy(m.attempt_peak), copy(m.attempt_key))
     return s
 end
 

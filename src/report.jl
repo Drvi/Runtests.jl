@@ -671,7 +671,10 @@ styled() do io
         # Rounded to a tenth, as `fmt_gib` rounds, then written without a string.
         print(io, FIELD); print_1dp(io, round(how.elapsed_ns / 1.0e9; digits = 1), TIME_WIDTH - 1)
         print(io, "s ("); print_int(io, pct, 2); print(io, "% compile)")
-        print(io, FIELD, "maxrss "); print_1dp(io, round(how.maxrss / 2^30; digits = 1)); print(io, " GiB")
+        # `tree max`: the worker with what it started, over the attempt; `maxrss`: one
+        # process, since it started.
+        print(io, FIELD, get(how, :tree, false) ? "tree max " : "maxrss ")
+        print_1dp(io, round(how.maxrss / 2^30; digits = 1)); print(io, " GiB")
     else
         print(io, "at ")
         print_bold(io, how)

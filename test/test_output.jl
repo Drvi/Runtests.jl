@@ -39,7 +39,8 @@ using Runtests: RuntestsWorkers
             @test occursin(
                 Regex("^$(Runtests.Private.MARK_PASSED) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
-            @test occursin("maxrss", l)
+            # The worker with what it started, or its own `maxrss` before a sample saw it.
+            @test occursin(r" · (tree max|maxrss) \d", l)
         end
     end
 

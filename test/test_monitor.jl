@@ -271,6 +271,25 @@ end
         @test any(c -> 10 <= c < 12, counts)
     end
 
+    @testset "an item's memory is its worker's with what the worker started, over the attempt" begin
+        dir = make_pkg("TreeMemory", "test/t_test.jl" => """
+            @testitem "starts a big process" begin
+                run(`\$(Base.julia_cmd()) --startup-file=no -e 'x = ones(UInt8, 600 * 2^20); sleep(2); print(sum(x) > 0)'`)
+                @test true
+            end
+            """)
+        with_runstate_dir() do _
+            (states, run, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = true))
+            @test states["starts a big process"] === Runtests.Private.PASSED
+            if Runtests.Private.Platform.PER_PROCESS_OK[]
+                done = match(r"DONE .* tree max +([0-9.]+) GiB", out)
+                @test done !== nothing && parse(Float64, done[1]) >= 0.6
+                rs = Runtests.Private.read_run_state(run.runstate.path)
+                @test only(rs.statuses).peak_rss_mb >= 600
+            end
+        end
+    end
+
     @testset "the status line says what is happening" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
@@ -316,7 +335,8 @@ end
         sample = Runtests.Private.Sample(r.t, r.phase, r.nprocs, r.nworkers, r.total_rss, r.largest_rss, r.largest_pid,
                                          r.machine_used, r.machine_total, -1.0f0, 73.4f0)
         @atomic m.reading = Runtests.Private.Reading(sample, saved.peak_total, saved.peak_single, saved.phase_entered,
-                                                     saved.worker_peak, saved.worker_pid)
+                                                     saved.worker_peak, saved.worker_pid, saved.tree_rss,
+                                                     saved.attempt_peak, saved.attempt_key)
         @test occursin(" · cpu  73% · ", status_line(m))
         @test !occursin(r"cpu +\d+\.\d/", status_line(m))
         @atomic m.reading = saved
@@ -643,7 +663,7 @@ end
         m = run.monitor
         r = @atomic m.reading
         @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
-                                                 [Int64(3) << 30], Int32[4242])
+                                                 [Int64(3) << 30], Int32[4242], [Int64(0)], [Int64(0)], [Int64(0)])
         note(pid) = Runtests.Private.memory_note(m, 1, pid)
         @test occursin("peak rss $(fmt_bytes(Int64(3) << 30))", note(4242))
         # A worker that died before a sample saw it is not given the peak of the

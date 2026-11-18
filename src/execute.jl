@@ -307,7 +307,9 @@ struct Statuses
     testsets::Vector{Any}
     # What its last attempt left of evidence, as `ItemResult.artifacts` says it.
     artifacts::Vector{UInt8}
-    # The rest of its status row: recompile seconds, MiB allocated and peak resident MiB.
+    # The rest of its status row: recompile seconds, MiB allocated and peak resident MiB:
+    # of its worker and the processes under it during the attempt, as the monitor
+    # sampled them, or else the process's largest so far (`maxrss`).
     recompile::Vector{Float32}
     alloc_mb::Vector{Float32}
     rss_mb::Vector{Float32}
@@ -2091,7 +2093,15 @@ function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::Abstrac
     end
     if rec !== nothing
         within[] = rec.how === nothing
-        return printline(run, item_line(run, slot.id, rec.i, rec.attempt, rec.how))
+        how = rec.how
+        if how !== nothing
+            # The memory of the worker and of what it started, as the monitor saw it,
+            # in place of what the worker's own process has held since it started.
+            w = @atomic slot.worker
+            tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, rec.i, rec.attempt, w.pid)
+            tree > 0 && (how = (; how..., maxrss = tree, tree = true))
+        end
+        return printline(run, item_line(run, slot.id, rec.i, rec.attempt, how))
     end
     return printline(run, string(within[] ? MARK_ITEM : MARK_WORKER, " ", rpad(string("w", slot.id), SLOT_LABEL_WIDTH[]), FIELD, line))
 end
@@ -2986,7 +2996,7 @@ reporting does, so the exit hook can use it.
 function persist_attempt!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
         testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool;
-        ended::Float64 = time(), artifacts::UInt8 = 0x00
+        ended::Float64 = time(), artifacts::UInt8 = 0x00, peak_rss::Union{Nothing, Int64} = nothing
     )
     (state === UNSEEN || state === RUNNING) && error("Runtests internal error: item $i recorded as $state")
     st = run.statuses
@@ -3003,7 +3013,7 @@ function persist_attempt!(
     st.compile[i] = stats.compile_ns / 1.0e9
     st.recompile[i] = stats.recompile_ns / 1.0e9
     st.alloc_mb[i] = stats.bytes / 2^20
-    st.rss_mb[i] = stats.maxrss / 2^20
+    st.rss_mb[i] = something(peak_rss, Int64(stats.maxrss)) / 2^20
     st.testsets[i] = testset
     # What the run prints of a failure, kept beside the item's output for whoever
     # reads the run state later; a cancel or a skip has nothing of its own to say.
@@ -3128,8 +3138,10 @@ function persist_result!(
     note = (is_non_pass(res.state) && max_attempts > 1) ?
         retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, run.plan.items.unit[i])) : ""
     ended = time()
+    w = @atomic slot.worker
+    tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, i, attempt, w.pid)
     kept, elapsed, n = persist_attempt!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false;
-                                        ended, artifacts = res.artifacts)
+                                        ended, artifacts = res.artifacts, peak_rss = tree > 0 ? tree : nothing)
     return (; i, slot = slot.id, attempt, state = res.state, stats = res.stats, synthetic = false, note, ended, elapsed, n, kept)
 end
 

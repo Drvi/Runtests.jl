@@ -549,7 +549,7 @@ end
             while !isfile(ready) && !istaskdone(task) && time() < deadline
                 sleep(0.05)
             end
-            Runtests.Private.recycle_biggest_worker!(Monitor(Runtests.Private.LIVE_RUN[]))
+            Runtests.Private.recycle_biggest_worker!(Monitor(Runtests.Private.LIVE_RUN.run))
             fetch(task)
         end
         @test states["holds the worker"] === Runtests.Private.PASSED

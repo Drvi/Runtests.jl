@@ -435,7 +435,7 @@ end
 
 function run_for_editor(s::Session, id, p::Plan, target)
     # This task is where a cancel is thrown, from its first moment: `execute` makes
-    # it the target too, and puts back what it found here when it is done.
+    # the run's task the target, and puts back what it found here when it is done.
     @atomic RuntestsWorkers.INTERRUPT_TARGET.task = current_task()
     run, ended = nothing, "finished"
     try

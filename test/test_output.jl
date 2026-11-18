@@ -52,6 +52,10 @@ using Runtests: RuntestsWorkers
         @test all(l -> !isspace(first(l)), heads)   # from the first column
         marks = unique(first(split(strip(l))) for l in heads)
         known = Set([Runtests.Private.MARK_INFO, (Runtests.Private.MARK_RUNNING, Runtests.Private.MARK_PASSED, Runtests.Private.MARK_FAILED, Runtests.Private.MARK_SET_ASIDE, Runtests.Private.MARK_ITEM, Runtests.Private.MARK_WORKER)...])
+        # The fixture's setup has lines of its own when its cache has to be compiled.
+        union!(known, (Runtests.Private.PRECOMPILE_MARK_RUNNING, Runtests.Private.PRECOMPILE_MARK_PASSED,
+                       Runtests.Private.PRECOMPILE_MARK_FAILED, Runtests.Private.PRECOMPILE_MARK_UNPRECOMPILABLE,
+                       Runtests.Private.PRECOMPILE_MARK_WORKER, Runtests.Private.PRECOMPILE_MARK_INFO))
         @test issubset(marks, known)
         # This fixture starts workers, runs items that pass, and reports.
         @test Runtests.Private.MARK_WORKER in marks
@@ -65,7 +69,9 @@ using Runtests: RuntestsWorkers
     @testset "the run reports on itself when there is no terminal" begin
         status = filter(l -> occursin("· INFO ", l), lines)
         @test !isempty(status)
-        @test all(l -> startswith(l, Runtests.Private.MARK_INFO * " w0" * Runtests.Private.FIELD), status)
+        # Marked as the precompile lines are while there is something to compile.
+        info_marks = (Runtests.Private.MARK_INFO, Runtests.Private.PRECOMPILE_MARK_INFO)
+        @test all(l -> any(m -> startswith(l, m * " w0" * Runtests.Private.FIELD), info_marks), status)
         @test any(l -> occursin("mem ", l), status)
         # The load average as well as memory, where there is one: Windows reports none.
         Sys.iswindows() || @test any(l -> occursin(r" · cpu +\d+\.\d/\d+ · ", l), status)

@@ -4,7 +4,7 @@ A run can give you figures for each attempt at an item: its time, CPU time, comp
 
 ## Collect the figures
 
-The run calls the function when each attempt at an item starts, and again when the attempt ends. A retry is a new attempt, so it gets two calls of its own.
+The run calls the function when each attempt at an item starts, and again when the attempt ends. A retry is a new attempt, so it gets two calls of its own. The calls come one at a time. When the items run on workers, the calls come from a thread of the default pool, even when you call `runtests` on the interactive thread.
 
 ```julia
 events = Runtests.TestItemEvent[]

@@ -404,6 +404,8 @@ mutable struct Run
     # process is exiting. Called under `on_event_lock`, so calls never overlap.
     @atomic on_event::Any
     const on_event_lock::ReentrantLock
+    # The thread the run's task and every task it starts with `@async` are stuck to.
+    const thread::Int
 end
 
 # One at a time in a process: a run, `chores` and a pasted item set the root paths
@@ -438,6 +440,61 @@ The caller holds the process (`exclusively`). `on_event` is called with an
 [`TestItemEvent`](@ref) as each attempt starts and ends.
 """
 function execute(p::Plan, target; on_event = nothing)
+    # Items that run in this process run on the caller's thread, as the code around
+    # the call would run them.
+    single_process(p) && return execute_here(p, target, on_event)
+    return in_default_pool(() -> execute_here(p, target, on_event))
+end
+
+"""
+    in_default_pool(f)
+
+`f()`, in a task stuck to a thread of the default pool when this task runs in
+another pool. The run starts its slots with `@async`, which sticks them to the thread
+of the task that starts them, and from Julia 1.12 the main task runs on the
+interactive thread, which is for the REPL and an editor's requests. Ctrl-C lands on
+that thread, in this task as it waits: it is handed on to `f`'s task, and this task
+waits on until that one ends. Returns what `f` returns, and throws what it throws.
+"""
+function in_default_pool(f)
+    Threads.threadpool() === :default && return f()
+    outer = @atomic RuntestsWorkers.INTERRUPT_TARGET.task
+    pinned = Threads.Event()
+    # `runtests` reads which file called it from here (`running_from_runtests`).
+    source = get(task_local_storage(), :SOURCE_PATH, nothing)
+    t = Threads.@spawn :default begin
+        # Before its first wait, so it never moves.
+        current_task().sticky = true
+        @atomic RuntestsWorkers.INTERRUPT_TARGET.task = current_task()
+        notify(pinned)
+        try
+            source === nothing ? f() : task_local_storage(f, :SOURCE_PATH, source)
+        finally
+            @atomic RuntestsWorkers.INTERRUPT_TARGET.task = outer
+        end
+    end
+    # Shielded: from Julia 1.14 a cancellation reaches `t` itself, which inherits this
+    # task's scope, and every wait here would throw it again.
+    caught = nothing
+    while !istaskdone(t)
+        try
+            if caught !== nothing
+                # `t` is the target once it is stuck to its thread.
+                shielded(() -> wait(pinned))
+                RuntestsWorkers.forward_interrupt(caught)
+                caught = nothing
+            end
+            shielded(() -> wait(t))
+        catch e
+            istaskdone(t) && break
+            is_interrupt(e) || rethrow()
+            caught = e
+        end
+    end
+    return fetch_result(t)
+end
+
+function execute_here(p::Plan, target, on_event)
     cfg = p.cfg
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
@@ -454,12 +511,14 @@ function execute(p::Plan, target; on_event = nothing)
     for i in 1:nitems(p)
         local_item[i] = (seen[p.items.package[i]] += 1)
     end
+    # As its first `@async` would: the run's tasks share this thread from here.
+    current_task().sticky = true
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, [joinpath(d, "item_") for d in logdirs],
         artifacts_prefixes, local_item, String[], column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event,
-        ReentrantLock()
+        ReentrantLock(), Threads.threadid()
     )
     run.events === nothing || (run.events.run = run)
     SLOT_LABEL_WIDTH[] = slot_label_width(nslots(p))
@@ -579,7 +638,7 @@ function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, tes
         cfg.workers == 0 && init_in_process!(run)
         interrupted = false
         ensure_exit_report()
-        LIVE_RUN[] = run
+        @atomic LIVE_RUN.run = run
         limit = stall_limit(p)
         @atomic run.last_finish = time()
         watchdog = start_watchdog(run, limit)
@@ -615,9 +674,9 @@ function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, tes
             # again, and this has to finish.
             shielded() do
                 close(watchdog)
-                # Reaching here at all means the run unwound, so the exit
-                # hook has nothing left to close.
-                LIVE_RUN[] = nothing
+                # The exit hook closes the run when it takes it first: the process
+                # is going down, and this task's thread was held while it did.
+                (@atomicswap LIVE_RUN.run = nothing) === run || return nothing
                 set_phase!(run.monitor, PHASE_REPORT)
                 stop_monitor!(run.monitor)
                 shutdown!(run)
@@ -2168,13 +2227,19 @@ function died_how(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
     return string(how, memory_note(run.monitor, slot.id, w.pid))
 end
 
+mutable struct LiveRun
+    @atomic run::Any
+end
+
 """
     LIVE_RUN
 
-The run this process is part-way through, or nothing. A process runs one at a
-time, and [`report_unfinished_run`](@ref) is the only reader.
+`LIVE_RUN.run` is the run this process is part-way through, or nothing. A process
+runs one at a time. Whichever of the run's own teardown and
+[`report_unfinished_run`](@ref) takes it from here closes the run, and the other
+leaves it be.
 """
-const LIVE_RUN = Ref{Any}(nothing)
+const LIVE_RUN = LiveRun(nothing)
 
 # Registered when a run reaches its test phase; a process that never gets that far
 # has nothing to say at exit. Exit hooks run newest first, so registering the one
@@ -2199,12 +2264,16 @@ Nothing here waits on the event loop. A script exiting on Ctrl-C under Julia 1.1
 its exit hooks from wherever its first thread was, and a wait there can last forever.
 So the workers are signalled and their connections left to the exit, the run state's
 beat is left to its timer, and the closing block is written straight to the
-descriptor (see [`write_now`](@ref)).
+descriptor (see [`write_now`](@ref)). The run's own thread, when it is another, is
+held meanwhile ([`RuntestsWorkers.hold_thread`](@ref)): a slot there whose worker
+this kills would wake, and record and report its item again.
 """
 function report_unfinished_run()
-    run = LIVE_RUN[]
+    run = @atomicswap LIVE_RUN.run = nothing
     run === nothing && return nothing
-    LIVE_RUN[] = nothing
+    # The run's tasks, on a thread other than this one, would go on while this closes
+    # the run, and record and say again what this records and says.
+    hold = RuntestsWorkers.hold_thread(run.thread)
     try
         # First, before anything here can let a slot run: one that found its worker
         # dead would report a death nothing explains, and blame the OOM killer.
@@ -2239,6 +2308,8 @@ function report_unfinished_run()
             end
         end
     catch
+    finally
+        RuntestsWorkers.release_thread(hold)
     end
     return nothing
 end
@@ -2715,6 +2786,8 @@ function handle_dispatch_failure!(
             print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
         end
         @atomic slot.worker = nothing
+        # Whatever took the worker recorded the item already (`record_stopped_item!`).
+        stopped_meanwhile(slot) && return false
         # A stopped run took this worker away itself: the item neither failed nor
         # ran, and is counted with the ones that never started.
         if is_cancelled(run.queues)

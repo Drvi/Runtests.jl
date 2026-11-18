@@ -454,6 +454,31 @@ end
         @test states["takes a while"] === PASSED && !Runtests.Private.RUN_ACTIVE[]
     end
 
+    # Julia 1.12 and later have an interactive thread unless told otherwise.
+    Threads.nthreads(:interactive) > 0 &&
+    @testset "a run called from the interactive thread runs on the default pool, and its items in this process stay" begin
+        # The slots, whose tasks call `on_event`, are on the run's thread.
+        dir = make_pkg("PoolOfTheRun", "test/t_test.jl" => """
+            @testitem "a" begin
+                @test true
+            end
+            @testitem "b" begin
+                @test true
+            end
+            """)
+        pools(workers) = fetch(Threads.@spawn :interactive exclusively() do
+            seen = Symbol[]
+            p, target = prepare((dir,); workers, logs=:issues, monitor=false)
+            run = execute(p, target; on_event = _ -> push!(seen, Threads.threadpool()))
+            rm(run.scratch; force=true, recursive=true)
+            (; seen, passed = all(==(PASSED), run.statuses.state))
+        end)
+        on_workers = pools(1)
+        @test on_workers.passed && length(on_workers.seen) == 4 && all(==(:default), on_workers.seen)
+        in_process = pools(0)
+        @test in_process.passed && length(in_process.seen) == 4 && all(==(:interactive), in_process.seen)
+    end
+
     @testset "failfast names the member of a chain that failed" begin
         dir = make_pkg("FailfastChain", "test/t_test.jl" => """
             @testitem "c passes" chain=:c begin

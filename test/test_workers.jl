@@ -96,6 +96,59 @@ end
         @test err isa CapturedException && occursin("inner", sprint(showerror, err))
     end
 
+    # A task stuck to its thread, as a run's task is, that waits until it is thrown into
+    # or let go. Returns it once it is stuck.
+    function stuck_task(go::Threads.Event)
+        pinned = Threads.Event()
+        t = Threads.@spawn begin
+            current_task().sticky = true
+            notify(pinned)
+            try
+                wait(go)
+                :let_go
+            catch e
+                e
+            end
+        end
+        wait(pinned)
+        return t
+    end
+
+    @testset "an interrupt reaches its target from any thread, once" begin
+        # From Julia 1.12 the test's own task is on the interactive thread and the
+        # target on another: the throw is handed to a task on the target's thread.
+        t = stuck_task(Threads.Event())
+        outer = @atomic RuntestsWorkers.INTERRUPT_TARGET.task
+        @atomic RuntestsWorkers.INTERRUPT_TARGET.task = t
+        try
+            @test RuntestsWorkers.forward_interrupt(InterruptException())
+            @test fetch(t) isa InterruptException
+            @test RuntestsWorkers.INTERRUPT_TARGET.task === nothing
+            @test !RuntestsWorkers.forward_interrupt(InterruptException())
+        finally
+            @atomic RuntestsWorkers.INTERRUPT_TARGET.task = outer
+        end
+    end
+
+    @testset "a held thread runs none of its tasks until it is released" begin
+        # What the exit hook does to a run's thread while it closes the run.
+        go = Threads.Event()
+        t = stuck_task(go)
+        tid = Threads.threadid(t)
+        if tid == Threads.threadid()
+            @test RuntestsWorkers.hold_thread(tid) === nothing
+            notify(go)
+        else
+            hold = RuntestsWorkers.hold_thread(tid)
+            @test hold[] == 1
+            notify(go)
+            sleep(0.3)
+            @test !istaskdone(t)
+            RuntestsWorkers.release_thread(hold)
+        end
+        @test fetch(t) === :let_go
+    end
+
     @testset "a skip expression draws from the item's seed, and leaves the caller's numbers alone" begin
         # It runs where the item does, just before it: its draws repeat with the seed,
         # as the body's do, and the process's own sequence goes on as if it had not.

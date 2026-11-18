@@ -416,7 +416,8 @@ end
 # Julia throws Ctrl-C into whichever task its first thread is running, or last ran.
 # Without an interactive thread (`-t 1`, `-t 4,0`) that is often one of the tasks
 # here: a worker's watcher, relay or reader, or a timer. Each hands it on rather
-# than end with it or take it for a failure of its own.
+# than end with it or take it for a failure of its own. With one, the first thread
+# is the interactive thread, and the task there is the caller waiting for the run.
 
 # Atomic: set on the target's thread, read from whichever thread caught Ctrl-C.
 mutable struct InterruptTarget
@@ -437,19 +438,73 @@ const INTERRUPT_TARGET = InterruptTarget(nothing)
 
 Throw `e` into [`INTERRUPT_TARGET`](@ref), once: the target is cleared as it is
 thrown into, so the same Ctrl-C caught by a second task does not interrupt the
-target's cleanup. Only from the target's own thread, where the target cannot be
-running and scheduling it is safe. Julia delivers SIGINT to thread 1, where the
-REPL and a script both run, so that is where the catching task is.
+target's cleanup. The target is stuck to a thread, and is thrown into from that
+thread, where it cannot be running: scheduling a task that is running on another
+thread corrupts the scheduler. From another thread, the throw is handed to a task
+on the target's, and `true` means it will happen unless the target ends first.
 """
 function forward_interrupt(e::Exception)
     t = @atomic INTERRUPT_TARGET.task
-    (t === nothing || t === current_task() || istaskdone(t)) && return false
-    (t.sticky && Threads.threadid(t) == Threads.threadid()) || return false
+    (t === nothing || t === current_task() || istaskdone(t) || !t.sticky) && return false
+    tid = Threads.threadid(t)
+    tid == 0 && return false   # never scheduled, so on no thread yet
+    tid == Threads.threadid() && return throw_into(t, e)
+    on_thread(() -> throw_into(t, e), tid)
+    return true
+end
+
+function throw_into(t::Task, e::Exception)
+    istaskdone(t) && return false
     # Taken by exactly one of the tasks that caught the same Ctrl-C.
     (@atomicreplace INTERRUPT_TARGET.task t => nothing).success || return false
     schedule(t, e; error=true)
     return true
 end
+
+# `f` in a task stuck to thread `tid`, as `@async` sticks a task to the thread that
+# starts it: while it runs, no other task stuck to that thread is running.
+function on_thread(f, tid::Integer)
+    t = Task(f)
+    t.sticky = true
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1) == 1 || error("Runtests: no thread $tid to run a task on")
+    return schedule(t)
+end
+
+"""
+    hold_thread(tid; limit = 2.0) -> Union{Nothing, Threads.Atomic{Int}}
+
+Keep the tasks stuck to thread `tid` from running until [`release_thread`](@ref),
+with a task stuck there that never waits. It takes the thread the next time the
+task running there waits, and this waits for that, for `limit` seconds at most,
+without waiting on a task or on the event loop, as an exit hook must. `nothing`
+when `tid` is this thread, where no other task runs while this one does.
+"""
+function hold_thread(tid::Integer; limit::Real = 2.0)
+    tid == Threads.threadid() && return nothing
+    state = Threads.Atomic{Int}(0)   # 0 waiting for the thread, 1 holding it, 2 released
+    on_thread(tid) do
+        Threads.atomic_cas!(state, 0, 1) == 0 || return nothing
+        while state[] == 1
+            # Collection waits for every thread to reach a safepoint.
+            GC.safepoint()
+            Libc.systemsleep(0.005)
+        end
+    end
+    deadline = time() + limit
+    while state[] == 0 && time() < deadline
+        GC.safepoint()
+        Libc.systemsleep(0.001)
+    end
+    return state
+end
+
+"""
+    release_thread(hold)
+
+End a [`hold_thread`](@ref). Julia's `exit` from 1.14 waits for every thread to
+reach a wait, so a hold must end before the exit hooks do.
+"""
+release_thread(hold::Union{Nothing, Threads.Atomic{Int}}) = (hold === nothing || (hold[] = 2); nothing)
 
 """
     after(f, seconds) -> Timer

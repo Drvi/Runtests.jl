@@ -1298,9 +1298,20 @@ const TEST_ENVIRONMENT = "the test environment"
 # What the pools of one project need compiled under one set of cache flags: every
 # dependency of the project (`whole`), or `names` and their dependencies. `load_path`
 # is the load path of the first pool that needs it. `subject` is the project as a
-# message names it, and `profiles` the profiles a message names.
+# message names it, and `profiles` the profiles a message names. In a run of several
+# packages, `by` holds what each tested package needs of it: names, or `nothing` for
+# all of it.
 const PrecompileNeed = @NamedTuple{project::String, load_path::Vector{String}, config::PrecompileConfig, whole::Bool,
-                                   names::Set{String}, subject::String, profiles::Set{String}}
+                                   names::Set{String}, subject::String, profiles::Set{String},
+                                   by::Dict{String, Union{Nothing, Set{String}}}}
+
+# Tested package `name` needs `names` of a project, or all of it (`nothing`).
+function ask!(by::Dict{String, Union{Nothing, Set{String}}}, name::AbstractString, names)
+    have = get!(Set{String}, by, name)
+    have === nothing && return nothing
+    names === nothing ? (by[name] = nothing) : union!(have, names)
+    return nothing
+end
 
 # The needs of the run's pools, one for each project and set of cache flags, and the
 # sets of flags besides this process's. In a run of one package a pool needs its
@@ -1354,6 +1365,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
     end
     # The packages whose names each need holds already.
     held = Set{Tuple{Int, Int32}}()
+    combined = is_combined(p)
     for pool in p.pools
         j = pool.profile
         skips_environment(p, j) && continue
@@ -1377,7 +1389,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
             if i === nothing
                 load_path = here ? copy(LOAD_PATH) : worker_load_path(run, j)
                 push!(needs, (; project, load_path, config, whole = false, names = Set{String}(), subject,
-                              profiles = Set{String}()))
+                              profiles = Set{String}(), by = Dict{String, Union{Nothing, Set{String}}}()))
                 i = lastindex(needs)
             end
             unit_profile = p.units.profile[u]
@@ -1391,19 +1403,24 @@ function precompile_needs(run::Run, p::Plan, flags_of)
                 # A worker loads Runtests before it connects. Where the project does not
                 # hold it, `precompile_queue` compiles it in this process's environment.
                 "Runtests" in deps_of(project) && push!(needs[i].names, "Runtests")
+                combined && ask!(needs[i].by, p.packages.name[p.profile_package[unit_profile]],
+                                 "Runtests" in deps_of(project) ? push!(copy(held_here), "Runtests") : held_here)
                 continue
             end
             # A profile in a project of its own is named, and one with flags of its own.
             (own || !default) && push!(needs[i].profiles, String(prof.name))
             if whole
                 needs[i].whole || (needs[i] = merge(needs[i], (; whole = true)))
+                combined && ask!(needs[i].by, p.packages.name[k], nothing)
                 continue
             end
             for item in p.units.span[u]
                 package = p.items.package[item]
                 (i, package) in held && continue
                 push!(held, (i, package))
-                union!(needs[i].names, intersect(test_dep_names(package), deps_of(project)))
+                asked = intersect(test_dep_names(package), deps_of(project))
+                union!(needs[i].names, asked)
+                combined && ask!(needs[i].by, p.packages.name[package], asked)
             end
         end
     end
@@ -1441,7 +1458,8 @@ function profile_flags(prof::Profile, args::Vector{String})
     end
 end
 
-const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String, profiles::Set{String}}
+const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String, profiles::Set{String},
+                              packages::Set{String}}
 
 # The setups the items load, by the project they load them in, in the order of the
 # pools: the project, the load path there, and each setup with the julia arguments and
@@ -1450,6 +1468,7 @@ const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, d
 # those with flags or a project of their own.
 function setup_needs(run::Run, p::Plan, flags_of)
     out = @NamedTuple{project::String, load_path::Vector{String}, needs::Vector{SetupNeed}}[]
+    combined = is_combined(p)
     for pool in p.pools, u in first(pool.head):last(pool.tail)
         j = pool.profile
         skips_environment(p, j) && continue
@@ -1473,10 +1492,11 @@ function setup_needs(run::Run, p::Plan, flags_of)
             at = findfirst(n -> n.name === name && n.flags == flags, needs)
             if at === nothing
                 push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR),
-                              profiles = Set{String}()))
+                              profiles = Set{String}(), packages = Set{String}()))
                 at = lastindex(needs)
             end
             named && push!(needs[at].profiles, String(p.profiles[j].name))
+            combined && push!(needs[at].packages, p.packages.name[p.items.package[i]])
         end
     end
     return out

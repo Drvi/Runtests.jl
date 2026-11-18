@@ -921,6 +921,38 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "a compile names the packages it is for, and whether a project of theirs names it" begin
+            # A's project names Near, B's test project names Helper, and both of those
+            # load Far, which no project of A or B names. Names no earlier run compiled.
+            tag = string(time_ns(); base = 16)
+            near, helper, far = "Near$tag", "Helper$tag", "Far$tag"
+            u = Dict(n => next_uuid() for n in (near, helper, far))
+            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
+            vendor(name, deps...) = write_package(joinpath(ws, "vendor", name), name,
+                ["Project.toml" => "name = \"$name\"\nuuid = \"$(u[name])\"\nversion = \"0.1.0\"\n" *
+                     (isempty(deps) ? "" : "\n[deps]\n" * join("$d = \"$(u[d])\"\n" for d in deps) *
+                                           "\n[sources]\n" * join("$d = {path = \"../$d\"}\n" for d in deps)),
+                 "src/$name.jl" => "module $name\n" * join("using $d\n" for d in deps) * "end\n"]; test_project = false)
+            vendor(far); vendor(near, far); vendor(helper, far)
+            needs(file, name, path) = open(io -> print(io, "\n[deps]\n$name = \"$(u[name])\"\n\n[sources]\n$name = {path = \"$path\"}\n"),
+                                          file, "a")
+            needs(joinpath(ws, "lib", "A", "Project.toml"), near, "../../vendor/$near")
+            t = TOML.parsefile(joinpath(ws, "lib", "B", "test", "Project.toml"))
+            t["deps"][helper] = u[helper]
+            t["sources"][helper] = Dict("path" => "../../../vendor/$helper")
+            open(io -> TOML.print(io, t), joinpath(ws, "lib", "B", "test", "Project.toml"), "w")
+            with_runstate_dir() do _
+                (states, _, _), out = capture_run(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+                @test states == Dict(("A", "a") => PASSED, ("B", "b") => PASSED)
+                # The column of an item's package, here the packages a compile is for,
+                # then what the compile is to them.
+                columns(name) = match(Regex("COMP · +\\d+/\\d+ · ([^·\\n]*?) +· ([a-z]+) +· \"$name\""), out).captures
+                @test columns(near) == ["A", "direct"]
+                @test columns(helper) == ["B", "direct"]
+                @test columns(far) == ["A +1", "indirect"]
+            end
+        end
+
         @testset "each item runs in its package's root, under its package's settings" begin
             # A's `test_end` outlasts A's limit, and B's profile of the same name has a
             # limit of its own. On one worker, each item, skip expression, `test_end` and

@@ -24,9 +24,12 @@ const QueueEnv = @NamedTuple{project::String, load_path::Vector{String}}
 # failure call the job's environment, and `name` is what a line of output calls it.
 # `profiles` are the profiles that need it for their flags or their project, which its
 # line of output names, and `version` is the version it compiles, `""` when none is known.
+# In a run of several packages, `requesters` are the tested packages that need it, which
+# its line names in a column. `indirect` marks a package that no project file of a
+# tested package names, nor the project it compiles in, and an extension of one.
 const QueueJob = @NamedTuple{env::Int, pkg::Base.PkgId, config::Int, deps::Vector{Int}, strict::Bool,
                              exts::Union{Nothing, Vector{Base.PkgId}}, kind::Symbol, group::Int, name::String,
-                             profiles::Set{String}, version::String}
+                             profiles::Set{String}, version::String, requesters::Set{String}, indirect::Bool}
 
 # The environment a group of jobs compiles in, as the announcement names it: a
 # project, as a message calls it, and the profiles whose flags or project need it.
@@ -295,9 +298,13 @@ end
 # the precompiler cannot read, a run without a project or a project without a manifest,
 # adds nothing. A project whose graph cannot be read adds nothing either, with a
 # warning: the step is work brought forward, and the workers compile what they load.
+# A package is indirect unless `named` holds its name, or, for a project of the tested
+# packages (`tested`), the project names it. `by` holds what each tested package
+# needs of the project (`PrecompileNeed`).
 function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Vector{String},
                       config::PrecompileConfig, names::Union{Nothing, Set{String}}, group::Int;
-                      profiles::Set{String} = Set{String}())
+                      profiles::Set{String} = Set{String}(), named::Set{String} = Set{String}(), tested::Bool = false,
+                      by::Dict{String, Union{Nothing, Set{String}}} = Dict{String, Union{Nothing, Set{String}}}())
     file = queue_project_file(project)
     file === nothing && return nothing
     g = get!(q.graphs, file) do
@@ -318,7 +325,8 @@ function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Ve
         j = add_job!(q, (String(project), pkg, flags),
                      (; env = e, pkg, config = c, deps = Int[], strict = !isempty(g.deps[pkg]), exts,
                       kind = :package, group, name = display_name(g, pkg), profiles = Set{String}(),
-                      version = graph_version(g, pkg)))
+                      version = graph_version(g, pkg), requesters = Set{String}(),
+                      indirect = !(get(g.parent, pkg, pkg).name in named || (tested && pkg in g.direct))))
         union!(q.jobs[j].profiles, profiles)
         # As `Pkg.precompile` takes a request: the names, or else the project's own.
         (names === nothing ? pkg in g.direct : !haskey(g.parent, pkg) && pkg.name in names) && push!(q.requested, j)
@@ -330,7 +338,30 @@ function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Ve
             (j == 0 || j in job.deps) || push!(job.deps, j)
         end
     end
+    for (who, asked) in by
+        for pkg in (asked === nothing ? keep : compile_set(g, asked))
+            j = get(q.index, (String(project), pkg, flags), 0)
+            j == 0 || push!(q.jobs[j].requesters, who)
+        end
+    end
     return nothing
+end
+
+# The packages that a project file of a tested package names: each tested package,
+# and the dependencies, weak dependencies and test dependencies that its project and
+# its test project name.
+function named_packages(p::Plan)
+    named = Set{String}(p.packages.name)
+    for root in p.packages.root, dir in (root, joinpath(root, "test"))
+        file = project_file_in(dir)
+        file === nothing && continue
+        toml = parse_project(file)
+        for section in ("deps", "weakdeps", "extras")
+            entries = get(toml, section, nothing)
+            entries isa AbstractDict && union!(named, keys(entries))
+        end
+    end
+    return named
 end
 
 """
@@ -347,10 +378,12 @@ file, for the warning that the run gives.
 function precompile_queue(run::Run, p::Plan, flags_of)
     q = PrecompileQueue()
     needs, others = precompile_needs(run, p, flags_of)
+    named = named_packages(p)
     for n in needs
         (n.whole || !isempty(n.names)) || continue
         group = group_of!(q, n.project, n.subject, n.profiles)
-        add_project!(q, n.project, n.load_path, n.config, n.whole ? nothing : n.names, group; n.profiles)
+        add_project!(q, n.project, n.load_path, n.config, n.whole ? nothing : n.names, group; n.profiles, named,
+                     tested = true, n.by)
     end
     # Runtests, which a worker loads before it connects, for the flags that no project of
     # the run compiles it for. In this process's environment, where it was loaded from.
@@ -361,13 +394,17 @@ function precompile_queue(run::Run, p::Plan, flags_of)
         any(((_, k, f),) -> k == pkg && f == flags, keys(q.index)) && continue
         group = group_of!(q, here, string("Runtests for workers started with `", join(first(config).exec, " "), "`"),
                           String[])
-        add_project!(q, here, here_path, config, Set(["Runtests"]), group)
+        # The tested packages whose workers start with these flags.
+        who = Set{String}(w for n in needs if last(n.config) == flags for w in keys(n.by))
+        add_project!(q, here, here_path, config, Set(["Runtests"]), group; named,
+                     by = Dict{String, Union{Nothing, Set{String}}}(w => Set(["Runtests"]) for w in who))
         # Not in the project's manifest: the compile process builds what it waits for.
         haskey(q.index, (here, pkg, flags)) && continue
         push!(q.requested,
               add_job!(q, (here, pkg, flags), (; env = env_of!(q, here, here_path), pkg, config = config_of!(q, config),
                                               deps = Int[], strict = false, exts = nothing, kind = :runtests, group,
-                                              name = "Runtests", profiles = Set{String}(), version = source_version(pkg))))
+                                              name = "Runtests", profiles = Set{String}(), version = source_version(pkg),
+                                              requesters = who, indirect = false)))
     end
     once = Dict{Symbol, String}()
     for (; project, load_path, needs) in setup_needs(run, p, flags_of)
@@ -386,7 +423,7 @@ function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vec
     group = group_of!(q, project, "test setups", String[])
     waits = Tuple{Int, Base.PkgId}[]
     in_worker_environment(project, load_path) do
-        for (; name, args, flags, dir, profiles) in needs
+        for (; name, args, flags, dir, profiles, packages) in needs
             pkg = Base.identify_package(String(name))
             pkg === nothing && throw(ConfigError("test setup module `$name` is not loadable from $dir"))
             if pkg.uuid === nothing
@@ -396,11 +433,12 @@ function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vec
             key = (String(project), pkg, flags)
             if haskey(q.index, key)
                 union!(q.jobs[q.index[key]].profiles, profiles)
+                union!(q.jobs[q.index[key]].requesters, packages)
                 continue
             end
             i = add_job!(q, key, (; env = e, pkg, config = config_of!(q, args => flags), deps = Int[], strict = false,
                                   exts = nothing, kind = :setup, group, name = pkg.name, profiles = copy(profiles),
-                                  version = source_version(pkg)))
+                                  version = source_version(pkg), requesters = copy(packages), indirect = false))
             push!(q.requested, i)
             for dep in setup_dependencies(pkg)
                 # Named in the setup's own `[deps]`, or for a setup that is not a package,
@@ -711,11 +749,24 @@ function run_queue(run::Run, q::PrecompileQueue)
                               q.envs), 0)
     # Its hooks are the lock on a cache file, as in a helper.
     any(i -> work[i] && q.jobs[i].env == own, 1:n) && Base.require(PrecompileHelper.FILEWATCHING)
-    nhelpers = announce(run, q, work, own)
     # Each stale cache takes a number as its job ends (`report`).
     total = count(work)
+    # A helper for each other environment with a stale cache.
+    nhelpers = length(Set(q.jobs[i].env for i in eachindex(q.jobs) if work[i] && q.jobs[i].env != own))
+    # From here until the helpers are down, the progress line counts the compiles: the
+    # announcement already draws it so.
+    queue_started!(total, nhelpers)
+    try
+        announce(run, q, work, nhelpers)
+    catch
+        queue_ended!()
+        rethrow()
+    end
     width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
     vwidth = maximum((textwidth(version_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
+    # The column of the tested packages, which only a run of several fills.
+    pwidth = maximum((textwidth(requesters_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
+    kwidth = maximum((textwidth(kind_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
     # When the last completion was reported: the reminder a run off a terminal prints
     # counts its thirty seconds from here, and a new completion resets it.
     last_report, reminded, watching = Ref(time()), Ref(false), Ref(true)
@@ -757,7 +808,8 @@ function run_queue(run::Run, q::PrecompileQueue)
         s === :failed && (@atomic QUEUE_PROGRESS.failed += 1)
         k = @atomic QUEUE_PROGRESS.done += 1
         # A reused job measured nothing: it takes its number, and prints no line.
-        (cancelled[] || is_quiet(s)) || report_job(run, q, i, h_id, s, seconds, rss, text, k, total, width, vwidth)
+        (cancelled[] || is_quiet(s)) ||
+            report_job(run, q, i, h_id, s, seconds, rss, text, k, total, width, vwidth, pwidth, kwidth)
         last_report[] = time()
         reminded[] = false
         return nothing
@@ -845,8 +897,6 @@ function run_queue(run::Run, q::PrecompileQueue)
         is_quiet(status[i]) && redraw()
         return
     end
-    # From here until the helpers are down, the progress line counts the compiles.
-    queue_started!(total, nhelpers)
     try
         # Every helper starts at once, and is up by the time its first job has waited
         # for the compiles it waits for, which can be another environment's. A helper
@@ -938,13 +988,9 @@ end
 # the profiles that need it, then the setups, under a head that counts the stale caches
 # and the fresh ones, the helper processes they spread over, if any, and how many
 # compiles run at once: the single semaphore (`run_queue`) that bounds the compiles of
-# this process and of every helper. `own` is this process's environment, which needs
-# no helper. Returns the number of helpers.
-function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
-    lines, setups, envs = String[], String[], Set{Int}()
-    for i in eachindex(q.jobs)
-        work[i] && q.jobs[i].env != own && push!(envs, q.jobs[i].env)
-    end
+# this process and of every helper, of which there are `nhelpers`.
+function announce(run::Run, q::PrecompileQueue, work::BitVector, nhelpers::Int)
+    lines, setups = String[], String[]
     for (g, group) in pairs(q.groups)
         mine = [i for i in eachindex(q.jobs) if work[i] && q.jobs[i].group == g]
         isempty(mine) && continue
@@ -959,10 +1005,10 @@ function announce(run::Run, q::PrecompileQueue, work::BitVector, own::Int)
     fresh = length(q.jobs) - count(work)
     head = string("precompiling ", plural(count(work), "stale cache"),
                   fresh == 0 ? "" : string(" (", fresh, " fresh)"),
-                  isempty(envs) ? "" : string(" with ", plural(length(envs), "worker")),
+                  nhelpers == 0 ? "" : string(" with ", plural(nhelpers, "worker")),
                   ", at most ", precompile_tasks(), " at once")
     print_label_block(run, head, join(lines, '\n'))
-    return length(envs)
+    return nothing
 end
 
 # A group's subject as a worker's UP line calls its environment — `env test`,
@@ -1000,6 +1046,18 @@ function job_fields(q::PrecompileQueue, i::Int)
     named = sort!(collect(setdiff(job.profiles, (String(DEFAULT_PROFILE),))))
     isempty(named) || push!(fields, string(length(named) == 1 ? "profile " : "profiles ", join(named, ", ")))
     return fields
+end
+
+# What a job compiles, as its line's column gives it: a setup, a package that a
+# project file of a tested package names or an extension of one, or another package.
+kind_text(job::QueueJob) = job.kind === :setup ? "testsetup" : job.indirect ? "indirect" : "direct"
+
+# The tested packages a job is for, as its line's column gives them: the first by
+# name, and how many more. Empty outside a run of several packages.
+function requesters_text(job::QueueJob)
+    isempty(job.requesters) && return ""
+    n = length(job.requesters)
+    return n == 1 ? first(job.requesters) : string(minimum(job.requesters), " +", n - 1)
 end
 
 version_text(job::QueueJob) = isempty(job.version) ? "" : "v" * job.version
@@ -1064,18 +1122,20 @@ end
 queue_ended!() = (@atomic QUEUE_PROGRESS.total = 0; nothing)
 
 """
-    report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth)
+    report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth, pwidth, kwidth)
 
 The line of job `i` of `q`, compiled by helper process `helper` (`0` for this
 process), the `n`th of `total` stale caches to end, in the shape of a test item's
 DONE line: its outcome, its time, the largest a compile of the helper has run (`rss`,
 `0` for none known), and what it compiled for where that is not the default. A compile
 that did not build follows it with its output, in the bracket a test item's failure
-has; `width` is the name column's, and `vwidth` the version column's.
+has; `width` is the name column's, `vwidth` the version column's, `pwidth` that of the
+tested packages, `0` outside a run of several, and `kwidth` that of what it compiles
+(`kind_text`).
 """
 function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, status::Symbol, seconds::Float64,
                     rss::Float64, text::AbstractString,
-                    n::Integer, total::Integer, width::Integer, vwidth::Integer)
+                    n::Integer, total::Integer, width::Integer, vwidth::Integer, pwidth::Integer, kwidth::Integer)
     haskey(COMPILE_STATES, status) || return nothing
     word, mark, color = COMPILE_STATES[status]
     shown = repr(q.jobs[i].name)
@@ -1084,6 +1144,13 @@ function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, statu
         print_line_head(io, mark, helper, clock_now())
         print_word(io, "COMP")
         print_int(io, n, ndigits(total)); write(io, UInt8('/')); print_int(io, total); print(io, FIELD)
+        # The tested packages it is for, where an item's line has its package.
+        if pwidth > 0
+            who = requesters_text(q.jobs[i])
+            print(io, who); pad_to(io, pwidth, textwidth(who)); print(io, FIELD)
+        end
+        kind = kind_text(q.jobs[i])
+        print(io, kind); pad_to(io, kwidth, textwidth(kind)); print(io, FIELD)
         print(io, shown)
         pad_to(io, width, textwidth(shown))
         if vwidth > 0

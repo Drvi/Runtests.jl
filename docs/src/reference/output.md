@@ -8,9 +8,9 @@ This page describes the output of a run, in six parts. These are the precompile 
 ┌ [TEST] precompiling 4 stale caches (8 fresh) with 1 worker, at most 16 at once
 └ precompiling the env test/qa for 1 profile: default
 ⬛ w1 · 12:09:51 · UP   · pid 80184 · env test/qa
-🟩 w0 · 12:09:52 · COMP · 1/4 · "Helpers"   · v0.2.0 · PASS ·  0.2s
-🟩 w1 · 12:09:52 · COMP · 2/4 · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
-🟩 w1 · 12:09:52 · COMP · 3/4 · "MyPackage" · v0.1.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+🟩 w0 · 12:09:52 · COMP · 1/4 · direct · "Helpers"   · v0.2.0 · PASS ·  0.2s
+🟩 w1 · 12:09:52 · COMP · 2/4 · direct · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+🟩 w1 · 12:09:52 · COMP · 3/4 · direct · "MyPackage" · v0.1.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
 ⬛ w1 · 12:09:52 · EXIT · pid 80184 · 2 compiled · 0.9s
 ┌ [TEST] precompiled 4 stale caches: 3 compiled, 1 reused (8 fresh) in 0.9s
 │ w0 · 1 compiled, 1 reused (8 fresh) · env test
@@ -28,7 +28,21 @@ The lines of the step have the shape of the lines of the run, with a square for 
 | 🟨 | A compile made no cache (`SKIP`). The module cannot be precompiled, or a package that it loads failed. |
 | 🟥 | A compile failed (`FAIL`). Its output follows in a block, as for a failed item. |
 
-The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The helpers start with the step, and each one ends when the compiles of its environment are done. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. A `COMP` line gives the position of the compile among the stale caches, the package and its version, the outcome and the time. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A stale cache that another compile builds first is reused. It takes its position and prints no line, so the positions of the printed lines can skip a number.
+The coordinator compiles for its own environment, as `w0`. Each other environment gets a helper process, `w1`, `w2` and so on. The helpers start with the step, and each one ends when the compiles of its environment are done. The `UP` line of a helper names the profiles, the environment and the Julia flags of its compiles. On the line of a helper, `maxrss` is the most memory that one of its compiles held. A stale cache that another compile builds first is reused. It takes its position and prints no line, so the positions of the printed lines can skip a number.
+
+A `COMP` line gives the position of the compile among the stale caches, the kind of the module, the package and its version, the outcome and the time. The kind is one of these:
+
+- `direct`: a project file of a tested package names the package. For an extension, a project file names the package of the extension.
+- `indirect`: no project file of a tested package names it. It compiles because another package loads it.
+- `testsetup`: a [setup](@ref setups) of a tested package.
+
+The column of the kind is as wide as the longest kind on the lines of the step. In a combined run, a `COMP` line has one more column after its position, where the line of an item has its package. This column names the tested packages that need the compile. It gives the first one by name and the number of the others, as in `Alpha +1`:
+
+```text
+🟩 w0 · 10:58:23 · COMP · 3/7 · Alpha +1 · indirect · "Dep2"    · v0.1.0 · PASS ·  0.4s
+🟩 w0 · 10:58:24 · COMP · 4/7 · Alpha +1 · direct   · "Dep1"    · v0.1.0 · PASS ·  0.6s
+🟩 w0 · 10:58:24 · COMP · 5/7 · Beta     · direct   · "Helper"  · v0.1.0 · PASS ·  0.6s
+```
 
 The block at the end splits the stale caches into those compiled, those reused, those failed and those skipped, and gives the fresh caches. When the step had helpers, the block has a line for each worker, with the caches of the environments that it covered. The coordinator also covers each environment that needed no helper. The lines add up to the first line. The `EXIT` line of a helper gives the same counts as its line here.
 

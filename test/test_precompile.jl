@@ -363,6 +363,9 @@ end
         @test all(==(PASSED), values(states))
         s = spans()
         @test s[setup][1] < s[slow][2]
+        # The column of what each compiles: the widest kind sets its width.
+        @test occursin(Regex("COMP · +\\d+/\\d+ · direct    · \"$slow\""), out)
+        @test occursin(Regex("COMP · +\\d+/\\d+ · testsetup · \"$setup\""), out)
     end
 
     @testset "a helper ends when its environment is done, not with the queue" begin
@@ -376,7 +379,7 @@ end
         @test all(==(PASSED), values(states))
         lines = collect(eachsplit(out, '\n'))
         exit_at = findfirst(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l), lines)
-        slow_at = findfirst(l -> occursin(Regex("COMP · +\\d+/\\d+ · \"$slow\""), l), lines)
+        slow_at = findfirst(l -> occursin(Regex("COMP · +\\d+/\\d+ · direct +· \"$slow\""), l), lines)
         @test exit_at !== nothing && slow_at !== nothing && exit_at < slow_at
     end
 
@@ -418,11 +421,12 @@ end
                        "test/Project.toml" => dep(after, ua, ".."),
                        "test/t_test.jl" => item("t"))
         thrown, out = run_caught(dir)
-        # A line as a test item's, and its output in the bracket of a failed item.
-        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$broken\" +· v0\\.1\\.0 +· FAIL"), out)
+        # A line as a test item's, and its output in the bracket of a failed item. No
+        # project file of the package names `broken`: it is there for `after`.
+        @test occursin(Regex("COMP · +\\d+/\\d+ · indirect +· \"$broken\" +· v0\\.1\\.0 +· FAIL"), out)
         @test occursin("broken on purpose", out)
         # Its compile could only have failed too: it is said skipped, not run.
-        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
+        @test occursin(Regex("COMP · +\\d+/\\d+ · direct +· \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
         # The queue's own count of the run says the same, with what it did compile.
         @test occursin(r"\[TEST\] precompiled \d+ stale caches?: \d+ compiled(, \d+ reused)?, 1 failed, 1 skipped( \(\d+ fresh\))? in ", out)
         # `after` is in the test environment's `[deps]`: the run stops with what failed,
@@ -455,7 +459,7 @@ end
                        "test/t_test.jl" => item("t"))
         thrown, out = run_caught(dir)
         @test thrown === nothing
-        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$ind → $(ind)Ext\" +· v0\\.1\\.0 +· FAIL"), out)
+        @test occursin(Regex("COMP · +\\d+/\\d+ · indirect +· \"$ind → $(ind)Ext\" +· v0\\.1\\.0 +· FAIL"), out)
         @test occursin("extension broken on purpose", out)
         @test occursin(r"DONE · +1/1 · \"t\" +· PASS", out)
     end
@@ -747,7 +751,7 @@ end
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, monitor_interval = 0))
     @test all(==(PASSED), values(states))
     @test occursin("still precompiling SlowPkg", out)
-    @test occursin(Regex("COMP · +\\d+/\\d+ · \"SlowPkg\" +· v0\\.1\\.0 +· PASS"), out)
+    @test occursin(Regex("COMP · +\\d+/\\d+ · direct +· \"SlowPkg\" +· v0\\.1\\.0 +· PASS"), out)
 end
 
 @testset "a name longer than the name column leaves the version unpadded" begin

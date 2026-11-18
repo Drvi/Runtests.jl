@@ -204,7 +204,7 @@ end
         write_setup(dir, one, "using $other"; deps = [other => uother], uuid = uone)
         write_setup(dir, other, "using $one"; deps = [one => uone], uuid = uother)
         needs = Runtests.Private.SetupNeed[(; name = Symbol(n), args = ``, flags = Base.CacheFlags(), dir = setups,
-                                              profiles = Set{String}())
+                                              profiles = Set{String}(), packages = Set{String}())
                                            for n in (file, filedep, pkg, pkgdep, one, other)]
         q = Runtests.Private.PrecompileQueue()
         Runtests.Private.with_load_path(setups) do

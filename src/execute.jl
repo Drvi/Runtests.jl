@@ -498,8 +498,9 @@ end
 
 function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
     return with_logger(RunLogger(current_logger(), run)) do
-        # Asked of git while the environments are made ready (`worktree_state`).
-        worktree = @async worktree_state(p.root)
+        # Asked of git while the environments are made ready (`worktree_state`), on any
+        # thread: the task shares nothing with the run.
+        worktree = Threads.@spawn worktree_state(p.root)
         try
             with_run_env(target, run) do
                 # Before the run state: an environment directory that does not resolve

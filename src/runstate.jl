@@ -564,11 +564,14 @@ end
 
 # While the run lasts, its file is written at least every `HEARTBEAT_S`: the magic
 # number, rewritten in place with the value it has, so that a beat changes no byte,
-# and one landing in a file a pruner deleted harms nothing. Its own task, which hands
-# an interrupt on, as the stall watchdog's does.
+# and one landing in a file a pruner deleted harms nothing. Its own task, on any
+# thread: an item that runs in this process (`workers = 0`) without yielding would
+# starve a beat on the run's own thread, and the run would look dead to other
+# processes. It writes under the file's lock, and hands on an interrupt it catches,
+# as the stall watchdog does.
 function start_heartbeat(rsf::RunStateFile)
     timer = Timer(HEARTBEAT_S; interval = HEARTBEAT_S)
-    task = shielded(() -> @async beat(rsf, timer))
+    task = shielded(() -> Threads.@spawn beat(rsf, timer))
     return (timer, task)
 end
 
@@ -1849,7 +1852,8 @@ function worktree_state(root::AbstractString)
         out = read(pipeline(`git -C $repo status --porcelain --untracked-files=no`; stderr = devnull), String)
         return isempty(out) ? "clean" : "dirty"
     catch e
-        is_interrupt(e) && rethrow()
+        # In a task of its own, which a Ctrl-C can land in: the interrupt is the run's.
+        is_interrupt(e) && RuntestsWorkers.forward_interrupt(e)
         return "unknown"
     end
 end

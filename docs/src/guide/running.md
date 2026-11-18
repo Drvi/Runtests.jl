@@ -107,7 +107,7 @@ Some problems stop the run before any item runs. These problems throw an excepti
 |:----------|:------|
 | `Runtests.ScanFailure` | A test file that does not parse, a name that two items use, a Julia file under `test/` that is not a test file, or a template expansion that is missing or not current. |
 | `Runtests.NoTestsError` | No test files, no item that the selection matches, or existing failing items of which none matches the selection. With no failing items, `runtestsf()` returns `nothing`. |
-| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, in another configuration file or in an environment variable. Examples are an incorrect value, an unknown profile, an undeclared group in `RUNTESTS_GROUP`, or a profile environment that does not resolve. |
+| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, in another configuration file or in an environment variable. Examples are an incorrect value, an unknown profile, an undeclared group in `RUNTESTS_GROUP`, or a profile environment that does not resolve. A package or a setup that the run needs and that does not precompile also throws it, as [Precompilation](@ref precompilation) describes. |
 | `ArgumentError` | A mistake in the call. Examples are a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a path outside `test/` or in another package, and a line that the file does not have. |
 
 A `ScanFailure` lists every problem that Runtests found, so you can correct them all before the next run.

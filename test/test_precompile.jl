@@ -295,6 +295,8 @@ end
     @test ext in g.deps[id("C")]
     # D and E wait for each other, and F for them: the precompiler leaves all three out.
     @test g.circular == Set([id("D"), id("E"), id("F")])
+    # What `Pkg.test` asks for: the project's `[deps]` and their extensions, not D or E.
+    @test g.direct == Set([id("A"), id("B"), id("C"), id("F"), id("H"), ext, wider])
     # Names compile with what they wait for, and an extension with all it waits for,
     # also when that is another extension.
     @test Runtests.Private.compile_set(g, Set(["A"])) == Set([id("A")])
@@ -396,7 +398,15 @@ end
         @test s[setup][1] >= s[slow][2]
     end
 
-    @testset "a package that fails to compile is said, what waits for it is left, and the run goes on" begin
+    # The run's error, or `nothing`, and its output, which `capture_run` loses to an error.
+    run_caught(dir) = with_runstate_dir(_ -> capture_run(() -> try
+        run_states(dir; workers = 1, logs = :issues, monitor = false)
+        nothing
+    catch e
+        e
+    end))
+
+    @testset "a dependency of the environment that cannot compile stops the run before its first item, as `Pkg.test` does" begin
         broken, after = "Broken$tag", "AfterBroken$tag"
         ub, ua = next_uuid(), next_uuid()
         dir = make_pkg("FailedCompile$tag",
@@ -407,8 +417,7 @@ end
                        "deps/$after/src/$after.jl" => "module $after\nusing $broken\nend\n",
                        "test/Project.toml" => dep(after, ua, ".."),
                        "test/t_test.jl" => item("t"))
-        (states, _, _), out = run_once(dir)
-        @test all(==(PASSED), values(states))
+        thrown, out = run_caught(dir)
         # A line as a test item's, and its output in the bracket of a failed item.
         @test occursin(Regex("COMP · +\\d+/\\d+ · \"$broken\" +· v0\\.1\\.0 +· FAIL"), out)
         @test occursin("broken on purpose", out)
@@ -416,6 +425,39 @@ end
         @test occursin(Regex("COMP · +\\d+/\\d+ · \"$after\" +· v0\\.1\\.0 +· SKIP"), out)
         # The queue's own count of the run says the same, with what it did compile.
         @test occursin(r"\[TEST\] precompiled \d+ stale caches?: \d+ compiled(, \d+ reused)?, 1 failed, 1 skipped( \(\d+ fresh\))? in ", out)
+        # `after` is in the test environment's `[deps]`: the run stops with what failed,
+        # its output, and what that left out.
+        @test thrown isa Runtests.ConfigError
+        msg = sprint(showerror, thrown)
+        @test startswith(msg, "Runtests: 1 module failed to precompile, so no item ran.")
+        @test occursin("`$broken` in the env test:\n", msg) && occursin("broken on purpose", msg)
+        @test endswith(msg, "Skipped because a module that it loads failed to precompile: `$after` in the env test.")
+        @test !occursin(r"DONE ·", out)
+    end
+
+    @testset "a module that nothing the run asks for loads fails, and the run goes on" begin
+        # An extension of a package the test environment does not name, whose triggers
+        # no package of the environment loads together: `Pkg.test` runs the tests too.
+        ind, trig, uses = "Ind$tag", "Trig$tag", "Uses$tag"
+        ui, ut, uu = next_uuid(), next_uuid(), next_uuid()
+        project(name, uuid) = "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n\n"
+        dir = make_pkg("FailedExtension$tag",
+                       "deps/$trig/Project.toml" => project(trig, ut),
+                       "deps/$trig/src/$trig.jl" => "module $trig\nend\n",
+                       "deps/$ind/Project.toml" => project(ind, ui) *
+                           "[weakdeps]\n$trig = \"$ut\"\n\n[extensions]\n$(ind)Ext = \"$trig\"\n",
+                       "deps/$ind/src/$ind.jl" => "module $ind\nend\n",
+                       "deps/$ind/ext/$(ind)Ext.jl" => "module $(ind)Ext\nusing $ind, $trig\nerror(\"extension broken on purpose\")\nend\n",
+                       "deps/$uses/Project.toml" => project(uses, uu) * dep(ind, ui, "../.."),
+                       "deps/$uses/src/$uses.jl" => "module $uses\nusing $ind\nend\n",
+                       "test/Project.toml" => "[deps]\n$trig = \"$ut\"\n$uses = \"$uu\"\n\n[sources]\n" *
+                           "$trig = {path = \"../deps/$trig\"}\n$uses = {path = \"../deps/$uses\"}\n",
+                       "test/t_test.jl" => item("t"))
+        thrown, out = run_caught(dir)
+        @test thrown === nothing
+        @test occursin(Regex("COMP · +\\d+/\\d+ · \"$ind → $(ind)Ext\" +· v0\\.1\\.0 +· FAIL"), out)
+        @test occursin("extension broken on purpose", out)
+        @test occursin(r"DONE · +1/1 · \"t\" +· PASS", out)
     end
 end
 

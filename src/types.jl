@@ -107,8 +107,8 @@ Base.showerror(io::IO, e::NoTestsError) = print(io, "Runtests: ", e.msg)
     ConfigError
 
 Thrown when a run cannot be set up as asked: a `TestItems.toml` or environment
-setting it does not accept, a profile or run state it cannot use, or a test setup
-that does not precompile. `msg` says what and where.
+setting it does not accept, a profile or run state it cannot use, or a package or
+test setup that the run needs and that does not precompile. `msg` says what and where.
 """
 struct ConfigError <: Exception
     msg::String

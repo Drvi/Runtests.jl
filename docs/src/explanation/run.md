@@ -30,7 +30,9 @@ The coordinator first finds out which caches are fresh, in its own process. As i
 
 Each compile prints a line when it ends, in the shape of the line of an item. 🟩 `PASS` marks a compile that built a cache. 🟨 `SKIP` marks a module that cannot be precompiled, which then loads from its source. It also marks a package that loads a failed package, because its compile can only fail. 🟥 `FAIL` marks a failure, and the output of the compile follows its line. A compile that finds its cache built by another compile prints no line. [Output](@ref output) describes the lines.
 
-A package that fails to compile does not stop the run. The packages that load it are not compiled, and the workers compile what their items load. A setup that fails to compile stops the run, because its items cannot load it.
+Some compile failures stop the run before its first item, as in `Pkg.test` from Julia 1.14. A failure stops the run when a module that the run asks for failed, or was skipped because a package that it loads failed. The run asks for the packages in the `[deps]` of each environment, the package of the environment and their extensions. When a profile has a `precompile` list, the run asks for the packages of that list instead. The run also asks for each setup and for Runtests. The run then throws a `Runtests.ConfigError` that gives the output of each failed compile.
+
+A failure of another module does not stop the run. An example is the extension of a package that `[deps]` does not name, when no module that the run asks for loads it. The workers then compile what their items load.
 
 ## [The plan](@id plan)
 

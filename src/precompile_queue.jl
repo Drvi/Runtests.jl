@@ -40,13 +40,16 @@ system image that the project's dependencies reach, and each extension whose pac
 triggers are all there. `deps` holds what each one waits for, `parent` the package of
 each extension, `triggers` the packages and extensions that load each extension, and
 `circular` the packages in or above a cycle, which the precompiler leaves out.
-`versions` holds the version that the manifest records for each package, by UUID.
+`direct` holds the packages of the project's `[deps]`, its own package and their
+extensions: what `Pkg.test` asks the precompiler for. `versions` holds the version
+that the manifest records for each package, by UUID.
 """
 struct EnvGraph
     deps::Dict{Base.PkgId, Vector{Base.PkgId}}
     parent::Dict{Base.PkgId, Base.PkgId}
     triggers::Dict{Base.PkgId, Vector{Base.PkgId}}
     circular::Set{Base.PkgId}
+    direct::Set{Base.PkgId}
     versions::Dict{Base.UUID, String}
 end
 
@@ -65,10 +68,13 @@ struct PrecompileQueue
     index::Dict{JobKey, Int}
     # The graph of each project file, `nothing` for one that could not be read.
     graphs::Dict{String, Union{Nothing, EnvGraph}}
+    # The jobs the run asks for, as `Pkg.test` asks the precompiler: one of them that
+    # fails, or is skipped for a failure under it, stops the run (`queue_failure`).
+    requested::Set{Int}
 end
 
 PrecompileQueue() = PrecompileQueue(QueueEnv[], PrecompileConfig[], QueueJob[], QueueGroup[],
-                                    Dict{JobKey, Int}(), Dict{String, Union{Nothing, EnvGraph}}())
+                                    Dict{JobKey, Int}(), Dict{String, Union{Nothing, EnvGraph}}(), Set{Int}())
 
 # As many compiles at a time as Julia's own precompiler runs: `JULIA_NUM_PRECOMPILE_TASKS`,
 # or one more than the CPU threads, half of them on Windows, and at most 16.
@@ -160,7 +166,12 @@ function env_graph(project_file::AbstractString)
             end
         end
     end
-    return EnvGraph(deps, parent, triggers, circular_packages(deps), versions_by_uuid(project_file))
+    # The project's own package is among `project_deps`.
+    direct = Set{Base.PkgId}(Base.PkgId(u, name) for (name, u) in env.project_deps)
+    for (ext, p) in parent
+        p in direct && push!(direct, ext)
+    end
+    return EnvGraph(deps, parent, triggers, circular_packages(deps), direct, versions_by_uuid(project_file))
 end
 
 # The version of each package that the manifest of `project_file` records, by UUID.
@@ -309,6 +320,8 @@ function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Ve
                       kind = :package, group, name = display_name(g, pkg), profiles = Set{String}(),
                       version = graph_version(g, pkg)))
         union!(q.jobs[j].profiles, profiles)
+        # As `Pkg.precompile` takes a request: the names, or else the project's own.
+        (names === nothing ? pkg in g.direct : !haskey(g.parent, pkg) && pkg.name in names) && push!(q.requested, j)
     end
     for pkg in keep
         job = q.jobs[q.index[(String(project), pkg, flags)]]
@@ -351,9 +364,10 @@ function precompile_queue(run::Run, p::Plan, flags_of)
         add_project!(q, here, here_path, config, Set(["Runtests"]), group)
         # Not in the project's manifest: the compile process builds what it waits for.
         haskey(q.index, (here, pkg, flags)) && continue
-        add_job!(q, (here, pkg, flags), (; env = env_of!(q, here, here_path), pkg, config = config_of!(q, config),
-                                        deps = Int[], strict = false, exts = nothing, kind = :runtests, group,
-                                        name = "Runtests", profiles = Set{String}(), version = source_version(pkg)))
+        push!(q.requested,
+              add_job!(q, (here, pkg, flags), (; env = env_of!(q, here, here_path), pkg, config = config_of!(q, config),
+                                              deps = Int[], strict = false, exts = nothing, kind = :runtests, group,
+                                              name = "Runtests", profiles = Set{String}(), version = source_version(pkg))))
     end
     once = Dict{Symbol, String}()
     for (; project, load_path, needs) in setup_needs(run, p, flags_of)
@@ -387,6 +401,7 @@ function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vec
             i = add_job!(q, key, (; env = e, pkg, config = config_of!(q, args => flags), deps = Int[], strict = false,
                                   exts = nothing, kind = :setup, group, name = pkg.name, profiles = copy(profiles),
                                   version = source_version(pkg)))
+            push!(q.requested, i)
             for dep in setup_dependencies(pkg)
                 # Named in the setup's own `[deps]`, or for a setup that is not a package,
                 # in the environment.
@@ -1098,30 +1113,49 @@ function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, statu
     return nothing
 end
 
+# Why the queue stops the run, or `nothing`: a job it asks for failed or was skipped.
+# As the error of `Pkg.precompile`, it gives every compile that failed with its output,
+# then the jobs asked for that were skipped.
+function queue_failure(q::PrecompileQueue, status::Vector{Symbol}, texts::Vector{String})
+    any(i -> status[i] === :failed || status[i] === :skipped, q.requested) || return nothing
+    failed = filter(i -> status[i] === :failed, eachindex(q.jobs))
+    skipped = sort!(filter(i -> status[i] === :skipped, collect(q.requested)))
+    io = IOBuffer()
+    print(io, plural(length(failed), "module"), " failed to precompile, so no item ran.")
+    foreach(i -> print(io, "\n\n", job_title(q, i), ":\n", strip(texts[i])), failed)
+    isempty(skipped) || print(io, "\n\nSkipped because a module that ", length(skipped) == 1 ? "it loads" : "they load",
+                              " failed to precompile: ", join((job_title(q, i) for i in skipped), ", "), ".")
+    return String(take!(io))
+end
+
+# A job as a message names it: a setup as such, a package with the environment it
+# compiles in, and the julia arguments of its compile, where there are any.
+function job_title(q::PrecompileQueue, i::Int)
+    job = q.jobs[i]
+    subject = q.groups[job.group].subject
+    place = group_name(subject)
+    args = first(q.configs[job.config])
+    return string(job.kind === :setup ? "test setup module `" : "`", job.name, "`",
+                  place == subject ? "" : " in " * place,
+                  isempty(args) ? "" : string(" under `", join(args.exec, " "), "`"))
+end
+
 """
     precompile_queued(run, p, flags_of)
 
-Build and run the run's precompile queue (`precompile_queue`, `run_queue`). Work brought
-forward, not work that has to succeed: a package that fails to compile is said, with
-its output, and the workers compile what they need themselves. A setup that fails stops
-the run, as its items could not load it. The run warns about each setup that is not a
-package, whose cache each environment and set of flags writes over.
+Build and run the run's precompile queue (`precompile_queue`, `run_queue`). As
+`Pkg.test` from Julia 1.14 does, the run stops before its first item when a module it
+asks for fails to compile, or is skipped because a module under it failed: a package
+of an environment's `[deps]`, its own package or one of their extensions, a package of
+a profile's `precompile` list, a setup, or Runtests. A failure that none of those loads
+is said, with its output, and the run goes on. The run warns about each setup that is
+not a package, whose cache each environment and set of flags writes over.
 """
 function precompile_queued(run::Run, p::Plan, flags_of)
     q, once = precompile_queue(run, p, flags_of)
     status, texts = run_queue(run, q)
-    setup_failure = nothing
-    for i in eachindex(q.jobs)
-        status[i] === :failed || continue
-        job, text = q.jobs[i], texts[i]
-        args = first(q.configs[job.config])
-        if job.kind === :setup
-            setup_failure === nothing && (setup_failure = ConfigError(string(
-                "test setup module `", job.pkg.name, "` failed to precompile",
-                isempty(args) ? "" : string(" under `", join(args.exec, " "), "`"), ":\n", text)))
-        end
-    end
-    setup_failure === nothing || throw(setup_failure)
+    failure = queue_failure(q, status, texts)
+    failure === nothing || throw(ConfigError(failure))
     if !isempty(once)
         files = sort!([relpath_or_path(file, p.root) for file in values(once)])
         one = length(files) == 1

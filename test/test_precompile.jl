@@ -465,6 +465,25 @@ end
     end
 end
 
+@testset "a profile's environment variables do not reach the compiled code" begin
+    # Only a profile's flags and preferences change what compiles. A package that reads
+    # a variable at its top level holds the precompile process's value, whatever value
+    # each of two profiles gives the variable, and each item still sees its own.
+    tag = string(time_ns(); base = 16)
+    var, name, u = "RT_SEEN_$tag", "Reads$tag", next_uuid()
+    items = join(("@testitem \"$p\" profile=:$p begin\n    using $name\n    @test $name.SEEN == \"unset\"\n" *
+                  "    @test ENV[\"$var\"] == \"$p\"\nend\n" for p in ("one", "two")))
+    dir = make_pkg("EnvBlind$tag",
+        "deps/$name/Project.toml" => "name = \"$name\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
+        "deps/$name/src/$name.jl" => "module $name\nconst SEEN = get(ENV, \"$var\", \"unset\")\nend\n",
+        "test/Project.toml" => "[deps]\n$name = \"$u\"\n\n[sources]\n$name = {path = \"../deps/$name\"}\n",
+        "test/TestItems.toml" => "[profiles.one]\nenv = { $var = \"one\" }\n\n[profiles.two]\nenv = { $var = \"two\" }\n",
+        "test/t_test.jl" => items)
+    (states, _, _), out = with_runstate_dir(_ -> capture_run(() -> run_states(dir; workers = 2, logs = :issues, monitor = false)))
+    @test states == Dict("one" => PASSED, "two" => PASSED)
+    @test occursin(Regex("COMP · [^\\n]*\"$name\""), out)
+end
+
 @testset "a coverage run precompiles for the flags its workers count lines under" begin
     # From 1.14 the path whose lines are counted is in the cache flags, and the package
     # there needs a cache built under them. Before, coverage leaves the flags as they are.

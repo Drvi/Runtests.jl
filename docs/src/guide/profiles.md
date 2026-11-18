@@ -75,6 +75,8 @@ Each item runs the `test_end` of its own profile. Each has its own timeout, `ini
 
 `preferences` names a TOML file, relative to the configuration file. The file must exist. Its contents go over the `LocalPreferences.toml` of a temporary copy of the environment of the item. Runtests precompiles separately for the preferences of each profile.
 
+Only the Julia flags and the preferences of a profile change the compiled code. Its environment variables do not go to precompilation. A package that reads an environment variable at its top level gets the value of the process that precompiles it, not the value of the profile. If a value must change the compiled code, give it as a preference.
+
 ## [Precompilation](@id profile-precompile)
 
 Before the workers start, Runtests precompiles the environment of each profile for the Julia flags of that profile, as [Precompilation](@ref precompilation) tells. A flag that changes how Julia compiles code, for example `--check-bounds=yes`, makes Runtests compile each package of the environment again. For a large environment, this can take longer than the items of the profile.

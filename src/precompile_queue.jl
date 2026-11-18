@@ -241,12 +241,14 @@ function compile_set(g::EnvGraph, names::Union{Nothing, Set{String}})
         push!(keep, p)
         all_deps!(keep, g.deps, p)
     end
-    # Until none is added: an extension can wait for another extension.
+    # Until none is added: an extension can wait for another extension. `keep` holds
+    # everything its members wait for, so an extension whose own waits are all in it has
+    # the rest there too.
     added = true
     while added
         added = false
         for ext in keys(g.parent)
-            (ext in keep || !issubset(all_deps!(Set{Base.PkgId}(), g.deps, ext), keep)) && continue
+            (ext in keep || !issubset(g.deps[ext], keep)) && continue
             push!(keep, ext)
             added = true
         end
@@ -328,8 +330,9 @@ function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Ve
                       version = graph_version(g, pkg), requesters = Set{String}(),
                       indirect = !(get(g.parent, pkg, pkg).name in named || (tested && pkg in g.direct))))
         union!(q.jobs[j].profiles, profiles)
-        # As `Pkg.precompile` takes a request: the names, or else the project's own.
-        (names === nothing ? pkg in g.direct : !haskey(g.parent, pkg) && pkg.name in names) && push!(q.requested, j)
+        # As `Pkg.test` asks the precompiler: the project's own, or else the names, with
+        # the extensions of each, as a run of one package asks for its project's.
+        (names === nothing ? pkg in g.direct : get(g.parent, pkg, pkg).name in names) && push!(q.requested, j)
     end
     for pkg in keep
         job = q.jobs[q.index[(String(project), pkg, flags)]]
@@ -1213,10 +1216,12 @@ end
 Build and run the run's precompile queue (`precompile_queue`, `run_queue`). As
 `Pkg.test` from Julia 1.14 does, the run stops before its first item when a module it
 asks for fails to compile, or is skipped because a module under it failed: a package
-of an environment's `[deps]`, its own package or one of their extensions, a package of
-a profile's `precompile` list, a setup, or Runtests. A failure that none of those loads
-is said, with its output, and the run goes on. The run warns about each setup that is
-not a package, whose cache each environment and set of flags writes over.
+of an environment's `[deps]` or its own package, in a run of several packages a tested
+package or a package of its test project's `[deps]`, a package of a profile's
+`precompile` list, an extension of any of these, a setup, or Runtests. A failure that
+none of those loads is said, with its output, and the run goes on. The run warns about
+each setup that is not a package, whose cache each environment and set of flags writes
+over.
 """
 function precompile_queued(run::Run, p::Plan, flags_of)
     q, once = precompile_queue(run, p, flags_of)

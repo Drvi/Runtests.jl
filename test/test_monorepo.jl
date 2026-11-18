@@ -921,6 +921,36 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
+        @testset "an extension of a tested package that cannot compile stops the run, as it does a run alone" begin
+            # A's extension loads with `Test`, which A's test project names. Run alone, A
+            # asks for its project's extensions; a combined run asks for the same.
+            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a"),
+                                       "ext/AExt.jl" => "module AExt\nusing A, Test\nerror(\"extension broken on purpose\")\nend\n"],
+                               "B" => ["test/b_test.jl" => item_text("b")])
+            open(io -> print(io, "\n[weakdeps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n\n[extensions]\nAExt = \"Test\"\n"),
+                 joinpath(ws, "lib", "A", "Project.toml"), "a")
+            with_runstate_dir() do _
+                thrown, out = capture_run(() -> try
+                    run_mono(ws; workers = 1, logs = :issues, monitor = false)
+                    nothing
+                catch e
+                    e
+                end)
+                @test thrown isa ConfigError
+                msg = sprint(showerror, thrown)
+                @test occursin("`A → AExt`", msg) && occursin("extension broken on purpose", msg)
+                @test !occursin(r"DONE ·", out)
+                # Alone, A stops the same way.
+                alone = try
+                    capture_run(() -> run_states(joinpath(ws, "lib", "A"); workers = 1, logs = :issues, monitor = false))
+                    nothing
+                catch e
+                    e
+                end
+                @test alone isa ConfigError && occursin("`A → AExt`", sprint(showerror, alone))
+            end
+        end
+
         @testset "a compile names the packages it is for, and whether a project of theirs names it" begin
             # A's project names Near, B's test project names Helper, and both of those
             # load Far, which no project of A or B names. Names no earlier run compiled.

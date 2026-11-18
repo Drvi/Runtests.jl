@@ -565,9 +565,14 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             r = mono(ws; group = "gpu")
             @test selected(r) == ["A:a1"]
             @test ("lib/B" => "it declares no group `gpu`") in r.skipped
+            @test r.plan.selection == "group `gpu`"
             withenv("RUNTESTS_GROUP" => "gpu") do
                 @test selected(mono(ws)) == ["A:a1"]
-                @test selected(mono(ws; Runtests.Private.default_group_kwargs("runtestsd_mono", (;))...)) == ["A:a1"]
+                r = mono(ws; Runtests.Private.default_group_kwargs("runtestsd_mono", (;))...)
+                @test selected(r) == ["A:a1"]
+                # The run says the group it took, not the one the call asked for.
+                @test r.plan.selection == "group `gpu`, from `RUNTESTS_GROUP`"
+                @test mono(ws).plan.selection == "group `gpu`, from `RUNTESTS_GROUP`"
                 # A name selects whatever group it is in.
                 @test selected(mono(ws; name = "a3")) == ["A:a3"]
             end

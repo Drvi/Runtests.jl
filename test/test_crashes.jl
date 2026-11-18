@@ -3,7 +3,7 @@
 # profile's `test_end` expression. None of those may lose the run, and each has to
 # say which of the three it was.
 
-using Runtests.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
+using Runtests.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, ItemState, history, read_run_state, nitems
 
 # Code that kills the process where it stands the first `n` times it is reached,
 # counting in the file `RUNTESTS_CRASH_MARKER` names.
@@ -545,8 +545,10 @@ end
         r = exit_during(; stall_editor = true)
         @test r.called && r.ended
         @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
-        @test item_record(r.rs, "first") == (CANCELLED, [CANCELLED])
-        r.ended || @info "the coordinator did not end; it printed:\n$(r.printed)"
+        # `second` is in flight: its slot holds it while its start is told. `first` is
+        # in flight too, or still waiting for its worker to start, and then unseen.
+        @test item_record(r.rs, "second") == (CANCELLED, [CANCELLED])
+        @test item_record(r.rs, "first") in ((CANCELLED, [CANCELLED]), (UNSEEN, ItemState[]))
     end
     @testset "a callback of `on_event` waiting as its attempt starts" begin
         # The slot holds its item before anything is told the attempt began, so the

@@ -678,7 +678,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     end
     isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
     tags === nothing || check_tags_exist(Filter(; tags), all_tags)
-    description = mono_description(name, tags, group, chosen, workspace)
+    description = mono_description(name, tags, group, group_name, gsel, chosen, workspace)
     all_names = reduce(vcat, suite_names)
     unknown = Tuple{String, String}[]
     if item_keys !== nothing
@@ -912,11 +912,18 @@ function check_setup_names(ps::Participants, setups::Vector{Dict{Symbol, String}
 end
 
 # The selection of a combined run, as the run says it.
-function mono_description(name, tags, group, paths::Vector{String}, workspace::AbstractString)
+# The group is the one the run took (`mono_groups`): `RUNTESTS_GROUP` names it in place
+# of what the call asks, and the description says so.
+function mono_description(name, tags, group, group_name::AbstractString, gsel, paths::Vector{String},
+                          workspace::AbstractString)
     parts = String[]
     name === nothing || push!(parts, "name = $(repr(name))")
     tags === nothing || push!(parts, "tags = $(repr(tags))")
-    group === nothing || push!(parts, "group `$(group isa DefaultGroupCall ? DEFAULT_GROUP : group)`")
+    if group !== nothing || group_name != ALL_GROUP
+        k = findfirst(!isnothing, gsel)
+        from_env = k !== nothing && gsel[k].source == string("from ", ENV_GROUP_ASKER)
+        push!(parts, string("group `", group_name, "`", from_env ? string(", from ", ENV_GROUP_ASKER) : ""))
+    end
     isempty(paths) || push!(parts, "paths " * join((rel_slash(p, workspace) for p in paths), ", "))
     return isempty(parts) ? "the filter" : join(parts, " and ")
 end

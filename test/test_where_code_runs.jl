@@ -235,7 +235,7 @@ end
         # The item that fails on purpose fails the tests.
         @test !success(pipeline(ignorestatus(cmd); stdout = log, stderr = log))
         seen = notes(out)
-        isempty(seen) && echo_captured(read(log, String))
+        all(t -> haskey(seen, "WhereUnderPkg:$t"), ("skip", "body plain", "test_end")) || echo_captured(read(log, String))
         check_scopes(seen, "WhereUnderPkg", pkg)
         @test length(seen["WhereUnderPkg:test_end"]) == WHERE_TEST_ENDS
         for ns in values(seen), n in ns

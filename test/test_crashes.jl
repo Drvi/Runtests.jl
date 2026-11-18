@@ -512,9 +512,10 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     path = joinpath(tmp, "run.jl")
     write(path, script)
     log = Base.BufferStream()
+    # The empty entry at the end stands for the default load path.
+    load_path = join([REPO_ROOT, joinpath(REPO_ROOT, "test"), ""], Runtests.Private.PATHSEP)
     proc = run(pipeline(setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
-                               "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":"),
-                               "RUNTESTS_RUNSTATE_DIR" => runs);
+                               "JULIA_LOAD_PATH" => load_path, "RUNTESTS_RUNSTATE_DIR" => runs);
                         stdout = log, stderr = log); wait = false)
     timedwait(() -> isfile(called) || process_exited(proc), 600)
     t0 = time()
@@ -523,6 +524,7 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     ended || (kill(proc, Base.SIGKILL); wait(proc))
     close(log)
     printed = read(log, String)
+    isfile(called) || @info "the coordinator never got to its exit; it printed:\n$printed"
     files = [joinpath(r, f) for (r, _, fs) in walkdir(runs) for f in fs if f == "run.runstate"]
     rs = length(files) == 1 ? read_run_state(only(files)) : nothing
     return (; called = isfile(called), ended, elapsed, printed, rs)

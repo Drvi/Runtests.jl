@@ -1832,7 +1832,9 @@ end
             @test !rs.closed && Runtests.Private.is_live(rs)
             final = read_run_state(rs.path)
             @test final.closed && !Runtests.Private.is_live(final)
-            @test final.end_unix - final.start_unix >= maximum(e -> e.t1, final.events)
+            # As the events have their times, in `Float32`: on a coarse clock the end can
+            # be the last event's time, which rounding to `Float32` could put after it.
+            @test Float32(final.end_unix - final.start_unix) >= maximum(e -> e.t1, final.events)
         end
     end
 

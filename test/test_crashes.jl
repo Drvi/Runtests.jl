@@ -525,6 +525,8 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     close(log)
     printed = read(log, String)
     isfile(called) || @info "the coordinator never got to its exit; it printed:\n$printed"
+    isfile(called) && (!ended || elapsed > 15) &&
+        @info "the coordinator took $(round(elapsed; digits = 1))s to end$(ended ? "" : ", and was killed"); it printed:\n$printed"
     files = [joinpath(r, f) for (r, _, fs) in walkdir(runs) for f in fs if f == "run.runstate"]
     rs = length(files) == 1 ? read_run_state(only(files)) : nothing
     return (; called = isfile(called), ended, elapsed, printed, rs)
@@ -566,7 +568,9 @@ end
                 end
                 nothing
             end""")
-        @test r.called && r.ended && r.elapsed < 30
+        @test r.called
+        @test r.ended
+        @test r.elapsed < 30
         @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
     end
 end

@@ -613,13 +613,16 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     # Failing items, which come with their seeds, are the base's and the later runs',
     # and are not narrowed, as `runtestsf`'s are not.
     function names_of_package(k)
-        recorded = replayed === nothing || replayed.records[k] === nothing ? nothing : replayed.records[k].items
+        # Local: an assignment in a closure to a name of the function around it would
+        # change that variable.
+        local recorded_items = replayed === nothing || replayed.records[k] === nothing ? nothing : replayed.records[k].items
         if item_keys !== nothing
-            keys = get(wanted, ps.name[k], nothing)
-            return keys === nothing || recorded === nothing || item_seeds !== nothing ? keys :
-                intersect(keys, Set{String}(it.name for it in recorded))
+            local asked = get(wanted, ps.name[k], nothing)
+            return asked === nothing || recorded_items === nothing || item_seeds !== nothing ? asked :
+                intersect(asked, Set{String}(it.name for it in recorded_items))
         end
-        return recorded === nothing || name isa FailingItems ? name : replayed_names((it.name for it in recorded), name)
+        return recorded_items === nothing || name isa FailingItems ? name :
+            replayed_names((it.name for it in recorded_items), name)
     end
     package_names = [names_of_package(k) for k in 1:n]
     # A replayed package none of whose recorded items the call selects runs nothing.

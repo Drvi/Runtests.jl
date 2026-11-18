@@ -1973,7 +1973,9 @@ function recycle_worker!(run::Run, slot::Slot)
 end
 
 function ensure_worker!(run::Run, slot::Slot, target, exclusive::Bool)
-    slot.worker === nothing || (slot.worker.terminated ? nothing : return slot.worker)
+    # Read once: a second read could find what another task stored since.
+    w = @atomic slot.worker
+    (w === nothing || w.terminated) || return w
     w = start_worker(run, slot, target, exclusive)
     @atomic slot.worker = w
     return w

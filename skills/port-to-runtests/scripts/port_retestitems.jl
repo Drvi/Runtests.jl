@@ -68,7 +68,8 @@ function port_file!(path, testdir, setupdir, notes, moves)
         r = byte_range(node)
         if is_macro(node, "@testsetup")
             mod = kids(node)[2]
-            name = JS.sourcetext(kids(mod)[1])   # (module name body)
+            # (module name body), and from Julia 1.14 the syntax version before the name.
+            name = JS.sourcetext(kids(mod)[end - 1])
             from = comments_above(src, first(r))
             # A comment after the module's `end`, on its line, goes with it.
             eol = something(findnext(==('\n'), src, last(r)), ncodeunits(src) + 1)

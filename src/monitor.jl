@@ -28,9 +28,12 @@ struct Sample
     machine_used::Int64
     machine_total::Int64
     load1::Float32     # one-minute load average
+    # Where the platform has no load average (Windows): the machine's CPU use over the
+    # last `CPU_WINDOW_S` seconds, in percent of its threads. -1 otherwise.
+    cpu_pct::Float32
 end
 
-Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, 0, -1.0f0)
+Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, 0, -1.0f0, -1.0f0)
 
 # What one stage of a run cost. Per stage because the stages are different
 # machines: one process resolving, a few short-lived ones precompiling, and the
@@ -192,6 +195,11 @@ mutable struct Monitor
     over_since::Float64      # when machine pressure first crossed the threshold
     last_gc::Float64
     last_restart::Float64
+    # The CPU ticks at the start of the window `cpu_percent!` measures, when it started,
+    # and the percentage of the last window that ended.
+    cpu_window::Tuple{UInt64, UInt64}
+    cpu_window_at::Float64
+    cpu_pct::Float32
 end
 
 """
@@ -235,8 +243,24 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
         PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
         zeros(Int64, n), zeros(Int32, n), linebuf,
         IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0, 0.0,
-        zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0
+        zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
     )
+end
+
+# A window rather than the time since the last sample, a fifth of a second, which is
+# noise: the load average it stands in for is a one-minute average.
+const CPU_WINDOW_S = 10.0
+
+# The machine's CPU use over the last window that ended, in percent of its threads, or
+# -1 until one has. Reads the CPU ticks once a window.
+function cpu_percent!(m::Monitor, now::Float64)
+    now - m.cpu_window_at < CPU_WINDOW_S && return m.cpu_pct
+    busy, total, _ = cpu_ticks()
+    busy0, total0 = m.cpu_window
+    m.cpu_window_at > 0 && total > total0 && busy >= busy0 &&
+        (m.cpu_pct = Float32(100 * (busy - busy0) / (total - total0)))
+    m.cpu_window, m.cpu_window_at = (busy, total), now
+    return m.cpu_pct
 end
 
 # Counted rather than sampled: a sandbox worker can live and die between samples.
@@ -365,7 +389,8 @@ function sample!(m::Monitor)
         end
     end
     load1 = Float32(cpu_load())
-    s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1)
+    cpu_pct = load1 >= 0 ? -1.0f0 : cpu_percent!(m, time())
+    s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1, cpu_pct)
     # The sample before the head that points at it: a reader between the two would
     # get the slot's previous contents, a sample from minutes ago.
     head = mod1(m.ring_head + 1, RING_SAMPLES)
@@ -596,6 +621,10 @@ function print_status_line(io::IO, m::Monitor)
         print_1dp(io, s.load1, 4)
         write(io, UInt8('/'))
         print_int(io, cpu_count())
+    elseif s.cpu_pct >= 0
+        print(io, " · cpu ")
+        print_int(io, round(Int, s.cpu_pct), 3)
+        write(io, UInt8('%'))
     end
     # The stage and its age, then the oldest running item: last, because it is the
     # only field that changes width.

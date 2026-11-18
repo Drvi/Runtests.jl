@@ -309,6 +309,24 @@ end
         end
         @test count("w0", line) == 1        # the speaker, not a field label
 
+        # Without a load average, as on Windows, the line gives the machine's CPU use
+        # in percent, once a window of it has passed.
+        saved = m.reading
+        r = saved.sample
+        sample = Runtests.Private.Sample(r.t, r.phase, r.nprocs, r.nworkers, r.total_rss, r.largest_rss, r.largest_pid,
+                                         r.machine_used, r.machine_total, -1.0f0, 73.4f0)
+        @atomic m.reading = Runtests.Private.Reading(sample, saved.peak_total, saved.peak_single, saved.phase_entered,
+                                                     saved.worker_peak, saved.worker_pid)
+        @test occursin(" · cpu  73% · ", status_line(m))
+        @test !occursin(r"cpu +\d+\.\d/", status_line(m))
+        @atomic m.reading = saved
+        # A window has to pass before there is a percentage, and one starts with the first.
+        m.cpu_window_at = 0.0
+        @test Runtests.Private.cpu_percent!(m, 100.0) < 0
+        @test Runtests.Private.cpu_percent!(m, 105.0) < 0
+        pct = Runtests.Private.cpu_percent!(m, 100.0 + Runtests.Private.CPU_WINDOW_S)
+        @test pct == -1 || 0 <= pct <= 100
+
         # It is redrawn after every line the run prints, so it must not allocate to
         # do it: this is the one place in the run where formatting is on the hot path.
         # The steady-state cost. The clock is reformatted when the second turns,
@@ -464,7 +482,7 @@ end
         function reading(pressure)
             m.samples[1] = Runtests.Private.Sample(
                 1.0f0, PHASE_TEST, Int16(1), Int16(0), 0, 0, Int32(0),
-                round(Int64, pressure * 2^30), Int64(2^30), 0.0f0
+                round(Int64, pressure * 2^30), Int64(2^30), 0.0f0, -1.0f0
             )
             m.ring_head = 1
         end
@@ -662,7 +680,7 @@ end
         end
         sample(phase, total, largest, n, workers = 0) =
             Runtests.Private.Sample(1.0f0, phase, Int16(n), Int16(workers), Int64(total), Int64(largest),
-                        Int32(1), Int64(0), Int64(0), 1.0f0)
+                        Int32(1), Int64(0), Int64(0), 1.0f0, -1.0f0)
         Runtests.Private.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
         Runtests.Private.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8))
         Runtests.Private.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4))
@@ -786,7 +804,7 @@ end
         # line, not whether one happened to land.
         Runtests.Private.update_stats!(run.monitor,
             Runtests.Private.Sample(1.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(500_000_000), Int64(500_000_000),
-                        Int32(getpid()), Int64(0), Int64(0), 1.0f0))
+                        Int32(getpid()), Int64(0), Int64(0), 1.0f0, -1.0f0))
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
         @test occursin("rss ", summary)

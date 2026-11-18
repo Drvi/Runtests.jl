@@ -106,7 +106,7 @@ The progress line gives these values:
 - the number of failed items,
 - the busy workers and all workers,
 - the memory of the processes of the run, and of the largest of them,
-- the memory and CPU use of the machine,
+- the memory and CPU use of the machine. The CPU use is the one-minute load average over the number of CPU threads, for example `cpu  5.5/18`. A load above the number of threads means that threads wait for a CPU. Windows has no load average. There, the CPU use is the percentage of the CPU time of the machine that was busy in the last 10 seconds, for example `cpu  73%`.
 - the stage of the run and its time.
 
 While the precompile step runs, the first two values count the stale caches in place of the items, and the workers are the helper processes of the step. Before the tests start, the line names no test workers.

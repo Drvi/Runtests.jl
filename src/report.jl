@@ -754,6 +754,7 @@ function print_run_header(run)
         # The project's path in the run-state path's colour, as the log paths are.
         env = something(Base.active_project(), "none")
         println(io, "env: ", styled(x -> printstyled(x, env; color = :light_black)))
+        print_machine(io)
         print_packages(io, p)
         print_startup(io, p.startup)
         print_profiles(io, p)
@@ -761,6 +762,16 @@ function print_run_header(run)
         print_coverage_setting(io, p.cfg)
     end
     print_label_block(run, head, body)
+    return nothing
+end
+
+# What the workers share: the CPU threads and the memory of the machine, as the
+# progress line counts them. In a container the memory is what the container may use.
+function print_machine(io::IO)
+    used, total = Platform.machine_memory()
+    print(io, "machine: ", Platform.cpu_count(), " CPU threads")
+    total > 0 && print(io, " · ", fmt_gib(total), " memory, ", fmt_gib(total - used), " available")
+    println(io)
     return nothing
 end
 

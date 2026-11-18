@@ -53,6 +53,7 @@ While the step runs, the progress line has a white square. It counts the stale c
 ```text
 ┌ [TEST] v0.1.0 · julia 1.13.3 · 6 test items in 2 files · seed 0x522fb3b30334cd75 · 2 workers · threads 2,1
 │ env: /var/folders/…/jl_7AEUWb/Project.toml
+│ machine: 18 CPU threads · 64.0 GiB memory, 21.3 GiB available
 └ startup: scan 0.0s · plan 0.1s · setup 1.2s
 ```
 
@@ -62,7 +63,7 @@ The first line gives the versions of Runtests and Julia, and the number of selec
 - the environment variables that set configuration values,
 - the source of the `coverage` value.
 
-When the call or the environment selects items, a `selection` line comes first. It names what selected them, for example `tags = [:fast]`, or a group with its tags and what asked for it. The `env` line is the path of the test environment. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
+When the call or the environment selects items, a `selection` line comes first. It names what selected them, for example `tags = [:fast]`, or a group with its tags and what asked for it. The `env` line is the path of the test environment. The `machine` line gives the CPU threads and the memory of the machine, and the memory that is available when the run starts. In a container, the memory is what the container can use. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
 
 ## The lines of the run
 

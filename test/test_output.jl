@@ -23,6 +23,12 @@ using Runtests: RuntestsWorkers
     @test ok
     lines = split(log, '\n')
 
+    @testset "the opening block says what the machine has" begin
+        machine = only(filter(l -> occursin("machine: ", l), lines))
+        @test occursin("│ machine: $(Sys.CPU_THREADS) CPU threads", machine)
+        @test occursin(r" · \d+\.\d GiB memory, \d+\.\d GiB available$", machine)
+    end
+
     @testset "every item announces its start and its end" begin
         starts = filter(l -> occursin("· RUN", l), lines)
         dones  = filter(l -> occursin("· DONE", l), lines)

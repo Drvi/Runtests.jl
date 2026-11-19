@@ -4,7 +4,7 @@
 # goes to stderr, so nothing but events reaches the stream. What a command holds is
 # read in `command!`, and what an event holds is where it is emitted.
 
-const PROTOCOL_VERSION = 4
+const PROTOCOL_VERSION = 5
 
 # An item as the protocol names it: its package and its name, which together tell
 # apart the items of a server of several packages.
@@ -138,7 +138,7 @@ function list_items(root::AbstractString; config::Union{Nothing, AbstractString}
             profile = it.profile === DEFAULT_PROFILE ? nothing : String(it.profile),
             sandbox = it.exclusive,
             environment = isempty(it.environment) ? nothing : it.environment,
-            chain = it.chain === NO_CHAIN ? nothing : String(it.chain),
+            throttle = it.throttle === NO_THROTTLE ? nothing : String(it.throttle),
             skip = it.skip isa Bool ? it.skip : string(it.skip),
             timeout = it.timeout_s == USE_RUN_DEFAULT ? nothing : Int(it.timeout_s),
             retries = it.retries == USE_RUN_DEFAULT ? nothing : Int(it.retries),
@@ -160,9 +160,11 @@ names and written imports that a package's own test environment cannot load.
 function list_items_mono(root::AbstractString)
     ps = find_participants(root)
     items, errors, failed = Any[], Any[], Any[]
-    for r in ps.root
+    uses = Tuple{Int, Symbol}[]   # each package and throttle an item of it names
+    for (k, r) in enumerate(ps.root)
         l = list_items(r)
         append!(items, l.items); append!(errors, l.errors); append!(failed, l.failed)
+        foreach(it -> it.throttle === nothing || push!(uses, (k, Symbol(it.throttle))), l.items)
     end
     try
         check_setup_names(ps, [setup_modules(joinpath(r, "test")) for r in ps.root])
@@ -171,6 +173,21 @@ function list_items_mono(root::AbstractString)
         push!(errors, (; file = joinpath(ps.workspace, "Project.toml"), line = 0, message = e.msg))
     end
     append!(errors, scan_errors_json(written_import_problems(ps; all_setups = false)))
+    # A throttle the packages share, which a combined run refuses when their limits differ.
+    limits = map(ps.root) do r
+        try
+            read_config(joinpath(r, "test")).throttle
+        catch e
+            e isa ConfigError || rethrow()
+            Dict{Symbol, Int}()   # `list_items` said what is wrong with it
+        end
+    end
+    try
+        check_shared_limits(unique!(uses), limits, [string(ps.name[k], "'s TestItems.toml") for k in eachindex(ps.name)])
+    catch e
+        e isa ConfigError || rethrow()
+        push!(errors, (; file = joinpath(ps.workspace, "Project.toml"), line = 0, message = e.msg))
+    end
     packages = [(; name = ps.name[k], root = ps.root[k], testdir = joinpath(ps.root[k], "test")) for k in eachindex(ps.root)]
     return (; root = ps.workspace, testdir = nothing, packages, items, errors, failed)
 end

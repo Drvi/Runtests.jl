@@ -12,7 +12,7 @@
 #   strings     every string in the file, referenced by index
 #   meta        key/value pairs of strings: platform, invocation, environment
 #   profiles    name, julia args, threads, env, init, test_end, preferences path and content
-#   units       n_units x 16 B: item span, profile, exclusive, chain
+#   units       n_units x 16 B: item span, profile, exclusive, throttle
 #   items       n_items x 32 B: name, file, line, unit, source hash, seed
 #   environment the test environment's Manifest.toml, zlib-compressed: its length,
 #               the compressed length, then the compressed bytes
@@ -57,6 +57,10 @@ const RS_MEMORY_BYTES = 64
 const RS_EVENT_BYTES = 48
 
 const RS_FLAG_DRY_RUN = UInt32(1) << 1
+# The header's `closed` byte. Writers before it left that byte 0, and so did the first
+# that wrote it, until they closed the file: see `closed_file`.
+const RS_CLOSED = 0x01
+const RS_OPEN = 0x02
 
 """
     RunEnding
@@ -153,7 +157,7 @@ struct Header
     n_units::UInt32
     n_profiles::UInt16
     ending::UInt8      # `RunEnding`; rewritten in place as the run learns how it ends
-    closed::UInt8      # 1 once the writer closed the file, after its last event and `end_unix`
+    closed::UInt8      # `RS_CLOSED` once the writer closed the file, after its last event and `end_unix`; `RS_OPEN` before
     start_unix::Float64
     end_unix::Float64
     off_strings::UInt32
@@ -191,7 +195,7 @@ struct UnitRecord
     last::UInt32
     profile::UInt8
     exclusive::UInt8
-    chain::UInt32
+    throttle::UInt32
 end
 
 # One item's status as it sits on disk. Every field lands on its natural alignment,
@@ -359,6 +363,8 @@ function run_meta(p::Plan)
         push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
+    # Always written, empty for no `[throttle]`: a record without it predates throttles.
+    push!(meta, "throttle" => join((string(n, '=', l) for (n, l) in sort!(collect(cfg.throttle); by = first)), '\n'))
     # The slots the plan made, which `idle_worker_seconds` counts against. A package's
     # part of a run of several packages has none (`package_plan`): the run's slots
     # served every package, and its record holds only the package's own attempts.
@@ -427,7 +433,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         span = p.units.span[u]
         uref[] = UnitRecord(
             UInt32(first(span)), UInt32(last(span)), UInt8(p.units.profile[u]),
-            UInt8(p.units.exclusive[u]), intern!(strings, string(p.units.chain[u]))
+            UInt8(p.units.exclusive[u]), intern!(strings, string(p.units.throttle[u]))
         )
         write_record(units, uref)
     end
@@ -477,7 +483,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
 
     write_record(io, Ref(Header(
         RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), nitems(p), length(p.units),
-        length(p.profiles), UInt8(ENDING_NONE), 0, start, 0.0, off_strings, off_meta, off_profiles, off_units,
+        length(p.profiles), UInt8(ENDING_NONE), RS_OPEN, start, 0.0, off_strings, off_meta, off_profiles, off_units,
         off_items, off_status, off_memory, off_events, off_environment, off_workers, off_policies
     )))
     write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
@@ -700,12 +706,19 @@ function finish_run_state!(rsf::Union{Nothing, RunStateFile}, ending::RunEnding 
     end
     mark_ending!(rsf, ending)
     update!(io -> write(io, time()), rsf, header_offset(:end_unix))
-    update!(io -> write(io, UInt8(1)), rsf, header_offset(:closed))
+    update!(io -> write(io, RS_CLOSED), rsf, header_offset(:closed))
     @lock rsf.lock close(rsf.io)
     return nothing
 end
 
 ### Reading ################################################################
+
+# Whether the writer closed the file. A 0, from a writer before the `closed` byte or one
+# that left it open, counts as closed where the file says the run finished: those
+# writers said so only as they closed it. A run they stopped is not known to be over
+# until its heartbeat and its writer say so (`is_live`).
+closed_file(h::Header, ending::RunEnding) =
+    h.closed == RS_CLOSED || (h.closed == 0x00 && ending === ENDING_FINISHED && h.end_unix > 0)
 
 struct RunStateItem
     name::String
@@ -720,7 +733,7 @@ struct RunStateUnit
     span::UnitRange{Int32}
     profile::Int32
     exclusive::Bool
-    chain::Symbol
+    throttle::Symbol
 end
 
 struct RunStateStatus
@@ -899,13 +912,13 @@ function read_run_state(path::AbstractString)
         profiles, preferences = read_profiles_section(io, strings)
 
         seek(io, Int(h.off_units))
-        # A `Symbol` per chain name, not per unit: nearly every unit has the same one.
-        chains = Dict{UInt32, Symbol}()
+        # A `Symbol` per throttle name, not per unit: nearly every unit has the same one.
+        throttles = Dict{UInt32, Symbol}()
         units = map(1:bounded(read(io, UInt32), total)) do _
             r = read_record(io, UnitRecord)
-            chain = get(chains, r.chain, nothing)
-            chain === nothing && (chain = chains[r.chain] = Symbol(lookup(strings, r.chain)))
-            RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, chain)
+            throttle = get(throttles, r.throttle, nothing)
+            throttle === nothing && (throttle = throttles[r.throttle] = Symbol(lookup(strings, r.throttle)))
+            RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, throttle)
         end
 
         seek(io, Int(h.off_items))
@@ -976,7 +989,7 @@ function read_run_state(path::AbstractString)
         truncated |= !verdicts_have_events(statuses, events)
         ending = h.ending <= UInt8(typemax(RunEnding)) ? RunEnding(h.ending) : ENDING_NONE
         return RunStateRecord(
-            String(path), h.version, ending !== ENDING_NONE, h.closed == 0x01, h.flags & RS_FLAG_DRY_RUN != 0,
+            String(path), h.version, ending !== ENDING_NONE, closed_file(h, ending), h.flags & RS_FLAG_DRY_RUN != 0,
             !(ending in (ENDING_NONE, ENDING_FINISHED, ENDING_SETUP_FAILED)), ending === ENDING_SETUP_FAILED, ending,
             h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
             units, items, statuses, memory, events, worker_environments, profile_environments, policies,

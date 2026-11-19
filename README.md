@@ -50,7 +50,7 @@ Runtests.runtests_mono()                     # the packages of a Julia workspace
 
 The guides describe each of these features:
 
-- [Test items](https://drvi.github.io/Runtests.jl/dev/guide/writing/) with keywords for tags, timeouts, retries, skips, chains, sandboxes and profiles.
+- [Test items](https://drvi.github.io/Runtests.jl/dev/guide/writing/) with keywords for tags, timeouts, retries, skips, throttles, sandboxes and profiles.
 - [Test setups](https://drvi.github.io/Runtests.jl/dev/guide/setups/): modules that items load with `using`, precompiled before the workers start.
 - [Test templates](https://drvi.github.io/Runtests.jl/dev/guide/templates/): loops that `chores` expands into ordinary test items.
 - [Profiles and environments](https://drvi.github.io/Runtests.jl/dev/guide/profiles/): the flags, threads, variables, `init` and `test_end` of the workers, and directories whose items run in a project of their own.

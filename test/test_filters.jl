@@ -21,11 +21,11 @@ const SUITE = string(
 )
 
 const CHAINED = """
-@testitem "step one" tags=[:seq] chain=:c begin
+@testitem "step one" tags=[:seq] throttle=:c begin
     @test true
 end
 
-@testitem "step two" chain=:c begin
+@testitem "step two" throttle=:c begin
     @test true
 end
 
@@ -257,20 +257,20 @@ filtered(paths...; kwargs...) =
         # Two of three selected still may not overlap; one of three has nothing to
         # overlap with and is an ordinary item.
         three = make_pkg("PartialChain", "test/a_test.jl" => """
-        @testitem "c one" tags=[:keep] chain=:c begin
+        @testitem "c one" tags=[:keep] throttle=:c begin
             @test true
         end
-        @testitem "c two" chain=:c begin
+        @testitem "c two" throttle=:c begin
             @test true
         end
-        @testitem "c three" tags=[:keep] chain=:c begin
+        @testitem "c three" tags=[:keep] throttle=:c begin
             @test true
         end
         """)
         p, _ = prepare((three,); tags=:keep, workers=4)
         @test sort([p.items.name[i] for i in 1:nitems(p)]) == ["c one", "c three"]
         @test length(p.units) == 1
-        @test p.units.chain[1] === :c
+        @test p.units.throttle[1] === :c
         @test length(p.units.span[1]) == 2
 
         single, _ = prepare((three,); name="c two", workers=4)

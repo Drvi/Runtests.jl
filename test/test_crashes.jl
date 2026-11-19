@@ -3,7 +3,7 @@
 # profile's `test_end` expression. None of those may lose the run, and each has to
 # say which of the three it was.
 
-using Runtests.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, ItemState, history, read_run_state, nitems
+using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, CANCELLED, ItemState, history, read_run_state, nitems
 
 # Code that kills the process where it stands the first `n` times it is reached,
 # counting in the file `RUNTESTS_CRASH_MARKER` names.
@@ -153,6 +153,38 @@ end
             # What the file says matches what the run recorded, item for item.
             for (i, it) in enumerate(rs.items)
                 @test rs.statuses[i].state === states[it.name]
+            end
+        end
+    end
+
+    @testset "an attempt whose worker dies or is stopped keeps the memory the monitor saw of it" begin
+        dir = make_pkg("HeldMemory", "test/t_test.jl" => """
+        @testitem "dies holding memory" begin
+            x = ones(UInt8, 200 * 2^20)
+            sleep(1.5)
+            ccall(:abort, Cvoid, ())
+        end
+        @testitem "times out holding memory" timeout=3 begin
+            x = ones(UInt8, 200 * 2^20)
+            sleep(60)
+        end
+        """)
+        with_runstate_dir() do _
+            for monitor in (true, false)
+                states, run, p = run_states(dir; workers=2, logs=:issues, monitor)
+                @test states["dies holding memory"] === ERRORED && states["times out holding memory"] === TIMEDOUT
+                rs = read_run_state(run.runstate.path)
+                for name in ("dies holding memory", "times out holding memory")
+                    i = findfirst(==(name), p.items.name)
+                    event = only(e for e in rs.events if e.kind === :attempt && e.item == i)
+                    # The monitor's sample, in the statuses and the run state; without a
+                    # monitor nothing was sampled, and nothing is made up.
+                    if monitor
+                        @test run.statuses.rss_mb[i] > 150 && event.peak_rss_mb > 150
+                    else
+                        @test run.statuses.rss_mb[i] == 0 && event.peak_rss_mb == 0
+                    end
+                end
             end
         end
     end

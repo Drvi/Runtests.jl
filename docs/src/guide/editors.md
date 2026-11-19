@@ -42,7 +42,7 @@ The extension has three commands: Runtests: Run Failed Tests, Runtests: Restart 
 
 ### What the extension does not do
 
-The extension has no debugger and no coverage view. The Julia extension also finds `@testitem` declarations, and shows them in its own tree, run by its own runner. Items with the keywords of Runtests (`timeout`, `retries`, `chain`, `sandbox`, `failfast`) are errors there.
+The extension has no debugger and no coverage view. The Julia extension also finds `@testitem` declarations, and shows them in its own tree, run by its own runner. Items with the keywords of Runtests (`timeout`, `retries`, `throttle`, `sandbox`, `failfast`) are errors there.
 
 ## Drive Runtests from another editor
 

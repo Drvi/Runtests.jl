@@ -444,20 +444,32 @@ end
 Every process descended from `roots`, including them: precompilation and anything
 a test item starts belong to the run's memory as much as the workers do.
 """
-function process_tree(roots; maxdepth::Int = 4, children = child_lister())
-    seen = Set{Int32}()
-    frontier = Int32[Int32(r) for r in roots]
+process_tree(roots; maxdepth::Int = 4, children = child_lister()) =
+    collect(keys(process_owners(roots; maxdepth, children)))
+
+"""
+    process_owners(roots; maxdepth=4, children=child_lister()) -> Dict{Int32, Int32}
+
+Every process descended from `roots`, including them, each with the root it descends
+from, down to `maxdepth` generations below it. A root is its own: one that another
+root started, as this process starts its workers, heads a tree of its own.
+"""
+function process_owners(roots; maxdepth::Int = 4, children = child_lister())
+    owner = Dict{Int32, Int32}()
+    frontier = Tuple{Int32, Int32}[(Int32(r), Int32(r)) for r in roots]
     for _ in 0:maxdepth
         isempty(frontier) && break
-        next = Int32[]
-        for pid in frontier
-            pid in seen && continue
-            push!(seen, pid)
-            append!(next, children(pid))
+        next = Tuple{Int32, Int32}[]
+        for (pid, root) in frontier
+            haskey(owner, pid) && continue
+            owner[pid] = root
+            for c in children(pid)
+                push!(next, (Int32(c), root))
+            end
         end
         frontier = next
     end
-    return collect(seen)
+    return owner
 end
 
 """

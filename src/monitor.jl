@@ -3,7 +3,7 @@
 # leaves the answer behind. Best effort: if the monitor throws, it switches itself
 # off, says so once, and the tests carry on.
 
-using .Platform: process_rss, process_tree, child_lister, machine_memory, cpu_load, cpu_count,
+using .Platform: process_rss, process_owners, child_lister, machine_memory, cpu_load, cpu_count,
     cpu_ticks, process_cpu_seconds, ensure_checked!, PER_PROCESS_OK
 
 # The scan is over before the monitor exists. Resolving the environment and
@@ -387,9 +387,14 @@ end
 # not seen end, including one still connecting or shutting down, which no slot holds.
 # Their children — `Pkg`'s precompilation workers, anything a test item starts — are
 # found from there, because they spend the same memory budget.
-function tree_roots(::Monitor)
+function tree_roots(m::Monitor)
     roots = Int32[Int32(getpid())]
     append!(roots, RuntestsWorkers.live_worker_pids())
+    # Each slot's worker heads its own tree, which its memory is counted by.
+    for slot in run_of(m).slots
+        w = @atomic slot.worker
+        w === nothing || Int32(w.pid) in roots || push!(roots, Int32(w.pid))
+    end
     return roots
 end
 
@@ -400,15 +405,18 @@ function sample!(m::Monitor)
     total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0; nworkers = 0
     if PER_PROCESS_OK[]
         roots = tree_roots(m)
-        children = child_lister()
+        # One walk of the whole tree, each process with the worker it descends from, or
+        # this process for what no worker started.
         rss_of = Dict{Int32, Int64}()
-        for pid in process_tree(roots; children)
+        tree_of = Dict{Int32, Int64}()
+        for (pid, root) in process_owners(roots; children = child_lister())
             rss = process_rss(pid)
             rss <= 0 && continue
             rss_of[pid] = rss
+            tree_of[root] = get(tree_of, root, Int64(0)) + rss
             nprocs += 1
             # Every root but this process is a worker.
-            pid != first(roots) && pid in roots && (nworkers += 1)
+            pid != first(roots) && pid == root && (nworkers += 1)
             total_rss += rss
             rss > largest && ((largest, largest_pid) = (rss, Int32(pid)))
         end
@@ -427,10 +435,7 @@ function sample!(m::Monitor)
             rss > m.worker_peak[slot.id] && (m.worker_peak[slot.id] = rss)
             # The worker with what it started, such as a build, so that an item's memory
             # is what running it took.
-            tree = Int64(0)
-            for p in process_tree((pid,); children)
-                tree += get(rss_of, p, Int64(0))
-            end
+            tree = get(tree_of, pid, Int64(0))
             m.tree_rss[slot.id] = tree
             key = attempt_key(@atomic(slot.current), @atomic(slot.attempt))
             if key != m.attempt_key[slot.id]
@@ -1151,6 +1156,8 @@ function recycle_biggest_worker!(m::Monitor)
     w = @atomic victim.worker
     w === nothing && return nothing
     @atomic victim.recycle = true
+    # A slot waiting for a gate replaces its worker now rather than once it has a unit.
+    wake_waiting!(run.queues)
     say(run, "memory is above ", round(Int, 100 * run.plan.cfg.memory_threshold), "%; restarting w",
         victim.id, " (pid ", w.pid, most > 0 ? string(", ", fmt_bytes(most)) : "", ")",
         (@atomic victim.current) == 0 ? "" : " once its item is done")

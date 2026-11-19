@@ -102,6 +102,9 @@ Base.@kwdef struct RunConfig
     groups::Dict{String, TagExpr} = Dict{String, TagExpr}()
     order_first::Vector{String} = String[]
     order_last::Vector{String} = String[]
+    # The `[throttle]` table: how many items of each throttle may run at once. A
+    # throttle it does not name has a limit of 1.
+    throttle::Dict{Symbol, Int} = Dict{Symbol, Int}()
     # Every item's random numbers start from this and its name, so a run with the
     # same seed draws the same numbers in each item, whatever ran before it.
     seed::UInt64 = 0
@@ -151,7 +154,7 @@ end
 
 const ORDER_KEYS = (:first, :last)
 const PROFILE_KEYS = (:julia_args, :env, :preferences, :monorepo_default, :precompile)
-const TOP_KEYS = (:run, :order, :profiles, :groups, :monorepo)
+const TOP_KEYS = (:run, :order, :profiles, :groups, :throttle, :monorepo)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
 ### Names that become paths ###################################################
@@ -422,6 +425,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
+        throttle = read_throttle(path, toml),
         seed = seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed),
         config_file = String(config_file),
         # With `/` between the directories, whatever the system writes.
@@ -821,6 +825,37 @@ function read_groups(path, toml)
         end
     end
     return groups
+end
+
+"""
+    read_throttle(path, toml) -> Dict{Symbol, Int}
+
+The `[throttle]` table: for a throttle name, as `throttle = :name` gives it, the most
+items of that throttle that run at once, an integer from 1 to $(typemax(Int32)).
+"""
+function read_throttle(path, toml)
+    tbl = get(Dict{String, Any}, toml, "throttle")
+    tbl isa AbstractDict || throw(ConfigError("[throttle] of $(relpath_or_path(path)) must be a table"))
+    limits = Dict{Symbol, Int}()
+    for (key, value) in tbl
+        name = String(key)::String   # a TOML key
+        what = "throttle `$name` of [throttle] in $(relpath_or_path(path))"
+        Base.isidentifier(name) || throw(ConfigError(
+            "$what: a throttle name is what `throttle = :name` gives, a Julia identifier"
+        ))
+        (is_whole_number(value) && 1 <= value <= typemax(Int32)) || throw(ConfigError(
+            "$what must be the number of its items that may run at once, an integer from 1 to $(typemax(Int32)), " *
+                "got $(repr(value))"
+        ))
+        # The name as Julia reads `:name`, which composes accents and maps lookalikes
+        # (the micro sign to μ) where TOML keeps the key as written.
+        sym = Meta.parse(name)::Symbol
+        haskey(limits, sym) && throw(ConfigError(
+            "$what: Julia reads it as `:$sym`, as it reads another key of [throttle]; keep one"
+        ))
+        limits[sym] = Int(value)
+    end
+    return limits
 end
 
 """

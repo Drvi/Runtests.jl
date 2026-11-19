@@ -86,7 +86,7 @@ end
     @test false
 end
 
-@testitem "asks too late" chain=:late begin
+@testitem "asks too late" throttle=:late begin
     Threads.@spawn begin
         sleep(0.5)
         msg = try
@@ -100,7 +100,7 @@ end
     @test true
 end
 
-@testitem "after the one that asks too late" chain=:late begin
+@testitem "after the one that asks too late" throttle=:late begin
     path = joinpath(ENV["RUNTESTS_ART_MARKS"], "late")
     deadline = time() + 30
     while !isfile(path) && time() < deadline
@@ -141,12 +141,12 @@ end
     @test attempt == 2
 end
 
-@testitem "chain passes first" chain=:evidence begin
+@testitem "chain passes first" throttle=:evidence begin
     write(joinpath(Main.Runtests.artifacts_dir(), "first.txt"), "first")
     @test true
 end
 
-@testitem "chain fails second" chain=:evidence begin
+@testitem "chain fails second" throttle=:evidence begin
     write(joinpath(Main.Runtests.artifacts_dir(), "second.txt"), "second")
     @test false
 end
@@ -156,7 +156,7 @@ end
     @test false
 end
 
-@testitem "holds a reference and passes" chain=:release begin
+@testitem "holds a reference and passes" throttle=:release begin
     mutable struct Held
         x::Int
     end
@@ -166,7 +166,7 @@ end
     @test true
 end
 
-@testitem "sees it let go of" chain=:release begin
+@testitem "sees it let go of" throttle=:release begin
     for _ in 1:50
         GC.gc(true)
         haskey(ENV, "RUNTESTS_ART_RELEASED") && break
@@ -325,12 +325,12 @@ end
                 @test false
             end
 
-            @testitem "chained into a hang" chain=:hang begin
+            @testitem "chained into a hang" throttle=:hang begin
                 Main.Runtests.on_failure(d -> sleep(600))
                 @test false
             end
 
-            @testitem "after the hang in its chain" chain=:hang begin
+            @testitem "after the hang in its chain" throttle=:hang begin
                 @test true
             end
 

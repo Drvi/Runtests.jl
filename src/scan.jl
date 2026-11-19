@@ -397,7 +397,7 @@ end
 # The keywords a `@testitem` accepts. A position in this tuple is a bit in the
 # `seen` mask below, which is how a keyword given twice is caught without a set
 # per item.
-const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :chain, :sandbox, :profile)
+const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :throttle, :sandbox, :profile)
 
 function keyword_bit(key::Symbol)
     i = findfirst(==(key), ITEM_KEYWORDS)
@@ -428,7 +428,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
 
     tags = nothing; setups = Symbol[]
     timeout = USE_RUN_DEFAULT; retries = USE_RUN_DEFAULT
-    failfast = Int8(-1); chain = NO_CHAIN; profile = DEFAULT_PROFILE
+    failfast = Int8(-1); throttle = NO_THROTTLE; profile = DEFAULT_PROFILE
     exclusive = false; skip = false
     seen = UInt8(0)
     for k in (lo + 1):(hi - 1)
@@ -463,10 +463,10 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
             v = literal(val)
             v isa Bool || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `failfast` must be `true` or `false`, got `$(_show(val))`")
             failfast = Int8(v)
-        elseif key === :chain
+        elseif key === :throttle
             v = literal(val)
-            v isa Symbol || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `chain` must be a symbol, got `$(_show(val))`")
-            chain = v
+            v isa Symbol || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `throttle` must be a symbol, got `$(_show(val))`")
+            throttle = v
         elseif key === :sandbox
             v = literal(val)
             v isa Symbol && return scan_error!(errors, path, at,
@@ -479,23 +479,24 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
             v = literal(val)
             v isa Symbol || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `profile` must be a profile name, as in `profile = :fast`, got `$(_show(val))`")
             profile = v
+        elseif key === :chain
+            return scan_error!(errors, path, at,
+                "`@testitem $(repr(name))`: `chain` is now `throttle`: write `throttle = " *
+                    (literal(val) isa Symbol ? repr(literal(val)) : _show(val)) * "`. A throttle " *
+                    "that [throttle] of TestItems.toml gives no limit has the limit 1, and runs its items as a chain " *
+                    "did: in sequence, on one worker"
+            )
         else
             return scan_error!(errors, path, at, 
                 "`@testitem $(repr(name))`: unknown keyword `$key`; " *
-                    "known keywords are tags, timeout, retries, skip, failfast, chain, sandbox, profile"
+                    "known keywords are tags, timeout, retries, skip, failfast, throttle, sandbox, profile"
             )
         end
-    end
-    if exclusive && chain !== NO_CHAIN
-        return scan_error!(errors, path, at, 
-            "`@testitem $(repr(name))`: `sandbox=true` means alone in a process and " *
-                "`chain=:$chain` means together with its chain, so they cannot be combined"
-        )
     end
     collect_setups!(setups, body, known_setups)
     return RawItem(
         name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
-        timeout, retries, failfast, chain, profile, exclusive, environment, hash, Int32(1)
+        timeout, retries, failfast, throttle, profile, exclusive, environment, hash, Int32(1)
     )
 end
 

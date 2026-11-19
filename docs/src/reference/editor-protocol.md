@@ -14,7 +14,7 @@ julia --project=<an environment with Runtests> -e 'using Runtests; Runtests.serv
 
 `Runtests.serve_mono("<workspace root>")` serves the packages of a workspace, as [`runtests_mono`](@ref monorepos) runs them. Its listing holds the items of every package, and each run is a combined run. Two items of two packages can have the same name, so an item is known by its key: the name of its package and its own name.
 
-`serve_mono` reads each package's own configuration file and has no `config` argument. The protocol version is `4`, and the `hello` event gives it. An editor should check that version before sending a selection: earlier versions use different item identifiers, and before version 4 the `state` of `item_finished` is the state of the item, not of the attempt. A change that can break an editor written against the protocol increases the version.
+`serve_mono` reads each package's own configuration file and has no `config` argument. The protocol version is `5`, and the `hello` event gives it. An editor should check that version before sending a selection: earlier versions use different item identifiers, before version 4 the `state` of `item_finished` is the state of the item, not of the attempt, and before version 5 an item has `chain` in place of `throttle`. A change that can break an editor written against the protocol increases the version.
 
 ## Commands
 
@@ -74,7 +74,7 @@ Each item in `items` has these fields:
 | `profile` | The profile from `profile = :name`, or `null` for the default profile. |
 | `sandbox` | `true` for an item with `sandbox = true`, which runs alone in a process of its own. |
 | `environment` | The absolute path of the environment directory of the item's file, or `null` for the test environment. |
-| `chain` | The name of the chain, or `null`. |
+| `throttle` | The name of the throttle, or `null`. |
 | `skip` | `true`, `false`, or the text of the expression that the worker evaluates. |
 | `timeout`, `retries`, `failfast` | The value of the item, or `null` for the value of the run. |
 

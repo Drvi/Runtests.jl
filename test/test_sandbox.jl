@@ -3,11 +3,11 @@
 # chain, at a fixed point in the queue — and a suite normally uses more than one
 # of them at once.
 
-using Runtests.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
+using Runtests.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems, nslots
 
 # A chain member that takes long enough for an overlap to show, and records when it
 # ended as well as when it started; `before` runs first.
-chain_link(name; chain::Symbol, before="") = journal_item(name; opts="chain=:$chain", body=before * """
+chain_link(name; throttle::Symbol, before="") = journal_item(name; opts="throttle=:$throttle", body=before * """
     sleep(0.2)
     open(joinpath(ENV["RUNTESTS_JOURNAL"], string(time_ns(), "-", getpid(), "-end")), "w") do io
         println(io, $(repr(name * " end")), "\\t", getpid(), "\\t", time())
@@ -195,8 +195,8 @@ end
         with_marker_dir() do work
             marker = joinpath(work, "count")
             dir = make_pkg("ChainRetry", "test/t_test.jl" => string(
-                journal_item("link one"; opts="chain=:c"),
-                journal_item("link two"; opts="chain=:c timeout=2 retries=1", body="""
+                journal_item("link one"; opts="throttle=:c"),
+                journal_item("link two"; opts="throttle=:c timeout=2 retries=1", body="""
                     k = let p = ENV["RUNTESTS_CRASH_MARKER"]
                         n = isfile(p) ? parse(Int, read(p, String)) : 0
                         write(p, string(n + 1))
@@ -205,7 +205,7 @@ end
                     k < 1 && sleep(600)
                     @test true
                     """),
-                journal_item("link three"; opts="chain=:c"),
+                journal_item("link three"; opts="throttle=:c"),
             ))
             rows = withenv("RUNTESTS_CRASH_MARKER" => marker) do
                 with_journal() do path
@@ -226,9 +226,9 @@ end
 
     @testset "a chain cut short by a timeout does not run its remaining items" begin
         dir = make_pkg("ChainTimeout", "test/t_test.jl" => string(
-            journal_item("head"; opts="chain=:d"),
-            journal_item("hangs"; opts="chain=:d timeout=2", body="sleep(600)"),
-            journal_item("tail"; opts="chain=:d"),
+            journal_item("head"; opts="throttle=:d"),
+            journal_item("hangs"; opts="throttle=:d timeout=2", body="sleep(600)"),
+            journal_item("tail"; opts="throttle=:d"),
         ))
         rows = with_journal() do path
             states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
@@ -245,9 +245,9 @@ end
         dir = make_pkg(
             "ChainProfile",
             "test/t_test.jl" => string(
-                journal_item("checked one"; opts="chain=:p profile=:bounds",
+                journal_item("checked one"; opts="throttle=:p profile=:bounds",
                              body="@test Base.JLOptions().check_bounds == 1"),
-                journal_item("checked two"; opts="chain=:p profile=:bounds",
+                journal_item("checked two"; opts="throttle=:p profile=:bounds",
                              body="@test Base.JLOptions().check_bounds == 1"),
             ),
             "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n"
@@ -259,6 +259,54 @@ end
         end
         @test [r.name for r in rows] == ["checked one", "checked two"]
         @test length(unique(r.pid for r in rows)) == 1   # a chain is one worker
+    end
+
+    @testset "a throttle above 1 runs that many of its items at once, beside other items, and no more" begin
+        gated = ["gated $k" for k in 1:4]
+        plain = ["plain 1", "plain 2"]
+        # Each body holds its worker until three items have started: the run's three
+        # workers each start one, two of the throttle and one other, and a limit the
+        # run did not keep would let a third of the throttle start instead.
+        three_started = """
+            let dir = ENV["RUNTESTS_JOURNAL"], deadline = time() + 30
+                started() = count(readdir(dir; join=true)) do f
+                    r = split(strip(read(f, String)), '\\t')
+                    length(r) == 3 && !endswith(r[1], " end")
+                end
+                while started() < 3
+                    time() > deadline && (touch(joinpath(dir, "gave-up")); break)
+                    sleep(0.05)
+                end
+            end
+            """
+        dir = make_pkg(
+            "Throttled",
+            "test/t_test.jl" => join(chain_link(n; throttle=:g, before=three_started) for n in gated) *
+                                join(journal_item(n; body=three_started * "sleep(0.2)\n@test true") for n in plain),
+            "test/TestItems.toml" => "[throttle]\ng = 2\n[order]\nfirst = $(repr(gated))\n",
+        )
+        spans, pids, gave_up, states, slots = with_journal() do path
+            states, _, p = run_states(dir; workers=3, logs=:issues, monitor=false)
+            # When each began and ended, by the clock all processes of the machine share.
+            at = Dict{String, Float64}()
+            pids = Set{Int}()
+            for f in readdir(path; join=true)
+                r = split(strip(read(f, String)), '\t')
+                length(r) == 3 || continue
+                at[r[1]] = parse(Float64, r[3])
+                push!(pids, parse(Int, r[2]))
+            end
+            [(at[n], get(at, n * " end", Inf)) for n in gated], pids, isfile(joinpath(path, "gave-up")), states,
+                nslots(p)
+        end
+        @test slots == 3
+        @test all(==(PASSED), values(states))
+        @test !gave_up
+        @test length(pids) == 3
+        # When any of them began, at most one other was under way; and two were at once.
+        under_way(a) = count(((b, e),) -> b <= a < e, spans)
+        @test all(((a, _),) -> under_way(a) <= 2, spans)
+        @test any(((a, _),) -> under_way(a) == 2, spans)
     end
 
     @testset "an idle slot never runs work belonging to another profile in its own process" begin
@@ -363,7 +411,7 @@ end
             "test/b_test.jl" => string(
                 journal_item("filler one"; body=started_elsewhere(["tail chain three"]) * "@test true"),
                 journal_item("filler two"),
-                (chain_link(l; chain=:t) for l in links)...,
+                (chain_link(l; throttle=:t) for l in links)...,
             ),
         )
         rows, run, p, gave_up = with_journal() do path
@@ -390,9 +438,9 @@ end
             "RunningChain",
             "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["chain one"]) * "@test true"),
             "test/b_test.jl" => string(
-                chain_link("chain one"; chain=:r, before=started_elsewhere(fillers)),
-                chain_link("chain two"; chain=:r),
-                chain_link("chain three"; chain=:r),
+                chain_link("chain one"; throttle=:r, before=started_elsewhere(fillers)),
+                chain_link("chain two"; throttle=:r),
+                chain_link("chain three"; throttle=:r),
                 (journal_item(f) for f in fillers)...,
             ),
         )
@@ -414,8 +462,8 @@ end
             "Ordered",
             "test/t_test.jl" => string(
                 journal_item("alpha"),
-                journal_item("beta"; opts="chain=:c"),
-                journal_item("gamma"; opts="chain=:c"),
+                journal_item("beta"; opts="throttle=:c"),
+                journal_item("gamma"; opts="throttle=:c"),
                 journal_item("delta"),
             ),
             "test/TestItems.toml" => "[order]\nfirst = [\"gamma\"]\nlast = [\"alpha\"]\n"

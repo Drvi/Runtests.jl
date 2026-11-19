@@ -130,11 +130,11 @@ is_activated() = ACTIVATION[] !== nothing
 const REPL_IGNORED = (
     :timeout => "there is no second process to stop",
     :retries => "a failure you are looking at is not one to paper over",
-    :chain => "there is nothing for it to run in sequence with",
+    :throttle => "there is nothing else for it to run alongside or in sequence with",
 )
 
 # A sandboxed item has a process of its own, so a timeout has something to stop and
-# a retry something to start; `chain` still has nothing to run in sequence with.
+# a retry something to start; `throttle` still has nothing else to run with.
 repl_ignored(sandboxed::Bool) = sandboxed ? REPL_IGNORED[3:3] : REPL_IGNORED
 
 """
@@ -143,8 +143,8 @@ repl_ignored(sandboxed::Bool) = sandboxed ? REPL_IGNORED[3:3] : REPL_IGNORED
 Run one `@testitem` that was evaluated rather than scanned, and return its
 testset. It is read by the scanner's parser and evaluated by the worker's code.
 `sandbox`, a profile and an environment directory start a worker. Without a
-worker, `timeout` and `retries` are ignored with a warning; `chain` is always
-ignored because one pasted item has no chain to schedule.
+worker, `timeout` and `retries` are ignored with a warning; `throttle` is always
+ignored because one pasted item has no other items to schedule with.
 """
 function run_interactive(ex::Expr, source::LineNumberNode)
     path = source.file === nothing ? "REPL" : String(source.file)
@@ -218,7 +218,7 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
     for (key, why) in repl_ignored(sandboxed)
         set = key === :timeout ? item.timeout_s != USE_RUN_DEFAULT :
             key === :retries ? item.retries != USE_RUN_DEFAULT :
-            item.chain !== NO_CHAIN
+            item.throttle !== NO_THROTTLE
         set && push!(given, string("`", key, "` (", why, ")"))
     end
     isempty(given) && return nothing

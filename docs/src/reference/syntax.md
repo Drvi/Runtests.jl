@@ -40,11 +40,11 @@ The name is a string literal that is not blank. It must be unique across the sui
 | `retries` | An integer from 0 to 126. | The `retries` of the run. | The number of more attempts after a failure. A chain retries from its first item. |
 | `skip` | `true`, `false`, or an expression that gives a `Bool`. | `false` | Skip the item. The worker evaluates the expression before the body. |
 | `failfast` | `true` or `false`. | The `item_failfast` of the run. | Stop the item at its first failed test. |
-| `chain` | A symbol, for example `:db`. | none | The items of a chain run in sequence, on one worker. |
+| `throttle` | A symbol, for example `:db`. | none | At most the limit that `[throttle]` gives this name of the items with this `throttle` run at the same time. With the limit 1, the default, the items are a chain: they run in sequence, on one worker. See [Throttles](@ref throttles). |
 | `sandbox` | `true` or `false`. | `false` | `true` runs the item alone in a new process. |
 | `profile` | The name of a profile as a symbol, for example `:bounds`. | `:default` | The profile of the workers that run the item. |
 
-Each value except the value of `skip` must be a literal. Arithmetic on numeric literals is a literal too, for example `timeout = 5*60`. `sandbox = true` and `chain` cannot go together. `sandbox = true` and `profile` combine. All items of one chain must use the same profile and be in the same environment. `sandbox = :name` is an error that tells you to write `profile = :name`.
+Each value except the value of `skip` must be a literal. Arithmetic on numeric literals is a literal too, for example `timeout = 5*60`. `sandbox = true` and `profile` combine. `sandbox = true` cannot go in a chain, a throttle with the limit 1. All items of one chain must use the same profile and be in the same environment. `sandbox = :name` is an error that tells you to write `profile = :name`.
 
 The `skip` expression runs on the worker, in a module of its own, with `Test` and the package in scope, before the imports of the body. An exception in it, or a value that is not a `Bool`, is an error of the item.
 

@@ -212,11 +212,6 @@ const DEPS = fixture("TestDeps.jl")
                     @test true
                 end
             )
-            @test_throws ScanFailure (
-                @testitem "both" sandbox = true chain = :c begin
-                    @test true
-                end
-            )
         end
     end
 
@@ -224,7 +219,7 @@ const DEPS = fixture("TestDeps.jl")
         with_activated(DEPS) do _
             logs = Test.collect_test_logs() do
                 capture_run() do
-                    @testitem "pasted knobs" timeout=5 retries=2 chain=:c tags=[:x] begin
+                    @testitem "pasted knobs" timeout=5 retries=2 throttle=:c tags=[:x] begin
                         @test true
                     end
                 end
@@ -233,7 +228,7 @@ const DEPS = fixture("TestDeps.jl")
             @test length(warnings) == 1
             msg = first(warnings).message
             # Every one of them named, and why.
-            for key in ("timeout", "retries", "chain")
+            for key in ("timeout", "retries", "throttle")
                 @test occursin(key, msg)
             end
             # `tags` is not among them: selecting nothing is what a single pasted
@@ -366,9 +361,9 @@ end
         @test :retries in ignored(false)
         @test :timeout ∉ ignored(true)
         @test :retries ∉ ignored(true)
-        # A chain has nothing to be sequenced with either way, and `tags` select
+        # A throttle has nothing else to run with either way, and `tags` select
         # nothing here — which was never worth a line.
-        @test :chain in ignored(true)
+        @test :throttle in ignored(true)
         @test :tags ∉ ignored(false)
     end
 

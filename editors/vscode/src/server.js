@@ -8,7 +8,7 @@ const readline = require('node:readline');
 const { EventEmitter } = require('node:events');
 const { keyObject } = require('./model');
 
-const PROTOCOL = 4;
+const PROTOCOL = 5;
 
 class RuntestsServer extends EventEmitter {
     /**

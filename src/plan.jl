@@ -52,15 +52,19 @@ end
 """
     Units
 
-The schedulable thing: a chain of items, or a single item. Chain membership is
-represented by the items being contiguous, so the scheduler never has to ask what
-chain something belongs to — it dispatches a range.
+The schedulable thing: a chain of items, or a single item. A chain is the items of
+a throttle with a limit of 1, which run in sequence on one worker. Chain membership
+is represented by the items being contiguous, so the scheduler never has to ask what
+chain something belongs to — it dispatches a range. Each item of a throttle with a
+limit above 1 is a unit of its own, and `gate` numbers that throttle: the scheduler
+runs at most `Plan.gate_limit[gate]` of its units at once.
 """
 struct Units
     span::Vector{UnitRange{ItemIdx}}
     profile::Vector{ProfileIdx}
     exclusive::Vector{Bool}
-    chain::Vector{Symbol}
+    throttle::Vector{Symbol}    # the throttle its items name, NO_THROTTLE for none
+    gate::Vector{Int32}         # a throttle with a limit above 1, 0 for none
     est_s::Vector{Float64}
     why::Vector{Why}            # where `order_pool!` put it, and so why
     failed_ago::Vector{Int32}   # runs since a member last did not pass, -1 for none recorded
@@ -161,6 +165,7 @@ struct Plan
     slot_pool::Vector{Int32}                 # slot -> pool
     slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its stretch of its pool's body
     pending::Vector{Int32}                   # pools with no slot yet, in pickup order
+    gate_limit::Vector{Int32}                # per gate (`Units`): how many of its units run at once
     cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
@@ -231,19 +236,25 @@ function plan(
     validate_order(raw, packages)
 
     profiles, profile_package, profile_idx = profile_table(packages, raw)
-    units = build_units(raw, profile_idx, histories)
+    units, gate_limit = build_units(raw, profile_idx, histories, packages)
     # Pools in order of estimated completion, the latest first: the order they get
     # their first workers in, and the pickup order of those left without one.
     pools = pool_units(units, profiles, profile_package, packages)
-    estimate = pool_estimate(pools, units, histories)
+    estimate = pool_estimate(pools, units, histories, gate_limit)
     order = sortperm(eachindex(pools); by = k -> (-estimate(k, 1), minimum(u -> units[u].profile, pools[k])))
     pools = pools[order]
     slots = count_slots(pools, (k, n) -> estimate(order[k], n), cfg)
+    # What a unit of a gate counts as when ordered: its gate's work over its limit.
+    gate_floor = zeros(length(gate_limit))
+    for d in units
+        d.gate == 0 || (gate_floor[d.gate] += d.est_s)
+    end
+    gate_floor ./= gate_limit
     for (k, pool) in enumerate(pools)
-        order_pool!(pool, units, slots[k], packages, histories)
+        order_pool!(pool, units, slots[k], packages, histories, gate_floor)
     end
     return materialize(units, pools, slots, profiles, profile_package, cfg, packages, root, selection,
-                       sort(suite_names), histories)
+                       sort(suite_names), histories, gate_limit)
 end
 
 # The file the settings came from, as a message names it.
@@ -316,13 +327,14 @@ function check_order_conflicts(raw, cfg)
     end
     chains = Dict{Symbol, Vector{String}}()
     for it in raw
-        it.chain === NO_CHAIN || push!(get!(Vector{String}, chains, it.chain), it.name)
+        it.throttle === NO_THROTTLE || get(cfg.throttle, it.throttle, 1) > 1 ||
+            push!(get!(Vector{String}, chains, it.throttle), it.name)
     end
-    for (chain, members) in sort!(collect(chains); by = first)
+    for (name, members) in sort!(collect(chains); by = first)
         f = [m for m in members if m in first_]
         l = [m for m in members if m in last_]
         (isempty(f) || isempty(l) || f == l) && continue
-        push!(both, string("chain `", chain, "` runs as one, and `first` names ", join(map(repr, f), ", "),
+        push!(both, string("throttle `", name, "` runs as one chain, and `first` names ", join(map(repr, f), ", "),
                            " while `last` names ", join(map(repr, l), ", ")))
     end
     isempty(both) && return nothing
@@ -384,9 +396,10 @@ mutable struct UnitDraft
     const items::Vector{RawItem}
     const profile::ProfileIdx
     const exclusive::Bool
-    const chain::Symbol
+    const throttle::Symbol
+    const gate::Int32
     const est_s::Float64
-    key::Tuple{Int, Int, Float64, String, Int32}   # its place in its pool; see `order_pool!`
+    key::Tuple{Int, Int, Float64, Float64, String, Int32}   # its place in its pool; see `order_pool!`
     why::Why
     failed_ago::Int32
     failed_at::Int    # which of `items` failed most recently, 0 for none
@@ -395,63 +408,121 @@ mutable struct UnitDraft
     changed_new::Bool # whether that one never ran
 end
 
-# A chain is one package's: two packages that name the same chain have one each.
-function build_units(raw::Vector{RawItem}, profile_idx, histories::Vector{History})
-    draft(its, exclusive, chain) = UnitDraft(
-        its, profile_idx[(its[1].package, its[1].profile, its[1].environment)], exclusive, chain,
-        sum(it -> get(histories[it.package].seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
+# Under a limit of 1 a throttle's items are one unit, a chain, in file order, and the
+# throttle is one package's: two packages that name it have a chain each. Above 1 each
+# item is a unit of its own, and the throttle is a gate that every package naming it
+# shares, as a limit on what the machine runs at once; those packages must give it the
+# same limit. Gates are numbered in the order of the first package to name each, then
+# the name. Returns the units and each gate's limit.
+function build_units(raw::Vector{RawItem}, profile_idx, histories::Vector{History}, packages::Packages)
+    draft(its, exclusive, throttle, gate) = UnitDraft(
+        its, profile_idx[(its[1].package, its[1].profile, its[1].environment)], exclusive, throttle, Int32(gate),
+        sum(it -> get(histories[it.package].seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, 0.0, "", Int32(0)),
         IN_FILE_ORDER, Int32(-1), 0, false, 0, false
     )
-    chains = Dict{Tuple{Int32, Symbol}, Vector{RawItem}}()
+    throttles = Dict{Tuple{Int32, Symbol}, Vector{RawItem}}()
     units = UnitDraft[]
     for it in raw
-        if it.chain === NO_CHAIN
-            push!(units, draft([it], it.exclusive, NO_CHAIN))
+        if it.throttle === NO_THROTTLE
+            push!(units, draft([it], it.exclusive, NO_THROTTLE, 0))
         else
-            push!(get!(Vector{RawItem}, chains, (it.package, it.chain)), it)
+            push!(get!(Vector{RawItem}, throttles, (it.package, it.throttle)), it)
         end
     end
+    check_shared_limits(sort!(collect(keys(throttles))), [cfg.throttle for cfg in packages.cfg],
+                        [config_name(packages, k) for k in eachindex(packages.name)])
     errors = ScanError[]
-    for ((_, name), its) in sort!(collect(chains); by = first)
+    gate_limit = Int32[]
+    gate = Dict{Symbol, Int}()
+    for ((k, name), its) in sort!(collect(throttles); by = first)
+        limit = get(packages.cfg[k].throttle, name, 1)
+        if limit > 1
+            g = get!(gate, name) do
+                push!(gate_limit, Int32(limit))
+                length(gate_limit)
+            end
+            for it in its
+                push!(units, draft([it], it.exclusive, name, g))
+            end
+            continue
+        end
         sort!(its; by = i -> (i.file, i.line))
         first_ = its[1]
+        # A chain runs in one process, from its first item to its last.
         for it in its
-            if it.profile !== first_.profile
+            if it.exclusive
                 push!(
                     errors, ScanError(
                         it.file, it.line,
-                        "chain `:$name` mixes profiles: $(repr(it.name)) uses " *
+                        "`@testitem $(repr(it.name))`: `sandbox=true` means alone in a process, and " *
+                            "`throttle=:$name`, with a limit of 1, runs its items in sequence in one process, " *
+                            "so they cannot be combined; a limit above 1 in [throttle] can"
+                    )
+                )
+            elseif it.profile !== first_.profile
+                push!(
+                    errors, ScanError(
+                        it.file, it.line,
+                        "throttle `:$name` mixes profiles: $(repr(it.name)) uses " *
                             "`:$(it.profile)` but $(repr(first_.name)) uses `:$(first_.profile)`; " *
-                            "a chain runs in one process, so it must have one profile"
+                            "with a limit of 1 a throttle runs in one process, so it must have one profile"
                     )
                 )
             elseif it.environment != first_.environment
                 push!(
                     errors, ScanError(
                         it.file, it.line,
-                        "chain `:$name` spans environments: $(repr(it.name)) runs in " *
+                        "throttle `:$name` spans environments: $(repr(it.name)) runs in " *
                             environment_name(it.environment) * " but $(repr(first_.name)) in " *
-                            environment_name(first_.environment) * "; a chain runs in one process, " *
-                            "so its items must be in one environment"
+                            environment_name(first_.environment) * "; with a limit of 1 a throttle runs in one " *
+                            "process, so its items must be in one environment"
                     )
                 )
             end
         end
-        push!(units, draft(its, false, name))
+        push!(units, draft(its, false, name, 0))
     end
     isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
-    return units
+    return units, gate_limit
+end
+
+"""
+    check_shared_limits(uses, limits, names)
+
+That the packages of a run give each throttle they share one limit: a limit above 1
+makes it one throttle for all of them, so they must agree on it. `uses` holds the
+package and name of each throttle an item names, `limits` each package's `[throttle]`
+and `names` how a message names each package's configuration file.
+"""
+function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol, Int}}, names::AbstractVector{<:AbstractString})
+    seen = Dict{Symbol, Int}()
+    for (k, name) in uses
+        l = get(limits[k], name, 1)
+        get!(seen, name, l) == l && continue
+        ks = sort!(unique!([k for (k, n) in uses if n === name]))
+        said(k) = string(names[k], " ", haskey(limits[k], name) ? limits[k][name] : "1, by not naming it in [throttle]")
+        throw(ConfigError(string(
+            "throttle `:", name, "` has a limit above 1, so the packages that name it share it, and they give it ",
+            "different limits: ", join(map(said, ks), "; "), ". Give it the same limit in each"
+        )))
+    end
+    return nothing
 end
 
 # The units of each pool: one pool for each `pool_key` of the units' profiles. In the
 # order of their first profile.
 function pool_units(units::Vector{UnitDraft}, profiles::Vector{Profile}, profile_package::Vector{Int32}, packages::Packages)
-    groups = Dict{Any, Vector{Int}}()
-    for (u, d) in enumerate(units)
-        k = profile_package[d.profile]
-        push!(get!(Vector{Int}, groups, pool_key(profiles[d.profile], k, packages.root[k], packages.isolated[k])), u)
+    # A profile's pool depends on the profile alone: its key is made once per profile.
+    pool_of = Dict{Any, Int}()
+    of_profile = map(eachindex(profiles)) do j
+        k = profile_package[j]
+        get!(pool_of, pool_key(profiles[j], k, packages.root[k], packages.isolated[k]), length(pool_of) + 1)
     end
-    return sort!(collect(values(groups)); by = pool -> minimum(u -> units[u].profile, pool))
+    pools = [Int[] for _ in 1:length(pool_of)]
+    for (u, d) in enumerate(units)
+        push!(pools[of_profile[d.profile]], u)
+    end
+    return sort!(filter!(!isempty, pools); by = pool -> minimum(u -> units[u].profile, pool))
 end
 
 """
@@ -476,19 +547,29 @@ end
 
 The estimated completion of pool `k` with `n` workers, in seconds: the time a worker
 takes to be ready for its first item, as earlier runs measured it, then the larger of
-the pool's work shared among its workers and its longest unit, which no number of
-workers shortens. An item without a recorded duration counts as the typical item,
-also in a chain whose other items have one.
+the pool's work shared among its workers, its longest unit and each gate's work in it
+over the gate's limit, which no number of workers shortens. An item without a
+recorded duration counts as the typical item, also in a chain whose other items have
+one.
 """
-function pool_estimate(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, histories::Vector{History})
+function pool_estimate(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, histories::Vector{History},
+                       gate_limit::Vector{Int32})
     recorded(it) = get(histories[it.package].seconds, it.name, 0.0)
     typical = typical_estimate([recorded(it) for d in units for it in d.items])
     est(u) = sum(it -> (s = recorded(it); s > 0 ? s : typical), units[u].items; init = 0.0)
     work = [sum(est, pool; init = 0.0) for pool in pools]
     longest = [maximum(est, pool; init = 0.0) for pool in pools]
+    throttled = map(pools) do pool
+        gate_work = zeros(length(gate_limit))
+        for u in pool
+            g = units[u].gate
+            g == 0 || (gate_work[g] += est(u))
+        end
+        maximum(gate_work ./ gate_limit; init = 0.0)
+    end
     cold = combined_cold(histories)
     ready = cold.start_s + cold.compile_s
-    return (k, n) -> ready + max(work[k] / n, longest[k])
+    return (k, n) -> ready + max(work[k] / n, longest[k], throttled[k])
 end
 
 # What a fresh worker cost in the earlier runs of the packages: the mean of what each
@@ -537,7 +618,7 @@ const TAIL_CLASS = Int(PINNED_LAST)
 const LONG_FLOOR_S = 3.0
 
 """
-    order_pool!(pool, units, nslots, packages, histories)
+    order_pool!(pool, units, nslots, packages, histories, gate_floor)
 
 Sort a pool's units into the order they are handed out, by class and then within
 it:
@@ -552,7 +633,10 @@ it:
    more recent first; within each, the units class 3 would take, longest first,
    then file order;
 3. units long enough to decide how long the run takes — more than a quarter of
-   one slot's share of the pool's work, and at least `LONG_FLOOR_S` — longest first;
+   one slot's share of the pool's work, and at least `LONG_FLOOR_S` — longest first.
+   A unit of a gate counts as long as its gate's work over its limit, `gate_floor`,
+   when that is longer: the gate's units start early and together, the longest of
+   them first;
 4. everything else, in file order, where neighbours share compiled code;
 5. `[order] last`, in the order listed.
 
@@ -562,7 +646,7 @@ values are these numbers. Each package's `[order]` names its own items; in a poo
 that serves several packages, see [`order_blocks!`](@ref).
 """
 function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, packages::Packages,
-                     histories::Vector{History})
+                     histories::Vector{History}, gate_floor::Vector{Float64})
     pin = [Dict{String, Int}() for _ in eachindex(packages.name)]
     for (k, cfg) in enumerate(packages.cfg)
         for (i, n) in enumerate(cfg.order_first)
@@ -590,12 +674,12 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, p
         d.changed_at = something(findfirst(it -> edited(it, history) || never_ran(it, history), d.items), 0)
         d.changed_new = d.changed_at > 0 && never_ran(d.items[d.changed_at], history)
         urgency = d.changed_at > 0 ? 0 : ago
-        long = d.est_s >= LONG_FLOOR_S && d.est_s > share / 4
+        est = d.gate == 0 ? d.est_s : max(d.est_s, gate_floor[d.gate])
+        long = est >= LONG_FLOOR_S && est > share / 4
         d.why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : d.exclusive ? SANDBOXED :
             urgency < typemax(Int) ? RECENT : long ? LONG : IN_FILE_ORDER
-        d.key = (
-            Int(d.why), d.why === RECENT ? urgency : p, long && d.why in (RECENT, LONG) ? -d.est_s : 0.0, at...,
-        )
+        by_length = long && d.why in (RECENT, LONG)
+        d.key = (Int(d.why), d.why === RECENT ? urgency : p, by_length ? -est : 0.0, by_length ? -d.est_s : 0.0, at...)
     end
     return sort!(pool; by = u -> units[u].key)
 end
@@ -659,7 +743,8 @@ end
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
         profiles::Vector{Profile}, profile_package::Vector{Int32}, cfg::RunConfig, packages::Packages,
-        root::AbstractString, selection::AbstractString, suite_names::Vector{String}, histories::Vector{History}
+        root::AbstractString, selection::AbstractString, suite_names::Vector{String}, histories::Vector{History},
+        gate_limit::Vector{Int32}
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -672,7 +757,7 @@ function materialize(
     item_hash = UInt32[]; item_seed_ = UInt64[]; item_package = Int32[]
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
-    uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
+    uthrottle = Symbol[]; ugate = Int32[]; uest = Float64[]; ufile = Int32[]
     uwhy = Why[]; uago = Int32[]; ufailed = ItemIdx[]; ucancelled = Bool[]; uchanged = ItemIdx[]; unew = Bool[]
     all_setups = Symbol[]
     ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
@@ -700,7 +785,7 @@ function materialize(
             end
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
-            push!(uchain, d.chain); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
+            push!(uthrottle, d.throttle); push!(ugate, d.gate); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
             push!(uwhy, d.why); push!(uago, d.failed_ago)
             push!(ufailed, d.failed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.failed_at - 1))
             push!(ucancelled, d.cancelled)
@@ -728,9 +813,9 @@ function materialize(
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew), files, relfiles,
-        String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
-        profiles, profile_package, ps, slot_pool, slot_units, pending, combined_cold(histories),
+        items, Units(uspan, uprofile, uexcl, uthrottle, ugate, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew),
+        files, relfiles, String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
+        profiles, profile_package, ps, slot_pool, slot_units, pending, gate_limit, combined_cold(histories),
         sort!(unique!(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
     )
 end

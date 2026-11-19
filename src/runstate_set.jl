@@ -33,7 +33,7 @@ function package_plan(p::Plan, k::Integer)
     un = p.units
     units = Units(
         UnitRange{ItemIdx}[item[ItemIdx(first(un.span[u]))]:item[ItemIdx(last(un.span[u]))] for u in us],
-        ProfileIdx[profile[un.profile[u]] for u in us], un.exclusive[us], un.chain[us], un.est_s[us], un.why[us],
+        ProfileIdx[profile[un.profile[u]] for u in us], un.exclusive[us], un.throttle[us], un.gate[us], un.est_s[us], un.why[us],
         un.failed_ago[us], ItemIdx[local_item(un.failed_item[u]) for u in us], un.cancelled[us],
         ItemIdx[local_item(un.changed_item[u]) for u in us], un.changed_new[us]
     )
@@ -46,7 +46,7 @@ function package_plan(p::Plan, k::Integer)
     return Plan(
         items, units, abs_files, relfiles,
         String[string(relfiles[items.fileidx[n]], ":", items.line[n]) for n in eachindex(is)],
-        p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{UnitIdx}[], Int32[], p.cold,
+        p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{UnitIdx}[], Int32[], p.gate_limit, p.cold,
         sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[]
     )
 end
@@ -55,7 +55,7 @@ end
 # the run's for what is the run's (`RUN_WIDE_KEYS`) and how the run was made.
 function under_run_settings(own::RunConfig, run::RunConfig)
     from_own = (:threads, :timeout_s, :init_timeout_s, :test_end_timeout_s, :artifacts_timeout_s, :retries,
-                :item_failfast, :profiles, :groups, :order_first, :order_last, :item_seeds, :config_file,
+                :item_failfast, :profiles, :groups, :order_first, :order_last, :throttle, :item_seeds, :config_file,
                 :skip_environment)
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(n -> getfield(fieldname(RunConfig, n) in from_own ? own : run, n),
                                                       fieldcount(RunConfig)))

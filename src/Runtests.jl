@@ -358,6 +358,9 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
     # The order the recording handed its items out in, whatever this checkout's says.
     order_first = String.(split(get(rs.meta, "order_first", ""), '\n'; keepempty = false))
     order_last = String.(split(get(rs.meta, "order_last", ""), '\n'; keepempty = false))
+    # Its throttle limits, which decide what shares a process and retries together. A
+    # record from before throttles has none, and keeps this checkout's.
+    throttle = haskey(rs.meta, "throttle") ? recorded_throttle(rs.meta["throttle"]) : cfg.throttle
     recorded = split(get(rs.meta, "julia_flags", ""), ' '; keepempty = false)
     julia_flags = isempty(recorded) || recorded == code_flags() ? String[] : String.(recorded)
     if !isempty(julia_flags)
@@ -367,8 +370,19 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
         end
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; profiles, julia_flags, order_first, order_last,
+    return RunConfig(; merge(fields, (; profiles, julia_flags, order_first, order_last, throttle,
                                         replayed_manifest = recorded_manifest(rs), replayed_from = rs.path))...)
+end
+
+# `name=limit` lines, as `run_meta` writes `[throttle]`.
+function recorded_throttle(text::AbstractString)
+    limits = Dict{Symbol, Int}()
+    for line in split(text, '\n'; keepempty = false)
+        m = match(r"^([^=]+)=([1-9][0-9]{0,9})$", line)
+        m === nothing && throw(ConfigError("the run state's `throttle` is unreadable: $(repr(line))"))
+        limits[Symbol(m[1]::AbstractString)] = parse(Int, m[2]::AbstractString)
+    end
+    return limits
 end
 
 """
@@ -758,7 +772,7 @@ const PRECOMPILE_SIGNATURES = (
         using PrecompileSetup
         @test true
     end
-    @testitem "precompile two" chain=:c retries=1 begin
+    @testitem "precompile two" throttle=:c retries=1 begin
         @test true
     end
     """

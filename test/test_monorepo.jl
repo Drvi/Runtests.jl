@@ -448,7 +448,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 "A" => [
                     "test/a_test.jl" => item_text("same") * item_text("a1") * item_text("ends"; opts = "profile=:ends") *
                         item_text("fast"; opts = "profile=:fast") * item_text("init"; opts = "profile=:withinit") *
-                        item_text("db1"; opts = "chain=:db") * item_text("db2"; opts = "chain=:db"),
+                        item_text("db1"; opts = "throttle=:db") * item_text("db2"; opts = "throttle=:db"),
                     "test/qa/Project.toml" => "[deps]\n",
                     "test/qa/qa_test.jl" => item_text("qa"),
                     "test/TestItems.toml" => "[profiles.ends]\n[profiles.fast]\njulia_args = [\"--check-bounds=yes\"]\n[profiles.withinit]\n",
@@ -456,7 +456,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 ],
                 "B" => [
                     "test/b_test.jl" => item_text("same") * item_text("fast"; opts = "profile=:fast") *
-                        item_text("init"; opts = "profile=:withinit") * item_text("db1"; opts = "chain=:db"),
+                        item_text("init"; opts = "profile=:withinit") * item_text("db1"; opts = "throttle=:db"),
                     "test/TestItems.toml" => "[profiles.fast]\njulia_args = [\"--check-bounds=no\"]\n[profiles.withinit]\n",
                     profile_files("withinit"; init = "x = 1")...,
                 ],
@@ -486,6 +486,36 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             # The run's seed is every package's.
             p7 = mono(ws; seed = 7).plan
             @test all(==(7), p7.items.seed)
+        end
+
+        @testset "a throttle above 1 is one for every package that names it, with one limit" begin
+            build(b_limit) = make_workspace(
+                "A" => ["test/a_test.jl" => item_text("a1"; opts = "throttle=:pc") * item_text("a2"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => "[throttle]\npc = 3\n"],
+                "B" => ["test/b_test.jl" => item_text("b1"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => b_limit === nothing ? "" : "[throttle]\npc = $b_limit\n"];
+                root = nothing,
+            )
+            ws = build(3)
+            p = mono(ws).plan
+            gates = [p.units.gate[p.items.unit[item_of(p, pkg, n)]] for (pkg, n) in (("A", "a1"), ("A", "a2"), ("B", "b1"))]
+            @test allequal(gates) && only(unique(gates)) != 0 && p.gate_limit == [3]
+            # Each package's run state records its own limits, for a replay.
+            for k in 1:2
+                @test Dict(Runtests.Private.run_meta(Runtests.Private.package_plan(p, k)))["throttle"] == "pc=3"
+            end
+            limit_errors(ws) = [e.message for e in Runtests.Private.list_items_mono(ws).errors if occursin("throttle", e.message)]
+            @test isempty(limit_errors(ws))
+            # Packages that differ, and one that leaves the limit at 1, are told to agree.
+            for (b_limit, said) in ((2, "B's TestItems.toml 2"), (nothing, "B's TestItems.toml 1, by not naming it in [throttle]"))
+                ws = build(b_limit)
+                err = try; mono(ws); nothing; catch e; e; end
+                @test err isa ConfigError
+                @test occursin("throttle `:pc` has a limit above 1", sprint(showerror, err))
+                @test occursin(said, sprint(showerror, err))
+                # An editor's listing says so too, where a run would refuse to start.
+                @test any(m -> occursin(said, m), limit_errors(ws))
+            end
         end
 
         @testset "each package's [order] stays one block, the longest first" begin
@@ -713,10 +743,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                                 @test A.f() === :a
                                 @test basename(pwd()) == "A"
                             end
-                            @testitem "db1" chain=:db begin
+                            @testitem "db1" throttle=:db begin
                                 @test true
                             end
-                            @testitem "db2" chain=:db begin
+                            @testitem "db2" throttle=:db begin
                                 @test true
                             end
                             """],
@@ -727,7 +757,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                                 @test basename(pwd()) == "B"
                                 @test !isdefined(@__MODULE__, :A)
                             end
-                            @testitem "db1" chain=:db begin
+                            @testitem "db1" throttle=:db begin
                                 @test true
                             end
                             """];

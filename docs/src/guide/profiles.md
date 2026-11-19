@@ -167,6 +167,6 @@ A run keeps a pool of workers for each start configuration that its items use. T
 
 The `UP` line of a worker names its profile when an item of the run uses a profile other than `default`. It names the environment of the worker when an item uses an environment directory. [Output](@ref output) gives the details.
 
-Items of different pools run on different workers, and can run at the same time. `[order]` does not make them run one after the other. A `chain` runs its items in sequence on one worker. Thus all items of a chain must use the same profile and be in the same environment.
+Items of different pools run on different workers, and can run at the same time. `[order]` does not make them run one after the other. A chain, a throttle with the limit 1, runs its items in sequence on one worker. Thus all items of a chain must use the same profile and be in the same environment.
 
 When a pool has no items left, its workers can restart for another pool. A worker restarts only for a pool that the restart makes finish sooner. Of those pools, it restarts for the pool that finishes last. [How a run works](@ref plan) explains this.

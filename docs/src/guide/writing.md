@@ -46,7 +46,7 @@ Each other directory under `test/` that has its own `Project.toml` or `JuliaProj
     @test 1 + 1 == 2
 end
 
-@testitem "against a database" chain=:db timeout=600 retries=1 begin
+@testitem "against a database" throttle=:db timeout=600 retries=1 begin
     using MySetups          # test/testsetups/MySetups.jl
     @test MySetups.ping()
 end
@@ -63,7 +63,7 @@ Keywords come between the name and `begin`. The [syntax reference](@ref testitem
 - `retries = N` gives the item `N` more attempts after a failure, from 0 to 126.
 - `skip = expr` skips the item when `expr` gives `true`.
 - `failfast = true` stops the item at its first failed test.
-- `chain = :name` runs the items of one chain in sequence, on one worker.
+- `throttle = :name` limits how many items with the same `name` run at the same time. [Throttles](@ref throttles) tells you how.
 - `sandbox = true` runs the item alone in a new process, which stops after the item.
 - `profile = :name` runs the item on workers with the configuration of the profile `name`.
 
@@ -71,9 +71,24 @@ Each keyword except `skip` must be a literal. Arithmetic on numeric literals is 
 
 `skip` can be any expression. The worker evaluates it before the body, in a module of its own, with `Test` and the package in scope. The imports of the body are not in scope yet, and the body does not see what `skip` defines. It must give a `Bool`. An exception or a value of another type is an error of the item.
 
-### Retries, chains and sandboxes
+### [Throttles](@id throttles)
 
-A retry runs on the same worker, except in three cases: the worker timed out, the worker crashed, or the item has `sandbox = true`. A retry draws the same random numbers as the first attempt. [Random numbers](@ref random-numbers) shows how an item can draw new ones. A chain retries from its first item. All items in a chain must use the same profile and be in the same environment. `sandbox = true` and `chain` do not go together.
+A throttle is a name that items share with the `throttle` keyword. It limits how many of these items run at the same time. `[throttle]` of `test/TestItems.toml` gives the limit of each name. A name that `[throttle]` does not give has the limit 1.
+
+```toml
+[throttle]
+gpu = 2    # at most two items with `throttle = :gpu` run at the same time
+```
+
+With the limit 1, the items of a throttle are a chain. A chain runs its items in sequence, in file order, on one worker. Thus a later item can use the state that an earlier item left in the process. A chain retries from its first item. All items of a chain must use the same profile and be in the same environment. `sandbox = true` cannot go in a chain.
+
+With a limit above 1, the items of a throttle are independent of each other. Each item runs on any worker, in any order, and retries alone. While the limit is reached, the run holds the other items of the throttle back and runs other items. These items can use different profiles and environments, and `sandbox = true`.
+
+In a combined run, a chain belongs to one package. Two packages that use the same name have a chain each. A throttle with a limit above 1 limits what the machine runs at the same time, so all packages that use its name share it. Each of these packages must give it the same limit in its `[throttle]`.
+
+### Retries and sandboxes
+
+A retry runs on the same worker, except in three cases: the worker timed out, the worker crashed, or the item has `sandbox = true`. A retry draws the same random numbers as the first attempt. [Random numbers](@ref random-numbers) shows how an item can draw new ones. A chain retries from its first item.
 
 The items of a profile share the workers of that profile, and of every profile whose workers start the same way. If an item needs a new process of its own, add `sandbox = true`. The two keywords combine: `profile = :bounds sandbox = true` runs the item alone, in a new process of the `bounds` profile. Neither keyword chooses the packages of the item. The location of its file does.
 

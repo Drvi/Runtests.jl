@@ -32,7 +32,7 @@ In the file, write a symbol value as a TOML string, for example `logs = "issues"
 
 ## The configuration file
 
-`test/TestItems.toml` is optional. It has four tables:
+`test/TestItems.toml` is optional. It has five tables:
 
 ```toml
 [run]
@@ -50,11 +50,14 @@ default = "!gpu"               # what a run selects when nothing else selects
 gpu = "gpu"
 quick = "fast && !slow"
 
+[throttle]
+gpu = 2                        # at most two items with `throttle = :gpu` at the same time
+
 [profiles.bounds]
 julia_args = ["--check-bounds=yes"]   # for items with `profile = :bounds`
 ```
 
-`[profiles]` declares worker profiles. [Profiles and environments](profiles.md) tells you how to use them.
+`[throttle]` limits how many items of a throttle run at the same time. [Throttles](@ref throttles) tells you how to use it. `[profiles]` declares worker profiles. [Profiles and environments](profiles.md) tells you how to use them.
 
 To read another file in place of `test/TestItems.toml`, give the `config` keyword: `runtests(config = "ci.toml")`. The path is relative to the current directory, and the file must exist. Only the `config` keyword selects another file. No environment variable and no file next to it do that.
 
@@ -130,7 +133,7 @@ last  = ["large simulation"]
 On a run of the whole suite, `[order]` must name items that exist. A run of a part of the suite accepts names of items outside the selection.
 
 !!! warning
-    Do not use `[order]` for items that must run one after the other. Items of different profiles or environments, and sandboxed items, can run at the same time. Use a `chain` for items that must run in sequence, on one worker.
+    Do not use `[order]` for items that must run one after the other. Items of different profiles or environments, and sandboxed items, can run at the same time. Give items that must run in sequence, on one worker, the same `throttle` with the limit 1. Then they are a chain.
 
 ## [Groups](@id groups)
 

@@ -18,7 +18,7 @@ The item runs here, in this process, as a run would run it: its module and impor
 the test environment, or the environment of the directory its file is in, and the setups, and
 its profile's `env`, `init` and `test_end`. Its body is a function the debugger enters at the body's first call.
 What cannot be part of a function, `using` and `struct` among it, has run by then.
-Only this item runs: the items before it in a chain do not.
+Only this item runs: the items before it in a chain, a throttle with a limit of 1, do not.
 
 What this process cannot give the item is listed before it starts: a profile's
 `julia_args`, `threads` and `preferences`, a process of its own, and the keywords
@@ -218,6 +218,6 @@ function debug_ignored(item::RawItem, prof::Profile)
     item.exclusive && push!(out, "sandbox=true")
     item.timeout_s == USE_RUN_DEFAULT || push!(out, string("timeout=", item.timeout_s))
     item.retries == USE_RUN_DEFAULT || push!(out, string("retries=", item.retries))
-    item.chain === NO_CHAIN || push!(out, string("chain=:", item.chain))
+    item.throttle === NO_THROTTLE || push!(out, string("throttle=:", item.throttle))
     return out
 end

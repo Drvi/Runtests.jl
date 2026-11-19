@@ -1478,6 +1478,36 @@ end
         end
     end
 
+    @testset "a replay keeps the recorded throttle limits, and a record from before them the checkout's" begin
+        dir = make_pkg("RecordedThrottle",
+            "test/a_test.jl" => "@testitem \"s\" throttle=:db sandbox=true begin\n    @test true\nend\n" *
+                                "@testitem \"t\" throttle=:db begin\n    @test true\nend\n",
+            "test/TestItems.toml" => "[throttle]\ndb = 2\n")
+        with_runstate_dir() do _
+            p, _ = prepare((dir,); announce = false)
+            path = joinpath(mktempdir(), "run.runstate")
+            rsf = init_run_state(path, p)
+            finish_run_state!(rsf)
+            replayed() = first(first(capture_run(() -> prepare((dir,); replay = path))))
+            # Deleted since: still two units of a gate of two, the sandboxed one among
+            # them, where the limit 1 would refuse a sandbox in a chain.
+            write(joinpath(dir, "test", "TestItems.toml"), "")
+            r = replayed()
+            @test r.cfg.throttle == Dict(:db => 2) && r.gate_limit == [2] && length(r.units) == 2
+            # Changed since: the recorded limit still.
+            write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ndb = 5\n")
+            @test replayed().gate_limit == [2]
+            # A record without the field predates throttles, and runs with this checkout's.
+            rs = read_run_state(path)
+            delete!(rs.meta, "throttle")
+            cfg = Runtests.Private.replayed_config(Runtests.Private.read_config(joinpath(dir, "test")), rs, dir)
+            @test cfg.throttle == Dict(:db => 5)
+            # A record of no [throttle] says so, rather than leaving the field out.
+            @test Dict(Runtests.Private.run_meta(p))["throttle"] == "db=2"
+            @test Dict(Runtests.Private.run_meta(a_plan()))["throttle"] == ""
+        end
+    end
+
     @testset "a replay's workers compile with the Julia flags the run state recorded" begin
         # Recorded by a process whose bounds checking is the opposite of this one's,
         # by an item that holds its workers to it.
@@ -1798,6 +1828,27 @@ end
         # Its end is after the last event, not when the ending was said.
         @test rs.end_unix > stopped + 0.1
         @test occursin("stopped after a failure (failfast)", sprint(show, MIME"text/plain"(), rs))
+    end
+
+    @testset "a file whose closed byte is 0, as writers before it left it, is closed if it finished" begin
+        p = a_plan()
+        @test P.nslots(p) > 0   # what `idle_worker_seconds` counts against
+        written(ending) = begin
+            path = joinpath(mktempdir(), "run.runstate")
+            rsf = init_run_state(path, p)
+            @test open(io -> (seek(io, P.header_offset(:closed)); read(io, UInt8)), path) == P.RS_OPEN
+            P.append_event!(rsf, P.EVENT_ATTEMPT, UInt8(PASSED), 1, 0, 0.0, 1.0; item = 1, attempt = 1)
+            sleep(0.05)
+            finish_run_state!(rsf, ending)
+            open(io -> (seek(io, P.header_offset(:closed)); write(io, 0x00)), path, "r+")
+            read_run_state(path)
+        end
+        rs = written(P.ENDING_FINISHED)
+        @test rs.closed && !P.is_live(rs) && idle_worker_seconds(rs) !== nothing
+        # A stop said its end before its workers were done: with no close marker, not
+        # known to be over by the byte, and left to the heartbeat and the writer.
+        rs = written(P.ENDING_INTERRUPTED)
+        @test !rs.closed && idle_worker_seconds(rs) === nothing
     end
 
     @testset "a run stopped by failfast is live until its last item is done, and ends after it" begin

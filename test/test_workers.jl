@@ -122,8 +122,11 @@ end
             @warn "Failed to clean up temporary path \"C:\\Temp\\fmijl_x\"" _module = Base.Filesystem _group = :file
             @warn "a warning of the run" _group = :file
             @warn "a warning of Base.Filesystem of another group" _module = Base.Filesystem
+            @error "mktempdir cleanup" _module = Base.Filesystem _group = :file
+            @warn "another warning of Base.Filesystem about files" _module = Base.Filesystem _group = :file
         end
-        @test [r.message for r in inner.logs] == ["a warning of the run", "a warning of Base.Filesystem of another group"]
+        @test [r.message for r in inner.logs] == ["a warning of the run", "a warning of Base.Filesystem of another group",
+                                                  "mktempdir cleanup", "another warning of Base.Filesystem about files"]
     end
 
     @testset "an interrupt reaches its target from any thread, once" begin

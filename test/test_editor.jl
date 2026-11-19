@@ -95,7 +95,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             "Listed",
             "test/a_test.jl" => string(item("first"), "\n# a comment\n\n",
                                        item("second"; opts = "tags=[:fast, :db] timeout=30 retries=2 skip=(1 == 2)"),
-                                       item("chained"; opts = "chain=:c failfast=true")),
+                                       item("chained"; opts = "throttle=:c failfast=true")),
             "test/b_test.jl" => item("alone"; opts = "sandbox=true") * item("profiled"; opts = "profile=:big") *
                                 item("alone profiled"; opts = "sandbox=true profile=:big"),
             "test/qa/Project.toml" => "[deps]\n",
@@ -118,7 +118,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         s = byname["second"]
         @test (s.tags, s.timeout, s.retries, s.skip, s.failfast) == (["fast", "db"], 30, 2, "1 == 2", nothing)
         @test (first_.tags, first_.timeout, first_.retries, first_.skip) == (String[], nothing, nothing, false)
-        @test (byname["chained"].chain, byname["chained"].failfast) == ("c", true)
+        @test (byname["chained"].throttle, byname["chained"].failfast) == ("c", true)
         @test (byname["alone"].sandbox, byname["alone"].profile) == (true, nothing)
         @test (byname["profiled"].sandbox, byname["profiled"].profile) == (false, "big")
         @test (byname["alone profiled"].sandbox, byname["alone profiled"].profile) == (true, "big")

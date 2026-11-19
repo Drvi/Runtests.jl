@@ -1,8 +1,8 @@
-@testitem "chain one" chain=:seq begin
+@testitem "chain one" throttle=:seq begin
     @test true
 end
 
-@testitem "chain two" chain=:seq begin
+@testitem "chain two" throttle=:seq begin
     @test true
 end
 

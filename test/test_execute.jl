@@ -450,7 +450,7 @@ end
         marks = mktempdir()
         retrying = joinpath(marks, "retrying")
         dir = make_pkg("StoppedChainRetry", "test/t_test.jl" => """
-            @testitem "first" chain=:c retries=1 begin
+            @testitem "first" throttle=:c retries=1 begin
                 if isfile($(repr(joinpath(marks, "failed_once"))))
                     touch($(repr(retrying)))
                     sleep(2)
@@ -460,7 +460,7 @@ end
                     @test false
                 end
             end
-            @testitem "second" chain=:c begin
+            @testitem "second" throttle=:c begin
                 @test false
             end
             @testitem "stops the run" begin
@@ -485,11 +485,11 @@ end
         count_to(name, n) = "(m = $(repr(joinpath(marks, name))); k = isfile(m) ? parse(Int, read(m, String)) : 0; " *
                             "write(m, string(k + 1)); k + 1 >= $n)"
         dir = make_pkg("ChainRetries", "test/t_test.jl" => """
-            @testitem "setup" chain=:c retries=2 skip=isfile($(repr(joinpath(marks, "setup_ran")))) begin
+            @testitem "setup" throttle=:c retries=2 skip=isfile($(repr(joinpath(marks, "setup_ran")))) begin
                 touch($(repr(joinpath(marks, "setup_ran"))))
                 @test true
             end
-            @testitem "flaky" chain=:c retries=2 begin
+            @testitem "flaky" throttle=:c retries=2 begin
                 @test $(count_to("flaky", 3))
             end
             """)
@@ -537,7 +537,7 @@ end
                     Main.Runtests.current_testitem().name == $(repr(lost_after)) && ccall(:abort, Cvoid, ())
                     """)...,
                 "test/t_test.jl" => join(("""
-                    @testitem $(repr(n)) chain=:c retries=1 begin
+                    @testitem $(repr(n)) throttle=:c retries=1 begin
                         @test true
                     end
                     """ for n in ("one", "two", "three")), "\n"))
@@ -612,10 +612,10 @@ end
 
     @testset "failfast names the member of a chain that failed" begin
         dir = make_pkg("FailfastChain", "test/t_test.jl" => """
-            @testitem "c passes" chain=:c begin
+            @testitem "c passes" throttle=:c begin
                 @test true
             end
-            @testitem "c fails" chain=:c begin
+            @testitem "c fails" throttle=:c begin
                 @test false
             end
             """)
@@ -1048,10 +1048,10 @@ end
         with_journal() do jdir
             dir = make_pkg("ChainsHere",
                 "test/TestItems.toml" => "[profiles.named]\nenv = { CHAIN_PROFILE = \"1\" }\n",
-                "test/t_test.jl" => join([journal_item("here one"; opts = "chain=:here"),
-                                          journal_item("here two"; opts = "chain=:here"),
-                                          journal_item("apart one"; opts = "chain=:apart profile=:named"),
-                                          journal_item("apart two"; opts = "chain=:apart profile=:named")]))
+                "test/t_test.jl" => join([journal_item("here one"; opts = "throttle=:here"),
+                                          journal_item("here two"; opts = "throttle=:here"),
+                                          journal_item("apart one"; opts = "throttle=:apart profile=:named"),
+                                          journal_item("apart two"; opts = "throttle=:apart profile=:named")]))
             with_runstate_dir() do _
                 (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
                 @test all(==(PASSED), values(states))

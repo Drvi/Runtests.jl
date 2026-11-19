@@ -5,7 +5,7 @@ This page defines the terms of this manual, in alphabetical order.
 | Term | Definition |
 |:-----|:-----------|
 | attempt | One execution of a test item. A retry is a new attempt. |
-| chain | A set of test items with the same `chain` keyword. They run in sequence, on one worker. |
+| chain | The test items of a throttle with the limit 1. They run in sequence, on one worker. |
 | combined run | One call to `runtests_mono`. It can run one or more packages of a workspace in one plan. |
 | coordinator | The process that calls `runtests` or `runtests_mono`. It plans the run, starts the workers and prints the output. |
 | dry run | A run with `dry_run = true`. It prints the plan and runs nothing. |
@@ -30,6 +30,7 @@ This page defines the terms of this manual, in alphabetical order.
 | test item | A named block of tests, declared with `@testitem`. It runs alone, in a module of its own. |
 | test setup | A module in `test/testsetups/` that test items load with `using`. |
 | test template | A file in `test/testtemplates/` of `@testtemplate` loops. `chores` expands it into a test file. |
+| throttle | A name that test items share with the `throttle` keyword. At most the limit of the throttle of these items run at the same time. |
 | union environment | The environment of the shared workers of a combined run. It holds the test dependencies of all its packages that are not isolated. |
 | verdict | The latest recorded pass or failure of an item. Failures include errors, timeouts and lost-worker outcomes. A skip or explicit cancellation leaves the previous verdict unchanged. See [Run states and history](@ref history). |
 | worker | A Julia process that a run starts to run test items. |

@@ -1,5 +1,5 @@
 using Runtests.Private: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
-            is_test_file, NO_CHAIN, DEFAULT_PROFILE,
+            is_test_file, NO_THROTTLE, DEFAULT_PROFILE,
             USE_RUN_DEFAULT
 
 const BASIC = fixture("Basic.jl")
@@ -81,7 +81,7 @@ end
             @test true
         end
 
-        @testitem "two" chain=:c profile=:bounds skip=(Sys.iswindows()) begin
+        @testitem "two" throttle=:c profile=:bounds skip=(Sys.iswindows()) begin
             @test false
         end
 
@@ -105,7 +105,7 @@ end
             b, _ = scan_source("@testitem \"x\" begin\n    $load\nend\n"; setups=Dict(:MySetup => "x.jl"))
             @test b[1].setups == [:MySetup]
         end
-        @test a[2].chain === :c
+        @test a[2].throttle === :c
         @test a[2].profile === :bounds
         @test a[2].skip isa Expr                 # evaluated on the worker, not here
         @test a[3].exclusive
@@ -120,7 +120,7 @@ end
         @test a[1].timeout_s == USE_RUN_DEFAULT
         @test a[1].retries == USE_RUN_DEFAULT
         @test a[1].failfast == -1
-        @test a[1].chain === NO_CHAIN
+        @test a[1].throttle === NO_THROTTLE
         @test a[1].skip === false
         @test isempty(a[1].tags)
     end
@@ -151,7 +151,7 @@ end
             ("""@testitem "a" timeout=0 begin\n end\n""", "positive number"),
             ("""@testitem "a" bogus=1 begin\n end\n""", "unknown keyword `bogus`"),
             ("""@testitem "a" tags=[foo] begin\n end\n""", "vector of symbols"),
-            ("""@testitem "a" sandbox=true chain=:c begin\n end\n""", "cannot be combined"),
+            ("""@testitem "a" chain=:db begin\n end\n""", "`chain` is now `throttle`: write `throttle = :db`"),
             # A profile is chosen with `profile`, and the message says so.
             ("""@testitem "a" sandbox=:bounds begin\n end\n""", "write `profile = :bounds`"),
             ("""@testitem "a" sandbox=1 begin\n end\n""", "`sandbox` must be `true` or `false`"),

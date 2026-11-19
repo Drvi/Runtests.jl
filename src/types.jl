@@ -3,7 +3,7 @@ const UnitIdx = Int32
 const ProfileIdx = Int16
 const SlotIdx = Int16
 
-const NO_CHAIN = Symbol("")
+const NO_THROTTLE = Symbol("")
 const DEFAULT_PROFILE = :default
 
 const USE_RUN_DEFAULT = Int32(-1)
@@ -40,7 +40,7 @@ struct RawItem
     timeout_s::Int32       # USE_RUN_DEFAULT to inherit
     retries::Int32         # USE_RUN_DEFAULT to inherit
     failfast::Int8         # -1 to inherit, 0/1 otherwise
-    chain::Symbol          # NO_CHAIN when the item stands alone
+    throttle::Symbol       # NO_THROTTLE when the item names none
     profile::Symbol        # DEFAULT_PROFILE, or a name from TestItems.toml
     exclusive::Bool        # sandbox=true: alone in a process, torn down after
     # The directory whose environment the item runs in: the innermost one between its
@@ -58,7 +58,7 @@ end
 # `it` as an item of the run's package `k`.
 with_package(it::RawItem, k::Integer) = RawItem(
     it.name, it.file, it.line, it.tags, it.setups, it.code, it.skip, it.timeout_s, it.retries, it.failfast,
-    it.chain, it.profile, it.exclusive, it.environment, it.hash, Int32(k)
+    it.throttle, it.profile, it.exclusive, it.environment, it.hash, Int32(k)
 )
 
 # A problem in a test file, located. Scanning collects all of them before failing,

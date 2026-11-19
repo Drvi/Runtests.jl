@@ -1,5 +1,5 @@
 using Runtests.Private: plan, scan, discover, setup_modules, read_config, Filter, History, ConfigError,
-            ScanFailure, nslots, nitems, NO_CHAIN, print_plan, RawItem, USE_RUN_DEFAULT,
+            ScanFailure, nslots, nitems, NO_THROTTLE, print_plan, RawItem, USE_RUN_DEFAULT,
             DEFAULT_PROFILE, ItemIdx
 using Random: Xoshiro
 
@@ -37,7 +37,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
     @testset "a chain is one unit, contiguous and in declaration order" begin
         p = make_plan()
-        u = findfirst(==(:seq), p.units.chain)
+        u = findfirst(==(:seq), p.units.throttle)
         @test u !== nothing
         span = p.units.span[u]
         @test length(span) == 2
@@ -94,10 +94,10 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
     @testset "a chain may not mix profiles" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test"))
         write(joinpath(dir, "test", "a_test.jl"), """
-        @testitem "one" chain=:c profile=:a begin
+        @testitem "one" throttle=:c profile=:a begin
             @test true
         end
-        @testitem "two" chain=:c profile=:b begin
+        @testitem "two" throttle=:c profile=:b begin
             @test true
         end
         """)
@@ -112,13 +112,13 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
     @testset "a chain may not span environments" begin
         dir = mktempdir(); mkpath(joinpath(dir, "test", "qa"))
         write(joinpath(dir, "test", "qa", "Project.toml"), "[deps]\n")
-        write(joinpath(dir, "test", "a_test.jl"), "@testitem \"one\" chain=:c begin\nend\n")
-        write(joinpath(dir, "test", "qa", "b_test.jl"), "@testitem \"two\" chain=:c begin\nend\n")
+        write(joinpath(dir, "test", "a_test.jl"), "@testitem \"one\" throttle=:c begin\nend\n")
+        write(joinpath(dir, "test", "qa", "b_test.jl"), "@testitem \"two\" throttle=:c begin\nend\n")
         walked = Runtests.Private.walk_test_dir(joinpath(dir, "test"))
         items = scan(walked.tests, Filter(), Dict{Symbol,String}(); environments = walked.environments)
         err = try; plan(items, read_config(joinpath(dir, "test")); root=dir); catch e; e; end
         @test err isa ScanFailure
-        @test occursin("chain `:c` spans environments", sprint(showerror, err))
+        @test occursin("throttle `:c` spans environments", sprint(showerror, err))
     end
 
     @testset "workers are capped by the work available" begin
@@ -222,12 +222,12 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # serves, or steals from another slot of its own pool.
         dir = make_pkg(
             "Claiming",
-            "test/a_test.jl" => declared("a1", "a2", "a3") * declared("c1", "c2", "c3"; opts = "chain=:c"),
-            "test/b_test.jl" => declared("b1", "b2", "b3", "b4") * declared("d1", "d2"; opts = "chain=:d"),
+            "test/a_test.jl" => declared("a1", "a2", "a3") * declared("c1", "c2", "c3"; opts = "throttle=:c"),
+            "test/b_test.jl" => declared("b1", "b2", "b3", "b4") * declared("d1", "d2"; opts = "throttle=:d"),
             "test/p_test.jl" => declared("p1", "p2", "p3"; opts = "profile=:bounds") *
-                                declared("e1", "e2"; opts = "chain=:e profile=:bounds"),
+                                declared("e1", "e2"; opts = "throttle=:e profile=:bounds"),
             "test/t_test.jl" => declared("t1", "t2"; opts = "profile=:ends") *
-                                declared("f1", "f2"; opts = "chain=:f profile=:ends"),
+                                declared("f1", "f2"; opts = "throttle=:f profile=:ends"),
             "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n[profiles.ends]\n",
             profile_files("ends"; test_end = "nothing")...,
         )
@@ -238,7 +238,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             # A chain is one unit, its items in declaration order: handed out whole or
             # not at all.
             for (chain, links) in (:c => ["c1", "c2", "c3"], :d => ["d1", "d2"], :e => ["e1", "e2"], :f => ["f1", "f2"])
-                u = findfirst(==(chain), p.units.chain)
+                u = findfirst(==(chain), p.units.throttle)
                 @test [p.items.name[i] for i in p.units.span[u]] == links
             end
             # Every interleaving the slots could claim in, sampled.
@@ -270,6 +270,202 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             end
             @test isempty(wrong)
         end
+    end
+
+    @testset "a throttle above 1 makes each of its items a unit of its gate; at 1 it is a chain" begin
+        dir = make_pkg("Gated",
+            "test/a_test.jl" => declared("g1", "g2", "g3"; opts = "throttle=:g") * declared("c1", "c2"; opts = "throttle=:c") *
+                                declared("a1"),
+            "test/TestItems.toml" => "[throttle]\ng = 2\nunused = 3\n")
+        p = plan_dir(dir; workers = 3)
+        unit(n) = p.items.unit[findfirst(==(n), p.items.name)]
+        gated = unit.(["g1", "g2", "g3"])
+        @test allunique(gated) && all(u -> length(p.units.span[u]) == 1, gated)
+        @test all(u -> p.units.throttle[u] === :g, gated)
+        g = p.units.gate[gated[1]]
+        @test g != 0 && all(u -> p.units.gate[u] == g, gated) && p.gate_limit == [2]
+        # `c` has no limit, so 1: one unit, run in sequence on one worker.
+        @test unit("c1") == unit("c2") && p.units.gate[unit("c1")] == 0 && p.units.throttle[unit("c1")] === :c
+        @test p.units.throttle[unit("a1")] === NO_THROTTLE && p.units.gate[unit("a1")] == 0
+        # The dry run says which, on each item's row.
+        out = sprint(print_plan, p)
+        row(n) = only(l for l in split(out, '\n') if occursin(repr(n), l))
+        @test occursin("throttle `g`, 2 at a time", row("g1"))
+        @test occursin("throttle `c` 2/2", row("c2"))
+    end
+
+    @testset "a sandbox may be in a throttle above 1, but not in a chain" begin
+        src = declared("s1"; opts = "throttle=:g sandbox=true") * declared("s2"; opts = "throttle=:g")
+        p = plan_dir(make_pkg("GatedSandbox", "test/a_test.jl" => src, "test/TestItems.toml" => "[throttle]\ng = 2\n"))
+        @test p.units.exclusive[p.items.unit[findfirst(==("s1"), p.items.name)]]
+        err = try; plan_dir(make_pkg("ChainedSandbox", "test/a_test.jl" => src)); nothing; catch e; e; end
+        @test err isa ScanFailure && occursin("cannot be combined", sprint(showerror, err))
+        # A throttle above 1 runs no item in another's process, so its items may mix profiles.
+        mixed = make_pkg("GatedProfiles",
+            "test/a_test.jl" => declared("m1"; opts = "throttle=:g") * declared("m2"; opts = "throttle=:g profile=:bounds"),
+            "test/TestItems.toml" => "[throttle]\ng = 2\n[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+        @test length(plan_dir(mixed).pools) == 2
+    end
+
+    @testset "a gate's units start early and together, and bound how soon their pool can finish" begin
+        # Eight units of ten seconds that one at a time take eighty: longer than the
+        # pool's share among four workers, so they go first, in file order.
+        dir = make_pkg("GateFirst",
+            "test/a_test.jl" => declared(("a$i" for i in 1:8)...),
+            "test/g_test.jl" => declared(("g$i" for i in 1:8)...; opts = "throttle=:g"),
+            "test/TestItems.toml" => "[throttle]\ng = 1\n")
+        h = History(Dict(n => 10.0 for n in [["a$i" for i in 1:8]; ["g$i" for i in 1:8]]), Dict{String, Int}())
+        # At 1 the throttle is one unit of eighty seconds, long by itself.
+        p = plan_dir(dir; history = h, workers = 4)
+        @test p.units.why[p.items.unit[findfirst(==("g1"), p.items.name)]] === Runtests.Private.LONG
+        write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ng = 2\n")
+        p = plan_dir(dir; history = h, workers = 4)
+        gated = [p.items.unit[findfirst(==("g$i"), p.items.name)] for i in 1:8]
+        @test all(u -> p.units.why[u] === Runtests.Private.LONG, gated)
+        @test gated == collect(first(p.pools[1].head):(first(p.pools[1].head) + 7))
+        @test occursin("throttle `g` est 40.0s, 2 at a time", Runtests.Private.why_text(p, gated[1]))
+        # Unthrottled, each is a ten-second unit and none is long.
+        write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ng = 8\n")
+        p = plan_dir(dir; history = h, workers = 4)
+        @test all(i -> p.units.why[p.items.unit[findfirst(==("g$i"), p.items.name)]] === Runtests.Private.IN_FILE_ORDER, 1:8)
+    end
+
+    @testset "however the slots take turns, a gate never runs more than its limit, and every unit runs once" begin
+        # A gate of two in two pools, beside a chain and plain items, with slots fewer
+        # than the pools to more than one per pool. A slot runs one unit at a time and
+        # claims again only once it ended, as `run_slot` does.
+        dir = make_pkg("GateTurns",
+            "test/a_test.jl" => declared("a1", "a2", "a3") * declared(("g$i" for i in 1:5)...; opts = "throttle=:g"),
+            "test/b_test.jl" => declared("c1", "c2"; opts = "throttle=:c") * declared("b1", "b2"),
+            "test/p_test.jl" => declared("p1", "p2") * declared("h1", "h2", "h3"; opts = "throttle=:g profile=:bounds"),
+            "test/TestItems.toml" => "[throttle]\ng = 2\n[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+        P = Runtests.Private
+        for workers in (1, 2, 3, 6)
+            p = plan_dir(dir; workers)
+            wrong = String[]
+            for seed in 1:200
+                rng = Xoshiro(seed)
+                q = P.Queues(p)
+                current = zeros(Int32, nslots(p))   # the unit each slot runs, 0 for none
+                handed = zeros(Int, length(p.units))
+                live = collect(1:nslots(p))
+                steps = 0
+                while !isempty(live) && (steps += 1) < 100_000
+                    s = rand(rng, live)
+                    if current[s] != 0
+                        P.unit_ended!(q, current[s])
+                        current[s] = 0
+                        continue
+                    end
+                    c = @lock q.lock P.claim_now!(q, s)
+                    if c.kind === :done
+                        filter!(!=(s), live)
+                    elseif c.kind === :wait
+                        # Only while a unit of a gate runs: its end lets the slot go on.
+                        any(u -> u != 0 && p.units.gate[u] != 0, current) ||
+                            push!(wrong, "seed $seed: slot $s waits, and no gate runs anything")
+                    elseif c.kind === :unit
+                        current[s] = c.unit
+                        handed[c.unit] += 1
+                        running = count(u -> u != 0 && p.units.gate[u] == 1, current)
+                        running <= 2 || push!(wrong, "seed $seed: $running units of the gate run at once")
+                    end
+                end
+                steps < 100_000 || push!(wrong, "seed $seed: the slots stopped making progress")
+                all(==(1), handed) || push!(wrong, "seed $seed: units handed out $(handed)")
+            end
+            @test isempty(wrong)
+        end
+    end
+
+    @testset "a slot whose pool holds only units their gate holds back waits, and takes nothing as it wakes" begin
+        dir = make_pkg("GateWait", "test/a_test.jl" => declared("g1", "g2", "g3", "g4"; opts = "throttle=:g"),
+                       "test/TestItems.toml" => "[throttle]\ng = 2\n")
+        # A third worker would only wait: the gate's work over its limit bounds the run.
+        p = plan_dir(dir; workers = 3)
+        @test nslots(p) == 2
+        P = Runtests.Private
+        q = P.Queues(p)
+        first_ = P.claim!(q, 1); second = P.claim!(q, 2)
+        @test first_.kind === :unit && second.kind === :unit
+        @test (@lock q.lock P.claim_now!(q, 1)).kind === :wait
+        waiting(s) = (t = Threads.@spawn P.claim!(q, s); sleep(0.2); @test !istaskdone(t); t)
+        # A unit of the gate that ends wakes it, and it goes back to its loop, which
+        # looks at the memory guard before it claims: the place stays free meanwhile.
+        t = waiting(1)
+        P.set_paused!(q, true)
+        P.unit_ended!(q, first_.unit)
+        @test fetch(t).kind === :wait && q.gate_running == [1]
+        P.set_paused!(q, false)
+        third = P.claim!(q, 1)
+        @test third.kind === :unit && allunique([first_.unit, second.unit, third.unit]) && q.gate_running == [2]
+        # The memory guard asking for its worker wakes it as well.
+        t = waiting(1)
+        P.wake_waiting!(q)
+        @test fetch(t).kind === :wait && q.gate_running == [2]
+        # So does a stopped run, after which there is nothing to do.
+        t = waiting(2)
+        P.cancel!(q)
+        @test fetch(t).kind === :wait
+        @test P.claim!(q, 2).kind === :done
+    end
+
+    @testset "a slot that would wait for a gate starts a pool that has work, and the pool it left is taken up" begin
+        # A, B and C are profiles of their own that share a gate of two; D has no
+        # throttle. Three workers: A, B and C get one each, and D none at first.
+        dir = make_pkg("GateMoves",
+            "test/a_test.jl" => declared("a1"; opts = "throttle=:g profile=:a"),
+            "test/b_test.jl" => declared("b1"; opts = "throttle=:g profile=:b"),
+            "test/c_test.jl" => declared("c1", "c2", "c3"; opts = "throttle=:g profile=:c"),
+            "test/d_test.jl" => declared("d1"; opts = "profile=:d"),
+            "test/TestItems.toml" => "[throttle]\ng = 2\n" * join(("[profiles.$x]\njulia_args = [\"--threads=$k\"]\n"
+                                                                    for (k, x) in enumerate("abcd"))))
+        h = History(Dict("a1" => 120.0, "b1" => 110.0, "c1" => 30.0, "c2" => 30.0, "c3" => 30.0, "d1" => 80.0),
+                    Dict{String, Int}())
+        p = plan_dir(dir; history = h, workers = 3)
+        @test [p.profiles[p.pools[k].profile].name for k in p.pending] == [:d]
+        order = Runtests.Private.run_order(p)
+        start(n) = only(t for (t, _, i) in order.items if p.items.name[i] == n)
+        # C's worker finds its gate full and starts D rather than wait; C's units start
+        # as A's and B's end: the run takes 170 seconds where waiting took 190.
+        @test start("d1") == 0.0
+        @test sort([start("c1"), start("c2"), start("c3")]) == [110.0, 120.0, 140.0]
+        @test maximum(t + p.items.est_s[i] for (t, _, i) in order.items) == 170.0
+        # Each worker's work is what its items take, without what it waited.
+        for w in 1:nslots(p)
+            @test order.work[w] ≈ sum((p.items.est_s[i] for (_, s, i) in order.items if s == w); init = 0.0)
+        end
+    end
+
+    @testset "a worker does not move to a pool whose gates its workers already fill" begin
+        # Seven units of a gate of two, which two workers fill, and one other unit.
+        dir = make_pkg("GateFull",
+            "test/t_test.jl" => declared(("t$i" for i in 1:7)...; opts = "throttle=:g profile=:t"),
+            "test/s_test.jl" => declared("s1"),
+            "test/TestItems.toml" => "[throttle]\ng = 2\n[profiles.t]\njulia_args = [\"--threads=1\"]\n")
+        h = History(Dict(vcat(["t$i" => 4.0 for i in 1:7], ["s1" => 1.0])), Dict{String, Int}())
+        p = plan_dir(dir; history = h, workers = 3)
+        P = Runtests.Private
+        q = P.Queues(p)
+        pool_of(name) = (u = p.items.unit[findfirst(==(name), p.items.name)];
+                         findfirst(k -> u in first(p.pools[k].head):last(p.pools[k].tail), eachindex(p.pools)))
+        t_slots = [s for s in 1:nslots(p) if p.slot_pool[s] == pool_of("t1")]
+        s_slot = only(s for s in 1:nslots(p) if p.slot_pool[s] == pool_of("s1"))
+        @test length(t_slots) == 2
+        @test all(s -> P.claim!(q, s).kind === :unit, t_slots)
+        @test P.claim!(q, s_slot).kind === :unit
+        # Its own pool done, it would only wait for the gate there.
+        @test P.claim!(q, s_slot).kind === :done
+    end
+
+    @testset "a gate's long units go longest first" begin
+        dir = make_pkg("GateLongest", "test/a_test.jl" => declared("g1", "g2", "g3", "g4"; opts = "throttle=:g"),
+                       "test/TestItems.toml" => "[throttle]\ng = 2\n")
+        h = History(Dict("g1" => 10.0, "g2" => 10.0, "g3" => 10.0, "g4" => 30.0), Dict{String, Int}())
+        p = plan_dir(dir; history = h, workers = 2)
+        @test [p.items.name[first(p.units.span[u])] for u in p.pools[1].head] == ["g4", "g1", "g2", "g3"]
+        order = Runtests.Private.run_order(p)
+        @test maximum(t + p.items.est_s[i] for (t, _, i) in order.items) == 30.0
     end
 
     @testset "pools start in order of estimated completion, an item no run timed at the typical duration" begin
@@ -306,7 +502,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # counts as the typical item, ten seconds. `b` has one item of fifteen. By its
         # timed item alone, `c` would finish first.
         dir = make_pkg("MixedChain",
-            "test/a_test.jl" => declared("c1", "c2"; opts = "chain=:c profile=:a"),
+            "test/a_test.jl" => declared("c1", "c2"; opts = "throttle=:c profile=:a"),
             "test/b_test.jl" => declared("b1"; opts = "profile=:b"),
             "test/TestItems.toml" => "[profiles.a]\njulia_args = [\"--threads=1\"]\n[profiles.b]\njulia_args = [\"--threads=2\"]\n")
         p = plan_dir(dir; history = History(Dict("c1" => 10.0, "b1" => 15.0), Dict{String, Int}()), workers = 1)
@@ -499,7 +695,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
     @testset "a chain is ordered as one item, by its members' total" begin
         dir = make_pkg(
             "ChainWeight",
-            "test/a_test.jl" => declared("c1", "c2", "c3"; opts = "chain=:c"),
+            "test/a_test.jl" => declared("c1", "c2", "c3"; opts = "throttle=:c"),
             "test/b_test.jl" => declared("solo"),
             "test/c_test.jl" => declared("f1", "f2", "f3", "f4"),
         )
@@ -545,8 +741,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test length(rows) == 6
         row(name) = only(filter(l -> occursin(repr(name), l), rows))
         @test occursin("[order] first", row("slow thing"))
-        @test occursin("chain `seq` 1/2", row("chain one"))
-        @test occursin("chain `seq` 2/2", row("chain two"))
+        @test occursin("throttle `seq` 1/2", row("chain one"))
+        @test occursin("throttle `seq` 2/2", row("chain two"))
         @test occursin("setup `BasicSetup`", row("uses setup"))
         # A chain is the one place several items run as one unit, and it says so on
         # its rows; the output has no other use for the word.
@@ -877,8 +1073,8 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # A chain split across two files, a single item, and filler for the share.
         dir = make_pkg(
             "ChainWhy",
-            "test/a_test.jl" => declared("c1", "c2"; opts = "chain=:c"),
-            "test/d_test.jl" => declared("c3"; opts = "chain=:c"),
+            "test/a_test.jl" => declared("c1", "c2"; opts = "throttle=:c"),
+            "test/d_test.jl" => declared("c3"; opts = "throttle=:c"),
             "test/b_test.jl" => declared("solo"),
             "test/f_test.jl" => declared("f1", "f2", "f3", "f4"),
         )
@@ -899,7 +1095,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test why_column(History(seconds, Dict("c1" => 0)))["c1"] == "failed in the last run"
         # Long by the chain's total, though each member is short.
         w = why_column(History(merge(seconds, Dict("solo" => 4.0)), Dict{String, Int}()))
-        @test w["c1"] == "long: est 6.0s (chain: `c`)"
+        @test w["c1"] == "long: est 6.0s (throttle: `c`)"
         @test w["solo"] == "long: est 4.0s"
         # Edited since its last run: the member, which need not be the first.
         edited = History(seconds, Dict{String, Int}(); hashes = Dict("c3" => UInt32(1)), known = Set(keys(seconds)))
@@ -912,7 +1108,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
     end
 
     @testset "[order] last naming any member of a chain sends the chain last" begin
-        dir = make_pkg("ChainLast", "test/a_test.jl" => declared("one", "two"; opts = "chain=:c") * declared("three"))
+        dir = make_pkg("ChainLast", "test/a_test.jl" => declared("one", "two"; opts = "throttle=:c") * declared("three"))
         toml = joinpath(dir, "test", "TestItems.toml")
         for (listed, order) in (["one"] => ["three", "one", "two"], ["two"] => ["three", "one", "two"],
                                 ["three"] => ["one", "two", "three"])
@@ -930,7 +1126,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         write(toml, "[order]\nfirst = [\"one\"]\nlast = [\"two\"]\n")
         err = try plan_dir(dir) catch e; e end
         @test err isa ConfigError
-        @test occursin("chain `c` runs as one, and `first` names \"one\" while `last` names \"two\"", err.msg)
+        @test occursin("throttle `c` runs as one chain, and `first` names \"one\" while `last` names \"two\"", err.msg)
         write(toml, "[order]\nfirst = [\"three\"]\nlast = [\"three\"]\n")
         err = try plan_dir(dir) catch e; e end
         @test err isa ConfigError && occursin("\"three\" is named by both", err.msg)

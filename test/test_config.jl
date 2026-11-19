@@ -308,6 +308,30 @@ end
         end
     end
 
+    @testset "[throttle] gives a throttle the number of its items that may run at once" begin
+        with_toml("[throttle]\ngpu = 2\ndb = 1\n") do dir
+            @test read_config(dir).throttle == Dict(:gpu => 2, :db => 1)
+        end
+        @test isempty(read_config(mktempdir()).throttle)
+        # A key is the name Julia reads from `:name`: the micro sign is Greek mu, an
+        # accent written apart is composed with its letter.
+        with_toml("[throttle]\n\"\u00b5\" = 2\n\"e\u0301x\" = 3\n") do dir
+            @test read_config(dir).throttle == Dict(Symbol("\u03bc") => 2, Symbol("\u00e9x") => 3)
+        end
+        with_toml("[throttle]\n\"\u00b5\" = 2\n\"\u03bc\" = 3\n") do dir
+            err = try; read_config(dir); nothing; catch e; e; end
+            @test err isa ConfigError && occursin("as it reads another key of [throttle]", sprint(showerror, err))
+        end
+        for (toml, said) in (("[throttle]\ngpu = 0\n", "an integer from 1"), ("[throttle]\ngpu = 1.5\n", "an integer from 1"),
+                             ("[throttle]\ngpu = \"2\"\n", "an integer from 1"),
+                             ("[throttle]\n\"two words\" = 2\n", "a Julia identifier"), ("throttle = 2\n", "must be a table"))
+            with_toml(toml) do dir
+                err = try; read_config(dir); nothing; catch e; e; end
+                @test err isa ConfigError && occursin(said, sprint(showerror, err))
+            end
+        end
+    end
+
     @testset "a value of the wrong shape is refused, not taken apart" begin
         # A string where a list goes would be read as its characters, and a table's
         # entries as pairs of them; `true` would be the integer 1.

@@ -94,6 +94,17 @@ On a run of the whole suite, each name must be an item of the suite. A run of a 
 
 Each key is the name of a group, and each value is a [tag expression](@ref tag-expressions). `all` is reserved and cannot be declared. `default` is the group that `runtestsd` and `runtestsd_mono` select. A name that differs from `all` or `default` only in case is an error.
 
+### [throttle]
+
+Each key is the name of a throttle, as the `throttle` keyword gives it. Each value is the limit of the throttle: the most items of the throttle that run at the same time, an integer from 1 to 2147483647. A throttle that the table does not name has the limit 1. A key must be a Julia identifier. Julia reads the key as it reads `:name`, so `"µ"` (the micro sign) and `"μ"` are the same key. In a combined run, the packages that use a throttle with a limit above 1 share it, and must give it the same limit. [Throttles](@ref throttles) explains the limits.
+
+The limit 1 does not limit the machine to one item. It makes a chain in each package. For example, three packages each have one item with `throttle = :db`, and the run has three workers:
+
+- With `db = 2` in each package, the three items share one throttle. Two of them start together, and the third starts when one of these ends.
+- With `db = 1`, or without `[throttle]`, each package has a chain of one item. All three items start together.
+
+No setting runs the items of several packages one at a time. To get that behavior, put the items in one package.
+
 ### [monorepo]
 
 The workspace root's file can have this table. It selects the packages of a [combined run](@ref monorepos).

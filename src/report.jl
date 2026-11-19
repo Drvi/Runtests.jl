@@ -138,8 +138,8 @@ The order the run is expected to start the items in, and where: its own dispatch
 unit nothing is recorded for counting as a typical one. A worker that moves to
 another profile's items first pays what the recorded runs say a fresh worker costs.
 `items` holds `(start, worker, item)` in that order, a chain's members spread over
-its time; `work` is each worker's estimated seconds. A run without workers takes
-the units in plan order.
+its time; `work` is each worker's estimated busy seconds, without what it waits
+for a gate. A run without workers takes the units in plan order.
 """
 function run_order(p::Plan)
     typical = typical_estimate(p.units.est_s)
@@ -161,17 +161,33 @@ function run_order(p::Plan)
     end
     q = Queues(p)
     free = zeros(nslots(p))
+    waited = zeros(nslots(p))   # what of `free` a worker spent waiting for a gate, not working
     done = falses(nslots(p))
+    gated = Tuple{Float64, UnitIdx}[]   # the units of gates handed out, and when each ends
     while !all(done)
         # The next worker to ask is the first free, and the lowest numbered of those.
         s = argmin(k -> (done[k], free[k], k), 1:nslots(p))
-        claim = claim!(q, s)
+        # What ended by then lets its gate run another.
+        for (t, u) in gated
+            t <= free[s] && unit_ended!(q, u)
+        end
+        filter!(((t, _),) -> t > free[s], gated)
+        claim = @lock q.lock claim_now!(q, s)
+        if claim.kind === :wait
+            # It waits for the first of the gates' units to end.
+            isempty(gated) && error("Runtests internal error: a worker waits for a gate that runs nothing")
+            t = minimum(first, gated)
+            waited[s] += t - free[s]
+            free[s] = t
+            continue
+        end
         claim.kind === :done && (done[s] = true; continue)
         claim.kind === :rebind && (free[s] += cold_cost(q, claim.pool); continue)
         started!(free[s], s, claim.unit)
         free[s] += est[claim.unit]
+        q.gate[claim.unit] == 0 || push!(gated, (free[s], claim.unit))
     end
-    return (; items = sort!(items; by = x -> (x[1], x[2])), work = free)
+    return (; items = sort!(items; by = x -> (x[1], x[2])), work = free .- waited)
 end
 
 # An estimate as the dry run gives it: to a tenth of a second like every other
@@ -188,17 +204,18 @@ function tenths_text(s::Real)
 end
 
 """
-    why_text(p, u) -> String
+    why_text(p, u, work = gate_work(p)) -> String
 
 Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
 worker's stretch, where file order put it. It is shown on the unit's first item, so
 a chain placed for another of its members names that member, and a chain's changed
-file is named, since its members can be in several.
+file is named, since its members can be in several. `work` is each gate's, which a
+caller with many rows sums once.
 """
-function why_text(p::Plan, u::UnitIdx)
+function why_text(p::Plan, u::UnitIdx, work::Vector{Float64} = gate_work(p))
     why = p.units.why[u]
     span = p.units.span[u]
-    chain = p.units.chain[u]
+    throttle = p.units.throttle[u]
     name(i) = repr(p.items.name[i])
     if why === PINNED_FIRST || why === PINNED_LAST
         cfg = item_cfg(p, first(span))
@@ -208,8 +225,16 @@ function why_text(p::Plan, u::UnitIdx)
         return i == first(span) ? "[order] $which" : string("[order] ", which, " names ", name(i))
     end
     why === SANDBOXED && return "sandbox"
-    why === LONG && return string("long: est ", est_text(p.units.est_s[u]),
-                                  chain === NO_CHAIN ? "" : string(" (chain: `", chain, "`)"))
+    if why === LONG
+        g = p.units.gate[u]
+        # A gate's unit is as long as its own estimate or its gate's work over its
+        # limit, whichever is longer (`order_pool!`).
+        floor = g == 0 ? 0.0 : work[g] / p.gate_limit[g]
+        p.units.est_s[u] < floor && return string("long: throttle `", throttle, "` est ", est_text(floor), ", ",
+                                                  p.gate_limit[g], " at a time")
+        return string("long: est ", est_text(p.units.est_s[u]),
+                      throttle === NO_THROTTLE ? "" : string(" (throttle: `", throttle, "`)"))
+    end
     why === RECENT || return ""
     ago, f = p.units.failed_ago[u], p.units.failed_item[u]
     how = p.units.cancelled[u] ? "cancelled" : "failed"
@@ -221,16 +246,28 @@ function why_text(p::Plan, u::UnitIdx)
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
+# Each gate's recorded work: its units' estimates, summed.
+function gate_work(p::Plan)
+    work = zeros(length(p.gate_limit))
+    for (u, g) in pairs(p.units.gate)
+        g == 0 || (work[g] += p.units.est_s[u])
+    end
+    return work
+end
+
 # What an item row says about the item itself: the keywords it was declared with,
-# the chain it belongs to, and the setups it loads.
+# its place in its chain or its gate's limit, and the setups it loads.
 function details_text(p::Plan, i::Integer)
     it = p.items
     u = it.unit[i]
     parts = String[]
-    chain = p.units.chain[u]
-    if chain !== NO_CHAIN
+    throttle = p.units.throttle[u]
+    g = p.units.gate[u]
+    if g != 0
+        push!(parts, string("throttle `", throttle, "`, ", p.gate_limit[g], " at a time"))
+    elseif throttle !== NO_THROTTLE
         span = p.units.span[u]
-        push!(parts, string("chain `", chain, "` ", i - first(span) + 1, "/", length(span)))
+        push!(parts, string("throttle `", throttle, "` ", i - first(span) + 1, "/", length(span)))
     end
     # A sandbox is the reason it goes early, unless something else put it there.
     p.units.exclusive[u] && p.units.why[u] !== SANDBOXED && push!(parts, "sandbox")
@@ -348,7 +385,8 @@ function print_plan_table(io::IO, p::Plan, order)
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     # A chain's reason is its first item's: the unit is placed, not each member.
-    whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i]) : "" for i in rows]
+    work = gate_work(p)
+    whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i], work) : "" for i in rows]
     details = [details_text(p, i) for i in rows]
     columns = Tuple{String, Vector{String}}[]
     push!(columns, ("#", [string(i) for i in 1:n]))

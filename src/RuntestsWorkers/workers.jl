@@ -1117,15 +1117,19 @@ function quiet_temp_cleanup_at_exit()
     return nothing
 end
 
-# `inner`, without the warnings of `Base.Filesystem` about a temporary path it could
-# not delete: the ones it gives `_group = :file`.
+# `inner`, without the warnings of `Base.Filesystem` that a temporary path could not be
+# deleted. Everything else it says in their group, `:file`, goes through: its errors
+# that a `mktemp` or `mktempdir` block could not clean up are not repaired later.
 struct WithoutTempCleanup <: Logging.AbstractLogger
     inner::Logging.AbstractLogger
 end
 Logging.min_enabled_level(l::WithoutTempCleanup) = Logging.min_enabled_level(l.inner)
-Logging.shouldlog(l::WithoutTempCleanup, level, _module, group, id) =
-    !(_module === Base.Filesystem && group === :file) && Logging.shouldlog(l.inner, level, _module, group, id)
-Logging.handle_message(l::WithoutTempCleanup, args...; kwargs...) = Logging.handle_message(l.inner, args...; kwargs...)
+Logging.shouldlog(l::WithoutTempCleanup, level, _module, group, id) = Logging.shouldlog(l.inner, level, _module, group, id)
+function Logging.handle_message(l::WithoutTempCleanup, level, message, _module, group, id, file, line; kwargs...)
+    level == Logging.Warn && _module === Base.Filesystem && group === :file &&
+        startswith(string(message), "Failed to clean up temporary path") && return nothing
+    return Logging.handle_message(l.inner, level, message, _module, group, id, file, line; kwargs...)
+end
 Logging.catch_exceptions(l::WithoutTempCleanup) = Logging.catch_exceptions(l.inner)
 
 # On SIGINFO or SIGUSR1 the runtime prints every thread's backtrace and collects a

@@ -167,10 +167,10 @@ end
         end
 
         @testset "a chain cannot reach across environments" begin
-            bad = env_pkg("EnvChain", "test/a_tests.jl" => "@testitem \"here\" chain=:c begin\nend\n",
-                          "test/qa/qa_tests.jl" => "@testitem \"there\" chain=:c begin\nend\n")
+            bad = env_pkg("EnvChain", "test/a_tests.jl" => "@testitem \"here\" throttle=:c begin\nend\n",
+                          "test/qa/qa_tests.jl" => "@testitem \"there\" throttle=:c begin\nend\n")
             msg = message_of(() -> plan_of(bad))
-            @test occursin("chain `:c` spans environments", msg)
+            @test occursin("throttle `:c` spans environments", msg)
             @test occursin("in the environment of $(joinpath("test", "qa"))", msg)
             @test occursin("in the test environment", msg)
         end

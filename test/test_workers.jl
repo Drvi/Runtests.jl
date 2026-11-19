@@ -114,6 +114,18 @@ end
         return t
     end
 
+    @testset "a worker's exit leaves out Julia's warnings about the temporary paths it could not delete" begin
+        # What Julia's exit says on Windows of a directory whose library is still loaded,
+        # and deletes after the exit; any other warning, of that group too, goes through.
+        inner = Test.TestLogger()
+        Base.CoreLogging.with_logger(RuntestsWorkers.WithoutTempCleanup(inner)) do
+            @warn "Failed to clean up temporary path \"C:\\Temp\\fmijl_x\"" _module = Base.Filesystem _group = :file
+            @warn "a warning of the run" _group = :file
+            @warn "a warning of Base.Filesystem of another group" _module = Base.Filesystem
+        end
+        @test [r.message for r in inner.logs] == ["a warning of the run", "a warning of Base.Filesystem of another group"]
+    end
+
     @testset "an interrupt reaches its target from any thread, once" begin
         # From Julia 1.12 the test's own task is on the interactive thread and the
         # target on another: the throw is handed to a task on the target's thread.

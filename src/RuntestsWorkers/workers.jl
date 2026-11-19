@@ -1040,6 +1040,7 @@ function startworker(connect_timeout::Real)
     close(stdin)
     redirect_stderr(stdout)   # one ordered stream for the coordinator to relay
     install_inspection_hook()
+    quiet_temp_cleanup_at_exit()
     port, server = listenany(Sockets.localhost, UInt16(rand(10000:50000)))
     println(stdout, "runtestsworker:", port)
     flush(stdout)
@@ -1099,6 +1100,33 @@ Run `f` with a display size no terminal has. A worker's output is a pipe, which
 width cuts off the part that names what ran.
 """
 wide_display(f) = withenv(f, "COLUMNS" => "10000", "LINES" => "10000")
+
+"""
+    quiet_temp_cleanup_at_exit()
+
+On Windows, a library loaded from a temporary directory cannot be deleted while the
+process that loaded it lives, as an FMU's is. Julia's exit tries to delete each such
+directory anyway, warns that it could not, and from 1.12 deletes it from a process
+that outlives this one. The warning reports a failure that Julia then repairs, so
+from 1.12 the worker leaves it out. The hook that does so is registered after
+Julia's own, and so runs before it.
+"""
+function quiet_temp_cleanup_at_exit()
+    (Sys.iswindows() && isdefined(Base.Filesystem, :temp_cleanup_postprocess)) || return nothing
+    atexit(() -> Logging.global_logger(WithoutTempCleanup(Logging.global_logger())))
+    return nothing
+end
+
+# `inner`, without the warnings of `Base.Filesystem` about a temporary path it could
+# not delete: the ones it gives `_group = :file`.
+struct WithoutTempCleanup <: Logging.AbstractLogger
+    inner::Logging.AbstractLogger
+end
+Logging.min_enabled_level(l::WithoutTempCleanup) = Logging.min_enabled_level(l.inner)
+Logging.shouldlog(l::WithoutTempCleanup, level, _module, group, id) =
+    !(_module === Base.Filesystem && group === :file) && Logging.shouldlog(l.inner, level, _module, group, id)
+Logging.handle_message(l::WithoutTempCleanup, args...; kwargs...) = Logging.handle_message(l.inner, args...; kwargs...)
+Logging.catch_exceptions(l::WithoutTempCleanup) = Logging.catch_exceptions(l.inner)
 
 # On SIGINFO or SIGUSR1 the runtime prints every thread's backtrace and collects a
 # short CPU profile, which `Profile` reports afterwards from a task. In a deadlock

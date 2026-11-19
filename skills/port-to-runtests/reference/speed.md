@@ -2,7 +2,7 @@
 
 Only after parity holds (SKILL.md, step 8), and only when the user wants it.
 
-A long item or chain can limit its pool's completion, but worker startup, compilation,
+A long item, or a throttle's items at their limit, can limit its pool's completion, but worker startup, compilation,
 recent failures, explicit order and other pools also affect the run. Measure the
 items and pool that hold up the actual run before predicting whether a split helps.
 

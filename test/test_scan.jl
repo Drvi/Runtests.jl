@@ -151,7 +151,7 @@ end
             ("""@testitem "a" timeout=0 begin\n end\n""", "positive number"),
             ("""@testitem "a" bogus=1 begin\n end\n""", "unknown keyword `bogus`"),
             ("""@testitem "a" tags=[foo] begin\n end\n""", "vector of symbols"),
-            ("""@testitem "a" chain=:db begin\n end\n""", "`chain` is now `throttle`: write `throttle = :db`"),
+            ("""@testitem "a" chain=:db begin\n end\n""", "`chain` is gone, and items no longer run in sequence on one worker. To keep the items of one name from running at the same time, write `throttle = :db`"),
             # A profile is chosen with `profile`, and the message says so.
             ("""@testitem "a" sandbox=:bounds begin\n end\n""", "write `profile = :bounds`"),
             ("""@testitem "a" sandbox=1 begin\n end\n""", "`sandbox` must be `true` or `false`"),

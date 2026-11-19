@@ -485,7 +485,7 @@ function emit_run_finished(stream::EventStream, id, run, ended::String)
     st = run.statuses
     p = run.plan
     state = ended != "finished" ? ended : any(is_non_pass, st.state) ? "failed" : "passed"
-    counts = Dict(state_name(k) => count(==(k), st.state) for k in (PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, BROKEN_CHAIN, CANCELLED))
+    counts = Dict(state_name(k) => count(==(k), st.state) for k in (PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, CANCELLED))
     not_run = [item_key(p.packages.name[p.items.package[i]], p.items.name[i]) for i in 1:nitems(p)
                if st.state[i] === UNSEEN || st.state[i] === RUNNING]
     rs = @atomic run.runstate

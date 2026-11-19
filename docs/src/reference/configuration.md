@@ -28,7 +28,7 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 | `test_end_timeout` | `timeout` | Seconds for each `test_end` expression of a profile. |
 | `artifacts_timeout` | `timeout` | Seconds for all [producers](@ref evidence) of one failed attempt together. |
 | `retries` | `0` | More attempts after a failure, from 0 to 126. |
-| `failfast` | `false` | Stop the run when an item or chain still fails after its allowed retries. |
+| `failfast` | `false` | Stop the run when an item still fails after its allowed retries. |
 | `item_failfast` | `failfast` | Stop each item at its first failed test. |
 | `logs` | `:issues` | Which item output the run prints: `:issues`, `:batched`, `:eager` or `:quiet`. See below. |
 | `verbose` | `false` | Include passing testsets in the result summary. Item output is controlled by `logs`. |
@@ -96,14 +96,9 @@ Each key is the name of a group, and each value is a [tag expression](@ref tag-e
 
 ### [throttle]
 
-Each key is the name of a throttle, as the `throttle` keyword gives it. Each value is the limit of the throttle: the most items of the throttle that run at the same time, an integer from 1 to 2147483647. A throttle that the table does not name has the limit 1. A key must be a Julia identifier. Julia reads the key as it reads `:name`, so `"µ"` (the micro sign) and `"μ"` are the same key. In a combined run, the packages that use a throttle with a limit above 1 share it, and must give it the same limit. [Throttles](@ref throttles) explains the limits.
+Each key is the name of a throttle, as the `throttle` keyword gives it. Each value is the limit of the throttle: the most items of the throttle that run at the same time, an integer from 1 to 2147483647. A throttle that the table does not name has the limit 1. A key must be a Julia identifier. Julia reads the key as it reads `:name`, so `"µ"` (the micro sign) and `"μ"` are the same key. In a combined run, the packages that use a throttle share it, and must give it the same limit. [Throttles](@ref throttles) explains the limits.
 
-The limit 1 does not limit the machine to one item. It makes a chain in each package. For example, three packages each have one item with `throttle = :db`, and the run has three workers:
-
-- With `db = 2` in each package, the three items share one throttle. Two of them start together, and the third starts when one of these ends.
-- With `db = 1`, or without `[throttle]`, each package has a chain of one item. All three items start together.
-
-No setting runs the items of several packages one at a time. To get that behavior, put the items in one package.
+For example, three packages each have one item with `throttle = :db`, and the run has three workers. With `db = 2` in each package, two of the items start together, and the third starts when one of these ends. With `db = 1` in each package, or with no `[throttle]` in any of them, the items run one at a time. With `db = 2` in one package and no `[throttle]` in the others, the run stops with an error that names the different limits.
 
 ### [monorepo]
 

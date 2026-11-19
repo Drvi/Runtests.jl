@@ -2138,7 +2138,7 @@ function run_slot(run::Run, slot::Slot, target)
     return nothing
 end
 
-# Between units, never inside one: a chain's later items depend on its process.
+# Between units, never while one runs.
 function recycle_worker!(run::Run, slot::Slot)
     (; success) = @atomicreplace slot.recycle true => false
     success && stop_worker!(run, slot, "restarted by the memory guard")
@@ -2573,8 +2573,7 @@ Base.showerror(io::IO, e::TimeoutException) = print(
 )
 
 # An item's own keyword wins over the run default, the same way `timeout` and
-# `failfast` do. A chain is retried as a unit, so the most demanding member sets
-# the number of attempts.
+# `failfast` do.
 attempts_for(p::Plan, u::UnitIdx) = 1 + maximum(p.units.span[u]) do i
     p.items.retries[i] == USE_RUN_DEFAULT ? item_cfg(p, i).retries : Int(p.items.retries[i])
 end
@@ -2585,13 +2584,8 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
     p = run.plan
     max_attempts = attempts_for(p, u)
     for attempt in 1:max_attempts
-        broken = run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
+        run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
         note_attempt!(run, slot, u)
-        # Every item that ran passed, and its worker was lost in a `test_end`: the rest
-        # of a chain lost the state it relied on. Another attempt would run again what
-        # passed, so the unit ends here.
-        settled = broken && !has_non_pass(run, u)
-        settled && mark_remaining_broken!(run, u, Int8(attempt))
         has_non_pass(run, u) || return nothing
         # Another attempt only for an item that failed in this one. An item this attempt
         # skipped or cancelled holds an earlier attempt's verdict (`record!`), which
@@ -2599,10 +2593,7 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
         st = run.statuses
         failed_now = any(i -> is_decisive(st.state[i]) && is_non_pass(st.state[i]) && st.attempt[i] == attempt,
                          p.units.span[u])
-        if settled || attempt == max_attempts || !failed_now
-            # Out of attempts. A chain cut short by a dead worker has lost the state
-            # its remaining items relied on, so they are recorded as broken.
-            broken && mark_remaining_broken!(run, u, Int8(attempt))
+        if attempt == max_attempts || !failed_now
             # Failfast waits for the last attempt: stopping the run under a retry
             # would record the failure as a cancellation.
             p.cfg.failfast && stop!(run, ENDING_FAILFAST) === false &&
@@ -2612,8 +2603,6 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
         # A run stopped meanwhile, by another item's failfast or a profile whose
         # `init` failed, retries nothing: the attempt's verdict is the item's.
         is_cancelled(run.queues) && return nothing
-        # Retrying a chain restarts it from its first item: re-running one item of
-        # a sequence that mutates state does not mean anything.
         reset_unit!(run, u)
     end
     return nothing
@@ -2690,9 +2679,8 @@ function set_state!(run::Run, i::Integer, state::ItemState)
     return nothing
 end
 
-# One attempt at every item of a unit: on the slot's worker, or here when there is
-# no pool and the unit did not ask for a process of its own. `true` when a worker
-# was lost part way through, which leaves the rest of the unit unable to run.
+# One attempt at the unit's item: on the slot's worker, or here when there is no pool
+# and the unit did not ask for a process of its own.
 function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8, max_attempts::Int)
     p = run.plan
     skipped = skips_environment(p, p.units.profile[u])
@@ -2712,10 +2700,11 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
             d === nothing ? set_state!(run, i, CANCELLED) : restore_decided!(run, i, d::Decided)
             continue
         end
-        attempt_item!(run, slot, i, target, attempt, max_attempts) || return true
+        # A worker lost in the attempt is gone already.
+        attempt_item!(run, slot, i, target, attempt, max_attempts) || return nothing
     end
     exclusive && stop_worker!(run, slot)
-    return false
+    return nothing
 end
 
 # The slot holds the item from before anything is told the attempt began until its
@@ -2790,7 +2779,7 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
         end
         return false
     end
-    # Then the evidence, before a retry, the chain's next item or a sandbox's end.
+    # Then the evidence, before a retry or a sandbox's end.
     return finish_attempt!(run, slot, i, attempt, result, w)
 end
 
@@ -3123,7 +3112,7 @@ end
 Everything that follows from one attempt's outcome, in one place: the item's
 status in memory and on disk, the count of finished items, and the item's report.
 `synthetic` says the run decided the outcome rather than the item — a timeout, a
-dead worker, a chain cut short — and `testset` then holds a single error saying so.
+dead worker, a stopped run — and `testset` then holds a single error saying so.
 The run state has the outcome before anything is told of it (`persist_attempt!`): the
 report, an editor and `on_event` can each stop the run.
 """
@@ -3222,10 +3211,10 @@ It says which item it is (`name`, `file`, `line`, `attempt`, and the `package` a
 `root` of its suite), where it ran (`worker`, numbered as the run's lines number
 them, `w1`, and `pid`, its process), when it started or ended (`time`, as `time()`
 gives it), and how it went (`state`: `:running`
-as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped`,
-`:broken_chain` or `:cancelled`). `pid` is 0 when no process ran the attempt: the run
-could not start a worker for it, or it is an item of a chain whose worker died before
-it ran or an item of an environment the run skips, which have `worker` 0 as well.
+as it starts, and then `:passed`, `:failed`, `:errored`, `:timedout`, `:skipped` or
+`:cancelled`). `pid` is 0 when no process ran the attempt: the run could not start a
+worker for it, or it is an item of an environment the run skips, which has `worker`
+0 as well.
 
 As it ends, it says what the attempt cost: `elapsed`, `cpu` (user and system time),
 `compile`, `recompile` (of `compile`) and `gc` in seconds, `allocated` in bytes,
@@ -3234,7 +3223,7 @@ resident so far, in bytes. Every figure but `elapsed` is the whole process's,
 which runs one item at a time: its worker's, or with `workers = 0` this process's.
 `measured` says the item measured them itself.
 It is `false` as an attempt starts, and as it ends when the run decided the outcome,
-as for a timeout, a lost worker, a chain cut short or a stopped run: the figures are
+as for a timeout, a lost worker or a stopped run: the figures are
 then 0, and `elapsed` is how long the attempt held its worker.
 
 `events_dir` is a directory for files that the function writes: `events` in the
@@ -3363,24 +3352,6 @@ function finish_quietly(ts::Test.AbstractTestSet)
         end
     end
     return ts
-end
-
-function mark_remaining_broken!(run::Run, u::UnitIdx, attempt::Int8)
-    p = run.plan
-    for i in p.units.span[u]
-        run.statuses.state[i] === UNSEEN || continue
-        began!(run, i, SlotIdx(0), attempt, 0)
-        ts = error_testset(
-            run, i, "the worker running this chain died before this item ran; " *
-                "the state it depended on is gone, so it was not run", time()
-        )
-        # Slot 0: in this attempt the item never ran anywhere.
-        record!(
-            run, i, SlotIdx(0), attempt, BROKEN_CHAIN, ts, RuntestsWorkers.PerfStats(), true,
-            "the worker running this chain died before this item ran"
-        )
-    end
-    return nothing
 end
 
 ### In-process mode ########################################################

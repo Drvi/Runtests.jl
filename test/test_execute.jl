@@ -1,5 +1,5 @@
 using Runtests.Private: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
-            SKIPPED, BROKEN_CHAIN, CANCELLED, ConfigError, nitems, is_non_pass
+            SKIPPED, CANCELLED, ConfigError, nitems, is_non_pass
 using Logging: Logging
 using Random: Random
 
@@ -180,16 +180,6 @@ end
             # The status line's count: the attempts that errored are not failures.
             @test run.nonpass == count(is_non_pass, run.statuses.state) == 1
             @test parse(Int, read(joinpath(dir, "runtests_abort_count"), String)) == 3
-        end
-    end
-
-    @testset "a chain whose worker dies does not run its remaining items" begin
-        with_marker_dir() do dir
-            states, _, _ = run_states(FAULTY; workers=1, tags=[:chaindie], logs=:issues)
-            @test states["chain start kills the worker"] === ERRORED
-            @test states["chain rest must not run"] === BROKEN_CHAIN
-            # not skipped quietly and not run on a fresh worker: it did not run
-            @test !isfile(joinpath(dir, "runtests_must_not_run"))
         end
     end
 
@@ -444,62 +434,6 @@ end
         end
     end
 
-    @testset "a chain's member that a stopped retry does not reach keeps its failure" begin
-        # The chain fails, and its retry is under way when another item's failfast stops
-        # the run: the member the retry never reached is failed, in memory as on disk.
-        marks = mktempdir()
-        retrying = joinpath(marks, "retrying")
-        dir = make_pkg("StoppedChainRetry", "test/t_test.jl" => """
-            @testitem "first" throttle=:c retries=1 begin
-                if isfile($(repr(joinpath(marks, "failed_once"))))
-                    touch($(repr(retrying)))
-                    sleep(2)
-                    @test true
-                else
-                    touch($(repr(joinpath(marks, "failed_once"))))
-                    @test false
-                end
-            end
-            @testitem "second" throttle=:c begin
-                @test false
-            end
-            @testitem "stops the run" begin
-                while !isfile($(repr(retrying)))
-                    sleep(0.05)
-                end
-                @test false
-            end
-            """)
-        with_runstate_dir() do _
-            (states, run, p), _ = capture_run(() -> run_states(dir; workers = 2, failfast = true, logs = :issues, monitor = false))
-            @test states["second"] === FAILED && run.statuses.attempt[findfirst(==("second"), p.items.name)] == 1
-            rs = Runtests.Private.read_run_state(run.runstate.path)
-            @test rs.statuses[findfirst(it -> it.name == "second", rs.items)].state === FAILED
-        end
-    end
-
-    @testset "a chain retries for the member that failed, whatever another member's retry did" begin
-        # The setup passes, then skips on the retry: the member that failed still gets
-        # the attempts it asks for, and passes on its third.
-        marks = mktempdir()
-        count_to(name, n) = "(m = $(repr(joinpath(marks, name))); k = isfile(m) ? parse(Int, read(m, String)) : 0; " *
-                            "write(m, string(k + 1)); k + 1 >= $n)"
-        dir = make_pkg("ChainRetries", "test/t_test.jl" => """
-            @testitem "setup" throttle=:c retries=2 skip=isfile($(repr(joinpath(marks, "setup_ran")))) begin
-                touch($(repr(joinpath(marks, "setup_ran"))))
-                @test true
-            end
-            @testitem "flaky" throttle=:c retries=2 begin
-                @test $(count_to("flaky", 3))
-            end
-            """)
-        with_runstate_dir() do _
-            (states, run, p), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
-            @test states["setup"] === PASSED && states["flaky"] === PASSED
-            @test run.statuses.attempt[findfirst(==("flaky"), p.items.name)] == 3
-        end
-    end
-
     @testset "an attempt is reported with what its `test_end` printed" begin
         dir = make_pkg("HookOutput", profile_files(; test_end = "println(\"HOOK OUTPUT\")")...,
             "test/t_test.jl" => """
@@ -524,31 +458,6 @@ end
                 # A quiet body's log is the hook's: an editor is given it.
                 quiet = only(l for l in split(String(take!(buf)), '\n') if occursin("item_finished", l) && occursin("\"quiet\"", l))
                 @test !occursin("\"log\":null", quiet)
-            end
-        end
-    end
-
-    @testset "a worker lost in a hook after a chain's member leaves the rest of the chain broken" begin
-        # The member's own verdict stands, is not tried again, and the members after it,
-        # which lost the state they relied on, are broken rather than never run.
-        for (lost_after, expected) in (("one", Dict("one" => PASSED, "two" => BROKEN_CHAIN, "three" => BROKEN_CHAIN)),
-                                       ("three", Dict("one" => PASSED, "two" => PASSED, "three" => PASSED)))
-            dir = make_pkg("HookLoss" * lost_after, profile_files(; test_end = """
-                    Main.Runtests.current_testitem().name == $(repr(lost_after)) && ccall(:abort, Cvoid, ())
-                    """)...,
-                "test/t_test.jl" => join(("""
-                    @testitem $(repr(n)) throttle=:c retries=1 begin
-                        @test true
-                    end
-                    """ for n in ("one", "two", "three")), "\n"))
-            with_runstate_dir() do _
-                (states, run, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
-                @test states == expected
-                @test all(<=(1), run.statuses.attempt)
-                @test !occursin("internal", out)
-                rs = Runtests.Private.read_run_state(run.runstate.path)
-                @test [st.state for st in rs.statuses] == [expected[it.name] for it in rs.items]
-                @test Runtests.Private.failing_items(dir) == sort!([n for (n, s) in expected if s === BROKEN_CHAIN])
             end
         end
     end
@@ -608,20 +517,6 @@ end
         @test on_workers.passed && length(on_workers.seen) == 4 && all(==(:default), on_workers.seen)
         in_process = pools(0)
         @test in_process.passed && length(in_process.seen) == 4 && all(==(:interactive), in_process.seen)
-    end
-
-    @testset "failfast names the member of a chain that failed" begin
-        dir = make_pkg("FailfastChain", "test/t_test.jl" => """
-            @testitem "c passes" throttle=:c begin
-                @test true
-            end
-            @testitem "c fails" throttle=:c begin
-                @test false
-            end
-            """)
-        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, failfast=true, logs=:issues, monitor=false))
-        @test states["c fails"] === FAILED
-        @test occursin("stopping after \"c fails\" failed (failfast)", out)
     end
 
     @testset "an item's RUN and DONE lines are drawn by the coordinator, on a worker or not" begin
@@ -866,13 +761,13 @@ end
             events = Runtests.TestItemEvent[]
             with_marker_dir() do _
                 heard(ev -> push!(events, ev), FAULTY; workers = 1,
-                      name = r"^(passes|passes on the second try|chain start kills the worker|chain rest must not run)$")
+                      name = r"^(passes|passes on the second try|kills its worker)$")
             end
             kinds = Dict{Tuple{String, Int}, Vector{Symbol}}()
             for ev in events
                 push!(get!(kinds, (ev.name, ev.attempt), Symbol[]), ev.kind)
             end
-            @test length(kinds) == 5   # the retried item twice
+            @test length(kinds) == 4   # the retried item twice
             @test all(==([:started, :finished]), values(kinds))
             @test all(ev -> ev.state === :running && !ev.measured && ev.elapsed == 0, filter(ev -> ev.kind === :started, events))
             ended = Dict((ev.name, ev.attempt) => ev for ev in events if ev.kind === :finished)
@@ -884,13 +779,9 @@ end
             @test passed.worker == 1 && passed.pid > 0
             @test passed.elapsed > 0 && passed.compile >= passed.recompile >= 0 && passed.maxrss > 0
             # An outcome the run decided has nothing the item measured.
-            died = ended[("chain start kills the worker", 1)]
+            died = ended[("kills its worker", 1)]
             @test died.state === :errored && !died.measured && died.pid > 0
-            rest = ended[("chain rest must not run", 1)]
-            @test rest.state === :broken_chain && !rest.measured && rest.worker == 0 && rest.pid == 0
-            for ev in (died, rest)
-                @test ev.cpu == ev.compile == ev.recompile == ev.gc == 0 && ev.allocated == ev.allocations == ev.maxrss == 0
-            end
+            @test died.cpu == died.compile == died.recompile == died.gc == 0 && died.allocated == died.allocations == died.maxrss == 0
         end
 
         @testset "each event names the events directory of its run, made only for a run given a function" begin
@@ -1041,28 +932,6 @@ end
                                                              monitor = false))
             @test states["first fails"] === FAILED
             @test states["never starts"] in (UNSEEN, CANCELLED)
-        end
-    end
-
-    @testset "under workers = 0 a chain runs in order, in this process or in one process of its own" begin
-        with_journal() do jdir
-            dir = make_pkg("ChainsHere",
-                "test/TestItems.toml" => "[profiles.named]\nenv = { CHAIN_PROFILE = \"1\" }\n",
-                "test/t_test.jl" => join([journal_item("here one"; opts = "throttle=:here"),
-                                          journal_item("here two"; opts = "throttle=:here"),
-                                          journal_item("apart one"; opts = "throttle=:apart profile=:named"),
-                                          journal_item("apart two"; opts = "throttle=:apart profile=:named")]))
-            with_runstate_dir() do _
-                (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
-                @test all(==(PASSED), values(states))
-            end
-            rows = journal(jdir)
-            pid(name) = only(r.pid for r in rows if r.name == name)
-            order(a, b) = [r.name for r in rows if r.name in (a, b)]
-            @test pid("here one") == pid("here two") == getpid()
-            @test order("here one", "here two") == ["here one", "here two"]
-            @test pid("apart one") == pid("apart two") != getpid()
-            @test order("apart one", "apart two") == ["apart one", "apart two"]
         end
     end
 

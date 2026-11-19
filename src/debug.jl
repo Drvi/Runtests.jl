@@ -18,7 +18,6 @@ The item runs here, in this process, as a run would run it: its module and impor
 the test environment, or the environment of the directory its file is in, and the setups, and
 its profile's `env`, `init` and `test_end`. Its body is a function the debugger enters at the body's first call.
 What cannot be part of a function, `using` and `struct` among it, has run by then.
-Only this item runs: the items before it in a chain, a throttle with a limit of 1, do not.
 
 What this process cannot give the item is listed before it starts: a profile's
 `julia_args`, `threads` and `preferences`, a process of its own, and the keywords
@@ -87,8 +86,8 @@ function debug_item(enter, name::Union{Nothing, String, Regex}, seed::Union{Noth
 end
 
 # What a run records as a failure that can be stepped into again: an item that ran.
-# One that never got to run, because its chain broke or the run was stopped, has
-# nothing of its own to show.
+# One that never got to run, because the run was stopped, has nothing of its own to
+# show.
 const STEPPABLE = (FAILED, ERRORED, TIMEDOUT)
 
 """

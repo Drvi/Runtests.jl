@@ -195,8 +195,6 @@ test('an outcome says what to show, and where', () => {
     const timedout = model.outcome({ state: 'timedout', elapsed: 2, note: 'timed out after 2s', failures: [] });
     assert.equal(timedout.kind, 'errored');
     assert.deepEqual(timedout.messages, [{ text: 'timed out after 2s', file: null, line: 0 }]);
-    assert.equal(model.outcome({ state: 'broken_chain', elapsed: 0, note: '', failures: [] }).messages[0].text,
-        'did not run: an earlier item of its chain lost its worker');
     assert.equal(model.outcome({ state: 'cancelled', elapsed: 0, note: '', failures: [] }).kind, 'skipped');
     assert.equal(model.outcome({ state: 'skipped', elapsed: 0, note: '', failures: [] }).kind, 'skipped');
 });

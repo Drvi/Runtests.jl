@@ -481,10 +481,10 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
             profile = v
         elseif key === :chain
             return scan_error!(errors, path, at,
-                "`@testitem $(repr(name))`: `chain` is now `throttle`: write `throttle = " *
-                    (literal(val) isa Symbol ? repr(literal(val)) : _show(val)) * "`. A throttle " *
-                    "that [throttle] of TestItems.toml gives no limit has the limit 1, and runs its items as a chain " *
-                    "did: in sequence, on one worker"
+                "`@testitem $(repr(name))`: `chain` is gone, and items no longer run in sequence on one worker. " *
+                    "To keep the items of one name from running at the same time, write `throttle = " *
+                    (literal(val) isa Symbol ? repr(literal(val)) : _show(val)) * "`: at most one runs at once, " *
+                    "or as many as [throttle] of TestItems.toml allows"
             )
         else
             return scan_error!(errors, path, at, 

@@ -34,7 +34,7 @@ function package_plan(p::Plan, k::Integer)
     units = Units(
         UnitRange{ItemIdx}[item[ItemIdx(first(un.span[u]))]:item[ItemIdx(last(un.span[u]))] for u in us],
         ProfileIdx[profile[un.profile[u]] for u in us], un.exclusive[us], un.throttle[us], un.gate[us], un.est_s[us], un.why[us],
-        un.failed_ago[us], ItemIdx[local_item(un.failed_item[u]) for u in us], un.cancelled[us],
+        un.failed_ago[us], un.cancelled[us],
         ItemIdx[local_item(un.changed_item[u]) for u in us], un.changed_new[us]
     )
     root = p.packages.root[k]

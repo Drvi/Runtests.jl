@@ -52,12 +52,9 @@ end
 """
     Units
 
-The schedulable thing: a chain of items, or a single item. A chain is the items of
-a throttle with a limit of 1, which run in sequence on one worker. Chain membership
-is represented by the items being contiguous, so the scheduler never has to ask what
-chain something belongs to — it dispatches a range. Each item of a throttle with a
-limit above 1 is a unit of its own, and `gate` numbers that throttle: the scheduler
-runs at most `Plan.gate_limit[gate]` of its units at once.
+The schedulable thing: one item, as the one-item range `span`, which the run state
+records. The unit of an item that names a throttle has that throttle's `gate`: the
+scheduler runs at most `Plan.gate_limit[gate]` of the gate's units at once.
 """
 struct Units
     span::Vector{UnitRange{ItemIdx}}
@@ -67,11 +64,10 @@ struct Units
     gate::Vector{Int32}         # a throttle with a limit above 1, 0 for none
     est_s::Vector{Float64}
     why::Vector{Why}            # where `order_pool!` put it, and so why
-    failed_ago::Vector{Int32}   # runs since a member last did not pass, -1 for none recorded
-    failed_item::Vector{ItemIdx}    # that member, 0 for none
+    failed_ago::Vector{Int32}   # runs since its item last did not pass, -1 for none recorded
     cancelled::Vector{Bool}         # whether that was a cancel rather than a verdict
-    changed_item::Vector{ItemIdx}   # a member edited since its last run, or never run, 0 for none
-    changed_new::Vector{Bool}       # whether that member has never run
+    changed_item::Vector{ItemIdx}   # its item, if edited since its last run or never run; 0 for none
+    changed_new::Vector{Bool}       # whether that item has never run
 end
 
 Base.length(u::Units) = length(u.span)
@@ -305,7 +301,7 @@ function validate_order(raw, packages::Packages)
         for n in Iterators.flatten((cfg.order_first, cfg.order_last))
             n in names || push!(missing_, n)
         end
-        check_order_conflicts([it for it in raw if it.package == k], cfg)
+        check_order_conflicts(cfg)
         isempty(missing_) && continue
         throw(ConfigError(sprint() do io
             println(io, "[order] of ", config_name(packages, k), " names test items that do not exist:")
@@ -318,25 +314,10 @@ function validate_order(raw, packages::Packages)
     return nothing
 end
 
-# A chain runs as one, so it cannot go both first and last; neither can an item.
-function check_order_conflicts(raw, cfg)
-    first_, last_ = Set(cfg.order_first), Set(cfg.order_last)
-    both = String[]
-    for n in cfg.order_first
-        n in last_ && push!(both, string(repr(n), " is named by both"))
-    end
-    chains = Dict{Symbol, Vector{String}}()
-    for it in raw
-        it.throttle === NO_THROTTLE || get(cfg.throttle, it.throttle, 1) > 1 ||
-            push!(get!(Vector{String}, chains, it.throttle), it.name)
-    end
-    for (name, members) in sort!(collect(chains); by = first)
-        f = [m for m in members if m in first_]
-        l = [m for m in members if m in last_]
-        (isempty(f) || isempty(l) || f == l) && continue
-        push!(both, string("throttle `", name, "` runs as one chain, and `first` names ", join(map(repr, f), ", "),
-                           " while `last` names ", join(map(repr, l), ", ")))
-    end
+# An item cannot go both first and last.
+function check_order_conflicts(cfg)
+    last_ = Set(cfg.order_last)
+    both = [string(repr(n), " is named by both") for n in cfg.order_first if n in last_]
     isempty(both) && return nothing
     throw(ConfigError("[order] of $(config_name(cfg)) puts these both first and last:\n" *
                       join(("  " * b for b in both), "\n")))
@@ -402,97 +383,40 @@ mutable struct UnitDraft
     key::Tuple{Int, Int, Float64, Float64, String, Int32}   # its place in its pool; see `order_pool!`
     why::Why
     failed_ago::Int32
-    failed_at::Int    # which of `items` failed most recently, 0 for none
-    cancelled::Bool   # whether that was a cancel rather than a verdict
+    cancelled::Bool   # whether its last failure was a cancel rather than a verdict
     changed_at::Int   # which of `items` was edited since its last run, or never ran, 0 for none
     changed_new::Bool # whether that one never ran
 end
 
-# Under a limit of 1 a throttle's items are one unit, a chain, in file order, and the
-# throttle is one package's: two packages that name it have a chain each. Above 1 each
-# item is a unit of its own, and the throttle is a gate that every package naming it
-# shares, as a limit on what the machine runs at once; those packages must give it the
-# same limit. Gates are numbered in the order of the first package to name each, then
-# the name. Returns the units and each gate's limit.
+# Each item is a unit of its own. An item that names a throttle is a unit of its gate,
+# which every package naming the throttle shares, as a limit on what the machine runs
+# at once: those packages must give it one limit, 1 where `[throttle]` names none.
+# Gates are numbered in the order of their names. Returns the units and each gate's
+# limit.
 function build_units(raw::Vector{RawItem}, profile_idx, histories::Vector{History}, packages::Packages)
-    draft(its, exclusive, throttle, gate) = UnitDraft(
-        its, profile_idx[(its[1].package, its[1].profile, its[1].environment)], exclusive, throttle, Int32(gate),
-        sum(it -> get(histories[it.package].seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, 0.0, "", Int32(0)),
-        IN_FILE_ORDER, Int32(-1), 0, false, 0, false
-    )
-    throttles = Dict{Tuple{Int32, Symbol}, Vector{RawItem}}()
-    units = UnitDraft[]
-    for it in raw
-        if it.throttle === NO_THROTTLE
-            push!(units, draft([it], it.exclusive, NO_THROTTLE, 0))
-        else
-            push!(get!(Vector{RawItem}, throttles, (it.package, it.throttle)), it)
-        end
-    end
-    check_shared_limits(sort!(collect(keys(throttles))), [cfg.throttle for cfg in packages.cfg],
+    uses = sort!(unique!([(it.package, it.throttle) for it in raw if it.throttle !== NO_THROTTLE]))
+    check_shared_limits(uses, [cfg.throttle for cfg in packages.cfg],
                         [config_name(packages, k) for k in eachindex(packages.name)])
-    errors = ScanError[]
-    gate_limit = Int32[]
-    gate = Dict{Symbol, Int}()
-    for ((k, name), its) in sort!(collect(throttles); by = first)
-        limit = get(packages.cfg[k].throttle, name, 1)
-        if limit > 1
-            g = get!(gate, name) do
-                push!(gate_limit, Int32(limit))
-                length(gate_limit)
-            end
-            for it in its
-                push!(units, draft([it], it.exclusive, name, g))
-            end
-            continue
-        end
-        sort!(its; by = i -> (i.file, i.line))
-        first_ = its[1]
-        # A chain runs in one process, from its first item to its last.
-        for it in its
-            if it.exclusive
-                push!(
-                    errors, ScanError(
-                        it.file, it.line,
-                        "`@testitem $(repr(it.name))`: `sandbox=true` means alone in a process, and " *
-                            "`throttle=:$name`, with a limit of 1, runs its items in sequence in one process, " *
-                            "so they cannot be combined; a limit above 1 in [throttle] can"
-                    )
-                )
-            elseif it.profile !== first_.profile
-                push!(
-                    errors, ScanError(
-                        it.file, it.line,
-                        "throttle `:$name` mixes profiles: $(repr(it.name)) uses " *
-                            "`:$(it.profile)` but $(repr(first_.name)) uses `:$(first_.profile)`; " *
-                            "with a limit of 1 a throttle runs in one process, so it must have one profile"
-                    )
-                )
-            elseif it.environment != first_.environment
-                push!(
-                    errors, ScanError(
-                        it.file, it.line,
-                        "throttle `:$name` spans environments: $(repr(it.name)) runs in " *
-                            environment_name(it.environment) * " but $(repr(first_.name)) in " *
-                            environment_name(first_.environment) * "; with a limit of 1 a throttle runs in one " *
-                            "process, so its items must be in one environment"
-                    )
-                )
-            end
-        end
-        push!(units, draft(its, false, name, 0))
+    names = sort!(unique!([n for (_, n) in uses]))
+    gate = Dict(n => Int32(g) for (g, n) in enumerate(names))
+    gate_limit = Int32[get(packages.cfg[first(k for (k, m) in uses if m === n)].throttle, n, 1) for n in names]
+    units = map(raw) do it
+        UnitDraft(
+            [it], profile_idx[(it.package, it.profile, it.environment)], it.exclusive, it.throttle,
+            it.throttle === NO_THROTTLE ? Int32(0) : gate[it.throttle], get(histories[it.package].seconds, it.name, 0.0),
+            (0, 0, 0.0, 0.0, "", Int32(0)), IN_FILE_ORDER, Int32(-1), false, 0, false
+        )
     end
-    isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
     return units, gate_limit
 end
 
 """
     check_shared_limits(uses, limits, names)
 
-That the packages of a run give each throttle they share one limit: a limit above 1
-makes it one throttle for all of them, so they must agree on it. `uses` holds the
-package and name of each throttle an item names, `limits` each package's `[throttle]`
-and `names` how a message names each package's configuration file.
+That the packages of a run give each throttle they share one limit, 1 where
+`[throttle]` names none: a throttle is one for all of them. `uses` holds the package
+and name of each throttle an item names, `limits` each package's `[throttle]` and
+`names` how a message names each package's configuration file.
 """
 function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol, Int}}, names::AbstractVector{<:AbstractString})
     seen = Dict{Symbol, Int}()
@@ -502,8 +426,8 @@ function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol,
         ks = sort!(unique!([k for (k, n) in uses if n === name]))
         said(k) = string(names[k], " ", haskey(limits[k], name) ? limits[k][name] : "1, by not naming it in [throttle]")
         throw(ConfigError(string(
-            "throttle `:", name, "` has a limit above 1, so the packages that name it share it, and they give it ",
-            "different limits: ", join(map(said, ks), "; "), ". Give it the same limit in each"
+            "throttle `:", name, "` is one for every package that names it, and they give it different limits: ",
+            join(map(said, ks), "; "), ". Give it the same limit in each"
         )))
     end
     return nothing
@@ -549,8 +473,7 @@ The estimated completion of pool `k` with `n` workers, in seconds: the time a wo
 takes to be ready for its first item, as earlier runs measured it, then the larger of
 the pool's work shared among its workers, its longest unit and each gate's work in it
 over the gate's limit, which no number of workers shortens. An item without a
-recorded duration counts as the typical item, also in a chain whose other items have
-one.
+recorded duration counts as the typical item.
 """
 function pool_estimate(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, histories::Vector{History},
                        gate_limit::Vector{Int32})
@@ -626,10 +549,10 @@ it:
 0. `[order] first`, in the order listed;
 1. sandboxed units, in file order: each needs a fresh process, and at the start
    every process is fresh, so running them first discards no compiled code;
-2. units with a member that is failing, however long ago it failed, that the newest
-   run to select it stopped before, or that was edited since its last run or never
-   ran: the answer most likely to matter, as early as it can be had. An edited or
-   new member and a failure in the newest run come first, then older failures, the
+2. units whose item is failing, however long ago it failed, that the newest run to
+   select it stopped before, or that was edited since its last run or never ran: the
+   answer most likely to matter, as early as it can be had. An edited or new item
+   and a failure in the newest run come first, then older failures, the
    more recent first; within each, the units class 3 would take, longest first,
    then file order;
 3. units long enough to decide how long the run takes — more than a quarter of
@@ -640,8 +563,7 @@ it:
 4. everything else, in file order, where neighbours share compiled code;
 5. `[order] last`, in the order listed.
 
-Classes 0–3 are the pool's head, 4 its body and 5 its tail. A chain goes where
-its most urgent member would. The class is recorded as a [`Why`](@ref), whose
+Classes 0–3 are the pool's head, 4 its body and 5 its tail. The class is recorded as a [`Why`](@ref), whose
 values are these numbers. Each package's `[order]` names its own items; in a pool
 that serves several packages, see [`order_blocks!`](@ref).
 """
@@ -656,8 +578,6 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, p
             pin[k][n] = i
         end
     end
-    # The pinned member listed earliest places a chain, whichever its unpinned
-    # members are; `validate_order` rules out a chain on both lists.
     pinned = Dict{Int, Int}(u => (p = minimum(it -> get(pin[it.package], it.name, typemax(Int)), units[u].items);
                                   p == typemax(Int) ? 0 : p) for u in pool)
     order_blocks!(pinned, pool, units)
@@ -669,8 +589,7 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, p
         at = (d.items[1].file, d.items[1].line)
         ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
         d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
-        d.failed_at = ago == typemax(Int) ? 0 : k
-        d.cancelled = d.failed_at > 0 && d.items[k].name in history.cancelled
+        d.cancelled = ago != typemax(Int) && d.items[k].name in history.cancelled
         d.changed_at = something(findfirst(it -> edited(it, history) || never_ran(it, history), d.items), 0)
         d.changed_new = d.changed_at > 0 && never_ran(d.items[d.changed_at], history)
         urgency = d.changed_at > 0 ? 0 : ago
@@ -758,7 +677,7 @@ function materialize(
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
     uthrottle = Symbol[]; ugate = Int32[]; uest = Float64[]; ufile = Int32[]
-    uwhy = Why[]; uago = Int32[]; ufailed = ItemIdx[]; ucancelled = Bool[]; uchanged = ItemIdx[]; unew = Bool[]
+    uwhy = Why[]; uago = Int32[]; ucancelled = Bool[]; uchanged = ItemIdx[]; unew = Bool[]
     all_setups = Symbol[]
     ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
     for (k, pool) in enumerate(pools)
@@ -787,7 +706,6 @@ function materialize(
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
             push!(uthrottle, d.throttle); push!(ugate, d.gate); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
             push!(uwhy, d.why); push!(uago, d.failed_ago)
-            push!(ufailed, d.failed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.failed_at - 1))
             push!(ucancelled, d.cancelled)
             push!(uchanged, d.changed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.changed_at - 1))
             push!(unew, d.changed_new)
@@ -813,7 +731,7 @@ function materialize(
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uthrottle, ugate, uest, uwhy, uago, ufailed, ucancelled, uchanged, unew),
+        items, Units(uspan, uprofile, uexcl, uthrottle, ugate, uest, uwhy, uago, ucancelled, uchanged, unew),
         files, relfiles, String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
         profiles, profile_package, ps, slot_pool, slot_units, pending, gate_limit, combined_cold(histories),
         sort!(unique!(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]

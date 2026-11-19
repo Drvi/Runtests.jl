@@ -74,6 +74,6 @@ Without a name, `debug` steps into the most recent recorded failure, error or ti
 
 The item gets what a run gives it. It gets its module and imports, its environment, the setups, and the `env`, `init` and `test_end` of its profile. The body of the item becomes a function, and the debugger enters it at the first call, in the test file. Code that cannot be part of a function ran before then. Examples are `using`, `struct`, `const` and a method of `Base.show`.
 
-Only that item runs, not the items before it in a chain. Before the item starts, `debug` lists what this process cannot give it. Examples are the `julia_args` of a profile and `sandbox = true`. The item, its hooks and its artifact producers run in the current process without enforceable timeouts. An item that you leave in the debugger before it ends is recorded as an error, not as a pass.
+Only that item runs. Before the item starts, `debug` lists what this process cannot give it. Examples are the `julia_args` of a profile and `sandbox = true`. The item, its hooks and its artifact producers run in the current process without enforceable timeouts. An item that you leave in the debugger before it ends is recorded as an error, not as a pass.
 
 `debug` returns the testset of the item.

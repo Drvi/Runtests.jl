@@ -118,8 +118,6 @@ Collection has its own time budget and does not count toward the item's measured
 
 A producer that throws, or a `@test` in a producer that fails, goes into the `.artifacts.log` file. It does not change the verdict, and the next producer still runs. All producers of an attempt together have `artifacts_timeout` seconds; this [run setting](@ref run-keys) defaults to `timeout`. If they take longer, or the worker stops, the run replaces the worker and keeps the files written so far. If the body or `test_end` times out or loses its worker, producers do not run. When producers were registered, the `.artifacts.log` file says why.
 
-A worker lost during collection also loses a chain's process state. The remaining members cannot continue on that process; the usual chain retry rules apply.
-
 !!! warning
     A producer running in the caller's process, under `workers = 0` or while debugging, has no enforceable timeout. Sandboxed items that still get a worker under `workers = 0` keep the collection timeout.
 
@@ -131,7 +129,7 @@ The evidence is deleted with the run state. `RUNTESTS_ARTIFACT_DIR` copies it wi
 
 ### Limits
 
-Both functions work only in the body of an item, and in the tasks that the body starts and waits for. They throw an `ArgumentError` in `init`, in `skip`, in `test_end`, in a producer and outside an item. They also throw in a task that the item did not wait for, if the task calls them after the body returned. The items of a chain do not share evidence, because the directory of a passing item is deleted.
+Both functions work only in the body of an item, and in the tasks that the body starts and waits for. They throw an `ArgumentError` in `init`, in `skip`, in `test_end`, in a producer and outside an item. They also throw in a task that the item did not wait for, if the task calls them after the body returned.
 
 A registered producer keeps what it refers to, and the globals of the item, until collection ends or the producers are discarded after a pass. A `test_end` such as `GC.gc(true)` does not release that memory. A passed attempt releases it before its worker runs the next item. The producer's serialization or other expensive work happens only after a failure; registration still retains the references and writes a small note that producers are waiting.
 

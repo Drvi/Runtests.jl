@@ -166,15 +166,6 @@ end
             @test p.items.name == ["qa deeper"]
         end
 
-        @testset "a chain cannot reach across environments" begin
-            bad = env_pkg("EnvChain", "test/a_tests.jl" => "@testitem \"here\" throttle=:c begin\nend\n",
-                          "test/qa/qa_tests.jl" => "@testitem \"there\" throttle=:c begin\nend\n")
-            msg = message_of(() -> plan_of(bad))
-            @test occursin("throttle `:c` spans environments", msg)
-            @test occursin("in the environment of $(joinpath("test", "qa"))", msg)
-            @test occursin("in the test environment", msg)
-        end
-
         @testset "a file there that is not a test file is a stray, as anywhere under test/" begin
             bad = env_pkg("EnvStray", "test/qa/qa_tests.jl" => "@testitem \"fine\" begin\nend\n",
                           "test/qa/helpers.jl" => "x = 1\n")

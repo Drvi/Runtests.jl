@@ -5,7 +5,7 @@
 
 using Runtests.Private: prepare, execute, exclusively, nitems, read_config, read_run_state, runstate_files,
     rundata_dir, attempt_artifacts, stall_limit, STALL_LIMIT_OVERRIDE, RunStalled, ConfigError, plan, run_item,
-    ItemSpec, PASSED, FAILED, ERRORED, SKIPPED, BROKEN_CHAIN, EVENT_ATTEMPT
+    ItemSpec, PASSED, FAILED, ERRORED, SKIPPED, EVENT_ATTEMPT
 using Runtests.RuntestsWorkers: RuntestsWorkers, artifacts_log_path, ARTIFACT_FILES, ARTIFACT_PRODUCERS,
     PENDING_ARTIFACTS, finish_artifacts
 using Base.ScopedValues: with
@@ -86,7 +86,7 @@ end
     @test false
 end
 
-@testitem "asks too late" throttle=:late begin
+@testitem "asks too late" begin
     Threads.@spawn begin
         sleep(0.5)
         msg = try
@@ -100,7 +100,7 @@ end
     @test true
 end
 
-@testitem "after the one that asks too late" throttle=:late begin
+@testitem "after the one that asks too late" begin
     path = joinpath(ENV["RUNTESTS_ART_MARKS"], "late")
     deadline = time() + 30
     while !isfile(path) && time() < deadline
@@ -141,12 +141,12 @@ end
     @test attempt == 2
 end
 
-@testitem "chain passes first" throttle=:evidence begin
+@testitem "writes and passes" begin
     write(joinpath(Main.Runtests.artifacts_dir(), "first.txt"), "first")
     @test true
 end
 
-@testitem "chain fails second" throttle=:evidence begin
+@testitem "writes and fails" begin
     write(joinpath(Main.Runtests.artifacts_dir(), "second.txt"), "second")
     @test false
 end
@@ -156,7 +156,12 @@ end
     @test false
 end
 
-@testitem "holds a reference and passes" throttle=:release begin
+"""
+
+# An item whose producer holds an object, and one after it in the same process that
+# waits to see the object finalized.
+const RELEASE_ITEMS = raw"""
+@testitem "holds a reference and passes" begin
     mutable struct Held
         x::Int
     end
@@ -166,7 +171,7 @@ end
     @test true
 end
 
-@testitem "sees it let go of" throttle=:release begin
+@testitem "sees it let go of" begin
     for _ in 1:50
         GC.gc(true)
         haskey(ENV, "RUNTESTS_ART_RELEASED") && break
@@ -207,15 +212,13 @@ function check_art_run(states, run, p, out, marks)
 
     @testset "an attempt that passes leaves nothing, and its producers never run" begin
         for name in ("passes with files and a producer", "registers and passes", "is broken", "is skipped",
-                     "chain passes first", "holds a reference and passes", "asks too late")
+                     "writes and passes", "asks too late")
             @test states[name] in (PASSED, SKIPPED)
             @test !ispath(dir(name))
             @test !ispath(artifacts_log_path(dir(name)))
         end
         @test states["is skipped"] === SKIPPED
         @test !any(isfile, joinpath.(marks, ("passes", "registers", "broken", "skipped")))
-        # And what its producers held is let go of before the next item.
-        @test states["sees it let go of"] === PASSED
     end
 
     @testset "an attempt that fails keeps what it wrote, and its producers run once, in order" begin
@@ -269,8 +272,8 @@ function check_art_run(states, run, p, out, marks)
         @test art_read(joinpath(dir("passes on a retry"), "files", "attempt.txt")) == "1"
         @test art_read(produced("passes on a retry", "attempt.txt")) == "1"
         @test !ispath(dir("passes on a retry"; attempt = 2))
-        @test states["chain fails second"] === FAILED
-        @test art_read(joinpath(dir("chain fails second"), "files", "second.txt")) == "second"
+        @test states["writes and fails"] === FAILED
+        @test art_read(joinpath(dir("writes and fails"), "files", "second.txt")) == "second"
     end
 
     @testset "the failure and the closing block say where it is" begin
@@ -307,6 +310,13 @@ end
         check_art_run(art_run(pkg, marks; workers = 0)..., marks)
     end
 
+    @testset "what a passing attempt's producers hold is let go of before the next item" begin
+        # One worker, which runs the items in file order, the second in the first's process.
+        states, _, _, _ = art_run(make_pkg("Released", "test/r_tests.jl" => RELEASE_ITEMS), mktempdir(); workers = 1)
+        @test states["holds a reference and passes"] === PASSED
+        @test states["sees it let go of"] === PASSED
+    end
+
     @testset "a producer that hangs or dies ends its worker, and nothing else" begin
         bad = make_pkg("BadProducers", "test/bad_tests.jl" => raw"""
             @testitem "hangs in a producer" begin
@@ -325,15 +335,6 @@ end
                 @test false
             end
 
-            @testitem "chained into a hang" throttle=:hang begin
-                Main.Runtests.on_failure(d -> sleep(600))
-                @test false
-            end
-
-            @testitem "after the hang in its chain" throttle=:hang begin
-                @test true
-            end
-
             @testitem "runs on whatever worker is left" begin
                 @test true
             end
@@ -341,8 +342,6 @@ end
         states, run, p, out = art_run(bad, mktempdir(); workers = 1, artifacts_timeout = 3)
         @test states["hangs in a producer"] === FAILED
         @test states["dies in a producer"] === FAILED
-        @test states["chained into a hang"] === FAILED
-        @test states["after the hang in its chain"] === BROKEN_CHAIN
         @test states["runs on whatever worker is left"] === PASSED
         for name in ("hangs in a producer", "dies in a producer")
             @test isfile(joinpath(art_dir(run, p, name), "producer_1", "partial.txt"))

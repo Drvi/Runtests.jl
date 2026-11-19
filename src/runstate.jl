@@ -550,8 +550,6 @@ function write_policies!(io::IO, strings::StringTable, p::Plan)
     table = Dict{PolicyRecord, UInt32}()
     order = PolicyRecord[]
     index = Vector{UInt32}(undef, nitems(p))
-    # A unit's attempts are its items' most, once for each unit: a chain of thousands
-    # of items would otherwise take the most over itself for each of them.
     retries = Int8[attempts_for(p, u) - 1 for u in UnitIdx(1):UnitIdx(length(p.units))]
     for i in 1:nitems(p)
         skip = p.items.skip[i]
@@ -1817,7 +1815,8 @@ end
 
 Whether the time recorded with an outcome is how long the item takes: not for one the
 run stopped part way through (`cancelled`), whose time is how far it got, nor for one
-that never ran (`unseen`, a chain's `broken` members).
+that never ran (`unseen`, and `broken`, which older runs recorded for an item of a
+chain whose worker died before it ran).
 """
 timed(state::ItemState) = !(state === UNSEEN || state === CANCELLED || state === BROKEN_CHAIN)
 

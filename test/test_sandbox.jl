@@ -1,13 +1,13 @@
-# Sandboxes, chains and forced order, in combination. Each of the three decides
-# something different about where an item runs — alone in a process, next to its
-# chain, at a fixed point in the queue — and a suite normally uses more than one
-# of them at once.
+# Sandboxes, throttles and forced order, in combination. Each of the three decides
+# something different about where or when an item runs — alone in a process, beside
+# at most so many of its throttle, at a fixed point in the queue — and a suite
+# normally uses more than one of them at once.
 
-using Runtests.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems, nslots
+using Runtests.Private: PASSED, nitems, nslots
 
-# A chain member that takes long enough for an overlap to show, and records when it
-# ended as well as when it started; `before` runs first.
-chain_link(name; throttle::Symbol, before="") = journal_item(name; opts="throttle=:$throttle", body=before * """
+# An item that takes long enough for an overlap to show, and records when it ended
+# as well as when it started; `before` runs first.
+timed_item(name; opts="", before="") = journal_item(name; opts, body=before * """
     sleep(0.2)
     open(joinpath(ENV["RUNTESTS_JOURNAL"], string(time_ns(), "-", getpid(), "-end")), "w") do io
         println(io, $(repr(name * " end")), "\\t", getpid(), "\\t", time())
@@ -15,37 +15,7 @@ chain_link(name; throttle::Symbol, before="") = journal_item(name; opts="throttl
     @test true
     """)
 
-# The longest step the coordinator's clock, `time()`, was seen to take. Next to
-# nothing on Linux and macOS; on Windows it moves in steps of a millisecond or more,
-# and a time it stamps can read up to one step early.
-function clock_step(seconds = 0.2)
-    step, t = 0.0, time()
-    deadline = t + seconds
-    while t < deadline
-        u = time()
-        u > t && ((step, t) = (max(step, u - t), u))
-    end
-    return step
-end
-
-# The chain `links` ran in one process, each member starting after the one before
-# it ended: by the worker's clock, in the journal, and by the coordinator's, in the
-# dispatch time and duration it recorded, to within a step of that clock.
-function check_ran_in_sequence(rows, run, p, links)
-    ours = [r for r in rows if r.name in links || r.name in (l * " end" for l in links)]
-    @test [r.name for r in ours] == collect(Iterators.flatten((l, l * " end") for l in links))
-    @test length(unique(r.pid for r in ours)) == 1
-    idx = [findfirst(==(l), p.items.name) for l in links]
-    st = run.statuses
-    @test allequal(st.slot[i] for i in idx)
-    @test all(i -> st.pid[i] == first(ours).pid, idx)
-    slack = 1e-3 + clock_step()
-    for (a, b) in zip(idx, idx[2:end])
-        @test st.start[b] >= st.start[a] + st.elapsed[a] - slack
-    end
-end
-
-@testset "sandboxes, chains and order" begin
+@testset "sandboxes, throttles and order" begin
     @testset "a sandboxed item has its process to itself" begin
         dir = make_pkg("Alone", "test/t_test.jl" => string(
             journal_item("before"),
@@ -191,76 +161,6 @@ end
         end
     end
 
-    @testset "a chain retries from its first item" begin
-        with_marker_dir() do work
-            marker = joinpath(work, "count")
-            dir = make_pkg("ChainRetry", "test/t_test.jl" => string(
-                journal_item("link one"; opts="throttle=:c"),
-                journal_item("link two"; opts="throttle=:c timeout=2 retries=1", body="""
-                    k = let p = ENV["RUNTESTS_CRASH_MARKER"]
-                        n = isfile(p) ? parse(Int, read(p, String)) : 0
-                        write(p, string(n + 1))
-                        n
-                    end
-                    k < 1 && sleep(600)
-                    @test true
-                    """),
-                journal_item("link three"; opts="throttle=:c"),
-            ))
-            rows = withenv("RUNTESTS_CRASH_MARKER" => marker) do
-                with_journal() do path
-                    states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
-                    @test all(==(PASSED), values(states))
-                    journal(path)
-                end
-            end
-            names = [r.name for r in rows]
-            # The first attempt got as far as the item that hung; the retry ran the
-            # chain again from the top, because re-running the middle of a sequence
-            # that mutates state does not mean anything.
-            @test names == ["link one", "link two", "link one", "link two", "link three"]
-            # Each attempt is a chain, so each attempt is one process.
-            @test length(unique(r.pid for r in rows)) == 2
-        end
-    end
-
-    @testset "a chain cut short by a timeout does not run its remaining items" begin
-        dir = make_pkg("ChainTimeout", "test/t_test.jl" => string(
-            journal_item("head"; opts="throttle=:d"),
-            journal_item("hangs"; opts="throttle=:d timeout=2", body="sleep(600)"),
-            journal_item("tail"; opts="throttle=:d"),
-        ))
-        rows = with_journal() do path
-            states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
-            @test states["head"] === PASSED
-            @test states["hangs"] === TIMEDOUT
-            # The state it would have depended on died with the worker.
-            @test states["tail"] === BROKEN_CHAIN
-            journal(path)
-        end
-        @test [r.name for r in rows] == ["head", "hangs"]
-    end
-
-    @testset "a chain in a profile runs in order under that profile's flags" begin
-        dir = make_pkg(
-            "ChainProfile",
-            "test/t_test.jl" => string(
-                journal_item("checked one"; opts="throttle=:p profile=:bounds",
-                             body="@test Base.JLOptions().check_bounds == 1"),
-                journal_item("checked two"; opts="throttle=:p profile=:bounds",
-                             body="@test Base.JLOptions().check_bounds == 1"),
-            ),
-            "test/TestItems.toml" => "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n"
-        )
-        rows = with_journal() do path
-            states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
-            @test all(==(PASSED), values(states))
-            journal(path)
-        end
-        @test [r.name for r in rows] == ["checked one", "checked two"]
-        @test length(unique(r.pid for r in rows)) == 1   # a chain is one worker
-    end
-
     @testset "a throttle above 1 runs that many of its items at once, beside other items, and no more" begin
         gated = ["gated $k" for k in 1:4]
         plain = ["plain 1", "plain 2"]
@@ -281,7 +181,7 @@ end
             """
         dir = make_pkg(
             "Throttled",
-            "test/t_test.jl" => join(chain_link(n; throttle=:g, before=three_started) for n in gated) *
+            "test/t_test.jl" => join(timed_item(n; opts="throttle=:g", before=three_started) for n in gated) *
                                 join(journal_item(n; body=three_started * "sleep(0.2)\n@test true") for n in plain),
             "test/TestItems.toml" => "[throttle]\ng = 2\n[order]\nfirst = $(repr(gated))\n",
         )
@@ -394,87 +294,6 @@ end
         # time, which is the whole point, so a shared marker file would race.
         slot_of(name) = run.statuses.slot[findfirst(==(name), p.items.name)]
         @test slot_of("left over") != slot_of("slow one")
-    end
-
-    @testset "a chain stolen from the end of a queue moves whole" begin
-        # Two files are two affinity groups, so each of two slots gets one. The slot
-        # holding "solo" drains first and takes the second half of what the other
-        # has left, which always holds that queue's last unit: the chain. "filler
-        # one" holds its slot until the chain's last member has started elsewhere,
-        # so the chain is taken on every run, and never taken back. Behind "filler
-        # one" are "filler two" and the chain: as one unit the chain is the half
-        # taken, where three units of their own would be split, two and one.
-        links = ["tail chain one", "tail chain two", "tail chain three"]
-        dir = make_pkg(
-            "StolenChain",
-            "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["filler one"]) * "@test true"),
-            "test/b_test.jl" => string(
-                journal_item("filler one"; body=started_elsewhere(["tail chain three"]) * "@test true"),
-                journal_item("filler two"),
-                (chain_link(l; throttle=:t) for l in links)...,
-            ),
-        )
-        rows, run, p, gave_up = with_journal() do path
-            states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
-            @test all(==(PASSED), values(states))
-            journal(path), run, p, isfile(joinpath(path, "gave-up"))
-        end
-        @test !gave_up          # each hold was released by the move it waited for
-        planned(i) = findfirst(r -> p.items.unit[i] in r, p.slot_units)
-        chain = [findfirst(==(l), p.items.name) for l in links]
-        @test all(i -> run.statuses.slot[i] != planned(i), chain)   # the chain itself moved
-        check_ran_in_sequence(rows, run, p, links)
-    end
-
-    @testset "a slot looking for work never takes the rest of a running chain" begin
-        # The chain is the first unit of its slot's queue, claimed whole as it
-        # starts. "chain one" holds its worker until a filler has started
-        # elsewhere, so the other slot, freed by "solo", goes looking for work in
-        # this queue while the chain is under way: it finds the fillers, and never
-        # the chain's later members.
-        links = ["chain one", "chain two", "chain three"]
-        fillers = ["filler one", "filler two"]
-        dir = make_pkg(
-            "RunningChain",
-            "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["chain one"]) * "@test true"),
-            "test/b_test.jl" => string(
-                chain_link("chain one"; throttle=:r, before=started_elsewhere(fillers)),
-                chain_link("chain two"; throttle=:r),
-                chain_link("chain three"; throttle=:r),
-                (journal_item(f) for f in fillers)...,
-            ),
-        )
-        rows, run, p, gave_up = with_journal() do path
-            states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
-            @test all(==(PASSED), values(states))
-            journal(path), run, p, isfile(joinpath(path, "gave-up"))
-        end
-        @test !gave_up
-        planned(i) = findfirst(r -> p.items.unit[i] in r, p.slot_units)
-        at(name) = findfirst(==(name), p.items.name)
-        @test any(f -> run.statuses.slot[at(f)] != planned(at(f)), fillers)   # work was taken
-        @test all(l -> run.statuses.slot[at(l)] == planned(at(l)), links)     # but not the chain
-        check_ran_in_sequence(rows, run, p, links)
-    end
-
-    @testset "[order] moves the chain an item belongs to, not just the item" begin
-        dir = make_pkg(
-            "Ordered",
-            "test/t_test.jl" => string(
-                journal_item("alpha"),
-                journal_item("beta"; opts="throttle=:c"),
-                journal_item("gamma"; opts="throttle=:c"),
-                journal_item("delta"),
-            ),
-            "test/TestItems.toml" => "[order]\nfirst = [\"gamma\"]\nlast = [\"alpha\"]\n"
-        )
-        rows = with_journal() do path
-            states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
-            @test all(==(PASSED), values(states))
-            journal(path)
-        end
-        # `gamma` is pinned first, and it cannot go anywhere without `beta`.
-        @test [r.name for r in rows] == ["beta", "gamma", "delta", "alpha"]
     end
 
     @testset "a sandbox alongside forced order still runs exactly once, alone" begin

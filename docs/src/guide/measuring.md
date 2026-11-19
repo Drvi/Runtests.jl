@@ -35,7 +35,7 @@ Each call gets a `Runtests.TestItemEvent` with these fields:
 | `maxrss` | The most memory that the process held in RAM up to this point, in bytes. |
 | `events_dir` | A directory for files that the function writes. See [Keep what the function writes](@ref events-dir). |
 
-`pid` is 0 when no process ran the attempt. This happens when the run cannot start a worker, for example because the `init` of the profile fails. It also happens to an item of a chain whose worker stopped before the item ran. For that item, `worker` is 0 too.
+`pid` is 0 when no process ran the attempt. This happens when the run cannot start a worker, for example because the `init` of the profile fails. It also happens to an item of an environment that the run skips. For that item, `worker` is 0 too.
 
 ## What the figures cover
 
@@ -43,7 +43,7 @@ Only the second call has the figures. Each figure except `elapsed` is for the wh
 
 Measured item time excludes the profile's `test_end` and the deferred [artifact producers](@ref evidence). Their work still contributes to the run's total time. The `:finished` event is delivered after the verdict is recorded and before artifact collection begins; it does not signal that evidence files are complete.
 
-Sometimes the run decides the outcome, and the item measures nothing. Examples are a timeout, a worker that stopped, an item of a chain that cannot run, and a stopped run. Then `measured` is `false`, the figures are 0, and `elapsed` is the time that the attempt held its worker.
+Sometimes the run decides the outcome, and the item measures nothing. Examples are a timeout, a worker that stopped, and a stopped run. Then `measured` is `false`, the figures are 0, and `elapsed` is the time that the attempt held its worker.
 
 ## [Keep what the function writes](@id events-dir)
 

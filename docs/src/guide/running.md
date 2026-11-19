@@ -62,7 +62,7 @@ The selection narrows what runs, but not what Runtests reads. Each run parses th
 
 ## Run the failing items
 
-`Runtests.runtestsf()` runs the items whose latest verdict was not a pass. Failures include failed tests, errors, timeouts, a chain cut short by a lost worker, and an item left running when its coordinator died. Runtests keeps the latest verdict of each item across runs. Thus a run of one failure does not forget the other failures. [Run states and history](@ref history) explains which records count.
+`Runtests.runtestsf()` runs the items whose latest verdict was not a pass. Failures include failed tests, errors, timeouts, and an item left running when its coordinator died. Runtests keeps the latest verdict of each item across runs. Thus a run of one failure does not forget the other failures. [Run states and history](@ref history) explains which records count.
 
 These rules apply to `runtestsf`:
 
@@ -82,7 +82,7 @@ The `retries` setting controls additional attempts within one run. [Configure ru
 
 ## Run in this process
 
-`workers = 0` runs the items in the process that calls `runtests`, one after the other. An item that needs a process of its own still gets one. These are items with `sandbox = true`, items that run under a profile other than `default`, and items in an environment directory. The run starts a process for each such item or chain, stops it afterwards, and lists these items. A chain shares that process through its members and retries unless the process is lost.
+`workers = 0` runs the items in the process that calls `runtests`, one after the other. An item that needs a process of its own still gets one. These are items with `sandbox = true`, items that run under a profile other than `default`, and items in an environment directory. The run starts a process for each such item, stops it afterwards, and lists these items.
 
 The items in this process run in the root of the package, as on a worker. This is also true under `Pkg.test`, which starts the tests in `test/`. The `init` of the default profile runs once in `Main` of this process, in the root of the package, before the first item, and the run warns about it. [Where code runs](@ref where-code-runs) gives the details.
 

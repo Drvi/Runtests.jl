@@ -510,7 +510,8 @@ end
         pkg = make_pkg("StoppedTimings", "test/t_test.jl" => join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in ("slow", "chained"))))
         with_runstate_dir() do dir
             record_run(dir, pkg, 1, Dict("slow" => (PASSED, 300.0), "chained" => (PASSED, 4.0)); whole = true)
-            # Stopped 2 s into `slow`; `chained` never ran, its chain having broken.
+            # Stopped 2 s into `slow`; `chained` never ran, which an older run recorded as
+            # broken for an item of a chain whose worker died first.
             record_run(dir, pkg, 2, Dict("slow" => (Runtests.Private.CANCELLED, 2.0),
                                          "chained" => (Runtests.Private.BROKEN_CHAIN, 0.1)); whole = true)
             @test history(pkg).seconds == Dict("slow" => 300.0, "chained" => 4.0)
@@ -1489,8 +1490,7 @@ end
             rsf = init_run_state(path, p)
             finish_run_state!(rsf)
             replayed() = first(first(capture_run(() -> prepare((dir,); replay = path))))
-            # Deleted since: still two units of a gate of two, the sandboxed one among
-            # them, where the limit 1 would refuse a sandbox in a chain.
+            # Deleted since: the recorded limit of two, where this checkout gives 1.
             write(joinpath(dir, "test", "TestItems.toml"), "")
             r = replayed()
             @test r.cfg.throttle == Dict(:db => 2) && r.gate_limit == [2] && length(r.units) == 2

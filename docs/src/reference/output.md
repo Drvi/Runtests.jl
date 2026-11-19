@@ -165,14 +165,14 @@ After the block, `Test` prints its usual summary.
 │ startup: scan 0.0s
 │ setups: `BasicSetup`
 │ timeout: 1800s · retries: 0 · failfast: false · logs: issues · memory_threshold: 0.9
-│ estimated work: w1 0.049s · w2 0.058s
+│ estimated work: w1 0.048s · w2 0.066s
 └ order and workers: predicted from the recorded durations, an item without one counting as a typical one
 
   # · worker · test item    · at                   ·  est · tags       · why here      · details
   1 ·     w1 · "slow thing" · test/sub/b_test.jl:9 · 0.0s · slow       · [order] first · timeout 120s
-  2 ·     w2 · "chain one"  · test/sub/b_test.jl:1 · 0.0s ·            ·               · throttle `seq` 1/2
-  3 ·     w2 · "chain two"  · test/sub/b_test.jl:5 · 0.0s ·            ·               · throttle `seq` 2/2
-  4 ·     w1 · "add works"  · test/a_test.jl:1     · 0.0s · fast
+  2 ·     w2 · "chain one"  · test/sub/b_test.jl:1 · 0.0s ·            ·               · throttle `seq`, 1 at a time
+  3 ·     w1 · "add works"  · test/a_test.jl:1     · 0.0s · fast
+  4 ·     w2 · "chain two"  · test/sub/b_test.jl:5 · 0.0s ·            ·               · throttle `seq`, 1 at a time
   5 ·     w2 · "uses setup" · test/a_test.jl:11    · 0.0s ·            ·               · setup `BasicSetup`
   6 ·     w1 · "mul works"  · test/a_test.jl:6     · 0.0s · fast, math
 ```
@@ -188,7 +188,7 @@ The table lists the items in the expected order of the run. Each row also gives 
 | `est` | The newest recorded duration, in seconds with one decimal. The column shows when earlier runs recorded durations. |
 | `tags` | The tags of the item. |
 | `why here` | The rule that placed the item, when the rule is not file order. |
-| `details` | The keywords and setups of the item. For an item of a chain, its place in the chain, for example ``throttle `seq` 1/2``. For an item of a throttle with a limit above 1, the limit, for example ``throttle `gpu`, 2 at a time``. |
+| `details` | The keywords and setups of the item. For an item of a throttle, its limit, for example ``throttle `gpu`, 2 at a time``. |
 
 ## The output of chores
 

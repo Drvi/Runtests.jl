@@ -75,7 +75,7 @@ A timeout must be positive and at most 2,147,483,647 seconds. Runtests rounds a 
 
 `retries` gives each item more attempts after a failure, from 0 to 126. The `timeout` and `retries` keywords of an item replace the values of the run for that item.
 
-`failfast = true` stops the run when an item or chain still fails after its allowed retries. `item_failfast = true` stops each attempt at its first failed test. Its default is the run's `failfast` value; set it separately when you want a failing attempt to finish its remaining assertions before the run stops.
+`failfast = true` stops the run when an item still fails after its allowed retries. `item_failfast = true` stops each attempt at its first failed test. Its default is the run's `failfast` value; set it separately when you want a failing attempt to finish its remaining assertions before the run stops.
 
 ## Output
 
@@ -133,7 +133,7 @@ last  = ["large simulation"]
 On a run of the whole suite, `[order]` must name items that exist. A run of a part of the suite accepts names of items outside the selection.
 
 !!! warning
-    Do not use `[order]` for items that must run one after the other. Items of different profiles or environments, and sandboxed items, can run at the same time. Give items that must run in sequence, on one worker, the same `throttle` with the limit 1. Then they are a chain.
+    Do not use `[order]` to keep items from running at the same time. Items of different profiles or environments, and sandboxed items, can run at the same time. Give such items the same `throttle`. Items with the same `throttle` and the limit 1 run one at a time, in any order and on any worker. Nothing makes an item use the state that another item left.
 
 ## [Groups](@id groups)
 

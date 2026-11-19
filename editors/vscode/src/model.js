@@ -76,7 +76,6 @@ function selectedKeys(include, exclude, under, all) {
 
 const STATE_WORDS = {
     timedout: 'timed out',
-    broken_chain: 'did not run: an earlier item of its chain lost its worker',
     errored: 'errored',
     failed: 'failed',
 };

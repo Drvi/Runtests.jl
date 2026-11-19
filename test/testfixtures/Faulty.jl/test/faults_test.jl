@@ -50,16 +50,6 @@ end
     end
 end
 
-@testitem "chain start kills the worker" tags=[:chaindie] throttle=:dies begin
-    exit(9)
-end
-
-@testitem "chain rest must not run" tags=[:chaindie] throttle=:dies begin
-    using Faulty
-    write(Faulty.marker("must_not_run"), "ran")
-    @test true
-end
-
 @testitem "logs a lot" tags=[:logs] begin
     println("this is stdout from the item")
     @info "this is a log message"

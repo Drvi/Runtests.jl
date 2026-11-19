@@ -36,10 +36,10 @@ must give a `Bool`, and an error in it is the item's error.
 |:--------|:--------|
 | `tags=[:a, :b]` | tags used for filtering |
 | `timeout=N` | seconds before a worker attempt is stopped; overrides the run default. An item in the caller's process under `workers = 0` has no enforceable timeout. |
-| `retries=N` | overrides the run default; a chain (see `throttle`) retries from its first item |
+| `retries=N` | overrides the run default |
 | `skip=expr` | `Bool`, or an expression evaluated on the worker before the body |
 | `failfast=true` | stop this item at its first failure |
-| `throttle=:sym` | at most N items of the throttle run at once, N from `[throttle]` of `TestItems.toml`; with N = 1, the default, they are a chain and run in sequence on one worker |
+| `throttle=:sym` | at most N items with this throttle run at once, on any workers; N from `[throttle]` of `TestItems.toml`, 1 by default |
 | `sandbox=true` | run alone in a process that is torn down afterwards |
 | `profile=:name` | run on the workers of `[profiles.name]` of `TestItems.toml` |
 

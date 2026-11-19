@@ -96,7 +96,7 @@ Each item in `items` has these fields:
 | `package`, `name`, `file`, `line` | The item. |
 | `attempt` | The number of the attempt, from 1. |
 | `attempts` | The most attempts that the item gets. |
-| `worker` | The worker slot, from 1, or 0 for an outcome recorded before a worker ran the item, such as a broken chain. |
+| `worker` | The worker slot, from 1, or 0 for an outcome recorded before a worker ran the item, such as an item of an environment the run skips. |
 | `pid` | The ID of the process of the worker, or 0 when the worker did not start. |
 
 ### item_finished
@@ -105,14 +105,14 @@ It has the fields of `item_started`, and these:
 
 | Field | Meaning |
 |:------|:--------|
-| `state` | The state of this attempt: `passed`, `failed`, `errored`, `timedout`, `skipped`, `broken_chain` or `cancelled`. |
+| `state` | The state of this attempt: `passed`, `failed`, `errored`, `timedout`, `skipped` or `cancelled`. |
 | `verdict` | The state of the item after this attempt. It is `state`, except after an attempt that is `skipped` or `cancelled` when an earlier attempt decided the item. Then it is the state of that earlier attempt. |
 | `elapsed`, `compile` | Seconds, as the item measured them. For an outcome that the run decided, the time that the item held its worker. |
 | `note` | What the run says about the attempt, for example that a retry follows. Often empty. |
 | `log` | The file with captured item output, or `null` when no nonempty log exists. With `logs = "eager"`, output goes to stderr without a per-item log. |
 | `failures` | Each failed or erroring test: `kind` (`fail` or `error`), `message` as `Test` shows it, `file` and `line`. |
 
-An item that is retried, or that runs again with its chain, has an `item_started` and an `item_finished` for each attempt. The `verdict` of the latest is its current state, and the `verdict` of the last one before `run_finished` is its outcome. The other fields describe the attempt.
+An item that is retried has an `item_started` and an `item_finished` for each attempt. The `verdict` of the latest is its current state, and the `verdict` of the last one before `run_finished` is its outcome. The other fields describe the attempt.
 
 `item_finished` reports the verdict before [failure-artifact producers](@ref evidence) finish. Wait for `run_finished` before copying the complete run bundle.
 

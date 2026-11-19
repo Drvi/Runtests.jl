@@ -137,9 +137,8 @@ The order the run is expected to start the items in, and where: its own dispatch
 (`claim!`) played out with each unit taking as long as the recorded runs say, and a
 unit nothing is recorded for counting as a typical one. A worker that moves to
 another profile's items first pays what the recorded runs say a fresh worker costs.
-`items` holds `(start, worker, item)` in that order, a chain's members spread over
-its time; `work` is each worker's estimated busy seconds, without what it waits
-for a gate. A run without workers takes the units in plan order.
+`items` holds `(start, worker, item)` in that order; `work` is each worker's
+estimated busy seconds, without what it waits for a gate. A run without workers takes the units in plan order.
 """
 function run_order(p::Plan)
     typical = typical_estimate(p.units.est_s)
@@ -207,23 +206,14 @@ end
     why_text(p, u, work = gate_work(p)) -> String
 
 Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
-worker's stretch, where file order put it. It is shown on the unit's first item, so
-a chain placed for another of its members names that member, and a chain's changed
-file is named, since its members can be in several. `work` is each gate's, which a
-caller with many rows sums once.
+worker's stretch, where file order put it. `work` is each gate's, which a caller
+with many rows sums once.
 """
 function why_text(p::Plan, u::UnitIdx, work::Vector{Float64} = gate_work(p))
     why = p.units.why[u]
-    span = p.units.span[u]
     throttle = p.units.throttle[u]
-    name(i) = repr(p.items.name[i])
-    if why === PINNED_FIRST || why === PINNED_LAST
-        cfg = item_cfg(p, first(span))
-        which, listed = why === PINNED_FIRST ? ("first", cfg.order_first) : ("last", cfg.order_last)
-        # The member listed earliest is the one that set the chain's place.
-        i = argmin(i -> something(findfirst(==(p.items.name[i]), listed), typemax(Int)), span)
-        return i == first(span) ? "[order] $which" : string("[order] ", which, " names ", name(i))
-    end
+    why === PINNED_FIRST && return "[order] first"
+    why === PINNED_LAST && return "[order] last"
     why === SANDBOXED && return "sandbox"
     if why === LONG
         g = p.units.gate[u]
@@ -236,13 +226,10 @@ function why_text(p::Plan, u::UnitIdx, work::Vector{Float64} = gate_work(p))
                       throttle === NO_THROTTLE ? "" : string(" (throttle: `", throttle, "`)"))
     end
     why === RECENT || return ""
-    ago, f = p.units.failed_ago[u], p.units.failed_item[u]
+    ago = p.units.failed_ago[u]
     how = p.units.cancelled[u] ? "cancelled" : "failed"
-    failed = ago < 0 ? "" : string(f == first(span) ? "" : string(name(f), " "),
-                                   ago == 0 ? "$how in the last run" : string(how, " ", ago + 1, " runs ago"))
-    c = p.units.changed_item[u]
-    what = p.units.changed_new[u] ? "new" : "edited since its last run"
-    changed = c == 0 ? "" : c == first(span) ? what : string(name(c), " ", what)
+    failed = ago < 0 ? "" : ago == 0 ? "$how in the last run" : string(how, " ", ago + 1, " runs ago")
+    changed = p.units.changed_item[u] == 0 ? "" : p.units.changed_new[u] ? "new" : "edited since its last run"
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
@@ -256,19 +243,13 @@ function gate_work(p::Plan)
 end
 
 # What an item row says about the item itself: the keywords it was declared with,
-# its place in its chain or its gate's limit, and the setups it loads.
+# its throttle's limit, and the setups it loads.
 function details_text(p::Plan, i::Integer)
     it = p.items
     u = it.unit[i]
     parts = String[]
-    throttle = p.units.throttle[u]
     g = p.units.gate[u]
-    if g != 0
-        push!(parts, string("throttle `", throttle, "`, ", p.gate_limit[g], " at a time"))
-    elseif throttle !== NO_THROTTLE
-        span = p.units.span[u]
-        push!(parts, string("throttle `", throttle, "` ", i - first(span) + 1, "/", length(span)))
-    end
+    g == 0 || push!(parts, string("throttle `", p.units.throttle[u], "`, ", p.gate_limit[g], " at a time"))
     # A sandbox is the reason it goes early, unless something else put it there.
     p.units.exclusive[u] && p.units.why[u] !== SANDBOXED && push!(parts, "sandbox")
     prof = p.profiles[p.units.profile[u]]
@@ -384,9 +365,8 @@ function print_plan_table(io::IO, p::Plan, order)
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
-    # A chain's reason is its first item's: the unit is placed, not each member.
     work = gate_work(p)
-    whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i], work) : "" for i in rows]
+    whys = [why_text(p, it.unit[i], work) for i in rows]
     details = [details_text(p, i) for i in rows]
     columns = Tuple{String, Vector{String}}[]
     push!(columns, ("#", [string(i) for i in 1:n]))

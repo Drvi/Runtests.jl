@@ -356,10 +356,10 @@ Leave the changes uncommitted unless the user asks you to commit.
   (`using ASetup, BSetup`), or move shared definitions into one setup.
 - **State between testsets.** An include-based suite may pass variables, files or
   settings from one testset to the next. Each item has a fresh module, so it must
-  build its own values or get them from a setup. A `throttle = :name` (limit 1 by
-  default) keeps items in order on one worker when intentional process or file state
-  requires that; it does not share item variables. A `[throttle]` limit above 1
-  instead caps how many of the items run at once, on any workers.
+  build its own values or get them from a setup. Items run on any worker in any
+  order, and nothing passes state from one to the next. `throttle = :name` only caps
+  how many items of that name run at once (1 unless `[throttle]` gives more), for a
+  shared resource such as memory or a GPU.
 - **Process state.** Changes to `ENV`, the global logger, the working directory,
   preferences, or which packages and extensions are loaded used to last until the
   suite ended. Now the items on a worker run one after another, and each sees what

@@ -476,9 +476,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test pool("A", "fast") != pool("B", "fast") && pool("A", "fast") != pool("A", "a1")
             @test pool("A", "init") != pool("B", "init")
             @test length(unique([pool("A", "a1"), pool("A", "qa"), pool("C", "c1")])) == 3
-            # A chain is one package's: two packages that name `:db` have one each.
-            @test p.items.unit[item_of(p, "A", "db1")] == p.items.unit[item_of(p, "A", "db2")] !=
-                  p.items.unit[item_of(p, "B", "db1")]
+            # A throttle is one for every package that names it: `:db` is one gate, of one.
+            gate(pkg, name) = p.units.gate[p.items.unit[item_of(p, pkg, name)]]
+            @test gate("A", "db1") == gate("A", "db2") == gate("B", "db1") != 0
+            @test p.gate_limit[gate("A", "db1")] == 1
             # An item runs under its own package's profile.
             prof(pkg, name) = p.profiles[p.units.profile[p.items.unit[item_of(p, pkg, name)]]]
             @test prof("A", "fast").julia_args == ["--check-bounds=yes"] && prof("B", "fast").julia_args == ["--check-bounds=no"]
@@ -488,7 +489,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test all(==(7), p7.items.seed)
         end
 
-        @testset "a throttle above 1 is one for every package that names it, with one limit" begin
+        @testset "a throttle is one for every package that names it, with one limit" begin
             build(b_limit) = make_workspace(
                 "A" => ["test/a_test.jl" => item_text("a1"; opts = "throttle=:pc") * item_text("a2"; opts = "throttle=:pc"),
                         "test/TestItems.toml" => "[throttle]\npc = 3\n"],
@@ -511,7 +512,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 ws = build(b_limit)
                 err = try; mono(ws); nothing; catch e; e; end
                 @test err isa ConfigError
-                @test occursin("throttle `:pc` has a limit above 1", sprint(showerror, err))
+                @test occursin("throttle `:pc` is one for every package that names it", sprint(showerror, err))
                 @test occursin(said, sprint(showerror, err))
                 # An editor's listing says so too, where a run would refuse to start.
                 @test any(m -> occursin(said, m), limit_errors(ws))

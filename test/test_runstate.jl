@@ -1765,7 +1765,7 @@ end
             _, run_out = capture_run(() -> run_states(pkg; replay = recorded, logs = :issues, monitor = false))
             @test count("this checkout differs from the replayed run", run_out) == 1
             @test occursin("revision:", run_out)
-            @test occursin("preferences differ in profile `default` (test/qa)", run_out)
+            @test occursin("preferences differ in profile `default` ($(joinpath("test", "qa")))", run_out)
             @test occursin("run with `dry_run = true` for details", run_out)
         end
     end

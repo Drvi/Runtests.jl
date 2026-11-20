@@ -53,7 +53,9 @@ include("platform.jl")
 include("monitor.jl")
 include("coverage.jl")
 include("editor.jl")
+include("scheduler.jl")
 include("execute.jl")
+include("environments.jl")
 include("precompile_queue.jl")
 include("artifacts.jl")
 include("interactive.jl")
@@ -319,15 +321,15 @@ end
 # The settings a run state recorded, as `runtests` keywords.
 function recorded_settings(rs::RunStateRecord)
     out = Pair{Symbol, Any}[]
-    for (key, parse_) in REPLAYED_SETTINGS
-        text = get(rs.meta, string(key), "")
+    for spec in REPLAY_SPECS
+        text = get(rs.meta, string(spec.key), "")
         isempty(text) && continue
         value = try
-            parse_(text)
+            parse_replay_setting(spec.replay, text)
         catch
-            throw(ConfigError("the run state's `$key` setting is unreadable: $(repr(text))"))
+            throw(ConfigError("the run state's `$(spec.key)` setting is unreadable: $(repr(text))"))
         end
-        push!(out, key => value)
+        push!(out, spec.key => value)
     end
     return NamedTuple(out)
 end
@@ -349,8 +351,8 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
         prefs = get(rs.preferences, name, "")
         path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
         # `precompile` from this checkout's configuration, as a run state does not hold it.
-        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path, "",
-                                 get(dirs, name, ""), get(cfg.profiles, name, prof).precompile)
+        profiles[name] = with_profile(prof; preferences = path, environment = "",
+                                      dir = get(dirs, name, ""), precompile = get(cfg.profiles, name, prof).precompile)
     end
     # The code its workers compiled, which this process's flags need not match: the
     # recorded flags go first, before each profile's own, as the recorded workers had
@@ -365,13 +367,11 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
     julia_flags = isempty(recorded) || recorded == code_flags() ? String[] : String.(recorded)
     if !isempty(julia_flags)
         for (name, prof) in profiles
-            profiles[name] = Profile(prof.name, [julia_flags; prof.julia_args], prof.threads, prof.env, prof.init,
-                                     prof.test_end, prof.preferences, prof.environment, prof.dir, prof.precompile)
+            profiles[name] = with_profile(prof; julia_args = [julia_flags; prof.julia_args])
         end
     end
-    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; profiles, julia_flags, order_first, order_last, throttle,
-                                        replayed_manifest = recorded_manifest(rs), replayed_from = rs.path))...)
+    return with_config(cfg; profiles, julia_flags, order_first, order_last, throttle,
+                       replayed_manifest = recorded_manifest(rs), replayed_from = rs.path)
 end
 
 # `name=limit` lines, as `run_meta` writes `[throttle]`.
@@ -757,8 +757,8 @@ const PRECOMPILE_SIGNATURES = (
     (prepare, (Tuple{String},)),
     (execute, (Plan, Target)),
     (report, (Run,)),
-    (run_on_workers, (Run, Target)),
-    (run_slot, (Run, Slot, Target)),
+    (run_on_workers, (Run,)),
+    (run_slot, (Run, Slot)),
 )
 
 # Everything between `runtests()` and the first test item: reading, configuring,

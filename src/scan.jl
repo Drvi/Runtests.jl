@@ -133,6 +133,20 @@ function environment_of(path::AbstractString, environments::Vector{String})
     return best
 end
 
+# Pre-sorted `(dir => joinpath(dir, ""))` longest-first: zero allocations per file.
+function env_prefixes(environments::Vector{String})
+    out = Pair{String, String}[dir => joinpath(dir, "") for dir in environments]
+    sort!(out; by = p -> -ncodeunits(first(p)))
+    return out
+end
+
+function environment_of(path::AbstractString, prefixes::Vector{Pair{String, String}})
+    for (dir, pref) in prefixes
+        startswith(path, pref) && return dir
+    end
+    return ""
+end
+
 # An environment as a message names it.
 environment_name(dir::AbstractString) = isempty(dir) ? "the test environment" : "the environment of $(relpath_or_path(dir))"
 
@@ -288,7 +302,7 @@ function setup_modules(testdir::AbstractString)
     end
     clashes = case_clashes(String.(keys(out)))
     isempty(clashes) || throw(ConfigError(string(
-        relpath_or_path(dir), " holds the setups ", join((join(("`$n`" for n in g), " and ") for g in clashes), ", "),
+        relpath_or_path(dir), " holds the setups ", format_case_clashes(clashes),
         ", whose names differ only in case: macOS and Windows hold one file for each such pair. Rename one"
     )))
     return out
@@ -302,7 +316,8 @@ end
 # not, and `environment` is the directory whose environment its items run in.
 function scan_file!(
         items::Vector{RawItem}, errors::Vector{ScanError}, names::Vector{ItemName}, tags::Set{Symbol},
-        path::String, filter::Filter, known_setups, environment::String = ""
+        path::String, filter::Filter, known_setups, environment::String = "",
+        path_ok::Bool = matches_path(filter.paths, path)
     )
     src = try
         read(path, String)
@@ -313,7 +328,9 @@ function scan_file!(
     line = Int32(0)
     # By index: iterating the untyped statements would box every step.
     statements = Meta.parseall(src; filename = path).args
-    starts = line_starts(src)
+    # Computed lazily on the first selected item in this file: filtered-out files
+    # still parse and validate every `@testitem`, but never need source hashes.
+    starts::Union{Nothing, Vector{Int}} = nothing
     for k in eachindex(statements)
         a = statements[k]
         if a isa LineNumberNode
@@ -323,11 +340,30 @@ function scan_file!(
             push!(errors, ScanError(path, line, msg isa AbstractString ? msg : sprint(showerror, msg)))
             return
         else
+            if !(a isa Expr) || a.head !== :macrocall || a.args[1] !== Symbol("@testitem")
+                push!(errors, ScanError(path, line, not_an_item(a)))
+                continue
+            end
+            parsed = parse_testitem_header(a, path, line, errors)
+            parsed === nothing && continue
+            union!(tags, parsed.tags)
+            if !(path_ok && matches_name(filter.name, parsed.name) &&
+                    matches_tags(filter.tags, parsed.tags) && matches_tags(filter.group, parsed.tags))
+                push!(names, ItemName(parsed.name, path, parsed.at))
+                continue
+            end
+            starts === nothing && (starts = line_starts(src))
             # A statement's text runs to the line before the next one starts.
             next_line = k < lastindex(statements) && statements[k + 1] isa LineNumberNode ?
                 Int((statements[k + 1]::LineNumberNode).line) : 0
-            hash = text_hash(src, starts, Int(line), next_line)
-            handle_statement!(items, errors, names, tags, a, path, line, filter, known_setups, environment, hash)
+            hash = text_hash(src, starts::Vector{Int}, Int(line), next_line)
+            setups = Symbol[]
+            isempty(known_setups) || unique!(collect_setups!(setups, parsed.body, known_setups))
+            push!(items, RawItem(
+                parsed.name, path, parsed.at, parsed.tags, setups, parsed.body, parsed.skip,
+                parsed.timeout, parsed.retries, parsed.failfast, parsed.throttle, parsed.profile,
+                parsed.exclusive, environment, hash, Int32(1)
+            ))
         end
     end
     return
@@ -362,26 +398,6 @@ end
 
 ### Header parsing #########################################################
 
-# One method whatever the statement is, so that the call is direct, not a dispatch
-# that boxes every argument once per item.
-function handle_statement!(items, errors, names, tags, @nospecialize(ex), path, line, filter, known_setups, environment,
-                           hash::UInt32 = UInt32(0))
-    if !(ex isa Expr) || ex.head !== :macrocall || ex.args[1] !== Symbol("@testitem")
-        push!(errors, ScanError(path, line, not_an_item(ex)))
-        return
-    end
-    item = parse_testitem(ex, path, line, errors, known_setups, environment; hash)
-    item === nothing && return
-    union!(tags, item.tags)
-    if !(matches_path(filter.paths, path) && matches_name(filter.name, item.name) &&
-            matches_tags(filter.tags, item.tags) && matches_tags(filter.group, item.tags))
-        push!(names, ItemName(item.name, path, item.line))
-        return
-    end
-    push!(items, item)
-    return
-end
-
 # Why a statement in a test file is refused: anything but a `@testitem` is.
 function not_an_item(@nospecialize ex)
     ex isa Expr && ex.head === :for && return "test files may only contain `@testitem` declarations, " *
@@ -398,16 +414,15 @@ end
 # `seen` mask below, which is how a keyword given twice is caught without a set
 # per item.
 const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :throttle, :sandbox, :profile)
+const ITEM_KEYWORDS_TEXT = join(ITEM_KEYWORDS, ", ")
 
 function keyword_bit(key::Symbol)
     i = findfirst(==(key), ITEM_KEYWORDS)
     return i === nothing ? UInt8(0) : UInt8(1) << (i - 1)
 end
 
-# `environment` is the directory whose environment the item's file is in (see
-# `environment_of`), or empty for the test environment.
-function parse_testitem(ex::Expr, path, line, errors, known_setups, environment::String = "";
-                        hash::UInt32 = UInt32(0))
+# Parse and validate a `@testitem` macrocall without scanning its body for setups.
+function parse_testitem_header(ex::Expr, path, line, errors)
     # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
     numbered = lo <= hi && ex.args[lo] isa LineNumberNode
@@ -426,7 +441,7 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
     (body isa Expr && body.head === :block) ||
         return scan_error!(errors, path, at, "`@testitem $(repr(name))` must end with a `begin ... end` body")
 
-    tags = nothing; setups = Symbol[]
+    tags = nothing
     timeout = USE_RUN_DEFAULT; retries = USE_RUN_DEFAULT
     failfast = Int8(-1); throttle = NO_THROTTLE; profile = DEFAULT_PROFILE
     exclusive = false; skip = false
@@ -487,16 +502,27 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups, environment:
                     "or as many as [throttle] of TestItems.toml allows"
             )
         else
-            return scan_error!(errors, path, at, 
-                "`@testitem $(repr(name))`: unknown keyword `$key`; " *
-                    "known keywords are tags, timeout, retries, skip, failfast, throttle, sandbox, profile"
+            return scan_error!(errors, path, at,
+                "`@testitem $(repr(name))`: unknown keyword `$key`; known keywords are $ITEM_KEYWORDS_TEXT"
             )
         end
     end
-    collect_setups!(setups, body, known_setups)
+    return (; name, at, tags = tags === nothing ? Symbol[] : tags, body, skip,
+            timeout, retries, failfast, throttle, profile, exclusive)
+end
+
+# `environment` is the directory whose environment the item's file is in (see
+# `environment_of`), or empty for the test environment.
+function parse_testitem(ex::Expr, path, line, errors, known_setups, environment::String = "";
+                        hash::UInt32 = UInt32(0))
+    parsed = parse_testitem_header(ex, path, line, errors)
+    parsed === nothing && return nothing
+    setups = Symbol[]
+    isempty(known_setups) || unique!(collect_setups!(setups, parsed.body, known_setups))
     return RawItem(
-        name, path, at, tags === nothing ? Symbol[] : tags, unique!(setups), body, skip,
-        timeout, retries, failfast, throttle, profile, exclusive, environment, hash, Int32(1)
+        parsed.name, path, parsed.at, parsed.tags, setups, parsed.body, parsed.skip,
+        parsed.timeout, parsed.retries, parsed.failfast, parsed.throttle, parsed.profile,
+        parsed.exclusive, environment, hash, Int32(1)
     )
 end
 
@@ -506,15 +532,6 @@ struct NotALiteral end
 function literal(@nospecialize(v))
     v isa Union{Bool, Integer, AbstractFloat, String, Char} && return v
     v isa QuoteNode && v.value isa Symbol && return v.value
-    if v isa Expr && (v.head === :vect || v.head === :tuple)
-        out = Any[]
-        for a in v.args
-            x = literal(a)
-            x isa NotALiteral && return NotALiteral()
-            push!(out, x)
-        end
-        return isempty(out) ? Any[] : [x for x in out]
-    end
     if v isa Expr && v.head === :call && length(v.args) == 3 && v.args[1] isa Symbol &&
             (v.args[1]::Symbol) in (:*, :+, :-, :/)
         # `timeout=5*60` reads better than `timeout=300`, and folding literal
@@ -653,6 +670,18 @@ by (file, line), every problem found sorted the same way, the name and place of 
 item the filter left out, and every tag an item of the suite carries. For a caller
 that shows what it can read beside what is broken.
 """
+function flatten_chunks(::Type{T}, chunks, idx::Int) where {T}
+    total = 0
+    for c in chunks
+        total += length(c[idx])
+    end
+    out = sizehint!(T[], total)
+    for c in chunks
+        append!(out, c[idx])
+    end
+    return out
+end
+
 function scan_files(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(), strays::Vector{ScanError} = ScanError[],
@@ -661,6 +690,10 @@ function scan_files(
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64), Set{Symbol}()) for _ in 1:nt]
+    prefixes = env_prefixes(environments)
+    path_prefs = String[joinpath(p, "") for p in filter.paths]
+    path_matches(file) = isempty(filter.paths) ||
+        any(i -> file == filter.paths[i] || startswith(file, path_prefs[i]), eachindex(filter.paths))
     ch = Channel{String}(length(files))
     foreach(f -> put!(ch, f), files)
     close(ch)
@@ -669,7 +702,8 @@ function scan_files(
         Threads.@spawn begin
             its, errs, nms, tgs = $items, $errors, $names, $tags
             for path in ch
-                scan_file!(its, errs, nms, tgs, path, filter, known_setups, environment_of(path, environments))
+                scan_file!(its, errs, nms, tgs, path, filter, known_setups,
+                           environment_of(path, prefixes), path_matches(path))
             end
         end
     end
@@ -678,10 +712,14 @@ function scan_files(
     for c in chunks
         append!(errors, c[2])
     end
-    items = reduce(vcat, (c[1] for c in chunks); init = RawItem[])
-    sort!(items; by = i -> (i.file, i.line))
-    rejected = reduce(vcat, (c[3] for c in chunks); init = ItemName[])
-    append!(errors, duplicate_name_errors(items, rejected))
+    # Rank files once in path order so item/rejected sorting compares `(Int32, Int32)`.
+    sorted_files = issorted(files) ? files : sort(files)
+    file_rank = Dict{String, Int32}(f => Int32(i) for (i, f) in enumerate(sorted_files))
+    items = flatten_chunks(RawItem, chunks, 1)
+    sort!(items; by = i -> (get(file_rank, i.file, Int32(0)), i.line))
+    rejected = flatten_chunks(ItemName, chunks, 3)
+    sort!(rejected; by = r -> (get(file_rank, r.file, Int32(0)), r.line))
+    append!(errors, duplicate_name_errors(items, rejected, file_rank))
     sort!(errors; by = e -> (e.file, e.line))
     return items, errors, rejected, reduce(union!, (c[4] for c in chunks); init = Set{Symbol}())
 end
@@ -713,27 +751,50 @@ function item_start(items::Vector{RawItem}, rejected::Vector{ItemName}, paths::V
 end
 
 # Over every item in the suite, selected or not: a name that is unique only
-# because this run filtered out its twin is not a unique name.
-function duplicate_name_errors(items::Vector{RawItem}, rejected::Vector{ItemName} = ItemName[])
-    all_names = ItemName[ItemName(it.name, it.file, it.line) for it in items]
-    append!(all_names, rejected)
-    sort!(all_names; by = n -> (n.file, n.line))
-    seen = Dict{String, ItemName}()
+# because this run filtered out its twin is not a unique name. Both `items` and
+# `rejected` arrive sorted by `(file_rank, line)`, so a 2-way merge checks every
+# item in file order without copying or re-sorting.
+function duplicate_name_errors(items::Vector{RawItem}, rejected::Vector{ItemName} = ItemName[],
+                               file_rank::Union{Nothing, Dict{String, Int32}} = nothing)
+    seen = Dict{String, Tuple{String, Int32}}()
+    sizehint!(seen, length(items) + length(rejected))
     errors = ScanError[]
-    for it in all_names
-        prev = get(seen, it.name, nothing)
+    function check!(name::String, file::String, line::Int32)
+        prev = get(seen, name, nothing)
         if prev === nothing
-            seen[it.name] = it
+            seen[name] = (file, line)
         else
             push!(
                 errors, ScanError(
-                    it.file, it.line,
-                    "duplicate test item name $(repr(it.name)); also declared at " *
-                        "$(relpath_or_path(prev.file)):$(prev.line). Names identify items in " *
+                    file, line,
+                    "duplicate test item name $(repr(name)); also declared at " *
+                        "$(relpath_or_path(prev[1])):$(prev[2]). Names identify items in " *
                         "TestItems.toml, in the run state and on the command line, so they must be unique."
                 )
             )
         end
+    end
+    i, j = 1, 1
+    ni, nj = length(items), length(rejected)
+    while i <= ni && j <= nj
+        it, r = items[i], rejected[j]
+        less = if file_rank !== nothing
+            ri, rj = get(file_rank, it.file, Int32(0)), get(file_rank, r.file, Int32(0))
+            ri < rj || (ri == rj && it.line <= r.line)
+        else
+            it.file < r.file || (it.file == r.file && it.line <= r.line)
+        end
+        if less
+            check!(it.name, it.file, it.line); i += 1
+        else
+            check!(r.name, r.file, r.line); j += 1
+        end
+    end
+    while i <= ni
+        it = items[i]; check!(it.name, it.file, it.line); i += 1
+    end
+    while j <= nj
+        r = rejected[j]; check!(r.name, r.file, r.line); j += 1
     end
     return errors
 end

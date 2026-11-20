@@ -3,10 +3,37 @@
 # A pasted item uses the scanner's parser and the worker's item evaluator. Without
 # a coordinator, run-only scheduling options need separate handling below.
 
-# What `activate` changed, for `deactivate` to undo: `(; project, setups, target, dir,
-# participants)`, or `nothing` when Runtests has not touched the session. `target` is
-# the package of `activate`; `participants` the packages of `activate_mono`.
-const ACTIVATION = Ref{Any}(nothing)
+# What `activate` changed, for `deactivate` to undo, or `nothing` when Runtests has
+# not touched the session. `target` is the package of `activate`; `participants` the
+# packages of `activate_mono`.
+struct Activation
+    project::Union{Nothing, String}
+    setups::Vector{String}
+    target::Any
+    dir::String
+    participants::Union{Nothing, Participants}
+end
+
+const ACTIVATION = Ref{Union{Nothing, Activation}}(nothing)
+
+function check_not_activated!()
+    ACTIVATION[] === nothing || throw(
+        ConfigError(
+            "Runtests is already active in this session (" *
+                something(Base.active_project(), "no project") *
+                "); call `Runtests.deactivate()` first"
+        )
+    )
+    return nothing
+end
+
+function pop_load_paths!(paths::Vector{String})
+    for p in paths
+        i = findlast(==(p), LOAD_PATH)
+        i === nothing || deleteat!(LOAD_PATH, i)
+    end
+    return nothing
+end
 
 """
     activate([paths...]) -> String
@@ -17,13 +44,7 @@ test-only dependencies work at the REPL. Returns the environment's path;
 [`deactivate`](@ref) undoes it.
 """
 function activate(args...)
-    ACTIVATION[] === nothing || throw(
-        ConfigError(
-            "Runtests is already active in this session (" *
-                something(Base.active_project(), "no project") *
-                "); call `Runtests.deactivate()` first"
-        )
-    )
+    check_not_activated!()
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     previous = Base.active_project()
@@ -34,7 +55,7 @@ function activate(args...)
     pushed && push!(LOAD_PATH, setups)
     # Kept because it cannot be found again: with the generated environment active,
     # the session's project is the environment, not the package.
-    ACTIVATION[] = (project = previous, setups = pushed ? [setups] : String[], target = target, dir = "", participants = nothing)
+    ACTIVATION[] = Activation(previous, pushed ? [setups] : String[], target, "", nothing)
     active = something(Base.active_project(), "")
     println(
         stdout, label_prefix(), "activated ", relpath_or_path(active, target.root),
@@ -54,10 +75,7 @@ function deactivate()
     state = ACTIVATION[]
     state === nothing && return nothing
     ACTIVATION[] = nothing
-    for setups in state.setups
-        i = findlast(==(setups), LOAD_PATH)
-        i === nothing || deleteat!(LOAD_PATH, i)
-    end
+    pop_load_paths!(state.setups)
     Base.set_active_project(state.project)
     # The union environment `activate_mono` wrote.
     isempty(state.dir) || rm(state.dir; force = true, recursive = true)
@@ -81,12 +99,7 @@ Two setups of one name stop it before anything changes. [`deactivate`](@ref) und
 it. Returns the active project.
 """
 function activate_mono(root::Union{Nothing, AbstractString} = nothing)
-    ACTIVATION[] === nothing || throw(
-        ConfigError(
-            "Runtests is already active in this session (" * something(Base.active_project(), "no project") *
-                "); call `Runtests.deactivate()` first"
-        )
-    )
+    check_not_activated!()
     ps = find_participants(root)
     PROJECT_ROOT[] = ps.workspace
     check_setup_names(ps, [setup_modules(joinpath(r, "test")) for r in ps.root])
@@ -104,9 +117,9 @@ function activate_mono(root::Union{Nothing, AbstractString} = nothing)
             push!(LOAD_PATH, setups)
             push!(pushed, setups)
         end
-        ACTIVATION[] = (project = previous, setups = pushed, target = nothing, dir = dir, participants = ps)
+        ACTIVATION[] = Activation(previous, pushed, nothing, dir, ps)
     catch
-        foreach(s -> (i = findlast(==(s), LOAD_PATH); i === nothing || deleteat!(LOAD_PATH, i)), pushed)
+        pop_load_paths!(pushed)
         Base.set_active_project(previous)
         rm(dir; force = true, recursive = true)
         rethrow()
@@ -243,15 +256,8 @@ end
 function in_profile_environment(f, target, prof::Union{Nothing, Profile})
     (prof === nothing || isempty(prof.environment)) && return f()
     project = profile_project(prof, Base.active_project(), target.root)
-    current, load_path = Base.active_project(), copy(LOAD_PATH)
-    Base.set_active_project(joinpath(project, "Project.toml"))
-    copy!(LOAD_PATH, stacked_load_path(load_path, current))
-    try
-        return f()
-    finally
-        copy!(LOAD_PATH, load_path)
-        Base.set_active_project(current)
-    end
+    return in_worker_environment(f, joinpath(project, "Project.toml"),
+                                 stacked_load_path(LOAD_PATH, Base.active_project()))
 end
 
 # An item's RUN or DONE line: one item, so no count, and a name column its own width.
@@ -316,10 +322,17 @@ function session_test_end(w::RuntestsWorkers.Worker, spec::ItemSpec, prof::Profi
     return true
 end
 
+function report_lost_evidence(prefix::String, attempt::Integer, why::AbstractString)
+    dir = artifacts_path(prefix, 1, attempt)
+    isfile(artifacts_log_path(dir)) && note_evidence(dir, string("not collected: ", why, ", so the producers did not run"))
+    (isdir(dir) || isfile(artifacts_log_path(dir))) && print_evidence(dir)
+    return nothing
+end
+
 function run_sandboxed(item::RawItem, target)
-    prof = interactive_profile(item, target)
-    # The limits a run holds the profile's own code to; without a project, a run's defaults.
+    # Read `TestItems.toml` once for both the profile and the run's timeout limits.
     limits = target === nothing ? RunConfig(; workers = 0) : read_config(target.testdir)
+    prof = interactive_profile(item, target, limits)
     timeout = item.timeout_s == USE_RUN_DEFAULT ? nothing : Int(item.timeout_s)
     attempts = item.retries == USE_RUN_DEFAULT ? 1 : Int(item.retries) + 1
     result = nothing
@@ -352,10 +365,7 @@ function run_sandboxed(item::RawItem, target)
             if session_test_end(w, spec, prof, limits.test_end_timeout_s, result)
                 print_evidence(finish_here!(spec, result; worker = w, limit = limits.artifacts_timeout_s))
             elseif is_non_pass(result.state)
-                dir = artifacts_path(prefix, 1, attempt)
-                isfile(artifacts_log_path(dir)) && note_evidence(dir, "not collected: the worker was ended in the " *
-                                                                      "profile's `test_end`, so the producers did not run")
-                (isdir(dir) || isfile(artifacts_log_path(dir))) && print_evidence(dir)
+                report_lost_evidence(prefix, attempt, "the worker was ended in the profile's `test_end`")
             end
             (!is_non_pass(result.state) || attempt == attempts) && break
         catch e
@@ -363,10 +373,7 @@ function run_sandboxed(item::RawItem, target)
             RuntestsWorkers.terminate!(w, :timeout)
             wait(w)
             # What the attempt wrote before it was stopped is kept, and said where.
-            dir = artifacts_path(prefix, 1, attempt)
-            isfile(artifacts_log_path(dir)) && note_evidence(dir, string("not collected: ", sprint(showerror, e),
-                                                                         ", so the producers did not run"))
-            (isdir(dir) || isfile(artifacts_log_path(dir))) && print_evidence(dir)
+            report_lost_evidence(prefix, attempt, sprint(showerror, e))
             attempt == attempts && rethrow()
         finally
             close(w)
@@ -382,12 +389,12 @@ end
 # The profile from the project's TestItems.toml, `default` included, as a run reads
 # it, in the item's environment. Only a session without a project has the built-in
 # default.
-function interactive_profile(item::RawItem, target)
+function interactive_profile(item::RawItem, target, cfg::Union{Nothing, RunConfig} = nothing)
     if target === nothing
         item.profile === DEFAULT_PROFILE && return Profile(DEFAULT_PROFILE)
         throw(ConfigError("`profile = :$(item.profile)` needs a TestItems.toml, and there is no project here"))
     end
-    cfg = read_config(target.testdir)
+    cfg === nothing && (cfg = read_config(target.testdir))
     haskey(cfg.profiles, item.profile) || throw(
         ConfigError(
             "`profile = :$(item.profile)` has no [profiles.$(item.profile)] in " *

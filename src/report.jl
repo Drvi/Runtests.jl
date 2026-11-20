@@ -91,8 +91,8 @@ end
 # What tells two profiles' settings apart, as their workers get them: an expression by
 # its code, wherever it was written.
 profile_settings(prof::Profile) =
-    (prof.julia_args, prof.threads, prof.env, prof.preferences, Base.remove_linenums!(copy(prof.init)),
-     Base.remove_linenums!(copy(prof.test_end)), prof.precompile)
+    (prof.julia_args, prof.threads, prof.env, prof.preferences, Base.remove_linenums!(deepcopy(prof.init)),
+     Base.remove_linenums!(deepcopy(prof.test_end)), prof.precompile)
 
 # Only profiles that actually change something are worth a line, one each however
 # many environments they run in, and the environment directories the items run in one
@@ -686,13 +686,13 @@ styled() do io
         pct = how.elapsed_ns > 0 ? round(Int, 100 * how.compile_ns / how.elapsed_ns) : 0
         print_colored(io, short_state(how.state), STATE_WIDTH, state_color(how.state))
         retry()
-        # Rounded to a tenth, as `fmt_gib` rounds, then written without a string.
-        print(io, FIELD); print_1dp(io, round(how.elapsed_ns / 1.0e9; digits = 1), TIME_WIDTH - 1)
+        # Rounded to a tenth inside `print_1dp`, without a string.
+        print(io, FIELD); print_1dp(io, how.elapsed_ns / 1.0e9, TIME_WIDTH - 1)
         print(io, "s ("); print_int(io, pct, 2); print(io, "% compile)")
         # `tree max`: the worker with what it started, over the attempt; `maxrss`: one
         # process, since it started.
         print(io, FIELD, get(how, :tree, false) ? "tree max " : "maxrss ")
-        print_1dp(io, round(how.maxrss / 2^30; digits = 1)); print(io, " GiB")
+        print_1dp(io, how.maxrss / 2^30); print(io, " GiB")
     else
         print(io, "at ")
         print_bold(io, how)
@@ -928,11 +928,11 @@ function conclusion_text(run, ended::Symbol = :finished)
             print(io, "run state: ")
             printstyled(io, rundata_dir(rs.path); color = :light_black)
             println(io)
-            if !isempty(run.exported)
-                print(io, "copied to: ")
-                printstyled(io, run.exported; color = :light_black)
-                println(io)
-            end
+        end
+        if (rs isa RunStateFile || rs isa RunStateSet) && !isempty(run.exported)
+            print(io, "copied to: ")
+            printstyled(io, run.exported; color = :light_black)
+            println(io)
         end
         print_evidence_kept(io, run)
         # What to type next, for whoever reads this in a CI log as much as here.
@@ -961,10 +961,16 @@ end
 # and where its run state and logs are.
 function print_package_lines(io::IO, run, rs::RunStateSet)
     p, st = run.plan, run.statuses
-    for k in eachindex(rs.files)
-        is = [i for i in 1:nitems(p) if p.items.package[i] == k]
-        bad = count(i -> is_non_pass(st.state[i]), is)
-        print(io, p.packages.name[k], ": ", plural(length(is), "test item"), bad == 0 ? "" : string(", ", bad, " not passed"))
+    npkg = length(rs.files)
+    total = zeros(Int, npkg)
+    bad = zeros(Int, npkg)
+    for i in 1:nitems(p)
+        k = p.items.package[i]
+        total[k] += 1
+        is_non_pass(st.state[i]) && (bad[k] += 1)
+    end
+    for k in 1:npkg
+        print(io, p.packages.name[k], ": ", plural(total[k], "test item"), bad[k] == 0 ? "" : string(", ", bad[k], " not passed"))
         if rs.files[k] === nothing
             print(io, " · no run state, it could not be written; logs in ")
             printstyled(io, run.logdirs[k]; color = :light_black)
@@ -972,11 +978,6 @@ function print_package_lines(io::IO, run, rs::RunStateSet)
             print(io, " · run state ")
             printstyled(io, rundata_dir(rs.files[k].path); color = :light_black)
         end
-        println(io)
-    end
-    if !isempty(run.exported)
-        print(io, "copied to: ")
-        printstyled(io, run.exported; color = :light_black)
         println(io)
     end
     return nothing
@@ -1046,32 +1047,6 @@ else
     finished_at!(ts::Test.DefaultTestSet, at::Float64) = (ts.time_end = at)
 end
 
-# A file's wall time: from its first item's dispatch to its last item's end. With
-# several workers these overlap, so they do not sum to the run's time.
-function file_testset(run, fid::Int32)
-    p = run.plan
-    st = run.statuses
-    first_start, last_end = Inf32, -Inf32
-    for i in 1:nitems(p)
-        (p.items.fileidx[i] == fid && st.state[i] !== UNSEEN) || continue
-        first_start = min(first_start, st.start[i])
-        last_end = max(last_end, st.start[i] + st.elapsed[i])
-    end
-    # In a run of several packages, as its package names it, under the package's testset.
-    name = is_combined(p) ? relpath_or_path(p.files[fid], p.packages.root[p.items.package[findfirst(==(fid), p.items.fileidx)]]) :
-        p.relfiles[fid]
-    isfinite(first_start) || return Test.DefaultTestSet(name; verbose = p.cfg.verbose)
-    ts = started_testset(name; verbose = p.cfg.verbose, at = run.t0 + first_start)
-    finished_at!(ts, run.t0 + last_end)
-    return ts
-end
-
-"""
-    report(run) -> Test.AbstractTestSet
-
-Fold every item's testset into one tree, print the summary, and throw if anything
-did not pass so that a test run fails the way `Pkg.test` does.
-"""
 function report(run)
     p = run.plan
     st = run.statuses
@@ -1079,22 +1054,47 @@ function report(run)
     # times are put where it already looks rather than into a column of our own.
     # The root's clock starts when the run did, so its row is the run's wall time.
     root = started_testset(p.cfg.testset_name; verbose = true, at = run.t0)
-    byfile = Dict{Int32, Test.DefaultTestSet}()
-    for fid in sort!(unique(p.items.fileidx))
-        byfile[fid] = file_testset(run, fid)
+    nf = length(p.files)
+    file_seen = falses(nf)
+    file_pkg = zeros(Int32, nf)
+    file_start = fill(Inf32, nf)
+    file_end = fill(-Inf32, nf)
+    for i in 1:nitems(p)
+        fid = p.items.fileidx[i]
+        file_seen[fid] = true
+        file_pkg[fid] = p.items.package[i]
+        if st.state[i] !== UNSEEN
+            s = st.start[i]
+            e = s + st.elapsed[i]
+            s < file_start[fid] && (file_start[fid] = s)
+            e > file_end[fid] && (file_end[fid] = e)
+        end
+    end
+    combined = is_combined(p)
+    byfile = Vector{Union{Nothing, Test.DefaultTestSet}}(nothing, nf)
+    for fid in 1:nf
+        file_seen[fid] || continue
+        name = combined ? relpath_or_path(p.files[fid], p.packages.root[file_pkg[fid]]) : p.relfiles[fid]
+        byfile[fid] = if isfinite(file_start[fid])
+            ts = started_testset(name; verbose = p.cfg.verbose, at = run.t0 + file_start[fid])
+            finished_at!(ts, run.t0 + file_end[fid])
+            ts
+        else
+            Test.DefaultTestSet(name; verbose = p.cfg.verbose)
+        end
     end
     for i in 1:nitems(p)
         ts = st.testsets[i]
         ts === nothing && continue
-        Test.record(byfile[p.items.fileidx[i]], ts)
+        Test.record(byfile[p.items.fileidx[i]]::Test.DefaultTestSet, ts)
     end
     # A run of several packages: a testset for each package, its files in it.
-    combined = is_combined(p)
-    file_package = Dict{Int32, Int32}(p.items.fileidx[i] => p.items.package[i] for i in 1:nitems(p))
     packages = combined ? [started_testset(name; verbose = true, at = run.t0) for name in p.packages.name] :
         Test.DefaultTestSet[]
-    for fid in sort!(collect(keys(byfile)))
-        Test.record(combined ? packages[file_package[fid]] : root, byfile[fid])
+    for fid in 1:nf
+        fts = byfile[fid]
+        fts === nothing && continue
+        Test.record(combined ? packages[file_pkg[fid]] : root, fts)
     end
     for ts in packages
         finished_at!(ts, time())
@@ -1194,15 +1194,16 @@ function add_error!(ts::Test.AbstractTestSet, msg::AbstractString, source::LineN
 end
 
 """
-    report_item!(run, i, state, n, msg)
+    report_item!(run, o)
 
 Everything an item has to say, written when it finishes and in one piece so that
 no other worker's output lands inside it: its failures, then its captured logs.
 `Test` would print failures where they are recorded, on a worker with printing
 switched off, so the coordinator prints them.
 """
-function report_item!(run, i::ItemIdx, state::ItemState, n::Integer, msg::AbstractString)
+function report_item!(run, o)
     p = run.plan
+    i, state = o.i, o.state
     # A cancelled item has nothing of its own to show; the conclusion counts them.
     state === CANCELLED && return nothing
     # Having nothing to say is the common case — a passing item in `:issues` mode —
@@ -1212,21 +1213,21 @@ function report_item!(run, i::ItemIdx, state::ItemState, n::Integer, msg::Abstra
         # A coordinator-written outcome — a timeout, a dead worker — is already
         # stated in this block's first line; showing the record it synthesized
         # would say it again, word for word.
-        is_non_pass(state) && !run.statuses.synthetic[i] && print_failures(io, run, i)
-        print_item_log(io, run, i, state)
+        is_non_pass(state) && !o.synthetic && print_failures(io, o.testset)
+        print_item_log(io, run, i, o.attempt, state)
         # Where the attempt's evidence is: written, or about to be collected.
-        if is_non_pass(state) && run.statuses.artifacts[i] != 0
+        if is_non_pass(state) && o.artifacts != 0
             print(io, "artifacts: ")
-            printstyled(io, attempt_artifacts(run, i, run.statuses.attempt[i]); color = :light_black)
+            printstyled(io, attempt_artifacts(run, i, o.attempt); color = :light_black)
             println(io)
         end
     end
     isempty(body) && return nothing
     total = nitems(p)
-    label = string("[", lpad(n, ndigits(total)), "/", total, "] ", short_state(state))
-    rest = string(repr(p.items.name[i]), isempty(msg) ? "" : string(" · ", msg))
+    label = string("[", lpad(o.n, ndigits(total)), "/", total, "] ", short_state(state))
+    rest = string(repr(p.items.name[i]), isempty(o.note) ? "" : string(" · ", o.note))
     footer = string(
-        "@ ", itemfile(p, i), ":", p.items.line[i], on_worker(run, i)
+        "@ ", itemfile(p, i), ":", p.items.line[i], on_worker(run, o.slot)
     )
     printline(run, bracket(strip_root(body, p.root), label, rest, footer, state_color(state)))
     return nothing
@@ -1282,8 +1283,7 @@ function strip_root(text::AbstractString, root::AbstractString)
     return out
 end
 
-function print_failures(io::IO, run, i::ItemIdx)
-    ts = run.statuses.testsets[i]
+function print_failures(io::IO, ts::Union{Nothing, Test.AbstractTestSet})
     ts === nothing && return nothing
     for r in collect_failures(ts)
         show(io, r)
@@ -1298,10 +1298,10 @@ end
 wants_log(logs::Symbol, state::ItemState) =
     logs === :batched || (logs === :issues && is_non_pass(state))
 
-function print_item_log(io::IO, run, i::ItemIdx, state::ItemState)
+function print_item_log(io::IO, run, i::ItemIdx, attempt::Integer, state::ItemState)
     p = run.plan
     wants_log(p.cfg.logs, state) || return nothing
-    path = item_logpath(run, i)
+    path = item_log(run, i, max(attempt, 1))
     has_logs = isfile(path) && filesize(path) > 0
     # An item that failed and said nothing is worth saying so about: silence there
     # is a fact about the failure, not a reason to print nothing.
@@ -1325,41 +1325,14 @@ trim_blank_lines(text::AbstractString) =
     replace(replace(text, r"\A(?:[ \t]*\n)+" => ""), r"(?:\n[ \t]*)+\z" => "")
 
 # With no workers there is no worker to name.
-on_worker(run, i::ItemIdx) =
-    (single_process(run.plan) || run.statuses.slot[i] == 0) ? "" :
-    string(" on worker ", run.statuses.slot[i])
-
-item_logpath(run, i::ItemIdx) = item_log(run, i, max(run.statuses.attempt[i], 1))
+on_worker(run, slot::Integer) =
+    (single_process(run.plan) || slot == 0) ? "" : string(" on worker ", slot)
 
 # The failure report of an attempt, beside its log.
-failure_path(prefix::String, index::Integer, attempt::Integer) =
-    string(chopsuffix(item_log_path(prefix, index, attempt), ".log"), ".failure.txt")
+failure_path(prefix::String, index::Integer, attempt::Integer) = string(prefix, index, "_", attempt, ".failure.txt")
 
-"""
-    item_log_path(prefix, index, attempt) -> String
-
-Where one attempt at one item writes what it prints. Built a byte at a time:
-`string` boxes each number, and this runs for every dispatch.
-"""
-function item_log_path(prefix::String, index::Integer, attempt::Integer)
-    n = ncodeunits(prefix)
-    buf = Vector{UInt8}(undef, n + ndigits(index) + ndigits(attempt) + 5)
-    copyto!(buf, 1, codeunits(prefix), 1, n)
-    k = write_digits!(buf, n, index)
-    buf[k += 1] = UInt8('_')
-    k = write_digits!(buf, k, attempt)
-    for c in codeunits(".log")
-        buf[k += 1] = c
-    end
-    return String(buf)
-end
-
-function write_digits!(buf::Vector{UInt8}, k::Int, n::Integer)
-    for p in (ndigits(n) - 1):-1:0
-        buf[k += 1] = UInt8('0') + UInt8((n ÷ 10^p) % 10)
-    end
-    return k
-end
+# Where one attempt at one item writes what it prints.
+item_log_path(prefix::String, index::Integer, attempt::Integer) = string(prefix, index, "_", attempt, ".log")
 
 function collect_failures(ts::Test.AbstractTestSet, out = Any[])
     for r in ts.results

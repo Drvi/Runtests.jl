@@ -9,6 +9,7 @@ const PROTOCOL_VERSION = 5
 # An item as the protocol names it: its package and its name, which together tell
 # apart the items of a server of several packages.
 item_key(package::AbstractString, name::AbstractString) = (; package = String(package), name = String(name))
+item_key(p::Plan, i::Integer) = item_key(p.packages.name[p.items.package[i]], p.items.name[i])
 
 """
     EventStream
@@ -31,20 +32,10 @@ EventStream(io::IO) = EventStream(io, ReentrantLock(), nothing, nothing)
 const EVENTS = ScopedValue{Union{Nothing, EventStream}}(nothing)
 
 function emit(s::EventStream, event::AbstractString; id = nothing, fields...)
+    payload = id === nothing ? (; event, fields...) : (; event, id, fields...)
     line = sprint() do io
-        write(io, "{\"event\":")
-        write_json(io, event)
-        if id !== nothing
-            write(io, ",\"id\":")
-            write_json(io, id)
-        end
-        for (k, v) in fields
-            write(io, ',')
-            write_json(io, String(k))
-            write(io, ':')
-            write_json(io, v)
-        end
-        write(io, "}\n")
+        write_json(io, payload)
+        write(io, '\n')
     end
     @lock s.lock begin
         write(s.io, line)
@@ -73,17 +64,16 @@ end
 # The attempt as the statuses hold it, while they hold it (`record!`), and the item's
 # verdict once it ended: its `state` but for an attempt that decided nothing after one
 # that did.
-function event_item_finished(run, i::ItemIdx, state::ItemState, attempt::Integer, slot::Integer, note::AbstractString;
-                             verdict::ItemState = state)
+function event_item_finished(run, o)
     p = run.plan
-    st = run.statuses
-    ts = st.testsets[i]
-    failures = ts === nothing ? [] : [failure_json(p, r) for r in collect_failures(ts)]
-    log = item_log(run, i, max(attempt, 1))
+    i = o.i
+    failures = [failure_json(p, r) for r in collect_failures(o.testset)]
+    log = item_log(run, i, max(o.attempt, 1))
     emit(run.events, "item_finished"; id = run.events.run_id, item_json(p, i)...,
-         attempt = Int(attempt), attempts = attempts_for(p, p.items.unit[i]), worker = Int(slot),
-         pid = Int(st.pid[i]), state = state_name(state), verdict = state_name(verdict), elapsed = st.elapsed[i],
-         compile = st.compile[i], note = String(note), log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)
+         attempt = Int(o.attempt), attempts = attempts_for(p, p.items.unit[i]), worker = Int(o.slot),
+         pid = Int(o.pid), state = state_name(o.state), verdict = state_name(o.verdict),
+         elapsed = Float32(o.elapsed), compile = Float32(o.stats.compile_ns / 1.0e9),
+         note = o.note, log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)
     return nothing
 end
 
@@ -112,21 +102,28 @@ files that parse even when others do not, so an editor shows what it can beside
 what is broken. An item's `end_line` is the line before the next item in its file,
 or the file's last: the lines where `runtests("file.jl:line")` picks that item.
 """
-function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
+# Single-pass scan + config validation for one package, returning both the JSON
+# listing and the scanned data (`raw_items`, `setups`, `cfg`, `clean_scan`) so
+# `list_items_mono` performs cross-package checks without re-scanning any file.
+function scan_package_listing(root::AbstractString; config::Union{Nothing, AbstractString} = nothing,
+                              shared::Union{Nothing, SharedProfiles} = nothing)
     target = resolve_target((root,))
     config_file = config === nothing ? joinpath(target.testdir, "TestItems.toml") : abspath(config)
     files, strays, templates, environments = walk_test_dir(target.testdir)
     setups = setup_modules(target.testdir)
     items, errors, _ = scan_files(files, Filter(), setups; strays, templates, environments)
-    if !isempty(items)
-        # What a run would refuse to start on beyond the files: the settings, the
-        # profiles items name, the items `[order]` names.
-        try
-            plan(items, read_config(target.testdir; config, nunits = length(items)); root = target.root)
-        catch e
-            e isa ConfigError ? push!(errors, ScanError(config_file, 0, e.msg)) :
-                e isa ScanFailure ? append!(errors, e.errors) : rethrow()
-        end
+    # Whether the test files themselves parsed cleanly (ignoring strays/templates), matching `written_import_problems`.
+    scan_only_errors = length(errors) > length(strays)
+    cfg = nothing
+    try
+        path, toml = config_toml(target.testdir, config)
+        sh = shared === nothing ? package_shared_profiles(dirname(abspath(target.testdir))) : shared
+        cfg = build_config(path, toml; config_file = config === nothing ? "" : path,
+                           testdir = target.testdir, shared = sh, nunits = length(items))
+        isempty(items) || plan(items, cfg; root = target.root)
+    catch e
+        e isa ConfigError ? push!(errors, ScanError(config_file, 0, e.msg)) :
+            e isa ScanFailure ? append!(errors, e.errors) : rethrow()
     end
     last_lines = Dict(f => countlines(f) for f in unique(it.file for it in items))
     package = something(project_name_of(target.project), "")
@@ -145,9 +142,14 @@ function list_items(root::AbstractString; config::Union{Nothing, AbstractString}
             failfast = it.failfast < 0 ? nothing : it.failfast == 1)
     end
     failed = [item_key(package, n) for n in failing_items(target.root; names = Set(it.name for it in items))]
-    return (; root = target.root, testdir = target.testdir,
-            packages = [(; name = package, root = target.root, testdir = target.testdir)], items = out,
-            errors = scan_errors_json(errors), failed)
+    listing = (; root = target.root, testdir = target.testdir,
+               packages = [(; name = package, root = target.root, testdir = target.testdir)], items = out,
+               errors = scan_errors_json(errors), failed)
+    return (; listing, raw_items = scan_only_errors ? RawItem[] : items, setups, cfg)
+end
+
+function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
+    return scan_package_listing(root; config).listing
 end
 
 """
@@ -159,29 +161,32 @@ names and written imports that a package's own test environment cannot load.
 """
 function list_items_mono(root::AbstractString)
     ps = find_participants(root)
+    shared = shared_profiles(config_toml(joinpath(ps.workspace, "test"), nothing)..., ps.workspace)
     items, errors, failed = Any[], Any[], Any[]
     uses = Tuple{Int, Symbol}[]   # each package and throttle an item of it names
+    raw_items, owner = RawItem[], Int[]
+    setups = Vector{Dict{Symbol, String}}(undef, length(ps.root))
+    profiles = Vector{Dict{Symbol, Profile}}(undef, length(ps.root))
+    limits = Vector{Dict{Symbol, Int}}(undef, length(ps.root))
     for (k, r) in enumerate(ps.root)
-        l = list_items(r)
+        scanned = scan_package_listing(r; shared)
+        l = scanned.listing
         append!(items, l.items); append!(errors, l.errors); append!(failed, l.failed)
         foreach(it -> it.throttle === nothing || push!(uses, (k, Symbol(it.throttle))), l.items)
+        setups[k] = scanned.setups
+        profiles[k] = scanned.cfg === nothing ? Dict{Symbol, Profile}() : scanned.cfg.profiles
+        limits[k] = scanned.cfg === nothing ? Dict{Symbol, Int}() : scanned.cfg.throttle
+        append!(raw_items, scanned.raw_items)
+        append!(owner, fill(k, length(scanned.raw_items)))
     end
     try
-        check_setup_names(ps, [setup_modules(joinpath(r, "test")) for r in ps.root])
+        check_setup_names(ps, setups)
     catch e
         e isa ConfigError || rethrow()
         push!(errors, (; file = joinpath(ps.workspace, "Project.toml"), line = 0, message = e.msg))
     end
-    append!(errors, scan_errors_json(written_import_problems(ps; all_setups = false)))
+    append!(errors, scan_errors_json(import_problems(ps, raw_items, owner, profiles, setups; all_setups = false)))
     # A throttle the packages share, which a combined run refuses when their limits differ.
-    limits = map(ps.root) do r
-        try
-            read_config(joinpath(r, "test")).throttle
-        catch e
-            e isa ConfigError || rethrow()
-            Dict{Symbol, Int}()   # `list_items` said what is wrong with it
-        end
-    end
     try
         check_shared_limits(unique!(uses), limits, [string(ps.name[k], "'s TestItems.toml") for k in eachindex(ps.name)])
     catch e
@@ -339,44 +344,29 @@ function say_failure(stream::EventStream, id, e)
     return nothing
 end
 
+cmd_require(cond::Bool, msg::AbstractString) = cond || throw(ArgumentError(String(msg)))
+
 function start_run!(s::Session, id, cmd::Dict{String, Any})
-    if s.task !== nothing && !istaskdone(s.task)
-        emit_error(s.stream, "a run is already in progress; cancel it or wait for it to finish"; id)
-        return nothing
-    end
+    cmd_require(s.task === nothing || istaskdone(s.task), "a run is already in progress; cancel it or wait for it to finish")
     names = get(cmd, "names", nothing)
-    if names !== nothing && !(names isa Vector{Any} && all(n -> n isa String, names))
-        emit_error(s.stream, "`names` is a list of test item names, got $(json(names))"; id)
-        return nothing
-    end
+    cmd_require(names === nothing || (names isa Vector{Any} && all(n -> n isa String, names)),
+                "`names` is a list of test item names, got $(json(names))")
     keys_ = get(cmd, "items", nothing)
     is_key(k) = k isa Dict{String, Any} && get(k, "package", nothing) isa String && get(k, "name", nothing) isa String
-    if keys_ !== nothing && !(keys_ isa Vector{Any} && all(is_key, keys_))
-        emit_error(s.stream, "`items` is a list of test items, each an object of a `package` and a `name`, got $(json(keys_))"; id)
-        return nothing
-    end
-    if s.combined && names !== nothing
-        emit_error(s.stream, "a server of several packages runs `items`, each a `package` and a `name`, not `names`"; id)
-        return nothing
-    end
+    cmd_require(keys_ === nothing || (keys_ isa Vector{Any} && all(is_key, keys_)),
+                "`items` is a list of test items, each an object of a `package` and a `name`, got $(json(keys_))")
+    cmd_require(!(s.combined && names !== nothing),
+                "a server of several packages runs `items`, each a `package` and a `name`, not `names`")
     item_keys = keys_ === nothing ? nothing : Tuple{String, String}[(k["package"], k["name"]) for k in keys_]
     failing = get(cmd, "failing", false)
-    if !(failing isa Bool)
-        emit_error(s.stream, "`failing` is `true` or `false`, got $(json(failing))"; id)
-        return nothing
-    end
+    cmd_require(failing isa Bool, "`failing` is `true` or `false`, got $(json(failing))")
     options = get(Dict{String, Any}, cmd, "options")
-    if !(options isa Dict{String, Any})
-        emit_error(s.stream, "`options` is an object, got $(json(options))"; id)
-        return nothing
-    end
+    cmd_require(options isa Dict{String, Any}, "`options` is an object, got $(json(options))")
     kwargs = Pair{Symbol, Any}[]
     for (k, v) in options
         key = Symbol(k)
-        if !(key in RUN_OPTIONS)
-            emit_error(s.stream, "unknown option $(json(k)); the options are $(join(map(o -> json(String(o)), RUN_OPTIONS), ", "))"; id)
-            return nothing
-        end
+        cmd_require(key in RUN_OPTIONS,
+                    "unknown option $(json(k)); the options are $(join(map(o -> json(String(o)), RUN_OPTIONS), ", "))")
         # A seed as `run_started` gives it, `"0x…"`, since JSON integers stop at 2^63.
         value = key === :logs && v isa String ? Symbol(v) :
             key === :seed && v isa String ? something(tryparse(UInt64, v), v) : v
@@ -391,7 +381,7 @@ function start_run!(s::Session, id, cmd::Dict{String, Any})
     try
         p, target, unknown = s.combined ? prepare_for_editor_mono(s, item_keys, kwargs; failing) :
             prepare_for_editor(s, names, item_keys, kwargs; failing)
-        emit(s.stream, "run_started"; id, items = [item_key(p.packages.name[p.items.package[i]], p.items.name[i]) for i in 1:nitems(p)],
+        emit(s.stream, "run_started"; id, items = [item_key(p, i) for i in 1:nitems(p)],
              workers = single_process(p) ? 0 : nslots(p), seed = seed_text(p.cfg.seed),
              unknown = [item_key(pkg, n) for (pkg, n) in unknown])
         s.cancelled = false
@@ -486,7 +476,7 @@ function emit_run_finished(stream::EventStream, id, run, ended::String)
     p = run.plan
     state = ended != "finished" ? ended : any(is_non_pass, st.state) ? "failed" : "passed"
     counts = Dict(state_name(k) => count(==(k), st.state) for k in (PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, CANCELLED))
-    not_run = [item_key(p.packages.name[p.items.package[i]], p.items.name[i]) for i in 1:nitems(p)
+    not_run = [item_key(p, i) for i in 1:nitems(p)
                if st.state[i] === UNSEEN || st.state[i] === RUNNING]
     rs = @atomic run.runstate
     # Each package's run state: one, or one for each package of a combined run.

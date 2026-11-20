@@ -26,7 +26,7 @@ mutable struct AttemptArtifacts
     const full_stacktraces :: Bool      # a producer's error keeps the framework's own frames
     const root      :: String           # where producers run, as the item did (see `ItemSpec`)
     const lock      :: ReentrantLock    # guards everything below
-    const producers :: Vector{Any}
+    producers       :: Union{Nothing, Vector{Any}}
     open            :: Bool
     files           :: Bool             # whether `files/` was made
     # The item's module, kept from `release_globals!` while producers may still read it;
@@ -34,11 +34,12 @@ mutable struct AttemptArtifacts
     modsym          :: Symbol
 end
 
-AttemptArtifacts(spec::ItemSpec) = AttemptArtifacts(
-    spec.index, spec.attempt, spec.artifacts,
-    TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile), spec.full_stacktraces, spec.root,
-    ReentrantLock(), Any[], true, false, Symbol("")
-)
+function AttemptArtifacts(spec::ItemSpec)
+    info = something(CURRENT_TESTITEM[],
+                     TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile))
+    return AttemptArtifacts(spec.index, spec.attempt, spec.artifacts, info,
+                            spec.full_stacktraces, spec.root, ReentrantLock(), nothing, true, false, Symbol(""))
+end
 
 # What an attempt's result says of its evidence, so that one with none costs the
 # coordinator nothing further.
@@ -46,7 +47,8 @@ const ARTIFACT_FILES     = 0x01   # it made `files/`
 const ARTIFACT_PRODUCERS = 0x02   # it registered producers
 
 artifact_flags(a::AttemptArtifacts) = @lock a.lock UInt8(
-    (a.files ? ARTIFACT_FILES : 0x00) | (isempty(a.producers) ? 0x00 : ARTIFACT_PRODUCERS)
+    (a.files ? ARTIFACT_FILES : 0x00) |
+    (a.producers !== nothing && !isempty(a.producers) ? ARTIFACT_PRODUCERS : 0x00)
 )
 
 """
@@ -99,8 +101,14 @@ function on_failure(f)
     a = current_artifacts("on_failure")
     first_one = @lock a.lock begin
         a.open || throw(closed_error("on_failure"))
-        push!(a.producers, f)
-        length(a.producers) == 1
+        ps = a.producers
+        if ps === nothing
+            a.producers = Any[f]
+            true
+        else
+            push!(ps, f)
+            false
+        end
     end
     first_one && note_registration(a)
     return nothing
@@ -145,7 +153,7 @@ end
 function close_registration!(a::AttemptArtifacts, modsym::Symbol)
     @lock a.lock begin
         a.open = false
-        isempty(a.producers) && return false
+        (a.producers === nothing || isempty(a.producers)) && return false
         a.modsym = modsym
         return true
     end
@@ -154,7 +162,7 @@ end
 # Let go of what an attempt's producers, and the module kept for them, refer to.
 function release_artifacts!(a::AttemptArtifacts)
     m = @lock a.lock begin
-        empty!(a.producers)
+        a.producers = nothing
         m = a.modsym
         a.modsym = Symbol("")
         m
@@ -199,7 +207,9 @@ end
 # Each producer in turn, with what it prints, its errors and its timing in the log
 # beside the evidence. One that fails leaves the rest to run.
 function run_producers(a::AttemptArtifacts)
-    producers = @lock a.lock copy(a.producers)
+    # Registration is closed (`a.open == false`) before `run_producers` runs, so no task can mutate `a.producers`.
+    producers = a.producers
+    producers === nothing && return (producers = 0, failed = 0, seconds = 0.0)
     t0 = time()
     failed = 0
     capture_output(artifacts_log_path(a.dir)) do

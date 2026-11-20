@@ -21,31 +21,43 @@ const ensure_checked! = OncePerProcess{Bool}() do
     platform_selfcheck!()
 end
 
+# Cached OS page size (avoids per-tick `getpagesize` syscall on macOS and fixes
+# 64 KiB-page Linux hosts before `platform_selfcheck!` runs).
+const PAGE_SIZE = OncePerProcess{Int64}() do
+    @static if Sys.isapple()
+        Int64(ccall(:getpagesize, Cint, ()))
+    elseif Sys.islinux()
+        Int64(ccall(:jl_getpagesize, Clong, ()))
+    else
+        Int64(4096)
+    end
+end
+
 ### macOS ##################################################################
 
 # proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, size): `struct proc_taskinfo`
 # starts with pti_virtual_size then pti_resident_size, both UInt64.
 const PROC_PIDTASKINFO = Cint(4)
 const TASKINFO_BYTES = 128
-const RESIDENT_OFFSET = 8
 
 function rss_macos(pid::Integer)
-    buf = zeros(UInt8, TASKINFO_BYTES)
+    # 16 × UInt64 = 128 bytes stack-allocated; slot 2 is `pti_resident_size` at +8.
+    buf = Ref{NTuple{16, UInt64}}()
     n = ccall(
-        :proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{UInt8}, Cint),
+        :proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint),
         pid, PROC_PIDTASKINFO, 0, buf, TASKINFO_BYTES
     )
     n <= 0 && return Int64(-1)
-    return Int64(only(reinterpret(UInt64, @view buf[(RESIDENT_OFFSET + 1):(RESIDENT_OFFSET + 8)])))
+    return Int64(buf[][2])
 end
 
 # Returns the number of children, not a byte count. Misread, it yields an empty
 # list, which the self-check catches by looking for a process it started.
 function children_macos(pid::Integer)
-    buf = zeros(Int32, 256)
+    buf = Vector{Int32}(undef, 256)
     n = ccall(:proc_listchildpids, Cint, (Cint, Ptr{Int32}, Cint), pid, buf, Cint(sizeof(buf)))
     n <= 0 && return Int32[]
-    return buf[1:min(Int(n), length(buf))]
+    return resize!(buf, min(Int(n), length(buf)))
 end
 
 # The name macOS gives the machine, `LocalHostName`, which stays when the hostname
@@ -71,13 +83,9 @@ end
 
 ### Linux ##################################################################
 
-const PAGESIZE = Ref{Int64}(4096)
-
 function rss_linux(pid::Integer)
-    path = "/proc/$(pid)/statm"
-    isfile(path) || return Int64(-1)
     fields = try
-        split(read(path, String))
+        split(read("/proc/$(pid)/statm", String))
     catch e
         is_interrupt(e) && rethrow()
         return Int64(-1)
@@ -85,7 +93,7 @@ function rss_linux(pid::Integer)
     length(fields) >= 2 || return Int64(-1)
     pages = tryparse(Int64, fields[2])
     pages === nothing && return Int64(-1)
-    return pages * PAGESIZE[]
+    return pages * PAGE_SIZE()
 end
 
 function children_linux(pid::Integer)
@@ -143,10 +151,31 @@ end
 const TH32CS_SNAPPROCESS = UInt32(0x2)
 const INVALID_HANDLE_VALUE = reinterpret(Ptr{Cvoid}, typemax(UInt))
 
-# The children of each pid, as a function, from a list of `pid => parent`. A pid
+# MEMORYSTATUSEX (64 bytes): dwLength, dwMemoryLoad, and 7 UInt64 byte counters.
+struct MemoryStatusEx
+    dwLength::UInt32
+    dwMemoryLoad::UInt32
+    ullTotalPhys::UInt64
+    ullAvailPhys::UInt64
+    ullTotalPageFile::UInt64
+    ullAvailPageFile::UInt64
+    ullTotalVirtual::UInt64
+    ullAvailVirtual::UInt64
+    ullAvailExtendedVirtual::UInt64
+end
+
+# The children of each pid, indexed once in O(P) so BFS lookups are O(1). A pid
 # Windows has reused since a parent exited can name a process that was never the
 # parent's child; a snapshot cannot tell them apart.
-children_in(parents) = pid -> Int32[c for (c, p) in parents if p == pid && c != pid]
+function children_in(parents)
+    by_parent = Dict{Int32, Vector{Int32}}()
+    for (c, p) in parents
+        c == p && continue
+        push!(get!(Vector{Int32}, by_parent, Int32(p)), Int32(c))
+    end
+    empty_pids = Int32[]
+    return pid -> get(by_parent, Int32(pid), empty_pids)
+end
 
 # The Windows API is `stdcall`, which only 32-bit Windows tells apart from C's, and
 # which LLVM refuses to compile for other processors: the calls exist on Windows only.
@@ -195,11 +224,10 @@ children_in(parents) = pid -> Int32[c for (c, p) in parents if p == pid && c != 
     children_windows(pid::Integer) = children_in(process_parents_windows())(pid)
 
     function available_fraction_windows()
-        buf = zeros(UInt8, 64)
-        reinterpret(UInt32, @view buf[1:4])[1] = UInt32(length(buf))
-        ok = ccall(:GlobalMemoryStatusEx, stdcall, Cint, (Ptr{UInt8},), buf)
+        st = Ref(MemoryStatusEx(UInt32(sizeof(MemoryStatusEx)), 0, 0, 0, 0, 0, 0, 0, 0))
+        ok = ccall(:GlobalMemoryStatusEx, stdcall, Cint, (Ref{MemoryStatusEx},), st)
         ok == 0 && return -1.0
-        load = only(reinterpret(UInt32, @view buf[5:8]))
+        load = st[].dwMemoryLoad
         load > 100 && return -1.0
         return (100 - Float64(load)) / 100
     end
@@ -270,7 +298,7 @@ function available_fraction_macos()
         n < 0 && return -1.0
         pages += n
     end
-    return clamp(pages * Int64(ccall(:getpagesize, Cint, ())) / total, 0.0, 1.0)
+    return clamp(pages * PAGE_SIZE() / total, 0.0, 1.0)
 end
 
 function meminfo_available()
@@ -310,12 +338,15 @@ function cgroup_available()
         reclaimable = Int64(0)
         if isfile("/sys/fs/cgroup/memory.stat")
             for line in eachline("/sys/fs/cgroup/memory.stat")
-                parts = split(line)
-                length(parts) == 2 || continue
-                if parts[1] == "inactive_file" || parts[1] == "slab_reclaimable"
-                    v = tryparse(Int64, parts[2])
-                    v === nothing || (reclaimable += v)
+                rest = if startswith(line, "inactive_file ")
+                    SubString(line, ncodeunits("inactive_file ") + 1)
+                elseif startswith(line, "slab_reclaimable ")
+                    SubString(line, ncodeunits("slab_reclaimable ") + 1)
+                else
+                    continue
                 end
+                v = tryparse(Int64, rest)
+                v === nothing || (reclaimable += v)
             end
         end
         return clamp((limit - max(current - reclaimable, 0)) / limit, 0.0, 1.0)
@@ -414,11 +445,12 @@ worker's time counts once it has exited and been reaped.
 function process_cpu_seconds()
     Sys.iswindows() && return -1.0
     total = 0.0
-    buf = zeros(UInt8, RUSAGE_BYTES)
+    # 32 × UInt64 = 256 bytes stack-allocated (`struct rusage` is ≤144 bytes).
+    buf = Ref{NTuple{32, UInt64}}()
     for who in (RUSAGE_SELF, RUSAGE_CHILDREN)
-        ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), who, buf) == 0 || return -1.0
+        ccall(:getrusage, Cint, (Cint, Ptr{Cvoid}), who, buf) == 0 || return -1.0
         # `ru_utime` then `ru_stime`, where `struct rusage` starts.
-        for t in GC.@preserve buf unsafe_load(Ptr{NTuple{2, Timeval}}(pointer(buf)))
+        for t in GC.@preserve buf unsafe_load(Ptr{NTuple{2, Timeval}}(Base.unsafe_convert(Ptr{Cvoid}, buf)))
             total += t.sec + t.usec / 1e6
         end
     end
@@ -482,14 +514,18 @@ against a process we just started ourselves.
 function platform_selfcheck!()
     PER_PROCESS_OK[] = false
     try
-        Sys.islinux() && (PAGESIZE[] = Int64(ccall(:jl_getpagesize, Clong, ())))
         me = getpid()
         rss = process_rss(me)
         maxrss = Int64(Sys.maxrss())
         # Resident size is not maxrss, but a working binding lands in the same
         # neighbourhood; a wrong struct offset does not.
         (rss > 0 && maxrss > 0 && rss < 100 * maxrss && rss > maxrss ÷ 100) || return false
-        proc = run(`$(Base.julia_cmd()[1]) --startup-file=no --history-file=no -e "sleep(20)"`; wait = false)
+        cmd = if !Sys.iswindows() && isfile("/bin/sleep")
+            `/bin/sleep 20`
+        else
+            `$(Base.julia_cmd()[1]) --startup-file=no --history-file=no -e "sleep(20)"`
+        end
+        proc = run(cmd; wait = false)
         try
             found = false
             for _ in 1:100
@@ -499,6 +535,7 @@ function platform_selfcheck!()
             found || return false
         finally
             kill(proc, Base.SIGKILL)
+            try wait(proc) catch end
         end
         PER_PROCESS_OK[] = true
         return true

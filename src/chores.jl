@@ -76,14 +76,10 @@ function package_chores!(io::IO, target, fix::Bool, configs::Vector{String})
     n, bad = said!(io, chore_step(io -> chore_templates!(io, target, fix)))
     todo += n
     problems += bad
-    # The checks that read the suite read it at the same time, each in a task.
-    suite = chore_task(io -> check_suite!(io, target))
-    named = [chore_task(io -> check_named_config!(io, target, path)) for path in configs]
-    (bad, names) = said!(io, suite)
+    # Scan the suite once, then check TestItems.toml, every named config, and every
+    # `[groups]` entry in memory against that single scan.
+    (bad, names) = said!(io, chore_step(io -> check_suite!(io, target, configs)))
     problems += bad
-    for t in named
-        problems += said!(io, t)
-    end
     todo += said!(io, chore_step(io -> chore_runstates!(io, target, fix, names)))
     return todo, problems
 end
@@ -103,119 +99,121 @@ function print_chores_outcome(io::IO, fix::Bool, todo::Integer, problems::Intege
     return nothing
 end
 
-# `prepare` of the package of `target` as a check does it, quietly and without
-# expanding templates. A run shows paths from its package's root, and the report
-# keeps showing them from the root it had.
-function prepare_to_check(target; kwargs...)
-    shown_from = PROJECT_ROOT[]
-    try
-        return prepare((target.root,); announce = false, expansions = false, kwargs...)
-    finally
-        PROJECT_ROOT[] = shown_from
-    end
-end
-
-# The suite as a full run would read it: its items, all of them whatever group the
-# config or the environment would select, then its settings and what they name,
-# each group's selection among them. The number of problems a person has to fix,
-# and the names of the test items, `nothing` when they could not be read. The
-# expansions of templates are the templates step's to report.
-function check_suite!(io::IO, target)
-    config = joinpath(target.testdir, "TestItems.toml")
+# The suite as a full run would read it: scan once, then check `test/TestItems.toml`,
+# each extra config in `configs`, and every `[groups]` entry against the scanned items
+# in memory. Returns the number of problems a person has to fix, and the names of the
+# test items (`nothing` when they could not be read).
+function check_suite!(io::IO, target, configs::Vector{String} = String[])
+    default_config = joinpath(target.testdir, "TestItems.toml")
     # A package with no test files of any kind, a fixture package in another's
     # `test/` say, has no suite for chores to keep: nothing to do, where a run of it
     # has nothing to run and says so.
-    # The settings' own problems are said below, by the run's reading of them.
     walked = walk_test_dir(target.testdir)
     if all(isempty, (walked.tests, walked.strays, walked.templates))
         println(io, "test items: none, no test files under ", joinpath(relpath_or_path(target.testdir), ""))
-        return 0, Set{String}()
-    end
-    try
-        p, _ = prepare_to_check(target; group = ALL_GROUP)
-        println(io, "test items: ", nitems(p), " in ", plural(length(p.files), "file"), ", all valid")
-        print(io, "config: ")
-        if isfile(config)
-            printstyled(io, relpath_or_path(config); color = :light_black)
-            println(io, ", valid")
-        else
-            println(io, "none")
+        bad = 0
+        for path in configs
+            bad += check_config_entry!(io, target, path, nothing, nothing, nothing, walked.environments)
         end
-        return check_groups!(io, target, p.cfg.groups), Set(p.items.name)
+        return bad, Set{String}()
+    end
+
+    items = nothing
+    suite_names = String[]
+    suite_tags = Set{Symbol}()
+    problems = 0
+    try
+        setups = setup_modules(target.testdir)
+        if isempty(walked.tests)
+            isempty(walked.strays) || throw(ScanFailure(copy(walked.strays)))
+            throw(NoTestsError("no test files found under $(joinpath(relpath_or_path(target.testdir), "")); test files are " *
+                               "named `*_test.jl` or `*_tests.jl` and live under `test/`"))
+        end
+        items = scan(walked.tests, Filter(), setups; strays = walked.strays, templates = walked.templates,
+                     expansions = false, suite_names, environments = walked.environments, suite_tags)
+        isempty(items) && throw(NoTestsError("no test items matched the filter"))
+        println(io, "test items: ", length(items), " in ", plural(length(unique(it -> it.file, items)), "file"), ", all valid")
     catch e
-        e isa ConfigError && return print_problem(io, "config", e.msg), nothing
+        if e isa ConfigError
+            problems += print_problem(io, "config", e.msg)
+            for path in configs
+                problems += check_config_entry!(io, target, path, nothing, nothing, nothing, walked.environments)
+            end
+            return problems, nothing
+        end
         e isa ScanFailure || e isa NoTestsError || rethrow()
         # Under a dry run the test files may be expansions `chores` has yet to write.
         if e isa NoTestsError && any(t -> !isfile(expansion_of(t)), walked.templates)
             println(io, "test items: none to read until the templates are expanded")
-            return 0, nothing
+            for path in configs
+                problems += check_config_entry!(io, target, path, nothing, nothing, nothing, walked.environments)
+            end
+            return problems, nothing
         end
-        n = if e isa ScanFailure
+        problems += if e isa ScanFailure
             println(io, "test items: ", plural(length(e.errors), "problem"), ":")
             foreach(err -> println(io, "  ", err), e.errors)
             length(e.errors)
         else
             print_problem(io, "test items", e.msg)
         end
-        # The settings on their own: which items they name waits on the items.
-        try
-            read_config(target.testdir)
-        catch e2
-            e2 isa ConfigError || rethrow()
-            return n + print_problem(io, "config", e2.msg), nothing
-        end
-        if isfile(config)
-            print(io, "config: ")
-            printstyled(io, relpath_or_path(config); color = :light_black)
-            println(io, " reads; the items it names are checked once the test items read")
-        end
-        return n, nothing
     end
+
+    problems += check_config_entry!(io, target, nothing, items, suite_names, suite_tags, walked.environments;
+                                    default_path = default_config)
+    for path in configs
+        problems += check_config_entry!(io, target, path, items, suite_names, suite_tags, walked.environments)
+    end
+    return problems, items === nothing ? nothing : Set{String}(suite_names)
 end
 
-# A config file the call named, checked as a run given it would check it: its
-# settings, and what they name among the test items, or the settings alone when the
-# items do not read. The number of problems a person has to fix, one when it is
-# wrong at all.
-function check_named_config!(io::IO, target, path::AbstractString)
-    items_read = true
-    groups = Dict{String, TagExpr}()
-    try
-        p, _ = prepare_to_check(target; config = path, group = ALL_GROUP)
-        groups = p.cfg.groups
-    catch e
-        e isa ConfigError && return print_problem(io, "config", e.msg)
-        e isa ScanFailure || e isa NoTestsError || rethrow()
-        items_read = false
-        try
-            read_config(target.testdir; config = path)
-        catch e2
-            e2 isa ConfigError || rethrow()
-            return print_problem(io, "config", e2.msg)
+# Validate one config file (`nothing` for `test/TestItems.toml`, or an explicit path)
+# and its `[groups]` against already-scanned `items` (or settings alone when `items === nothing`).
+function check_config_entry!(io::IO, target, config::Union{Nothing, AbstractString},
+                             items::Union{Nothing, Vector{RawItem}}, suite_names, suite_tags,
+                             environments::Vector{String}; default_path::String = "")
+    cfg = try
+        nunits = items === nothing ? 0 : length(items)
+        c = read_config(target.testdir; config, nunits)
+        if items !== nothing
+            naming = naming_root(target.root)
+            check_skip_environment(c.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming, ConfigError)
+            plan(items, c; history = History(), root = target.root, suite_names)
         end
+        c
+    catch e
+        e isa ConfigError || rethrow()
+        return print_problem(io, "config", e.msg)
+    end
+    path = config === nothing ? default_path : abspath(config)
+    if config === nothing && !isfile(path)
+        items === nothing || println(io, "config: none")
+        return 0
     end
     print(io, "config: ")
-    printstyled(io, relpath_or_path(abspath(path)); color = :light_black)
-    println(io, items_read ? ", valid" : " reads; the items it names are checked once the test items read")
-    return check_groups!(io, target, groups; config = path)
+    printstyled(io, relpath_or_path(path); color = :light_black)
+    if items === nothing
+        println(io, " reads; the items it names are checked once the test items read")
+        return 0
+    end
+    println(io, ", valid")
+    return check_groups!(io, path, cfg.groups, items, suite_tags)
 end
 
-# Every group of `[groups]` as a run selecting it would read it, since a lane of CI
-# that selects one finds a tag no item carries, or nothing to run, only when it
-# runs. Each reads the suite, in a task of its own. The number of groups wrong.
-function check_groups!(io::IO, target, groups::Dict{String, TagExpr}; config = nothing)
-    checks = map(sort!(collect(keys(groups)))) do name
-        Threads.@spawn try
-            prepare_to_check(target; config, group = name)
-            nothing
-        catch e
-            e isa ConfigError || e isa NoTestsError || rethrow()
-            e isa ConfigError ? e.msg : "group `$name` selects no test item"
-        end
-    end
+# Every group of `[groups]` checked in memory against the already-scanned items and
+# suite tags: catches unknown tags (`ConfigError`) and groups selecting zero items.
+function check_groups!(io::IO, config_path::AbstractString, groups::Dict{String, TagExpr},
+                       items::Vector{RawItem}, suite_tags::Set{Symbol})
     bad = 0
-    for t in checks
-        msg = fetch_result(t)
+    for name in sort!(collect(keys(groups)))
+        expr = groups[name]
+        msg = try
+            check_tags_exist(Filter(; group = GroupSelection(name, expr, "from the `group` keyword", String(config_path))), suite_tags)
+            any(it -> matches_tags(expr, it.tags), items) ? nothing : "group `$name` selects no test item"
+        catch e
+            e isa ConfigError || rethrow()
+            e.msg
+        end
         msg === nothing || (bad += print_problem(io, "groups", msg))
     end
     return bad
@@ -303,17 +301,19 @@ function chore_runstates!(io::IO, target, fix::Bool, names)
     isempty(files) && (println(io, "none"); return 0)
     print(io, length(files), " in ")
     printstyled(io, relpath_or_path(runstate_dir(target.root)); color = :light_black)
-    stale = prunable_runstates(target.root; names)
-    if isempty(stale)
-        println(io, ", none to delete")
-    else
-        # Another process may be reading one, or have deleted it, already.
-        fix && foreach(remove_runstate, stale)
-        println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete", ": beyond the newest ",
-                KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not")
+    return with_runs_read(target.root) do
+        stale = prunable_runstates(target.root; names)
+        if isempty(stale)
+            println(io, ", none to delete")
+        else
+            # Another process may be reading one, or have deleted it, already.
+            fix && foreach(remove_runstate, stale)
+            println(io, ", ", length(stale), " of this machine's ", fix ? "deleted" : "to delete", ": beyond the newest ",
+                    KEEP_RUNS, ", and holding nothing about the suite's items that a newer one does not")
+        end
+        print_other_machines(io, target.root)
+        return length(stale)
     end
-    print_other_machines(io, target.root)
-    return length(stale)
 end
 
 # The project's run states that other machines recorded, which no deletion on this

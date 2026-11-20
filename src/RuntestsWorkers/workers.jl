@@ -72,11 +72,13 @@ struct Frame
     error   :: Any     # the exception, when the payload could not be deserialized here
 end
 
+# Cap retained per-connection scratch buffers so one huge payload does not pin memory.
+const MAX_RETAINED_BUFFER = 1_048_576
+
 # `serialize` in the latest world, so a method a test item defined for its own type
-# is used. `sizehint` is the size of the previous message: a run's messages are
-# much alike, and a fresh `IOBuffer` doubles its way up from 32 bytes.
-function encode_message(id::UInt64, kind::UInt8, payload, sizehint::Integer = 0)
-    buf = IOBuffer(; sizehint = max(Int(sizehint), 64))
+# is used. Reuses `buf` in place to avoid per-message buffer growth and copies.
+function encode_message!(buf::IOBuffer, id::UInt64, kind::UInt8, payload)
+    truncate(buf, 0)
     write(buf, id, kind, UInt32(0))
     Base.invokelatest(serialize, buf, payload)
     len = UInt32(position(buf) - HEADER_BYTES)
@@ -84,6 +86,12 @@ function encode_message(id::UInt64, kind::UInt8, payload, sizehint::Integer = 0)
     write(buf, len)
     seekend(buf)
     write(buf, MSG_BOUNDARY)
+    return buf
+end
+
+function encode_message(id::UInt64, kind::UInt8, payload, sizehint::Integer = 0)
+    buf = IOBuffer(; sizehint = max(Int(sizehint), 64))
+    encode_message!(buf, id, kind, payload)
     return take!(buf)
 end
 
@@ -114,7 +122,7 @@ function read_message(io::IO, r::FrameReader = FrameReader())
     kind = header_field(r.header, UInt8, 8)
     len = header_field(r.header, UInt32, 9)
     # `resize!` down keeps the capacity, so after the first few messages this is
-    # the same memory every time.
+    # the same memory every time (capped at `MAX_RETAINED_BUFFER` afterwards).
     resize!(r.payload, len)
     read!(io, r.payload)
     read!(io, r.boundary)
@@ -125,6 +133,10 @@ function read_message(io::IO, r::FrameReader = FrameReader())
         payload = Base.invokelatest(deserialize, IOBuffer(r.payload))
     catch e
         err = e
+    end
+    if length(r.payload) > MAX_RETAINED_BUFFER
+        empty!(r.payload)
+        sizehint!(r.payload, 0)
     end
     return Frame(id, kind, payload, err)
 end
@@ -140,16 +152,17 @@ Base.fetch(f::Future) = fetch(f.value)
 
 mutable struct Worker
     const lock       :: ReentrantLock    # guards `futures`, and the `terminated` check made when registering one
-    const write_lock :: ReentrantLock    # one message at a time on the socket
+    const write_lock :: ReentrantLock    # guards `write_buf` and serialized socket writes
+    write_buf        :: IOBuffer         # reusable encode buffer for outgoing requests
     const pid        :: Int
     const process    :: Base.Process
     const socket     :: TCPSocket
+    const output_done :: Base.Event      # notified when `redirect_worker_output` finishes
     messages         :: Task
     output           :: Task
     process_watch    :: Task
     const futures    :: Dict{UInt64,Future}
     @atomic next_id    :: UInt64
-    @atomic last_encoded :: Int          # size of the last message sent, as a buffer hint
     @atomic terminated :: Bool
     @atomic closing    :: Bool           # the coordinator closed the connection and expects the worker to exit on its own
     # Why the process was ended: the `from` of the first `terminate!`, `:interrupt`
@@ -329,8 +342,11 @@ function end_group!(w::Worker)
     alive() = ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), 0) == 0
     alive() || return nothing
     ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), Base.SIGTERM)
-    timedwait(() -> !alive(), TERM_GRACE_SECONDS; pollint=0.02) === :ok && return nothing
-    ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), Base.SIGKILL)
+    deadline = time() + TERM_GRACE_SECONDS
+    while alive() && time() < deadline
+        sleep(0.05)
+    end
+    alive() && ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), Base.SIGKILL)
     return nothing
 end
 
@@ -561,6 +577,16 @@ function inspect!(w::Worker)
     return nothing
 end
 
+function fail_futures!(w::Worker, cause::Exception)
+    @lock w.lock begin
+        for (_, fut) in w.futures
+            close(fut.value, cause)
+        end
+        empty!(w.futures)
+    end
+    return nothing
+end
+
 """
     terminate!(w::Worker, from::Symbol=:manual, cause::Exception=WorkerTerminatedException(w))
 
@@ -573,12 +599,7 @@ function terminate!(w::Worker, from::Symbol=:manual, cause::Exception=WorkerTerm
     (; success) = @atomicreplace w.terminated false => true
     success || return nothing
     @atomic w.ended_by = from
-    @lock w.lock begin
-        for (_, fut) in w.futures
-            close(fut.value, cause)
-        end
-        empty!(w.futures)
-    end
+    fail_futures!(w, cause)
     # A worker that is already exiting (the coordinator closed the connection, or
     # the worker closed its own) gets a moment to finish. Signalled, it would report
     # the signal instead of the exit status it was about to give, and print a
@@ -597,8 +618,7 @@ function terminate!(w::Worker, from::Symbol=:manual, cause::Exception=WorkerTerm
     return nothing
 end
 
-function watch_and_terminate!(w::Worker, ev::Threads.Event)
-    notify(ev)
+function watch_and_terminate!(w::Worker)
     # This task records the process's end, so it waits on through an interrupt.
     while true
         try
@@ -638,12 +658,7 @@ on the event loop, as closing the connection is, can last forever.
 function kill!(w::Worker; exiting::Bool = false)
     (; success) = @atomicreplace w.terminated false => true
     success && (@atomic w.ended_by = :interrupt)
-    exiting || @lock w.lock begin
-        for (_, fut) in w.futures
-            close(fut.value, WorkerTerminatedException(w))
-        end
-        empty!(w.futures)
-    end
+    exiting || fail_futures!(w, WorkerTerminatedException(w))
     try
         process_exited(w.process) || signal!(w.pid, w.process, Base.SIGKILL)
     catch e
@@ -682,8 +697,13 @@ function Base.wait(w::Worker)
     # The worker and its process group are gone by now, but the relay ends at EOF,
     # which a process that left the group and holds the pipe can put off for as long
     # as it runs. What the worker wrote has been read by then, or never will be.
-    if timedwait(() -> istaskdone(w.output), GRACEFUL_EXIT_SECONDS; pollint=0.02) !== :ok
-        close(w.process.out)
+    if !istaskdone(w.output)
+        timer = Timer(_ -> close(w.process.out), GRACEFUL_EXIT_SECONDS)
+        try
+            wait(w.output_done)
+        finally
+            close(timer)
+        end
     end
     try
         wait(w.output)
@@ -770,18 +790,16 @@ function Worker(;
             write(s, cookie)
             s
         end
-        w = Worker(ReentrantLock(), ReentrantLock(), pid, proc, sock,
-                   Task(nothing), Task(nothing), Task(nothing),
-                   Dict{UInt64,Future}(), UInt64(0), 0, false, false, :none, job, on_exit)
+        w = Worker(ReentrantLock(), ReentrantLock(), IOBuffer(; sizehint = 1024), pid, proc, sock,
+                   Base.Event(), Task(nothing), Task(nothing), Task(nothing),
+                   Dict{UInt64,Future}(), UInt64(0), false, false, :none, job, on_exit)
         # Shielded: these watch the worker until it has gone, which on Ctrl-C is
         # what the caller's teardown waits for.
-        e1, e2, e3 = Threads.Event(), Threads.Event(), Threads.Event()
         shielded() do
-            w.process_watch = Threads.@spawn watch_and_terminate!(w, e1)
-            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, e2)
-            w.messages = Threads.@spawn process_responses(w, e3)
+            w.process_watch = Threads.@spawn watch_and_terminate!(w)
+            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc)
+            w.messages = Threads.@spawn process_responses(w)
         end
-        wait(e1); wait(e2); wait(e3)
         return w
     catch
         try
@@ -858,30 +876,32 @@ end
 # `eof` blocks until there is a line or the pipe is closed, and the partial last
 # line of a worker that was killed comes back from `readline`: nothing is polled
 # for and nothing is lost.
-function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process, ev::Threads.Event)
-    notify(ev)
-    while true
-        try
-            while !eof(proc)
-                line = readline(proc)
-                isempty(line) || (fn(io, w.pid, line); flush(io))
+function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process)
+    try
+        while true
+            try
+                while !eof(proc)
+                    line = readline(proc)
+                    isempty(line) || (fn(io, w.pid, line); flush(io))
+                end
+                return nothing
+            catch e
+                # `eof` and `readline` wait on the pipe's buffer and take nothing from it
+                # until a line is whole, so an interrupt loses no output.
+                is_interrupt(e) && (forward_interrupt(e); continue)
+                # Without a relay the worker blocks as soon as the pipe fills, so it
+                # cannot be kept.
+                @error "Runtests: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
+                terminate!(w, :output_error, e)
+                return nothing
             end
-            return nothing
-        catch e
-            # `eof` and `readline` wait on the pipe's buffer and take nothing from it
-            # until a line is whole, so an interrupt loses no output.
-            is_interrupt(e) && (forward_interrupt(e); continue)
-            # Without a relay the worker blocks as soon as the pipe fills, so it
-            # cannot be kept.
-            @error "Runtests: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
-            terminate!(w, :output_error, e)
-            return nothing
         end
+    finally
+        notify(w.output_done)
     end
 end
 
-function process_responses(w::Worker, ev::Threads.Event)
-    notify(ev)
+function process_responses(w::Worker)
     reader = FrameReader()
     try
         while true
@@ -973,23 +993,26 @@ remote_finish(w::Worker, index::Integer, attempt::Integer, collect::Bool) =
 
 function send_request(w::Worker, kind::UInt8, payload)
     id = @atomic w.next_id += 1
-    # A payload that will not serialize leaves nothing registered.
-    bytes = encode_message(id, kind, payload, @atomic w.last_encoded)
-    @atomic w.last_encoded = length(bytes)
     fut = Future(id, Channel{Any}(1))
-    # Registered under the lock that `terminate!` sweeps futures under, together
-    # with the `terminated` check: a future is either swept or never registered,
-    # never left waiting for a reply that cannot come.
-    @lock w.lock begin
-        w.terminated && throw(WorkerTerminatedException(w))
-        w.futures[id] = fut
-    end
-    try
-        @lock w.write_lock write(w.socket, bytes)
-    catch e
-        @lock w.lock delete!(w.futures, id)
-        w.terminated && throw(WorkerTerminatedException(w))
-        rethrow()
+    @lock w.write_lock begin
+        # A payload that will not serialize leaves nothing registered.
+        buf = encode_message!(w.write_buf, id, kind, payload)
+        # Registered under the lock that `terminate!` sweeps futures under, together
+        # with the `terminated` check: a future is either swept or never registered,
+        # never left waiting for a reply that cannot come.
+        @lock w.lock begin
+            w.terminated && throw(WorkerTerminatedException(w))
+            w.futures[id] = fut
+        end
+        try
+            write(w.socket, @view buf.data[1:buf.size])
+        catch e
+            @lock w.lock delete!(w.futures, id)
+            w.terminated && throw(WorkerTerminatedException(w))
+            rethrow()
+        finally
+            buf.size > MAX_RETAINED_BUFFER && (w.write_buf = IOBuffer(; sizehint = 1024))
+        end
     end
     return fut
 end
@@ -1155,6 +1178,7 @@ end
 # next request is read.
 function serve_requests(io::IO)
     reader = FrameReader()
+    outbuf = IOBuffer(; sizehint = 1024)
     while true
         frame = try
             read_message(io, reader)
@@ -1164,61 +1188,56 @@ function serve_requests(io::IO)
             rethrow()
         end
         kind, payload = handle_request(frame)
-        write(io, encode_reply(frame.id, kind, payload))
+        encode_reply!(outbuf, frame.id, kind, payload)
+        write(io, @view outbuf.data[1:outbuf.size])
+        outbuf.size > MAX_RETAINED_BUFFER && (outbuf = IOBuffer(; sizehint = 1024))
     end
 end
 
 function handle_request(frame::Frame)
     frame.error === nothing ||
         return KIND_ERROR, "the request could not be deserialized on the worker: " * format_error(frame.error)
-    if frame.kind === KIND_EVAL
-        try
+    kind = frame.kind
+    prefix = ""
+    try
+        if kind === KIND_EVAL
             Core.eval(Main, frame.payload)
             return KIND_RESULT, nothing
-        catch e
-            return KIND_ERROR, format_error(e, catch_backtrace())
-        end
-    elseif frame.kind === KIND_RUN
-        spec = frame.payload
-        try
+        elseif kind === KIND_RUN
+            prefix = "the worker could not run this test item: "
+            spec = frame.payload
             println(stdout, record_run(spec)); flush(stdout)
             result = run_item(spec)
             println(stdout, record_done(spec, result)); flush(stdout)
             return KIND_RESULT, result
-        catch e
-            return KIND_ERROR, "the worker could not run this test item: " * format_error(e, catch_backtrace())
-        end
-    elseif frame.kind === KIND_END
-        spec, test_end = frame.payload
-        try
+        elseif kind === KIND_END
+            prefix = "the worker could not run the `test_end` expression: "
+            spec, test_end = frame.payload
             return KIND_RESULT, run_test_end(spec, test_end)
-        catch e
-            return KIND_ERROR, "the worker could not run the `test_end` expression: " *
-                format_error(e, catch_backtrace())
-        end
-    elseif frame.kind === KIND_FINISH
-        index, attempt, collect = frame.payload
-        try
+        elseif kind === KIND_FINISH
+            prefix = "the worker could not collect this attempt's artifacts: "
+            index, attempt, collect = frame.payload
             return KIND_RESULT, finish_artifacts(index, attempt, collect)
-        catch e
-            return KIND_ERROR, "the worker could not collect this attempt's artifacts: " *
-                format_error(e, catch_backtrace())
         end
+    catch e
+        return KIND_ERROR, prefix * format_error(e, catch_backtrace())
     end
-    error("request of unknown kind $(frame.kind)")
+    error("request of unknown kind $(kind)")
 end
 
 # A reply that cannot be serialized becomes an error that says so; a String
 # always can be.
-function encode_reply(id::UInt64, kind::UInt8, payload)
+function encode_reply!(buf::IOBuffer, id::UInt64, kind::UInt8, payload)
     try
-        return encode_message(id, kind, payload)
+        return encode_message!(buf, id, kind, payload)
     catch e
-        return encode_message(id, KIND_ERROR, string(
+        return encode_message!(buf, id, KIND_ERROR, string(
             "the worker could not serialize the result of this test item (", format_error(e),
             "). Test results travel between processes, so everything they hold must be serializable."))
     end
 end
+
+encode_reply(id::UInt64, kind::UInt8, payload) = take!(encode_reply!(IOBuffer(), id, kind, payload))
 
 # `showerror` in the latest world, so a method the test item defined for its own
 # exception type is used; and never a second failure on top of the first.

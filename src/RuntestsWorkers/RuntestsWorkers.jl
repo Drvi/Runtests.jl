@@ -100,9 +100,9 @@ const PRECOMPILE_SIGNATURES = (
     (remote_end, (Worker, ItemSpec, Expr)),
     (remote_finish, (Worker, Int32, Int8, Bool)),
     (finish_artifacts, (Int32, Int8, Bool)),
-    (process_responses, (Worker, Base.Event)),
+    (process_responses, (Worker,)),
     (read_message, (IOBuffer,)),
-    (read_message, (IOBuffer, FrameReader)),
+    (read_message, (TCPSocket, FrameReader)),
     (terminate!, (Worker, Symbol)),
     (watch_coordinator, (Base.PipeEndpoint,)),
 )

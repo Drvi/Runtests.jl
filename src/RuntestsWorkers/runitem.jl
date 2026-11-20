@@ -69,7 +69,7 @@ ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, a
 struct ItemResult
     index   :: Int32
     state   :: ItemState
-    testset :: Test.AbstractTestSet
+    testset :: Test.DefaultTestSet
     stats   :: PerfStats
     artifacts :: UInt8   # `ARTIFACT_FILES` and `ARTIFACT_PRODUCERS`: what the attempt left to keep or collect
 end
@@ -234,7 +234,8 @@ function run_test_end(spec::ItemSpec, test_end::Expr)
             finish_testset!(ts)
         end
     end
-    return ItemResult(spec.index, state_of(ts), transferrable(ts), stats)
+    state = finalize_testset!(ts, false)
+    return ItemResult(spec.index, state, ts, stats)
 end
 
 # The scope an item's user code runs in: the item is visible to `current_testitem`,
@@ -312,35 +313,39 @@ function _run_item(spec::ItemSpec, enter=nothing)
     finally
         finish_testset!(ts)
     end
-    spec.full_stacktraces || trim_recorded_errors!(ts)
+    state = finalize_testset!(ts, !spec.full_stacktraces)
     flags = artifact_flags(artifacts)
     flags & ARTIFACT_PRODUCERS == 0 || (PENDING_ARTIFACTS[] = artifacts)
-    return ItemResult(spec.index, state_of(ts), transferrable(ts), stats, flags)
+    return ItemResult(spec.index, state, ts, stats, flags)
 end
 
-"""
-    trim_recorded_errors!(ts)
-
-Cut the backtrace of every error the item's testsets recorded at the item's entry
-frame, `__repl_entry_item`. `Test` cuts each at the last frame of a function named
-`__repl_entry…`, which in a worker is that one. In a run without workers started at
-the REPL, the REPL's own entry frame lies beneath it and is the one cut at, and what
-is between the two is the run's machinery. `Test` keeps the backtrace as text, so it
-is cut as text.
-"""
-function trim_recorded_errors!(ts::Test.DefaultTestSet)
+# Single-pass tree walk over `ts`: optionally trims `__repl_entry_item` frames from
+# recorded `Test.Error`s, converts `Test.Pass` records to transferrable form, and
+# computes the aggregate `ItemState` (`PASSED`, `FAILED`, or `ERRORED`).
+function finalize_testset!(ts::Test.AbstractTestSet, trim::Bool)
+    state = PASSED
     for (i, res) in enumerate(ts.results)
         if res isa Test.AbstractTestSet
-            trim_recorded_errors!(res)
+            s = finalize_testset!(res, trim)
+            if s === ERRORED
+                state = ERRORED
+            elseif s === FAILED && state === PASSED
+                state = FAILED
+            end
         elseif res isa Test.Error
-            bt = cut_at_item_frame(res.backtrace)
-            bt === res.backtrace || (ts.results[i] = with_backtrace(res, bt))
+            if trim
+                bt = cut_at_item_frame(res.backtrace)
+                bt === res.backtrace || (ts.results[i] = with_backtrace(res, bt))
+            end
+            state = ERRORED
+        elseif res isa Test.Fail
+            state === PASSED && (state = FAILED)
+        elseif res isa Test.Pass
+            ts.results[i] = transferrable(res)
         end
     end
-    return ts
+    return state
 end
-
-trim_recorded_errors!(ts) = ts
 
 const ITEM_FRAME = r"^\s*\[\d+\] __repl_entry_item\("
 # A frame's own line, its location's, or a run of frames folded into one.
@@ -596,17 +601,21 @@ end
 # A per-item testset is a result to be shipped, not something to print on the
 # worker; the coordinator prints the run's summary once, in one place.
 function with_testset_printing(f, enabled::Bool)
-    isdefined(Test, :TESTSET_PRINT_ENABLE) || return f()
-    flag = Test.TESTSET_PRINT_ENABLE
-    # A `ScopedValue` on Julia 1.13, a `Ref` before it. Both are internal to Test,
-    # so read the shape rather than the version number.
-    flag isa ScopedValue && return with(f, flag => enabled)
-    prev = flag[]
-    flag[] = enabled
-    try
+    # A `ScopedValue` on Julia 1.13+, a `Ref` before it. Detected at compile time by
+    # shape rather than version number.
+    @static if isdefined(Test, :TESTSET_PRINT_ENABLE) && Test.TESTSET_PRINT_ENABLE isa ScopedValue
+        return with(f, Test.TESTSET_PRINT_ENABLE => enabled)
+    elseif isdefined(Test, :TESTSET_PRINT_ENABLE)
+        flag = Test.TESTSET_PRINT_ENABLE
+        prev = flag[]
+        flag[] = enabled
+        try
+            return f()
+        finally
+            flag[] = prev
+        end
+    else
         return f()
-    finally
-        flag[] = prev
     end
 end
 

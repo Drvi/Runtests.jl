@@ -54,23 +54,28 @@ function merge_coverage(tracedir::AbstractString, packages::Vector{String}, out:
     counts = Dict{String, Dict{Int, Int64}}()
     for f in readdir(tracedir; join = true)
         endswith(f, ".info") || continue
-        file = nothing
+        cur_lines = nothing
         for line in eachline(f)
             if startswith(line, "SF:")
-                file = nothing
+                cur_lines = nothing
+                sf = SubString(line, 4)
                 for (roots, prefix) in sources
-                    file = package_source(line[4:end], roots, prefix)
-                    file === nothing || break
+                    file = package_source(sf, roots, prefix)
+                    if file !== nothing
+                        cur_lines = get!(Dict{Int, Int64}, counts, file)
+                        break
+                    end
                 end
-            elseif startswith(line, "DA:") && file !== nothing
-                fields = split(line[4:end], ',')
-                length(fields) >= 2 || continue
-                l, n = tryparse(Int, fields[1]), tryparse(Int64, fields[2])
+            elseif cur_lines !== nothing && startswith(line, "DA:")
+                comma = findnext(',', line, 4)
+                comma === nothing && continue
+                comma2 = findnext(',', line, comma + 1)
+                l = tryparse(Int, SubString(line, 4, comma - 1))
+                n = tryparse(Int64, comma2 === nothing ? SubString(line, comma + 1) : SubString(line, comma + 1, comma2 - 1))
                 (l === nothing || n === nothing) && continue
-                lines = get!(Dict{Int, Int64}, counts, file)
-                lines[l] = get(lines, l, 0) + n
+                cur_lines[l] = get(cur_lines, l, Int64(0)) + n
             elseif line == "end_of_record"
-                file = nothing
+                cur_lines = nothing
             end
         end
     end
@@ -86,20 +91,27 @@ function merge_coverage(tracedir::AbstractString, packages::Vector{String}, out:
         end
     end
     filter!(((_, lines),) -> !isempty(lines), counts)
-    open(out, "w") do io
+    total_lines, total_hit = open(out, "w") do io
+        tl, th = 0, 0
         for file in sort!(collect(keys(counts)))
             lines = counts[file]
             println(io, "SF:", file)
+            hit = 0
             for l in sort!(collect(keys(lines)))
-                println(io, "DA:", l, ",", lines[l])
+                n = lines[l]
+                n > 0 && (hit += 1)
+                println(io, "DA:", l, ",", n)
             end
-            println(io, "LH:", count(>(0), values(lines)))
-            println(io, "LF:", length(lines))
+            nlines = length(lines)
+            tl += nlines
+            th += hit
+            println(io, "LH:", hit)
+            println(io, "LF:", nlines)
             println(io, "end_of_record")
         end
+        (tl, th)
     end
-    return (length(counts), sum(length, values(counts); init = 0),
-            sum(lines -> count(>(0), values(lines)), values(counts); init = 0))
+    return (length(counts), total_lines, total_hit)
 end
 
 # A tracefile's source path as the report names it: a file of the package's `src/` or
@@ -142,9 +154,13 @@ function body_lines!(lines::Vector{Int}, ex, inside::Bool)
     elseif ex isa Expr
         if is_function_definition(ex)
             # The body, not the signature.
-            foreach(a -> body_lines!(lines, a, true), ex.args[2:end])
+            for k in 2:length(ex.args)
+                body_lines!(lines, ex.args[k], true)
+            end
         else
-            foreach(a -> body_lines!(lines, a, inside), ex.args)
+            for a in ex.args
+                body_lines!(lines, a, inside)
+            end
         end
     end
     return lines
@@ -212,7 +228,8 @@ function collect_coverage(run)
         pid = tryparse(Int32, chop(f; tail = 5))
         pid === nothing || push!(written, pid)
     end
-    lost = count(!in(written), @lock run.lock collect(run.item_pids))
+    # Every worker has exited and been reaped before `collect_coverage` runs.
+    lost = count(!in(written), run.item_pids)
     try
         files, lines, hit = merge_coverage(dir, run.plan.packages.root, out; base = root)
         return CoverageSummary(out, files, lines, hit, lost, "")

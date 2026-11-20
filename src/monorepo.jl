@@ -402,8 +402,11 @@ function import_problems(
                     )))
                 end
             else
-                check(path, ex, "")
-                for (root, _) in imports_in(ex)
+                for (root, line) in imports_in(ex)
+                    (root in allowed || !(root in shared)) || push!(problems, ScanError(path, line, string(
+                        "imports ", root, ", which is not in [deps] of ", declarer, ", so ", ps.name[k],
+                        "'s own run cannot load it"
+                    )))
                     haskey(setups[k], root) && !(root in used_setups) && (push!(used_setups, root); push!(pending, root))
                 end
             end
@@ -421,9 +424,14 @@ function imports_in(@nospecialize(ex), out::Vector{Tuple{Symbol, Int32}} = Tuple
         line[] = Int32(ex.line)
     elseif ex isa Expr && ex.head !== :quote
         if ex.head === :using || ex.head === :import
-            foreach(root -> push!(out, (root, line[])), sort!(collect(imported_roots(ex))))
+            ln = line[]
+            for root in sort!(collect(imported_roots(ex)))
+                push!(out, (root, ln))
+            end
         else
-            foreach(a -> imports_in(a, out, line), ex.args)
+            for a in ex.args
+                imports_in(a, out, line)
+            end
         end
     end
     return out
@@ -460,13 +468,15 @@ participants declare with different UUIDs, for a preference that two participant
 set differently, and for a dependency, Runtests among them, that the manifest does
 not hold. The workspace has to be instantiated first.
 """
-function union_environment(ps::Participants, dir::AbstractString)
-    deps, declared = union_dependencies(ps)
-    runtests = Base.PkgId(parentmodule(@__MODULE__))
-    preferences = merged_preferences(ps, [k for k in eachindex(ps.name) if !ps.isolated[k]])
+union_environment(ps::Participants, dir::AbstractString) = union_environment(ps, ps.workspace, dir)
 
-    manifest = Base.project_file_manifest_path(existing_project_file(ps.workspace))
-    no_manifest = ConfigError("the workspace at $(ps.workspace) has no manifest: instantiate it, with `Pkg.instantiate()` in its root")
+function union_environment(ps::Union{Participants, Packages}, workspace::AbstractString, dir::AbstractString)
+    deps, declared = union_dependencies(ps, workspace)
+    runtests = Base.PkgId(parentmodule(@__MODULE__))
+    preferences = merged_preferences(ps, workspace, [k for k in eachindex(ps.name) if !ps.isolated[k]])
+
+    manifest = Base.project_file_manifest_path(existing_project_file(workspace))
+    no_manifest = ConfigError("the workspace at $workspace has no manifest: instantiate it, with `Pkg.instantiate()` in its root")
     manifest === nothing && throw(no_manifest)
     isfile(manifest) || throw(no_manifest)
     data = parse_project(manifest)
@@ -475,14 +485,14 @@ function union_environment(ps::Participants, dir::AbstractString)
     held(name, uuid) = any(e -> e isa AbstractDict && get(e, "uuid", "") == uuid, get(entries, name, ()))
     missing_ = sort!(String[name for (name, uuid) in deps if !held(name, uuid)])
     isempty(missing_) || throw(ConfigError(string(
-        "the manifest of the workspace, ", relpath_or_path(manifest, ps.workspace), ", does not hold ",
+        "the manifest of the workspace, ", relpath_or_path(manifest, workspace), ", does not hold ",
         join((string(n, " (", declared[n], ")") for n in missing_), ", "),
         runtests.name in missing_ ? ". A combined run needs Runtests in the workspace: add it to [deps] of the " *
             "root project or of a member, then resolve the workspace" : ": resolve the workspace"
     )))
 
     open(io -> TOML.print(io, Dict("deps" => deps); sorted = true), joinpath(dir, "Project.toml"), "w")
-    open(io -> TOML.print(io, absolute_paths!(data, ps.workspace); sorted = true), joinpath(dir, "Manifest.toml"), "w")
+    open(io -> TOML.print(io, absolute_paths!(data, workspace); sorted = true), joinpath(dir, "Manifest.toml"), "w")
     isempty(preferences) ||
         open(io -> TOML.print(io, preferences; sorted = true), joinpath(dir, "LocalPreferences.toml"), "w")
     return joinpath(dir, "Project.toml")
@@ -492,7 +502,9 @@ end
 # what declared each first: the participants that are not isolated, their test
 # dependencies and Runtests. A name that two of them declare with different UUIDs
 # stops the run.
-function union_dependencies(ps::Participants)
+union_dependencies(ps::Participants) = union_dependencies(ps, ps.workspace)
+
+function union_dependencies(ps::Union{Participants, Packages}, workspace::AbstractString)
     deps = Dict{String, String}()
     declared = Dict{String, String}()
     function declare!(name, uuid, where_)
@@ -506,10 +518,10 @@ function union_dependencies(ps::Participants)
     end
     for k in eachindex(ps.name)
         ps.isolated[k] && continue
-        declare!(ps.name[k], string(ps.uuid[k]), relpath_or_path(existing_project_file(ps.root[k]), ps.workspace))
+        declare!(ps.name[k], string(ps.uuid[k]), relpath_or_path(existing_project_file(ps.root[k]), workspace))
         testproj = existing_project_file(joinpath(ps.root[k], "test"))
         for (name, uuid) in get(parse_project(testproj), "deps", Dict{String, Any}())
-            declare!(name, string(uuid), relpath_or_path(testproj, ps.workspace))
+            declare!(name, string(uuid), relpath_or_path(testproj, workspace))
         end
     end
     runtests = Base.PkgId(parentmodule(@__MODULE__))
@@ -519,7 +531,9 @@ end
 
 # The `LocalPreferences.toml` of the test projects of participants `shared`, together.
 # Two that set one preference of a package to different values stop the run.
-function merged_preferences(ps::Participants, shared::Vector{Int})
+merged_preferences(ps::Participants, shared::Vector{Int}) = merged_preferences(ps, ps.workspace, shared)
+
+function merged_preferences(ps::Union{Participants, Packages}, workspace::AbstractString, shared::Vector{Int})
     out = Dict{String, Any}()
     from = Dict{Tuple{String, String}, String}()
     for k in shared
@@ -533,25 +547,21 @@ function merged_preferences(ps::Participants, shared::Vector{Int})
                     throw(ConfigError(string(
                         "the participants of a combined run share one environment, and they set preference ",
                         repr(key), " of ", pkg, " differently: ", repr(mine[key]), " in ", from[(pkg, key)], ", and ",
-                        repr(value), " in ", relpath_or_path(path, ps.workspace), ". Make them agree, or put one of ",
+                        repr(value), " in ", relpath_or_path(path, workspace), ". Make them agree, or put one of ",
                         "the participants in `isolated` of [monorepo]"
                     )))
                 end
                 mine[key] = value
-                from[(pkg, key)] = relpath_or_path(path, ps.workspace)
+                from[(pkg, key)] = relpath_or_path(path, workspace)
             end
         end
     end
     return out
 end
 
-# The settings of a combined run itself: from the call, the `RUNTESTS_` variables and
-# `[run]` of the workspace root, in that order. One in another package's `[run]` has
-# no effect. The others are each package's own: a keyword or variable gives one to
-# every package, and otherwise each package keeps its own.
-const RUN_WIDE_KEYS = (:workers, :memory_threshold, :logs, :verbose, :monitor, :monitor_interval,
-    :full_stacktraces, :full_names, :testset_name, :coverage, :seed, :failfast)
-const PACKAGE_KEYS = Tuple(k for k in RUN_KEYS if !(k in RUN_WIDE_KEYS))
+# `RUN_WIDE_KEYS` and `PACKAGE_KEYS` come from `SETTING_SPECS` in `config.jl`:
+# run-wide settings come from the call, `RUNTESTS_` variables, and `[run]` of the
+# workspace root; per-package settings stay each package's own unless overridden.
 
 """
     prepare_mono(paths; packages, name, tags, group, replay, announce, expansions, kwargs...)
@@ -660,6 +670,7 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             continue
         end
         files, strays, templates, environments = walk_test_dir(joinpath(ps.root[k], "test"))
+        warn_packages(environments)
         environment_names[k] = String[rel_slash(dir, naming) for dir in environments]
         tags_k = Set{Symbol}()
         its = try
@@ -688,9 +699,10 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             "no test items matched the items asked for: none of " * join((string(p, " ", repr(i)) for (p, i) in item_keys), ", ")
         ))
     end
-    isempty(items) && throw(NoTestsError("no test items matched " * description * name_hint(filters[1].name, all_names)))
+    asked_name = name === nothing ? nothing : Filter(; name).name
+    isempty(items) && throw(NoTestsError("no test items matched " * description * name_hint(asked_name, all_names)))
     if name !== nothing && replayed === nothing
-        hint = name_hint(filters[1].name, all_names)
+        hint = name_hint(asked_name, all_names)
         isempty(hint) || throw(NoTestsError("not every name given is a test item" * hint))
     end
     files_seconds = time() - t_files
@@ -943,9 +955,24 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
                       overrides::Vector{Dict{Symbol, Any}} = [Dict{Symbol, Any}() for _ in kept])
     root_path, root_toml = config_toml(joinpath(ps.workspace, "test"), nothing)
     shared = shared_profiles(root_path, root_toml, ps.workspace)
+    run_section(toml) = (r = get(toml, "run", nothing); r isa AbstractDict ? r : Dict{String, Any}())
     run_kwargs = Dict{Symbol, Any}(pairs(kwargs))
-    if requested_workers(kwargs, root_toml) == "auto"
-        per_worker = maximum(k -> worker_threads(configs[k]..., kwargs, shared), kept)
+    # Read each kept package's profiles once when auto-sizing workers, then reuse them in `build_config`.
+    pkg_profiles = Vector{Union{Nothing, Dict{Symbol, Profile}}}(nothing, length(kept))
+    if pick_run_setting(:workers, "auto", kwargs, run_section(root_toml)) == "auto"
+        cpus = effective_cpu_threads()
+        per_worker = 1
+        for (idx, k) in enumerate(kept)
+            path, toml = configs[k]
+            profs = read_profiles(path, toml; shared)
+            pkg_profiles[idx] = profs
+            t = threads_spec("threads", pick_run_setting(:threads, DEFAULT_THREADS, kwargs, run_section(toml)), ArgumentError)
+            most = default_thread_count(t, cpus)
+            for prof in values(profs)
+                isempty(prof.threads) || (most = max(most, default_thread_count(prof.threads, cpus)))
+            end
+            most > per_worker && (per_worker = most)
+        end
         run_kwargs[:workers] = auto_workers(string(per_worker), nunits)
     end
     run = build_config(root_path, root_toml; nunits, shared, run_kwargs...)
@@ -953,51 +980,19 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
     cfgs = RunConfig[]
     for (n, k) in enumerate(kept)
         path, toml = configs[k]
-        run_table = get(toml, "run", nothing)
+        rt = get(toml, "run", nothing)
         # The root's run-wide settings are the run's; another package's have no effect.
-        if ps.root[k] != ps.workspace && run_table isa AbstractDict
-            dropped = [key for key in keys(run_table) if Symbol(key) in RUN_WIDE_KEYS]
+        if ps.root[k] != ps.workspace && rt isa AbstractDict
+            dropped = [key for key in keys(rt) if Symbol(key) in RUN_WIDE_KEYS]
             isempty(dropped) ||
-                (toml = merge(toml, Dict("run" => Dict(key => v for (key, v) in run_table if !(key in dropped)))))
+                (toml = merge(toml, Dict("run" => Dict(key => v for (key, v) in rt if !(key in dropped)))))
         end
         given = merge(overrides[n], package_kwargs)
-        push!(cfgs, build_config(path, toml; given..., shared, workers = run.workers, failfast = run.failfast,
+        push!(cfgs, build_config(path, toml; given..., shared, profiles = pkg_profiles[n],
+                                 workers = run.workers, failfast = run.failfast,
                                  seed = run.seed, logs = run.logs, coverage = false))
     end
     return run, cfgs
-end
-
-# The `workers` a combined run asks for, as the call, the variable or the root's file
-# gives it, `"auto"` when none does.
-function requested_workers(kwargs, root_toml)
-    w = get(kwargs, :workers, nothing)
-    w === nothing || return w
-    env = strip(get(ENV, env_setting_name(:workers), ""))
-    isempty(env) || return env == "auto" ? "auto" : something(tryparse(Int, env), env)
-    run = get(root_toml, "run", Dict{String, Any}())
-    return run isa AbstractDict ? get(run, "workers", "auto") : "auto"
-end
-
-# The `threads` of the workers of a package with the configuration `toml`, short of a
-# keyword: the variable's, or its file's, or the default.
-function package_threads(toml)
-    env = strip(get(ENV, env_setting_name(:threads), ""))
-    isempty(env) || return String(env)
-    run = get(toml, "run", nothing)
-    return string(run isa AbstractDict ? get(run, "threads", "2,1") : "2,1")
-end
-
-# The most threads a worker of a package with configuration file `path` starts with:
-# its `threads`, and each of its profiles', those its workspace shares among them.
-# `auto` counts as every CPU.
-function worker_threads(path, toml, kwargs, shared::SharedProfiles)
-    cpus = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
-    count_of(spec) = (t = first(split(spec, ',')); t == "auto" ? cpus : something(tryparse(Int, t), 2))
-    most = count_of(threads_spec("threads", get(kwargs, :threads, package_threads(toml)), ArgumentError))
-    for prof in values(read_profiles(path, toml; shared))
-        isempty(prof.threads) || (most = max(most, count_of(prof.threads)))
-    end
-    return most
 end
 
 """
@@ -1011,8 +1006,6 @@ its own test project, which the instantiated workspace provides.
 """
 function with_union_env(f, run)
     p = run.plan
-    ps = Participants(p.root, p.packages.name, p.packages.uuid, p.packages.root, p.packages.isolated,
-                      Pair{String, String}[])
     with_status_line_off(run.monitor) do
         say(run, "instantiating the workspace at ", p.root)
         instantiate_workspace(p.root)
@@ -1020,7 +1013,7 @@ function with_union_env(f, run)
     dir = mktempdir(; prefix = "runtests_union_")
     original = Base.active_project()
     try
-        union = union_environment(ps, dir)
+        union = union_environment(p.packages, p.root, dir)
         for k in eachindex(p.packages.name)
             push!(run.package_projects,
                   p.packages.isolated[k] ? something(project_file(joinpath(p.packages.root[k], "test")), union) : union)
@@ -1037,21 +1030,11 @@ end
 # Explicitly resolve when the manifest is missing; Pkg handles the manifest during
 # instantiate in either case.
 function instantiate_workspace(root::AbstractString)
-    original = Base.active_project()
-    try
-        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-            with_pkg() do Pkg, _
-                Pkg.activate(root; io = devnull)
-                manifest = Base.project_file_manifest_path(project_file(root))
-                (manifest === nothing || !isfile(manifest)) && Pkg.resolve(; io = devnull)
-                Pkg.instantiate(; allow_autoprecomp = false, io = devnull)
-            end
-        end
-    catch e
-        is_interrupt(e) && rethrow()
-        throw(ConfigError("could not instantiate the workspace at $root: $(sprint(showerror, e))"))
-    finally
-        Base.set_active_project(original)
+    with_pkg_isolated("could not instantiate the workspace at $root: ") do Pkg, _
+        Pkg.activate(root; io = devnull)
+        manifest = Base.project_file_manifest_path(project_file(root))
+        (manifest === nothing || !isfile(manifest)) && Pkg.resolve(; io = devnull)
+        Pkg.instantiate(; allow_autoprecomp = false, io = devnull)
     end
     return nothing
 end
@@ -1113,8 +1096,15 @@ function chores_mono(root::Union{Nothing, AbstractString} = nothing; dry_run::Bo
             end
             todo += said!(io, gone)
             failure === nothing || return print(io, "stopped: the chores of ", ps.name[length(done) + 1], " failed")
-            print_worker_groups(io, ps)
-            imports = written_import_problems(ps)
+            # Walk directories, read configs and profiles once for both worker-group and import reporting.
+            root_path, root_toml = config_toml(joinpath(ps.workspace, "test"), nothing)
+            shared = shared_profiles(root_path, root_toml, ps.workspace)
+            pkg_walks = [walk_test_dir(joinpath(r, "test")) for r in ps.root]
+            pkg_configs = [config_toml(joinpath(r, "test"), nothing) for r in ps.root]
+            pkg_profiles = [try read_profiles(p, t; shared) catch e; e isa ConfigError || rethrow(); Dict{Symbol, Profile}() end
+                            for (p, t) in pkg_configs]
+            print_worker_groups(io, ps, root_path, root_toml, shared, pkg_walks, pkg_configs, pkg_profiles)
+            imports = written_import_problems(ps; walks = pkg_walks, profiles = pkg_profiles)
             if isempty(imports)
                 println(io, "imports: each loads in the test environment of its own package")
             else
@@ -1144,6 +1134,14 @@ end
 function print_worker_groups(io::IO, ps::Participants)
     root_path, root_toml = config_toml(joinpath(ps.workspace, "test"), nothing)
     shared = shared_profiles(root_path, root_toml, ps.workspace)
+    pkg_walks = [walk_test_dir(joinpath(r, "test")) for r in ps.root]
+    pkg_configs = [config_toml(joinpath(r, "test"), nothing) for r in ps.root]
+    pkg_profiles = [read_profiles(p, t; shared) for (p, t) in pkg_configs]
+    return print_worker_groups(io, ps, root_path, root_toml, shared, pkg_walks, pkg_configs, pkg_profiles)
+end
+
+function print_worker_groups(io::IO, ps::Participants, root_path::String, root_toml::Dict{String, Any},
+                             shared::SharedProfiles, pkg_walks, pkg_configs, pkg_profiles)
     root_profiles = read_profiles(root_path, root_toml)
     declared_in(toml) = Set{Symbol}(Symbol(n) for n in keys(get(Dict{String, Any}, toml, "profiles")))
     root_declared = declared_in(root_toml)
@@ -1154,20 +1152,21 @@ function print_worker_groups(io::IO, ps::Participants)
     environments = String[]
     for k in eachindex(ps.root)
         testdir = joinpath(ps.root[k], "test")
-        path, toml = config_toml(testdir, nothing)
+        _, toml = pkg_configs[k]
         declared = declared_in(toml)
         # The default profile is the package's own when its code is in files, with no table.
         init, test_end = profile_code(testdir, String(DEFAULT_PROFILE))
         isempty(init.args) && isempty(test_end.args) || push!(declared, DEFAULT_PROFILE)
-        profiles = read_profiles(path, toml; shared)
-        threads = package_threads(toml)
+        profiles = pkg_profiles[k]
+        rt = get(toml, "run", nothing)
+        threads = string(pick_run_setting(:threads, DEFAULT_THREADS, (;), rt isa AbstractDict ? rt : Dict{String, Any}()))
         for name in sort!(collect(keys(profiles)); by = n -> (n !== DEFAULT_PROFILE, string(n)))
             prof = profiles[name]
             s = get(shared.profiles, name, nothing)
             how = s === nothing ? :own : ps.root[k] == ps.workspace || !(name in declared) ? :shared :
-                isempty(profile_differences(prof, s)) ? :copy : :own
+                same_profile(prof, s) ? :copy : :own
             as_root = how === :own && name in declared && name in root_declared && ps.root[k] != ps.workspace &&
-                isempty(profile_differences(prof, root_profiles[name]))
+                same_profile(prof, root_profiles[name])
             key = pool_key(run_profile(prof, threads), k, ps.root[k], ps.isolated[k])
             g = findfirst(isequal(key), keys_)
             if g === nothing
@@ -1177,7 +1176,7 @@ function print_worker_groups(io::IO, ps::Participants)
             end
             push!(groups[g], (k, name, how, prof, as_root))
         end
-        append!(environments, [relpath_or_path(d, ps.workspace) for d in walk_test_dir(testdir).environments])
+        append!(environments, [relpath_or_path(d, ps.workspace) for d in pkg_walks[k].environments])
     end
     n = length(groups)
     println(io, "workers: ", n == 1 ? "one group, so the items of every package can share a worker" :
@@ -1204,31 +1203,29 @@ function print_worker_groups(io::IO, ps::Participants)
     return nothing
 end
 
-# The settings in which profile `own` differs from `shared`, by their keys.
-function profile_differences(own::Profile, shared::Profile)
-    out = String[]
-    own.julia_args == shared.julia_args || push!(out, "julia_args")
-    own.threads == shared.threads || push!(out, "threads")
-    own.env == shared.env || push!(out, "env")
-    same_code(own.init, shared.init) || push!(out, "init")
-    same_code(own.test_end, shared.test_end) || push!(out, "test_end")
-    own.preferences == shared.preferences || push!(out, "preferences")
-    return out
-end
+# Whether two profiles declare the same runtime settings.
+same_profile(own::Profile, shared::Profile) =
+    own.julia_args == shared.julia_args && own.threads == shared.threads && own.env == shared.env &&
+    same_code(own.init, shared.init) && same_code(own.test_end, shared.test_end) &&
+    own.preferences == shared.preferences
 
 # `import_problems` for every item, setup and profile of the participants `ps`, as
 # their files are now. A suite that does not scan is its own chores' to report.
-function written_import_problems(ps::Participants; all_setups::Bool = true)
-    shared = shared_profiles(config_toml(joinpath(ps.workspace, "test"), nothing)..., ps.workspace)
+function written_import_problems(ps::Participants; all_setups::Bool = true, walks = nothing,
+                                 profiles::Union{Nothing, Vector{Dict{Symbol, Profile}}} = nothing)
+    shared = profiles === nothing ? shared_profiles(config_toml(joinpath(ps.workspace, "test"), nothing)..., ps.workspace) : nothing
     items, owner = RawItem[], Int[]
-    profiles, setups = Dict{Symbol, Profile}[], Dict{Symbol, String}[]
+    profs = profiles === nothing ? Dict{Symbol, Profile}[] : profiles
+    setups = Dict{Symbol, String}[]
     for k in eachindex(ps.root)
         testdir = joinpath(ps.root[k], "test")
         s = setup_modules(testdir)
-        path, toml = config_toml(testdir, nothing)
         push!(setups, s)
-        push!(profiles, try read_profiles(path, toml; shared) catch e; e isa ConfigError || rethrow(); Dict{Symbol, Profile}() end)
-        w = walk_test_dir(testdir)
+        if profiles === nothing
+            path, toml = config_toml(testdir, nothing)
+            push!(profs, try read_profiles(path, toml; shared) catch e; e isa ConfigError || rethrow(); Dict{Symbol, Profile}() end)
+        end
+        w = walks === nothing ? walk_test_dir(testdir) : walks[k]
         its = try
             scan(w.tests, Filter(), s; environments = w.environments, expansions = false, suite_tags = Set{Symbol}())
         catch e
@@ -1237,7 +1234,7 @@ function written_import_problems(ps::Participants; all_setups::Bool = true)
         end
         append!(items, its); append!(owner, fill(k, length(its)))
     end
-    return import_problems(ps, items, owner, profiles, setups; all_setups)
+    return import_problems(ps, items, owner, profs, setups; all_setups)
 end
 
 # A line for each package whose `test/runtests.jl` does more than load packages and

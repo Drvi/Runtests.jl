@@ -10,7 +10,7 @@ Where attempt `attempt` at item `index` keeps its evidence: `item_<index>_<attem
 beside its log, with `prefix` the part of the path a log's shares.
 """
 artifacts_path(prefix::String, index::Integer, attempt::Integer) =
-    string(chopsuffix(item_log_path(prefix, index, attempt), ".log"), ".artifacts")
+    string(prefix, index, "_", attempt, ".artifacts")
 
 attempt_artifacts(run::Run, i::Integer, attempt::Integer) =
     artifacts_path(run.artifacts_prefixes[run.plan.items.package[i]], run.local_item[i], attempt)
@@ -59,6 +59,14 @@ function evidence_after_loss!(run::Run, i::ItemIdx, attempt::Int8, why::Abstract
     return flags
 end
 
+# Run registered producers for `(index, attempt)` locally or on `w` within `limit` seconds.
+function run_artifact_producers(w::Union{Nothing, RuntestsWorkers.Worker}, index::Integer, attempt::Integer,
+                                name::AbstractString, limit::Integer)
+    w === nothing && return RuntestsWorkers.finish_artifacts(index, attempt, true)
+    return fetch_within(RuntestsWorkers.remote_finish(w, index, attempt, true), limit,
+                        TimeoutException(limit, "collecting the artifacts of", name, "artifacts_timeout"))
+end
+
 """
     finish_attempt!(run, slot, i, attempt, res, w) -> Bool
 
@@ -86,12 +94,7 @@ function finish_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, res::I
     said = ""
     @atomic slot.collecting = i
     try
-        status = if w === nothing
-            RuntestsWorkers.finish_artifacts(i, attempt, true)
-        else
-            fetch_within(RuntestsWorkers.remote_finish(w, i, attempt, true), limit,
-                         TimeoutException(limit, "collecting the artifacts of", name, "artifacts_timeout"))
-        end
+        status = run_artifact_producers(w, i, attempt, name, limit)
         said = string(plural(status.producers, "producer"), status.failed == 0 ? "" : string(", ", status.failed, " failed"),
                       " in ", fmt_seconds(status.seconds))
     catch e
@@ -113,31 +116,21 @@ end
 # the worker survived it, with what the run is told.
 function collection_failed!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, e, w)
     dir = attempt_artifacts(run, i, attempt)
-    if w === nothing || !(e isa TimeoutException || w.terminated)
+    outcome = resolve_worker_failure!(run, slot, w, e, artifacts_log_path(dir); is_worker = w !== nothing)
+    if outcome === :alive
         # The worker is fine: the log could not be written, nothing was waiting, or
         # the reply did not read.
         msg = e isa RuntestsWorkers.RemoteException ? e.msg : sprint(showerror, e)
         note_evidence(dir, string("not collected: ", msg))
-        return true, string("not collected: ", first(split(msg, '\n')))
-    end
-    if e isa TimeoutException
-        print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
-        RuntestsWorkers.inspect!(w)
-        # What the worker says on its way down goes beside the evidence, as an item's
-        # dying words go in its log.
-        @atomic slot.dying_log = artifacts_log_path(dir)
-        RuntestsWorkers.terminate!(w, :timeout)
-        wait(w)
-        flush_dying_log!(slot)
+        return true, string("not collected: ", first(eachsplit(msg, '\n')))
+    elseif outcome === :timeout
         why = string("incomplete: ", sprint(showerror, e), "; the worker was ended, and what the producers wrote is kept")
     else
-        wait(w)
         stopped = is_cancelled(run.queues) || w.ended_by === :interrupt
         why = stopped ? "incomplete: the run was stopped while the producers ran; what they wrote is kept" :
             string("incomplete: the worker died while the producers ran, ", died_how(run, slot, w),
                    "; what they wrote is kept")
     end
-    (@atomic slot.worker) === w && (@atomic slot.worker = nothing)
     note_evidence(dir, why)
     return false, why
 end
@@ -162,14 +155,12 @@ function finish_here!(spec::ItemSpec, res::ItemResult; worker::Union{Nothing, Ru
     end
     if res.artifacts & ARTIFACT_PRODUCERS != 0
         try
-            if worker === nothing
-                RuntestsWorkers.finish_artifacts(spec.index, spec.attempt, true)
-            else
-                fetch_within(RuntestsWorkers.remote_finish(worker, spec.index, spec.attempt, true), limit,
-                             TimeoutException(limit, "collecting the artifacts of", spec.name, "artifacts_timeout"))
-            end
+            run_artifact_producers(worker, spec.index, spec.attempt, spec.name, limit)
         catch e
-            is_interrupt(e) && (note_evidence(spec.artifacts, "incomplete: interrupted while the producers ran"); rethrow())
+            if is_interrupt(e)
+                shielded(() -> note_evidence(spec.artifacts, "incomplete: interrupted while the producers ran"))
+                rethrow()
+            end
             worker === nothing || e isa TimeoutException && RuntestsWorkers.terminate!(worker, :timeout)
             note_evidence(spec.artifacts, string("incomplete: ", sprint(showerror, e), "; what the producers wrote is kept"))
         end

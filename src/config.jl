@@ -41,11 +41,22 @@ struct Profile
     precompile::Union{Nothing, Vector{String}}
 end
 
+const DEFAULT_THREADS = "2,1"
+const DEFAULT_TIMEOUT_S = 30 * 60
+
 Profile(
-    name::Symbol; julia_args = String[], threads = "2,1", env = Pair{String, String}[],
+    name::Symbol; julia_args = String[], threads = DEFAULT_THREADS, env = Pair{String, String}[],
     init = Expr(:block), test_end = Expr(:block), preferences = "", environment = "", dir = "", precompile = nothing
 ) =
     Profile(name, julia_args, threads, env, init, test_end, preferences, environment, dir, precompile)
+
+# A copy of `p` with selected fields replaced.
+with_profile(
+    p::Profile;
+    name = p.name, julia_args = p.julia_args, threads = p.threads, env = p.env,
+    init = p.init, test_end = p.test_end, preferences = p.preferences,
+    environment = p.environment, dir = p.dir, precompile = p.precompile
+) = Profile(name, julia_args, threads, env, init, test_end, preferences, environment, dir, precompile)
 
 """
     SharedProfiles
@@ -67,13 +78,13 @@ const NO_SHARED_PROFILES = SharedProfiles("", Dict{Symbol, Profile}())
 
 Base.@kwdef struct RunConfig
     workers::Int
-    threads::String = "2,1"
-    timeout_s::Int = 30 * 60
+    threads::String = DEFAULT_THREADS
+    timeout_s::Int = DEFAULT_TIMEOUT_S
     # The suite's code, not the item's, so limits of their own.
-    init_timeout_s::Int = 30 * 60
-    test_end_timeout_s::Int = 30 * 60
+    init_timeout_s::Int = DEFAULT_TIMEOUT_S
+    test_end_timeout_s::Int = DEFAULT_TIMEOUT_S
     # All the producers of one failed attempt together (see `Runtests.on_failure`).
-    artifacts_timeout_s::Int = 30 * 60
+    artifacts_timeout_s::Int = DEFAULT_TIMEOUT_S
     retries::Int = 0
     failfast::Bool = false
     item_failfast::Bool = false
@@ -128,14 +139,58 @@ Base.@kwdef struct RunConfig
     skip_environment::Vector{String} = String[]
 end
 
-# Each is a keyword, a variable and a key of `[run]`, but for `skip_environment`, which
-# `[run]` refuses (see `build_config`).
-const RUN_KEYS = (
-    :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :artifacts_timeout, :retries,
-    :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
-    :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
-    :skip_environment,
+# A copy of `cfg` with selected fields replaced.
+function with_config(cfg::RunConfig; kwargs...)
+    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
+    return RunConfig(; merge(fields, values(kwargs))...)
+end
+
+# Declarative table of the 20 run settings. Each is a keyword, a `RUNTESTS_<KEY>`
+# variable, and a key of `[run]` (except `skip_environment`, which `[run]` refuses).
+#   kind:   :flag | :text | :workers | :skip_env | :number
+#   scope:  :run (run-wide in monorepo) | :pkg (per-package in monorepo)
+#   replay: :none | :int | :float | :bool | :symbol | :string | :uint64 | :csv
+const SETTING_SPECS = (
+    (key = :workers,           field = :workers,             kind = :workers,  scope = :run, replay = :int),
+    (key = :threads,           field = :threads,             kind = :text,     scope = :pkg, replay = :string),
+    (key = :timeout,           field = :timeout_s,           kind = :number,   scope = :pkg, replay = :int),
+    (key = :init_timeout,      field = :init_timeout_s,      kind = :number,   scope = :pkg, replay = :int),
+    (key = :test_end_timeout,  field = :test_end_timeout_s,  kind = :number,   scope = :pkg, replay = :int),
+    (key = :artifacts_timeout, field = :artifacts_timeout_s, kind = :number,   scope = :pkg, replay = :int),
+    (key = :retries,           field = :retries,             kind = :number,   scope = :pkg, replay = :int),
+    (key = :failfast,          field = :failfast,            kind = :flag,     scope = :run, replay = :bool),
+    (key = :item_failfast,     field = :item_failfast,       kind = :flag,     scope = :pkg, replay = :bool),
+    (key = :logs,              field = :logs,                kind = :text,     scope = :run, replay = :symbol),
+    (key = :verbose,           field = :verbose,             kind = :flag,     scope = :run, replay = :none),
+    (key = :memory_threshold,  field = :memory_threshold,    kind = :number,   scope = :run, replay = :float),
+    (key = :monitor,           field = :monitor,             kind = :flag,     scope = :run, replay = :none),
+    (key = :monitor_interval,  field = :monitor_interval,    kind = :number,   scope = :run, replay = :none),
+    (key = :full_stacktraces,  field = :full_stacktraces,    kind = :flag,     scope = :run, replay = :none),
+    (key = :full_names,        field = :full_names,          kind = :flag,     scope = :run, replay = :none),
+    (key = :testset_name,      field = :testset_name,        kind = :text,     scope = :run, replay = :none),
+    (key = :coverage,          field = :coverage,            kind = :flag,     scope = :run, replay = :none),
+    (key = :seed,              field = :seed,                kind = :number,   scope = :run, replay = :uint64),
+    (key = :skip_environment,  field = :skip_environment,    kind = :skip_env, scope = :pkg, replay = :csv),
 )
+
+const RUN_KEYS = map(s -> s.key, SETTING_SPECS)
+const FLAG_SETTINGS = Tuple(s.key for s in SETTING_SPECS if s.kind === :flag)
+const TEXT_SETTINGS = Tuple(s.key for s in SETTING_SPECS if s.kind === :text)
+const RUN_WIDE_KEYS = Tuple(s.key for s in SETTING_SPECS if s.scope === :run)
+const PACKAGE_KEYS = Tuple(s.key for s in SETTING_SPECS if s.scope === :pkg)
+const REPLAY_SPECS = Tuple((key = s.key, field = s.field, replay = s.replay) for s in SETTING_SPECS if s.replay !== :none)
+
+# Parse a recorded meta string for a replayed setting.
+function parse_replay_setting(kind::Symbol, s::AbstractString)
+    kind === :int    && return parse(Int, s)
+    kind === :float  && return parse(Float64, s)
+    kind === :bool   && return parse(Bool, s)
+    kind === :symbol && return Symbol(s)
+    kind === :string && return String(s)
+    kind === :uint64 && return parse(UInt64, s)
+    kind === :csv    && return String[n for n in split(s, ',')]
+    error("unknown replay kind: $kind")
+end
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
 const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_event, :worker_init, :test_end)
@@ -275,11 +330,21 @@ function check_keys(path, tbl::AbstractDict, allowed::Tuple, where_)
     return
 end
 
+# Format `case_clashes` groups as `` `a` and `b`, `c` and `d` ``.
+format_case_clashes(clashes::Vector{Vector{String}}) =
+    join((join(("`$n`" for n in g), " and ") for g in clashes), ", ")
+
+# A table of the configuration, validated to be a TOML table.
+function table_section(path, parent::AbstractDict, key::AbstractString, label = key)
+    t = get(Dict{String, Any}, parent, key)
+    t isa AbstractDict || throw(ConfigError("[$label] of $(relpath_or_path(path)) must be a table"))
+    return t
+end
+
 # A table of the configuration, holding only the keys it may hold. `label` is how
 # a message names it.
 function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple, label = key)
-    t = get(Dict{String, Any}, parent, key)
-    t isa AbstractDict || throw(ConfigError("[$label] of $(relpath_or_path(path)) must be a table"))
+    t = table_section(path, parent, key, label)
     check_keys(path, t, allowed, label)
     return t
 end
@@ -305,9 +370,6 @@ function env_flag(name::AbstractString)
     throw(ConfigError("`$name` must be true or false (or 1, 0, yes, no), got $(repr(ENV[name]))"))
 end
 
-# The run settings that are true or false, read from a variable as `env_flag` reads it.
-const FLAG_SETTINGS = (:failfast, :item_failfast, :verbose, :monitor, :full_stacktraces, :full_names, :coverage)
-
 # The variable that sets the run setting `key`: `RUNTESTS_WORKERS` for `workers`.
 env_setting_name(key::Symbol) = string("RUNTESTS_", uppercase(String(key)))
 
@@ -318,12 +380,28 @@ function env_setting(key::Symbol, name::String, text::String)
     key in FLAG_SETTINGS && return env_flag(name)
     # Names with commas between them.
     key === :skip_environment && return String[strip(n) for n in split(text, ','; keepempty = false)]
-    (key in (:threads, :logs, :testset_name) || (key === :workers && text == "auto")) && return text
+    (key in TEXT_SETTINGS || (key === :workers && text == "auto")) && return text
     return something(tryparse(Int, text), tryparse(UInt64, text), tryparse(Float64, text), Some(text))
 end
 
+# Pick a run setting with precedence: keyword > RUNTESTS_<KEY> > `[run]` > default.
+# Records env overrides in `from_env` when provided.
+function pick_run_setting(key::Symbol, default, kwargs, run::AbstractDict,
+                          from_env::Union{Nothing, Vector{Pair{String, String}}} = nothing)
+    v = get(kwargs, key, nothing)
+    v === nothing || return v
+    name = env_setting_name(key)
+    text = String(strip(get(ENV, name, "")))
+    if !isempty(text)
+        from_env === nothing || push!(from_env, name => text)
+        return env_setting(key, name, text)
+    end
+    return get(run, string(key), default)
+end
+
 function build_config(path, toml; nunits = 0, config_file::AbstractString = "", testdir::AbstractString = dirname(path),
-                      shared::Union{Nothing, SharedProfiles} = nothing, kwargs...)
+                      shared::Union{Nothing, SharedProfiles} = nothing,
+                      profiles::Union{Nothing, Dict{Symbol, Profile}} = nothing, kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
     end
@@ -343,17 +421,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     # variable is read only when no keyword decides, so a bad value there fails only a
     # run it would have set.
     from_env = Pair{String, String}[]
-    function pick(key, default)
-        v = get(kwargs, key, nothing)
-        v === nothing || return v
-        name = env_setting_name(key)
-        text = String(strip(get(ENV, name, "")))
-        if !isempty(text)
-            push!(from_env, name => text)
-            return env_setting(key, name, text)
-        end
-        return get(run, string(key), default)
-    end
+    pick(key, default) = pick_run_setting(key, default, kwargs, run, from_env)
     # A value from a variable is said with its variable, which is all that shows it.
     function bad(msg, keys...)
         given(keys...) && return ArgumentError(msg)
@@ -369,7 +437,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     flag(key, default) = (v = pick(key, default); v isa Bool ? v :
         throw(bad("`$key` must be true or false, got $(repr(v))", key)))
 
-    threads = threads_spec("threads", pick(:threads, "2,1"), given(:threads) ? ArgumentError : ConfigError)
+    threads = threads_spec("threads", pick(:threads, DEFAULT_THREADS), msg -> bad(msg, :threads))
     w = pick(:workers, "auto")
     # A worker is a slot, and slots are numbered in a `SlotIdx`.
     ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(bad(
@@ -378,7 +446,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     workers = w isa Integer ? Int(w) : auto_workers(threads, nunits)
     logs = Symbol(pick(:logs, default_logs(workers)))::Symbol
     logs in LOG_MODES || throw(bad("`logs` must be one of $(LOG_MODES), got $(repr(logs))", :logs))
-    timeout = seconds(:timeout, pick(:timeout, 30 * 60))
+    timeout = seconds(:timeout, pick(:timeout, DEFAULT_TIMEOUT_S))
     retries = pick(:retries, 0)
     (is_whole_number(retries) && 0 <= retries <= MAX_RETRIES) ||
         throw(bad("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))", :retries))
@@ -390,11 +458,10 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
     (seed === nothing || (is_whole_number(seed) && 0 <= seed <= typemax(UInt64))) ||
         throw(bad("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))", :seed))
     order = section(path, toml, "order", ORDER_KEYS)
-    coverage = pick(:coverage, false)
+    coverage = flag(:coverage, false)
     coverage_source = given(:coverage) ? "the `coverage` keyword" :
         any(((n, _),) -> n == "RUNTESTS_COVERAGE", from_env) ? "`RUNTESTS_COVERAGE`" :
         haskey(run, "coverage") ? relpath_or_path(path) : ""
-    coverage isa Bool || throw(bad("`coverage` must be true or false, got $(repr(coverage))", :coverage))
     coverage && workers == 0 && throw((given(:coverage, :workers) ? ArgumentError : ConfigError)(
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
             "whose coverage was fixed when it started; use one worker or more"
@@ -421,7 +488,7 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
-        profiles = read_profiles(path, toml; shared, testdir),
+        profiles = profiles === nothing ? read_profiles(path, toml; shared, testdir) : profiles,
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
@@ -457,15 +524,15 @@ default_logs(workers::Integer, interactive::Bool = isinteractive()) =
 function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = nothing,
                        testdir::AbstractString = dirname(path))
     profiles = Dict{Symbol, Profile}()
-    tbl = get(Dict{String, Any}, toml, "profiles")
-    tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
+    tbl = table_section(path, toml, "profiles")
     # Numbered in a byte in a run state, `default` among them.
     length(tbl) <= MAX_PACKAGE_PROFILES ||
         throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $MAX_PACKAGE_PROFILES fit"))
-    check_profile_names(path, collect(String, keys(tbl)))
-    check_testconfigs(testdir, collect(String, keys(tbl)))
-    for name in keys(tbl)
-        prof, shares = parse_profile(path, tbl, name; testdir)
+    names = collect(String, keys(tbl))
+    check_profile_names(path, names)
+    code_files = check_testconfigs(testdir, names)
+    for name in names
+        prof, shares = parse_profile(path, tbl, name; testdir, code_files)
         (shares && shared !== nothing && !same_file(path, shared.path)) && throw(ConfigError(string(
             "`monorepo_default` of [profiles.", name, "] in ", relpath_or_path(path), ": only the test/TestItems.toml ",
             "of a workspace's root shares a profile with the packages of the workspace",
@@ -477,7 +544,7 @@ function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = noth
     # The package's own default profile, with no table, when its code is in files: a
     # default that the workspace shares takes its place only where the package has none.
     if !haskey(profiles, DEFAULT_PROFILE)
-        init, test_end = profile_code(testdir, String(DEFAULT_PROFILE))
+        init, test_end = profile_code(testdir, String(DEFAULT_PROFILE), code_files)
         isempty(init.args) && isempty(test_end.args) ||
             (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = "", init, test_end))
     end
@@ -486,7 +553,7 @@ function read_profiles(path, toml; shared::Union{Nothing, SharedProfiles} = noth
         clashes = case_clashes(String.(keys(profiles)))
         isempty(clashes) || throw(ConfigError(string(
             relpath_or_path(path), " and ", relpath_or_path(shared.path), ", which shares its profiles, declare ",
-            join((join(("`$n`" for n in g), " and ") for g in clashes), ", "), ", which differ only in case: ",
+            format_case_clashes(clashes), ", which differ only in case: ",
             "macOS and Windows hold one directory in test/$TESTCONFIGS_DIR/ for each such pair. Rename one"
         )))
     end
@@ -511,7 +578,7 @@ function check_profile_names(path, names::Vector{String})
     end
     clashes = case_clashes(names)
     isempty(clashes) || throw(ConfigError(string(
-        relpath_or_path(path), " declares the profiles ", join((join(("`$n`" for n in g), " and ") for g in clashes), ", "),
+        relpath_or_path(path), " declares the profiles ", format_case_clashes(clashes),
         ", which differ only in case: macOS and Windows hold one directory in test/$TESTCONFIGS_DIR/ for each such ",
         "pair. Rename one"
     )))
@@ -519,17 +586,19 @@ function check_profile_names(path, names::Vector{String})
 end
 
 """
-    check_testconfigs(testdir, names)
+    check_testconfigs(testdir, names) -> Dict{String, Set{String}}
 
 Throw a `ConfigError` for each entry of `test/testconfigs/` that is not code of a
 profile: the default profile's `worker_init.jl` and `test_end.jl` at its top, and for
 each other profile in `names` a directory with its exact name that holds the two files.
 Hidden entries are passed over. A directory that is a profile's name in another case
-is an error: macOS and Windows would read it, and Linux would not.
+is an error: macOS and Windows would read it, and Linux would not. Returns the valid
+files found per profile name so `profile_code` need not re-read the directories.
 """
 function check_testconfigs(testdir::AbstractString, names::Vector{String})
+    found = Dict{String, Set{String}}()
     dir = joinpath(testdir, TESTCONFIGS_DIR)
-    (exists_exactly(testdir, TESTCONFIGS_DIR) && isdir(dir)) || return nothing
+    (exists_exactly(testdir, TESTCONFIGS_DIR) && isdir(dir)) || return found
     others = filter(!=(String(DEFAULT_PROFILE)), names)
     bad = String[]
     notes = String[]
@@ -537,10 +606,15 @@ function check_testconfigs(testdir::AbstractString, names::Vector{String})
         startswith(e, '.') && continue
         path = joinpath(dir, e)
         if !isdir(path)
-            e in TESTCONFIG_FILES || push!(bad, "`$e`")
+            e in TESTCONFIG_FILES ? push!(get!(Set{String}, found, String(DEFAULT_PROFILE)), e) : push!(bad, "`$e`")
         elseif e in others
             for f in readdir(path)
-                startswith(f, '.') || (f in TESTCONFIG_FILES && isfile(joinpath(path, f))) || push!(bad, "`$e/$f`")
+                startswith(f, '.') && continue
+                if f in TESTCONFIG_FILES && isfile(joinpath(path, f))
+                    push!(get!(Set{String}, found, e), f)
+                else
+                    push!(bad, "`$e/$f`")
+                end
             end
         else
             push!(bad, "`$e/`")
@@ -548,7 +622,7 @@ function check_testconfigs(testdir::AbstractString, names::Vector{String})
             i === nothing || push!(notes, "`$e/` is the profile `$(others[i])` in another case")
         end
     end
-    isempty(bad) && return nothing
+    isempty(bad) && return found
     throw(ConfigError(string(
         relpath_or_path(dir), " holds ", join(bad, ", "), ". It holds `", WORKER_INIT_FILE, "` and `", TEST_END_FILE,
         "`, the code of the default profile, and for each other profile of [profiles] a directory of its name ",
@@ -564,15 +638,20 @@ profile_code_dir(testdir::AbstractString, name::AbstractString) =
     name == String(DEFAULT_PROFILE) ? joinpath(testdir, TESTCONFIGS_DIR) : joinpath(testdir, TESTCONFIGS_DIR, name)
 
 """
-    profile_code(testdir, name) -> (init, test_end)
+    profile_code(testdir, name[, code_files]) -> (init, test_end)
 
 The `init` and `test_end` of profile `name`, from `test/testconfigs/` in `testdir`:
 each file parsed with its path, so that an error in it names the file and the line.
 An empty block for a file that is not there with its exact name.
 """
-function profile_code(testdir::AbstractString, name::AbstractString)
+function profile_code(testdir::AbstractString, name::AbstractString,
+                      code_files::Union{Nothing, Dict{String, Set{String}}} = nothing)
     parts = name == String(DEFAULT_PROFILE) ? (TESTCONFIGS_DIR,) : (TESTCONFIGS_DIR, name)
-    code(file) = exists_exactly(testdir, parts..., file) ? parse_code_file(joinpath(testdir, parts..., file)) : Expr(:block)
+    have = code_files === nothing ? nothing : get(code_files, String(name), nothing)
+    function code(file)
+        ok = code_files === nothing ? exists_exactly(testdir, parts..., file) : (have !== nothing && file in have)
+        return ok ? parse_code_file(joinpath(testdir, parts..., file)) : Expr(:block)
+    end
     return code(WORKER_INIT_FILE), code(TEST_END_FILE)
 end
 
@@ -591,11 +670,11 @@ function call_code!(profiles::Dict{Symbol, Profile}, worker_init, test_end; dir:
         "`$key` must be an expression, as in `$key = :(using Foo)` or a `quote` block, got $(repr(ex))"
     ))
     p = profiles[DEFAULT_PROFILE]
-    profiles[DEFAULT_PROFILE] = Profile(
-        p.name, p.julia_args, p.threads, p.env,
-        worker_init === nothing ? p.init : block(:worker_init, worker_init),
-        test_end === nothing ? p.test_end : block(:test_end, test_end),
-        p.preferences, p.environment, String(dir), p.precompile
+    profiles[DEFAULT_PROFILE] = with_profile(
+        p;
+        init = worker_init === nothing ? p.init : block(:worker_init, worker_init),
+        test_end = test_end === nothing ? p.test_end : block(:test_end, test_end),
+        dir = String(dir)
     )
     return profiles
 end
@@ -621,25 +700,27 @@ end
 # Profile `name` of the `[profiles]` table `tbl` of the configuration file `path`, with
 # its code from `testdir` (see `profile_code`), and whether it says
 # `monorepo_default = true`.
-function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::AbstractString = dirname(path))
+function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::AbstractString = dirname(path),
+                       code_files::Union{Nothing, Dict{String, Set{String}}} = nothing)
     label = "profiles.$name"
-    given = tbl[name]
-    given isa AbstractDict && haskey(given, "environment") && throw(ConfigError(
+    given = table_section(path, tbl, name, label)
+    haskey(given, "environment") && throw(ConfigError(
         "`environment` of [$label] in $(relpath_or_path(path)): a profile has no environment. The test items in " *
             "a directory under `test/` with a Project.toml of its own run in that environment, under any " *
             "profile; remove the key, and give those items `profile = :$name` where they need this profile"
     ))
-    given isa AbstractDict && haskey(given, "threads") && throw(ConfigError(
+    haskey(given, "threads") && throw(ConfigError(
         "`threads` of [$label] in $(relpath_or_path(path)): the threads of a profile are a flag of `julia_args`, " *
             "as in `julia_args = [\"--threads=$(get(given, "threads", "4"))\"]`. Move them there, and remove the key"
     ))
     for (key, file) in (("init", WORKER_INIT_FILE), ("test_end", TEST_END_FILE))
-        given isa AbstractDict && haskey(given, key) && throw(ConfigError(string(
+        haskey(given, key) && throw(ConfigError(string(
             "`", key, "` of [", label, "] in ", relpath_or_path(path), ": the code of a profile is in a file of its own. ",
             "Move it to ", relpath_or_path(joinpath(profile_code_dir(testdir, name), file)), ", and remove the key"
         )))
     end
-    p = section(path, tbl, name, PROFILE_KEYS, label)
+    check_keys(path, given, PROFILE_KEYS, label)
+    p = given
     args = string_list(path, p, "julia_args", label)
     vars = get(Dict{String, Any}, p, "env")
     (vars isa AbstractDict && all(v -> v isa Union{AbstractString, Real}, values(vars))) || throw(ConfigError(
@@ -653,7 +734,7 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::A
         "`monorepo_default` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(shares))"
     ))
     precompile = haskey(p, "precompile") ? string_list(path, p, "precompile", label) : nothing
-    init, test_end = profile_code(testdir, name)
+    init, test_end = profile_code(testdir, name, code_files)
     threads = take_threads!(args, " in `julia_args` of [$label] in $(relpath_or_path(path))")
     prof = Profile(
         Symbol(name), args, threads, env, init, test_end,
@@ -711,8 +792,7 @@ function share_profiles!(profiles::Dict{Symbol, Profile}, shared::SharedProfiles
         if own === nothing
             profiles[name] = s
         elseif same_code(own.init, s.init) && same_code(own.test_end, s.test_end)
-            profiles[name] = Profile(own.name, own.julia_args, own.threads, own.env, s.init, s.test_end,
-                                     own.preferences, own.environment, s.dir, own.precompile)
+            profiles[name] = with_profile(own; init = s.init, test_end = s.test_end, dir = s.dir)
         end
     end
     return profiles
@@ -741,8 +821,7 @@ function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
     for name in marked
         # Its code is in the workspace root's `test/testconfigs/`.
         prof, _ = parse_profile(path, tbl, name)
-        out[prof.name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end,
-                                 prof.preferences, prof.environment, String(workspace), prof.precompile)
+        out[prof.name] = with_profile(prof; dir = String(workspace))
     end
     return SharedProfiles(String(path), out)
 end
@@ -774,10 +853,7 @@ end
 
 # The profile as its workers start: with its own `--threads`, or the run's when it
 # sets none.
-run_profile(prof::Profile, threads::String) = isempty(prof.threads) ?
-    Profile(prof.name, prof.julia_args, threads, prof.env, prof.init, prof.test_end, prof.preferences, prof.environment,
-            prof.dir, prof.precompile) :
-    prof
+run_profile(prof::Profile, threads::String) = isempty(prof.threads) ? with_profile(prof; threads) : prof
 
 # The profile fields a worker gets when it starts: everything but its name,
 # `test_end` (run after each item), `dir` (handled separately by `pool_key`) and
@@ -787,9 +863,7 @@ start_configuration(prof::Profile) =
 
 # The profile as its workers start in the environment of the directory `environment`,
 # or in the test environment when it is empty.
-in_environment(prof::Profile, environment::AbstractString) =
-    Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, prof.preferences,
-            String(environment), prof.dir, prof.precompile)
+in_environment(prof::Profile, environment::AbstractString) = with_profile(prof; environment = String(environment))
 
 """
     read_groups(path, toml) -> Dict{String, TagExpr}
@@ -801,8 +875,7 @@ unless declared here, and `$ALL_GROUP` is the whole suite, and is not declared. 
 name that differs from either only in case is an error.
 """
 function read_groups(path, toml)
-    tbl = get(Dict{String, Any}, toml, "groups")
-    tbl isa AbstractDict || throw(ConfigError("[groups] of $(relpath_or_path(path)) must be a table"))
+    tbl = table_section(path, toml, "groups")
     groups = Dict{String, TagExpr}()
     for (name, value) in tbl
         what = "group `$name` of [groups] in $(relpath_or_path(path))"
@@ -834,8 +907,7 @@ The `[throttle]` table: for a throttle name, as `throttle = :name` gives it, the
 items of that throttle that run at once, an integer from 1 to $(typemax(Int32)).
 """
 function read_throttle(path, toml)
-    tbl = get(Dict{String, Any}, toml, "throttle")
-    tbl isa AbstractDict || throw(ConfigError("[throttle] of $(relpath_or_path(path)) must be a table"))
+    tbl = table_section(path, toml, "throttle")
     limits = Dict{Symbol, Int}()
     for (key, value) in tbl
         name = String(key)::String   # a TOML key
@@ -962,13 +1034,18 @@ nondefault_flags(flags) = String[f for f in flags if !(f in DEFAULT_CODE_FLAGS)]
 # compiles the same code again. An `Int64`: 4 GiB is 0 in a 32-bit `Int`.
 const ASSUMED_WORKER_RSS = Int64(4) * 2^30
 
+# The CPUs this process may use: fewer than the machine's under a container
+# quota, and oversubscribing them turns timeouts flaky. 1.12 has only the
+# machine's count.
+effective_cpu_threads() = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
+
+# Default threads per worker from a `--threads` spec (`auto` gives one per CPU).
+default_thread_count(threads::AbstractString, cpus::Int = effective_cpu_threads()) =
+    (t = first(split(threads, ','))) == "auto" ? cpus : something(tryparse(Int, t), 2)
+
 function auto_workers(threads::String, nunits::Int)
-    # The CPUs this process may use: fewer than the machine's under a container
-    # quota, and oversubscribing them turns timeouts flaky. 1.12 has only the
-    # machine's count.
-    cpus = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.EFFECTIVE_CPU_THREADS : Sys.CPU_THREADS
-    # `auto` gives each worker a thread per CPU.
-    per_worker = (t = first(split(threads, ','))) == "auto" ? cpus : something(tryparse(Int, t), 2)
+    cpus = effective_cpu_threads()
+    per_worker = default_thread_count(threads, cpus)
     by_cpu = max(1, cpus ÷ max(1, per_worker))
     by_mem = max(1, Int(Sys.total_memory() ÷ ASSUMED_WORKER_RSS))
     n = clamp(min(by_cpu, by_mem), 1, 8)

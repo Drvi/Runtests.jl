@@ -79,11 +79,12 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
         uuid === nothing && push!(problems, "$(shown(project)): `uuid = $(repr(toml["uuid"]))` is not a UUID")
         uuids[name] = something(uuid, random_uuid())
     end
-    available = test_env_packages(target)
+    own = parse_project(target.project)
+    available = test_env_packages(target, own)
     # What a moved setup's `@__DIR__` becomes `pkgdir` of; `nothing` for a project
     # that is not a package.
-    own = TOML.parsefile(target.project)
     pkg = haskey(own, "uuid") ? String(own["name"]) : nothing
+    stdlib_cache = Dict{String, Union{Nothing, Base.UUID}}()
     plans = SetupPackage[]
     for name in names
         source = modules[Symbol(name)]
@@ -108,7 +109,9 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
         for root in imported_roots(ex)
             n = String(root)
             (root in (:Base, :Core, :Main) || n == name) && continue
-            u = something(get(available, n, nothing), stdlib_uuid(n), get(uuids, n, nothing), Some(nothing))
+            u = get(available, n, nothing)
+            u === nothing && (u = get!(() -> stdlib_uuid(n), stdlib_cache, n))
+            u === nothing && (u = get(uuids, n, nothing))
             u === nothing ? push!(unknown, n) : (deps[n] = u)
         end
         isempty(unknown) || push!(
@@ -204,13 +207,12 @@ The packages a test item can import by name: `test/Project.toml`'s `[deps]` when
 there is one, or else the package's `[deps]` and the extras its `test` target
 names, and the package itself either way.
 """
-function test_env_packages(target)
-    root = TOML.parsefile(target.project)
+function test_env_packages(target, root::Dict{String, Any} = parse_project(target.project))
     out = Dict{String, Base.UUID}()
     haskey(root, "uuid") && (out[root["name"]] = Base.UUID(root["uuid"]))
-    testproj = joinpath(target.testdir, "Project.toml")
-    if isfile(testproj)
-        for (n, u) in get(Dict{String, Any}, TOML.parsefile(testproj), "deps")
+    testproj = project_file(target.testdir)
+    if testproj !== nothing
+        for (n, u) in get(Dict{String, Any}, parse_project(testproj), "deps")
             out[n] = Base.UUID(u)
         end
     else
@@ -295,11 +297,8 @@ function imported_roots(ex, out::Set{Symbol} = Set{Symbol}())
     ex isa Expr || return out
     if ex.head === :using || ex.head === :import
         for a in ex.args
-            a isa Expr && a.head === :(:) && (a = a.args[1])
-            a isa Expr && a.head === :as && (a = a.args[1])
-            if a isa Expr && a.head === :. && !isempty(a.args) && a.args[1] isa Symbol && a.args[1] !== :.
-                push!(out, a.args[1])
-            end
+            m = module_head(a)
+            m !== nothing && m !== :. && push!(out, m)
         end
         return out
     end

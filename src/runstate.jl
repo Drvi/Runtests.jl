@@ -84,14 +84,19 @@ stopped by Ctrl-C did not fail, one left running in a run stopped as hung did.
     ENDING_ERRORED = 9        # stopped by an error of the run itself
 end
 
-# The words a run state's description gives an ending.
-const ENDING_WORDS = Dict(
-    ENDING_FINISHED => "finished", ENDING_FAILFAST => "stopped after a failure (failfast)",
-    ENDING_INTERRUPTED => "interrupted", ENDING_STALLED => "stopped as hung",
-    ENDING_EXITED => "stopped as its process exited", ENDING_INIT_FAILED => "stopped: a profile's init failed",
-    ENDING_START_FAILED => "stopped: a worker could not start", ENDING_SETUP_FAILED => "ended before its first item",
-    ENDING_ERRORED => "stopped by an error of the run",
+# The words a run state's description gives an ending, indexed by `UInt8(ending)`.
+const ENDING_WORDS = (
+    "finished",
+    "stopped after a failure (failfast)",
+    "interrupted",
+    "stopped as hung",
+    "stopped as its process exited",
+    "stopped: a profile's init failed",
+    "stopped: a worker could not start",
+    "ended before its first item",
+    "stopped by an error of the run",
 )
+ending_word(e::RunEnding) = (i = Int(UInt8(e)); 1 <= i <= length(ENDING_WORDS) ? ENDING_WORDS[i] : "")
 
 const EVENT_ATTEMPT = UInt8(1)       # an attempt at an item ended
 const EVENT_WORKER_UP = UInt8(2)     # a worker process started
@@ -188,15 +193,39 @@ struct ItemRecord
 end
 @assert sizeof(ItemRecord) == 32
 
-# Sixteen bytes, two of them padding after `exclusive`: the compiler's layout, so
-# it cannot drift from the struct.
+# Sixteen bytes, with explicit zeroed padding after `exclusive` so `write_record`
+# never writes uninitialized stack bytes to disk.
 struct UnitRecord
     first::UInt32
     last::UInt32
     profile::UInt8
     exclusive::UInt8
+    pad::UInt16
     throttle::UInt32
 end
+@assert sizeof(UnitRecord) == 16
+
+# Peak memory summary written in-place to the reserved `RS_MEMORY_BYTES` block.
+struct MemoryRecord
+    peak_total_mb::Float32
+    peak_total_at::Float32
+    peak_single_mb::Float32
+    peak_single_pid::Int32
+    setup_peak_mb::Float32
+    test_peak_mb::Float32
+    nprocs_peak::Int32
+end
+@assert sizeof(MemoryRecord) == 28
+
+const MemorySummary = @NamedTuple{
+    peak_total_mb::Float32, peak_total_at::Float32, peak_single_mb::Float32,
+    peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32, nprocs_peak::Int32
+}
+const ZERO_MEMORY = MemorySummary((0.0f0, 0.0f0, 0.0f0, Int32(0), 0.0f0, 0.0f0, Int32(0)))
+memory_summary(r::MemoryRecord) = MemorySummary((
+    r.peak_total_mb, r.peak_total_at, r.peak_single_mb, r.peak_single_pid,
+    r.setup_peak_mb, r.test_peak_mb, r.nprocs_peak
+))
 
 # One item's status as it sits on disk. Every field lands on its natural alignment,
 # so there is no padding.
@@ -260,6 +289,7 @@ struct RunStateFile
     # nothing. Only ever touched under `lock`.
     status_ref::Base.RefValue{StatusRecord}
     event_ref::Base.RefValue{EventRecord}
+    memory_ref::Base.RefValue{MemoryRecord}
     # Keeps the file's modification time fresh while the run lasts; see `is_live`.
     heartbeat::Base.RefValue{Union{Nothing, Tuple{Timer, Task}}}
     # How the run ended, once it is known: the first reason given is the one kept.
@@ -307,22 +337,13 @@ read_text(path) = (path isa AbstractString && isfile(path)) ? read(path, String)
 # The seed as it is printed and passed back: a Julia literal, `runtests(seed = 0x…)`.
 seed_text(seed::UInt64) = string("0x", string(seed; base = 16, pad = 16))
 
-# The run settings a replay puts back, with how each is read out of the file. What
-# only changes how a run is presented is recorded but not replayed.
-const REPLAYED_SETTINGS = (
-    :workers => s -> parse(Int, s), :threads => identity,
-    :timeout => s -> parse(Int, s), :init_timeout => s -> parse(Int, s),
-    :test_end_timeout => s -> parse(Int, s), :artifacts_timeout => s -> parse(Int, s), :retries => s -> parse(Int, s),
-    :failfast => s -> parse(Bool, s), :item_failfast => s -> parse(Bool, s),
-    :logs => Symbol, :memory_threshold => s -> parse(Float64, s),
-    :seed => s -> parse(UInt64, s), :skip_environment => s -> String[n for n in split(s, ',')],
-)
-
-run_setting(cfg::RunConfig, key::Symbol) =
-    key === :timeout ? cfg.timeout_s : key === :init_timeout ? cfg.init_timeout_s :
-    key === :test_end_timeout ? cfg.test_end_timeout_s : key === :artifacts_timeout ? cfg.artifacts_timeout_s :
-    key === :skip_environment ? join(cfg.skip_environment, ',') :
-    getfield(cfg, key)
+# Format a `RunConfig` setting from `REPLAY_SPECS` for `meta`.
+function format_replay_setting(cfg::RunConfig, spec)
+    val = getfield(cfg, spec.field)
+    spec.key === :seed && return seed_text(val::UInt64)
+    spec.replay === :csv && return join(val::Vector{String}, ',')
+    return string(val)
+end
 
 # Variables a run's behaviour can depend on, and the ones that find the CI job it
 # ran in. Anything that looks like a credential stays out: the file is meant to be
@@ -359,8 +380,8 @@ function run_meta(p::Plan)
         "selection" => p.selection,
         "environment" => env, "environment_project" => read_text(env),
     ]
-    for key in RUN_KEYS
-        push!(meta, string(key) => key === :seed ? seed_text(cfg.seed) : string(run_setting(cfg, key)))
+    for spec in SETTING_SPECS
+        push!(meta, string(spec.key) => format_replay_setting(cfg, spec))
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     # Always written, empty for no `[throttle]`: a record without it predates throttles.
@@ -395,7 +416,9 @@ directories can each have a profile of the same name.
 """
 function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, start::Float64 = time(),
                         meta::Vector{Pair{String, String}} = Pair{String, String}[],
-                        worker_projects::Vector{String} = String[])
+                        worker_projects::Vector{String} = String[],
+                        heartbeat::Bool = true,
+                        shared_env::Union{Nothing, Tuple{Vector{UInt8}, Vector{UInt8}}} = nothing)
     mkpath(dirname(path))
     io = open(path, "w+")
     strings = StringTable()
@@ -403,81 +426,90 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     sizehint!(strings.index, 2 * nitems(p) + 64)
     sizehint!(strings.order, 2 * nitems(p) + 64)
 
-    profiles = IOBuffer()
-    write(profiles, UInt32(length(p.profiles)))
+    # Write all static sections after `strings` sequentially into one `body` buffer;
+    # record each section's offset relative to `body` start, then shift by `off_meta`.
+    body = IOBuffer()
+
+    rel_meta = UInt32(position(body))
+    pairs_ = [run_meta(p); meta]
+    write(body, UInt32(length(pairs_)))
+    for (k, v) in pairs_
+        write(body, intern!(strings, k), intern!(strings, v))
+    end
+
+    rel_profiles = UInt32(position(body))
+    write(body, UInt32(length(p.profiles)))
     for (j, prof) in enumerate(p.profiles)
-        write(profiles, intern!(strings, string(prof.name)))
-        write(profiles, UInt32(length(prof.julia_args)))
+        write(body, intern!(strings, string(prof.name)))
+        write(body, UInt32(length(prof.julia_args)))
         for a in prof.julia_args
-            write(profiles, intern!(strings, a))
+            write(body, intern!(strings, a))
         end
         # As configured, empty for the run's: a replay asked for other threads gives
         # them to the profiles that take the run's.
-        write(profiles, intern!(strings, p.packages.cfg[p.profile_package[j]].profiles[prof.name].threads))
-        write(profiles, UInt32(length(prof.env)))
+        write(body, intern!(strings, p.packages.cfg[p.profile_package[j]].profiles[prof.name].threads))
+        write(body, UInt32(length(prof.env)))
         for (k, v) in prof.env
-            write(profiles, intern!(strings, k))
-            write(profiles, intern!(strings, v))
+            write(body, intern!(strings, k))
+            write(body, intern!(strings, v))
         end
-        write(profiles, intern!(strings, expr_text(prof.init)))
-        write(profiles, intern!(strings, expr_text(prof.test_end)))
-        write(profiles, intern!(strings, prof.preferences))
+        write(body, intern!(strings, expr_text(prof.init)))
+        write(body, intern!(strings, expr_text(prof.test_end)))
+        write(body, intern!(strings, prof.preferences))
         # The content too: the path is one on the machine that ran it.
-        write(profiles, intern!(strings, read_text(prof.preferences)))
+        write(body, intern!(strings, read_text(prof.preferences)))
     end
 
-    units = IOBuffer()
-    write(units, UInt32(length(p.units)))
+    rel_units = UInt32(position(body))
+    write(body, UInt32(length(p.units)))
     uref = Ref{UnitRecord}()
     for u in 1:length(p.units)
         span = p.units.span[u]
         uref[] = UnitRecord(
             UInt32(first(span)), UInt32(last(span)), UInt8(p.units.profile[u]),
-            UInt8(p.units.exclusive[u]), intern!(strings, string(p.units.throttle[u]))
+            UInt8(p.units.exclusive[u]), UInt16(0), intern!(strings, string(p.units.throttle[u]))
         )
-        write_record(units, uref)
+        write_record(body, uref)
     end
 
-    items = IOBuffer()
-    write(items, UInt32(nitems(p)))
+    rel_items = UInt32(position(body))
+    write(body, UInt32(nitems(p)))
     iref = Ref{ItemRecord}()
     for i in 1:nitems(p)
         iref[] = ItemRecord(
             intern!(strings, p.items.name[i]), intern!(strings, itemfile(p, i)),
             UInt32(p.items.line[i]), UInt32(p.items.unit[i]), p.items.hash[i], UInt32(0), p.items.seed[i]
         )
-        write_record(items, iref)
+        write_record(body, iref)
     end
 
-    manifest = Vector{UInt8}(environment_manifest())
-    workers = IOBuffer()
-    write_workers!(workers, strings, p, worker_projects, manifest)
-    policies = IOBuffer()
-    write_policies!(policies, strings, p)
-
-    pairs_ = [run_meta(p); meta]
-    meta = IOBuffer()
-    write(meta, UInt32(length(pairs_)))
-    for (k, v) in pairs_
-        write(meta, intern!(strings, k), intern!(strings, v))
+    manifest, packed = if shared_env === nothing
+        m = Vector{UInt8}(environment_manifest())
+        (m, isempty(m) ? UInt8[] : zlib_compress(m))
+    else
+        shared_env
     end
+    rel_environment = UInt32(position(body))
+    write(body, UInt32(length(manifest)), UInt32(length(packed)), packed)
+
+    rel_workers = UInt32(position(body))
+    write_workers!(body, strings, p, worker_projects, manifest)
+
+    rel_policies = UInt32(position(body))
+    write_policies!(body, strings, p)
 
     strbuf = IOBuffer()
     write_strings(strbuf, strings)
 
-    packed = isempty(manifest) ? UInt8[] : zlib_compress(manifest)
-    environment = IOBuffer()
-    write(environment, UInt32(length(manifest)), UInt32(length(packed)), packed)
-
     off_strings = UInt32(RS_HEADER_BYTES)
     off_meta = off_strings + UInt32(strbuf.size)
-    off_profiles = off_meta + UInt32(meta.size)
-    off_units = off_profiles + UInt32(profiles.size)
-    off_items = off_units + UInt32(units.size)
-    off_environment = off_items + UInt32(items.size)
-    off_workers = off_environment + UInt32(environment.size)
-    off_policies = off_workers + UInt32(workers.size)
-    off_status = off_policies + UInt32(policies.size)
+    off_profiles = off_meta + rel_profiles
+    off_units = off_meta + rel_units
+    off_items = off_meta + rel_items
+    off_environment = off_meta + rel_environment
+    off_workers = off_meta + rel_workers
+    off_policies = off_meta + rel_policies
+    off_status = off_meta + UInt32(body.size)
     off_memory = off_status + UInt32(RS_STATUS_BYTES * nitems(p))
     off_events = off_memory + UInt32(RS_MEMORY_BYTES)
 
@@ -487,23 +519,17 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
         off_items, off_status, off_memory, off_events, off_environment, off_workers, off_policies
     )))
     write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
-    write(io, take!(strbuf)); write(io, take!(meta)); write(io, take!(profiles))
-    write(io, take!(units)); write(io, take!(items)); write(io, take!(environment))
-    write(io, take!(workers)); write(io, take!(policies))
-    blank = Ref{StatusRecord}()
-    for _ in 1:nitems(p)
-        write_status_record(
-            io, blank, UNSEEN, Int8(0), SlotIdx(0), 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0
-        )
-    end
-    write(io, zeros(UInt8, RS_MEMORY_BYTES))
+    write(io, take!(strbuf))
+    write(io, take!(body))
+    # `UInt8(UNSEEN) == 0`, so blank statuses and memory are a single zero block.
+    write(io, zeros(UInt8, RS_STATUS_BYTES * nitems(p) + RS_MEMORY_BYTES))
     flush(io)
     rsf = RunStateFile(
         io, String(path), off_status, off_memory, UInt32(nitems(p)),
-        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{Union{Nothing, Tuple{Timer, Task}}}(nothing),
-        Ref(ENDING_NONE)
+        ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{MemoryRecord}(),
+        Ref{Union{Nothing, Tuple{Timer, Task}}}(nothing), Ref(ENDING_NONE)
     )
-    rsf.heartbeat[] = start_heartbeat(rsf)
+    heartbeat && (rsf.heartbeat[] = start_heartbeat(rsf))
     return rsf
 end
 
@@ -539,7 +565,7 @@ function write_workers!(io::IO, strings::StringTable, p::Plan, worker_projects::
         end
     end
     write(io, UInt32(length(index)))
-    foreach(k -> write(io, k), index)
+    write(io, index)
     return nothing
 end
 
@@ -555,17 +581,16 @@ function write_policies!(io::IO, strings::StringTable, p::Plan)
         skip = p.items.skip[i]
         r = PolicyRecord(Int32(item_timeout(p, ItemIdx(i))), intern!(strings, skip isa Expr ? expr_text(skip) : string(skip)),
                          retries[p.items.unit[i]], Int8(item_failfast(p, i)), UInt16(0))
-        index[i] = get!(table, r) do
+        id = get(table, r, UInt32(0))
+        if id == 0
             push!(order, r)
-            UInt32(length(order))
+            id = UInt32(length(order))
+            table[r] = id
         end
+        index[i] = id
     end
     write(io, UInt32(length(order)))
-    ref = Ref{PolicyRecord}()
-    for r in order
-        ref[] = r
-        write_record(io, ref)
-    end
+    write(io, order)
     write(io, UInt32(length(index)))
     write(io, index)
     return nothing
@@ -666,10 +691,16 @@ function append_event!(
     end
 end
 
-write_memory!(rsf::Union{Nothing, RunStateFile}, m) = update!(rsf, rsf === nothing ? 0 : rsf.off_memory) do io
-    write(io, Float32(m.peak_total_bytes / 2^20), Float32(m.peak_total_at), Float32(m.peak_single_bytes / 2^20))
-    write(io, Int32(m.peak_single_pid), Float32(phase_peak(m, PHASE_SETUP) / 2^20))
-    write(io, Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak))
+function write_memory!(rsf::Union{Nothing, RunStateFile}, m)
+    rsf === nothing && return nothing
+    update!(rsf, rsf.off_memory) do io
+        rsf.memory_ref[] = MemoryRecord(
+            Float32(m.peak_total_bytes / 2^20), Float32(m.peak_total_at), Float32(m.peak_single_bytes / 2^20),
+            Int32(m.peak_single_pid), Float32(phase_peak(m, PHASE_SETUP) / 2^20),
+            Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak)
+        )
+        write_record(io, rsf.memory_ref)
+    end
 end
 
 """
@@ -702,10 +733,22 @@ function finish_run_state!(rsf::Union{Nothing, RunStateFile}, ending::RunEnding 
         rsf.heartbeat[] = nothing
         exiting || (close(first(beating)); wait(last(beating)))
     end
-    mark_ending!(rsf, ending)
-    update!(io -> write(io, time()), rsf, header_offset(:end_unix))
-    update!(io -> write(io, RS_CLOSED), rsf, header_offset(:closed))
-    @lock rsf.lock close(rsf.io)
+    failure = @lock rsf.lock try
+        if isopen(rsf.io)
+            if rsf.ending[] === ENDING_NONE
+                rsf.ending[] = ending
+                seek(rsf.io, header_offset(:ending)); write(rsf.io, UInt8(ending)); flush(rsf.io)
+            end
+            seek(rsf.io, header_offset(:end_unix)); write(rsf.io, time()); flush(rsf.io)
+            seek(rsf.io, header_offset(:closed)); write(rsf.io, RS_CLOSED); flush(rsf.io)
+            close(rsf.io)
+        end
+        nothing
+    catch e
+        is_interrupt(e) && rethrow()
+        e
+    end
+    failure === nothing || @warn "Runtests: could not write the run state" exception = failure maxlog = 1
     return nothing
 end
 
@@ -812,8 +855,7 @@ struct RunStateRecord
     units::Vector{RunStateUnit}
     items::Vector{RunStateItem}
     statuses::Vector{RunStateStatus}
-    memory::@NamedTuple{peak_total_mb::Float32, peak_total_at::Float32, peak_single_mb::Float32,
-        peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32, nprocs_peak::Int32}
+    memory::MemorySummary
     events::Vector{RunStateEvent}
     # Each distinct environment of the profiles' workers, each profile's index into them
     # (0 for none), and each item's policy.
@@ -822,6 +864,17 @@ struct RunStateRecord
     policies::Vector{ItemPolicy}
     truncated::Bool
     mtime::Float64      # when the file was last written, as it was read; see `is_live`
+end
+
+# Lightweight header + metadata view for callers that only inspect `meta`/`closed`/`mtime`
+# (`gone_checkout`, `exported_siblings`, `findfirst_record`), avoiding reading the rest of the file.
+struct RunStateMeta
+    path::String
+    closed::Bool
+    ending::RunEnding
+    start_unix::Float64
+    meta::Dict{String, String}
+    mtime::Float64
 end
 
 """
@@ -836,10 +889,18 @@ written, whose end is not known.
 """
 function idle_worker_seconds(rs::RunStateRecord)
     slots = tryparse(Int, get(rs.meta, "slots", ""))
-    attempts = [e for e in rs.events if e.kind === :attempt]
-    (slots === nothing || isempty(attempts) || !rs.closed || rs.end_unix <= rs.start_unix) && return nothing
-    span = (rs.end_unix - rs.start_unix) - minimum(e -> e.t0, attempts)
-    busy = sum(e -> Float64(e.t1 - e.t0), attempts)
+    (slots === nothing || !rs.closed || rs.end_unix <= rs.start_unix) && return nothing
+    first_t0 = Inf32
+    busy = 0.0
+    any_attempt = false
+    for e in rs.events
+        e.kind === :attempt || continue
+        any_attempt = true
+        e.t0 < first_t0 && (first_t0 = e.t0)
+        busy += Float64(e.t1 - e.t0)
+    end
+    any_attempt || return nothing
+    span = (rs.end_unix - rs.start_unix) - first_t0
     return max(0.0, slots * span - busy)
 end
 
@@ -855,31 +916,70 @@ way through. A live one's verdicts are not in yet, and an item it holds as `runn
 is being run, not one a run left so when it died; its finished items' durations are
 as good as any.
 """
-is_live(rs::RunStateRecord; now::Real = time()) = !rs.closed && now - rs.mtime < LIVE_S && !writer_gone(rs)
+is_live(rs::Union{RunStateRecord, RunStateMeta}; now::Real = time()) =
+    !rs.closed && now - rs.mtime < LIVE_S && !writer_gone(rs)
 
 # Whether the process that wrote `rs` is known to have exited, so that a run killed a
 # moment ago counts as over at once rather than `LIVE_S` later: it ran on this
 # machine, by its own hostname, not `RUNTESTS_HOST`, which names one machine across
 # the CI runners that take turns being it and whose pids mean nothing here, and its
 # pid is free. A pid another process has taken since says nothing either way.
-function writer_gone(rs::RunStateRecord)
-    get(rs.meta, "hostname", "") in (machine_name(), gethostname()) || return false
+function writer_gone(rs::Union{RunStateRecord, RunStateMeta})
+    h = get(rs.meta, "hostname", "")
+    (h == machine_name() || h == gethostname()) || return false
     pid = tryparse(Int32, get(rs.meta, "pid", ""))
     pid === nothing && return false
     return ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == Base.UV_ESRCH
 end
 
+# Read only the header, string table and `meta` section of a run state file
+# (skipping profiles, units, items, compressed manifest, workers, policies, statuses, events).
+function read_run_meta(path::AbstractString)
+    try
+        rp = record_path(path)
+        written = mtime(rp)
+        bytes, h = open(rp) do io
+            hdr = read(io, RS_HEADER_BYTES)
+            length(hdr) == RS_HEADER_BYTES || return nothing
+            hdr_rec = read_record(IOBuffer(hdr), Header)
+            (hdr_rec.magic == RS_MAGIC && hdr_rec.version == RS_VERSION) || return nothing
+            stop = Int(hdr_rec.off_profiles)
+            # Cap read to file size in case `off_profiles` is garbled.
+            fsize = filesize(io)
+            limit = min(stop, Int(fsize))
+            buf = limit > RS_HEADER_BYTES ? vcat(hdr, read(io, limit - RS_HEADER_BYTES)) : hdr
+            return buf, hdr_rec
+        end
+        io = IOBuffer(bytes)
+        total = length(bytes)
+        seek(io, Int(h.off_strings))
+        strings = read_strings(io, bytes)
+        seek(io, Int(h.off_meta))
+        meta = Dict{String, String}()
+        for _ in 1:bounded(read(io, UInt32), total)
+            k = lookup(strings, read(io, UInt32))
+            meta[k] = lookup(strings, read(io, UInt32))
+        end
+        ending = h.ending <= UInt8(typemax(RunEnding)) ? RunEnding(h.ending) : ENDING_NONE
+        return RunStateMeta(String(rp), closed_file(h, ending), ending, h.start_unix, meta, written)
+    catch e
+        is_interrupt(e) && rethrow()
+        return nothing
+    end
+end
+
 """
-    read_run_state(path) -> Union{Nothing,RunStateRecord}
+    read_run_state(path; full = true) -> Union{Nothing,RunStateRecord}
 
 Read a run state: a run's directory, `<run>.rundata`, or the `run.runstate` file in
 it. A file that is truncated, from a crashed run, or written by a different
 version gives as much as can be read, or `nothing`. The reader suppresses ordinary
 read and parse errors so a broken old record does not stop a new run, and a record
 that another run deletes while it reads gives `nothing`. An interrupt during parsing
-is rethrown.
+is rethrown. With `full = false`, skips sections unused by history/pruning
+(`profiles`, `units`, `environment`, `workers`, `policies`, `memory`).
 """
-function read_run_state(path::AbstractString)
+function read_run_state(path::AbstractString; full::Bool = true)
     # Another run prunes records at any moment. On Windows a file that is being deleted
     # can refuse even `stat` until every process has closed it, so the look at the path
     # and at the modification time can fail as the read does.
@@ -906,85 +1006,103 @@ function read_run_state(path::AbstractString)
             meta[k] = lookup(strings, read(io, UInt32))
         end
 
-        seek(io, Int(h.off_profiles))
-        profiles, preferences = read_profiles_section(io, strings)
+        profiles = Dict{Symbol, Profile}()
+        preferences = Dict{Symbol, String}()
+        units = RunStateUnit[]
+        manifest_bytes = 0
+        manifest_zlib = UInt8[]
+        worker_environments = WorkerEnvironment[]
+        profile_environments = Int[]
+        policies = ItemPolicy[]
+        truncated = false
 
-        seek(io, Int(h.off_units))
-        # A `Symbol` per throttle name, not per unit: nearly every unit has the same one.
-        throttles = Dict{UInt32, Symbol}()
-        units = map(1:bounded(read(io, UInt32), total)) do _
-            r = read_record(io, UnitRecord)
-            throttle = get(throttles, r.throttle, nothing)
-            throttle === nothing && (throttle = throttles[r.throttle] = Symbol(lookup(strings, r.throttle)))
-            RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, throttle)
+        if full
+            seek(io, Int(h.off_profiles))
+            profiles, preferences = read_profiles_section(io, strings)
+
+            seek(io, Int(h.off_units))
+            # A `Symbol` per throttle name, not per unit: nearly every unit has the same one.
+            throttles = Dict{UInt32, Symbol}()
+            units = map(1:bounded(read(io, UInt32), total)) do _
+                r = read_record(io, UnitRecord)
+                throttle = get(throttles, r.throttle, nothing)
+                throttle === nothing && (throttle = throttles[r.throttle] = Symbol(lookup(strings, r.throttle)))
+                RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, throttle)
+            end
         end
 
         seek(io, Int(h.off_items))
-        run_seed = something(tryparse(UInt64, get(meta, "seed", "")), UInt64(0))
         items = map(1:min(bounded(read(io, UInt32), total), n_items)) do _
             r = read_record(io, ItemRecord)
             RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit), r.hash, r.seed)
         end
 
-        # Kept as stored: inflating it is for whoever asks for it.
-        seek(io, Int(h.off_environment))
-        manifest_bytes = Int(read(io, UInt32))
-        manifest_zlib = read(io, bounded(read(io, UInt32), total))
+        if full
+            # Kept as stored: inflating it is for whoever asks for it.
+            seek(io, Int(h.off_environment))
+            manifest_bytes = Int(read(io, UInt32))
+            manifest_zlib = read(io, bounded(read(io, UInt32), total))
 
-        # A file cut short in them still gives what comes before, as it does further on.
-        truncated = false
-        worker_environments, profile_environments, policies = try
-            (read_workers_section(seek(io, Int(h.off_workers)), strings, total, manifest_bytes, manifest_zlib)...,
-             read_policies_section(seek(io, Int(h.off_policies)), strings, total))
-        catch e
-            e isa EOFError || rethrow()
-            truncated = true
-            (WorkerEnvironment[], Int[], ItemPolicy[])
-        end
-
-        statuses = sizehint!(RunStateStatus[], n_items)
-        for i in 1:n_items
-            at = Int(h.off_status) + (i - 1) * RS_STATUS_BYTES
-            if at + RS_STATUS_BYTES > total
+            # A file cut short in them still gives what comes before, as it does further on.
+            worker_environments, profile_environments, policies = try
+                (read_workers_section(seek(io, Int(h.off_workers)), strings, total, manifest_bytes, manifest_zlib)...,
+                 read_policies_section(seek(io, Int(h.off_policies)), strings, total))
+            catch e
+                e isa EOFError || rethrow()
                 truncated = true
-                push!(statuses, RunStateStatus(UNSEEN, Int8(0), Int16(0), 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, Int32(0)))
-                continue
+                (WorkerEnvironment[], Int[], ItemPolicy[])
             end
-            seek(io, at)
-            push!(statuses, read_status_record(io))
         end
 
-        memory = if Int(h.off_memory) + 28 <= total
-            seek(io, Int(h.off_memory))
-            (; peak_total_mb = read(io, Float32), peak_total_at = read(io, Float32), peak_single_mb = read(io, Float32),
-                peak_single_pid = read(io, Int32), setup_peak_mb = read(io, Float32), test_peak_mb = read(io, Float32),
-                nprocs_peak = read(io, Int32))
-        else
+        statuses = Vector{RunStateStatus}(undef, n_items)
+        off_st = Int(h.off_status)
+        avail_st = off_st <= total ? min(n_items, (total - off_st) ÷ RS_STATUS_BYTES) : 0
+        if avail_st > 0
+            seek(io, off_st)
+            for i in 1:avail_st
+                statuses[i] = read_status_record(io)
+            end
+        end
+        if avail_st < n_items
             truncated = true
-            (; peak_total_mb = 0.0f0, peak_total_at = 0.0f0, peak_single_mb = 0.0f0, peak_single_pid = Int32(0),
-                setup_peak_mb = 0.0f0, test_peak_mb = 0.0f0, nprocs_peak = Int32(0))
+            blank_st = RunStateStatus(UNSEEN, Int8(0), Int16(0), 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, Int32(0))
+            for i in (avail_st + 1):n_items
+                statuses[i] = blank_st
+            end
+        end
+
+        memory = ZERO_MEMORY
+        if full
+            if Int(h.off_memory) + sizeof(MemoryRecord) <= total
+                seek(io, Int(h.off_memory))
+                memory = memory_summary(read_record(io, MemoryRecord))
+            else
+                truncated = true
+            end
         end
 
         at = Int(h.off_events)
-        events = sizehint!(RunStateEvent[], max(0, total - at) ÷ RS_EVENT_BYTES)
-        while at + RS_EVENT_BYTES <= total
+        n_ev = at <= total ? (total - at) ÷ RS_EVENT_BYTES : 0
+        events = Vector{RunStateEvent}(undef, n_ev)
+        if n_ev > 0
             seek(io, at)
-            e = read_record(io, EventRecord)
-            kind = e.kind == EVENT_ATTEMPT ? :attempt : e.kind == EVENT_WORKER_UP ? :worker_up :
-                e.kind == EVENT_WORKER_DOWN ? :worker_down : :unknown
-            state = kind === :attempt && e.state <= UInt8(CANCELLED) ? ItemState(e.state) : UNSEEN
-            ended_by = kind === :worker_down ? worker_end(e.state) : :none
-            push!(events, RunStateEvent(kind, state, ended_by, e.attempt, e.seq, e.slot, e.item, e.pid, e.t0, e.t1,
-                                        e.exitcode, e.signal, recorded(e.compile), recorded(e.recompile),
-                                        recorded(e.alloc_mb), recorded(e.peak_rss_mb)))
-            at += RS_EVENT_BYTES
+            for i in 1:n_ev
+                e = read_record(io, EventRecord)
+                kind = e.kind == EVENT_ATTEMPT ? :attempt : e.kind == EVENT_WORKER_UP ? :worker_up :
+                    e.kind == EVENT_WORKER_DOWN ? :worker_down : :unknown
+                state = kind === :attempt && e.state <= UInt8(CANCELLED) ? ItemState(e.state) : UNSEEN
+                ended_by = kind === :worker_down ? worker_end(e.state) : :none
+                events[i] = RunStateEvent(kind, state, ended_by, e.attempt, e.seq, e.slot, e.item, e.pid, e.t0, e.t1,
+                                          e.exitcode, e.signal, recorded(e.compile), recorded(e.recompile),
+                                          recorded(e.alloc_mb), recorded(e.peak_rss_mb))
+            end
         end
         # Part of an event, which a writer stopped while appending it left.
-        at < total && (truncated = true)
+        at + n_ev * RS_EVENT_BYTES < total && (truncated = true)
         # A verdict whose attempt has no event of the same outcome: the writer stopped
         # between the two writes of a completion. The verdict is kept, and the evidence
         # for it said to be incomplete.
-        truncated |= !verdicts_have_events(statuses, events)
+        full && (truncated |= !verdicts_have_events(statuses, events))
         ending = h.ending <= UInt8(typemax(RunEnding)) ? RunEnding(h.ending) : ENDING_NONE
         return RunStateRecord(
             String(path), h.version, ending !== ENDING_NONE, closed_file(h, ending), h.flags & RS_FLAG_DRY_RUN != 0,
@@ -1024,17 +1142,28 @@ function read_policies_section(io::IO, strings, total::Integer)
         r = read_record(io, PolicyRecord)
         ItemPolicy(r.timeout_s, r.retries, r.failfast != 0, lookup(strings, r.skip))
     end
-    return ItemPolicy[table[read(io, UInt32)] for _ in 1:bounded(read(io, UInt32), total)]
+    n = bounded(read(io, UInt32), total)
+    out = sizehint!(ItemPolicy[], n)
+    for _ in 1:n
+        idx = read(io, UInt32)
+        1 <= idx <= length(table) ? push!(out, table[idx]) : throw(EOFError())
+    end
+    return out
+end
+
+function inflate_manifest(zlib::Vector{UInt8}, bytes::Int, label::AbstractString = "")
+    bytes == 0 && return ""
+    try
+        return String(zlib_uncompress(zlib, bytes))
+    catch e
+        is_interrupt(e) && rethrow()
+        isempty(label) || @debug "Runtests: the manifest recorded in $(label) is unreadable" exception = e
+        return ""
+    end
 end
 
 # The manifest of a recorded worker environment, as `recorded_manifest` gives the run's.
-recorded_manifest(env::WorkerEnvironment) = env.manifest_bytes == 0 ? "" :
-    try
-        String(zlib_uncompress(env.manifest_zlib, env.manifest_bytes))
-    catch e
-        is_interrupt(e) && rethrow()
-        ""
-    end
+recorded_manifest(env::WorkerEnvironment) = inflate_manifest(env.manifest_zlib, env.manifest_bytes)
 
 # Whether every item's recorded verdict has the event of its attempt with that outcome.
 # One pass over the events marks each item whose row has its event; an event of no
@@ -1059,16 +1188,7 @@ end
 The test environment's `Manifest.toml` as the run recorded it: `""` when it
 recorded none, or when the stored copy does not inflate to what it should.
 """
-function recorded_manifest(rs::RunStateRecord)
-    rs.manifest_bytes == 0 && return ""
-    try
-        return String(zlib_uncompress(rs.manifest_zlib, rs.manifest_bytes))
-    catch e
-        is_interrupt(e) && rethrow()
-        @debug "Runtests: the manifest recorded in $(rs.path) is unreadable" exception = e
-        return ""
-    end
-end
+recorded_manifest(rs::RunStateRecord) = inflate_manifest(rs.manifest_zlib, rs.manifest_bytes, rs.path)
 
 function read_status_record(io::IO)
     r = read_record(io, StatusRecord)
@@ -1175,7 +1295,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     took = rs.end_unix > rs.start_unix ? string(", took ", fmt_seconds(rs.end_unix - rs.start_unix)) : ""
     # A damaged file's start is no time a clock can show.
     started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
-    println(io, "  started ", started, took, rs.complete ? string(", ", ENDING_WORDS[rs.ending]) : "")
+    println(io, "  started ", started, took, rs.complete ? string(", ", ending_word(rs.ending)) : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
         m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
@@ -1194,14 +1314,16 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     passed = count(==(PASSED), states)
     tally = [passed > 0 ? ["$passed passed"] : String[]; state_tally(states)]
     println(io, "  ", length(rs.items), " items: ", join(tally, ", "))
-    # Paired by `zip`: a damaged file can hold fewer items than statuses.
-    bad = [(it, st) for (it, st) in zip(rs.items, rs.statuses) if is_non_pass(st.state) || st.state === RUNNING]
+    # Paired by index: a damaged file can hold fewer items than statuses.
+    bad = Tuple{Int, RunStateItem, RunStateStatus}[
+        (i, it, st) for (i, (it, st)) in enumerate(zip(rs.items, rs.statuses))
+        if is_non_pass(st.state) || st.state === RUNNING
+    ]
     isempty(bad) || println(io, "  not passed:")
     prefix = joinpath(rundata_dir(rs.path), "item_")
-    for (it, st) in bad
+    for (i, it, st) in bad
         println(io, "    ", rpad(repr(it.name), 30), " ", rpad(string(st.state), 12), " attempt ", st.attempt,
             " · worker ", st.slot, " (pid ", st.pid, ") · ", fmt_seconds(st.elapsed), " · ", it.file, ":", it.line)
-        i = findfirst(x -> x === it, rs.items)
         kept = filter(ispath, [failure_path(prefix, i, max(st.attempt, 1)), item_log_path(prefix, i, max(st.attempt, 1)),
                                artifacts_path(prefix, i, max(st.attempt, 1))])
         isempty(kept) || println(io, "      ", join(kept, " · "))
@@ -1217,7 +1339,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
             " (", how, ") · had run ", length(ran), isempty(ran) ? "" : string(": ", join(repr.(last(ran, 5)), ", "), length(ran) > 5 ? ", …" : ""))
     end
     print(io, "  run it again with Runtests.runtests(replay = ", repr(run_location(rs.path)), ")")
-    any(((it, st),) -> is_non_pass(st.state) && st.state !== CANCELLED, zip(rs.items, rs.statuses)) &&
+    any(((_, _, st),) -> is_non_pass(st.state) && st.state !== CANCELLED, bad) &&
         print(io, ", or its failing items with Runtests.runtestsf(replay = ", repr(run_location(rs.path)), ")")
 end
 
@@ -1264,7 +1386,7 @@ const MACHINE_NAME = Ref("")
 # Whether this machine recorded a run state, and so may prune it: by `run_host`, or,
 # with no `RUNTESTS_HOST`, by the hostname the machine had when it wrote it, which on
 # macOS can be another than the name it has now.
-function recorded_here(rs::RunStateRecord)
+function recorded_here(rs::Union{RunStateRecord, RunStateMeta})
     host = get(rs.meta, "host", "")
     host == run_host() && return true
     return isempty(get(ENV, "RUNTESTS_HOST", "")) && host == gethostname()
@@ -1417,15 +1539,21 @@ function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS; names = no
     return nothing
 end
 
+# Once-per-session warning tracker for directories (CI host, foreign format).
+const WARNED_DIRS_LOCK = ReentrantLock()
+const WARNED_HOSTS = Set{String}()
+const WARNED_FORMATS = Set{String}()
+
+warn_once!(seen::Set{String}, key::AbstractString) =
+    @lock WARNED_DIRS_LOCK (key in seen ? false : (push!(seen, String(key)); true))
+
 # On CI each job is a new machine to its hostname, so a directory of run states that a
 # cache brings back from job to job gains files and never loses any, unless
 # `RUNTESTS_HOST` names the machine the jobs take turns being. Said once a session for
 # each directory, when it holds run states of other machines.
-const WARNED_HOSTS = Set{String}()
 function warn_unnamed_ci_host(dir::AbstractString)
     get(ENV, "CI", "") in ("true", "1") && isempty(get(ENV, "RUNTESTS_HOST", "")) || return nothing
-    first_time = @lock WARNED_FORMATS_LOCK (dir in WARNED_HOSTS ? false : (push!(WARNED_HOSTS, dir); true))
-    first_time || return nothing
+    warn_once!(WARNED_HOSTS, dir) || return nothing
     @warn "Runtests: $(relpath_or_path(dir)) holds run states of other machines, and `RUNTESTS_HOST` is not set: " *
         "on CI each job is a new machine, and what a cache brings back is never pruned. Set `RUNTESTS_HOST` to " *
         "one name for the jobs that share the cache"
@@ -1451,12 +1579,13 @@ end
 # This project's run states that can be read, oldest first, each with its file.
 # Ordered by when each run started, as the file records it, not by its name: a run
 # state from elsewhere, renamed as it was downloaded say, counts from when it ran.
+# Reads with `full = false` (skipping profile AST parsing and cold replay blobs).
 function project_runs(root::AbstractString)
     project = project_id(root)
     runs = Pair{String, RunStateRecord}[]
     others = 0   # files of a format this version does not read
     for f in runstate_files(root)
-        rs = read_run_state(f)
+        rs = read_run_state(f; full = false)
         if rs === nothing
             v = runstate_version(f)
             v === nothing || v == RS_VERSION || (others += 1)
@@ -1485,16 +1614,10 @@ function runstate_version(path::AbstractString)
     end
 end
 
-# The directories already warned about, once a session each: every read of the
-# history comes past the same files.
-const WARNED_FORMATS = Set{String}()
-const WARNED_FORMATS_LOCK = ReentrantLock()
-
 # A run state this version does not read, another version's, is history the run goes
 # without, which is said rather than left to be found out.
 function warn_other_formats(dir::AbstractString, others::Integer)
-    first_time = @lock WARNED_FORMATS_LOCK (dir in WARNED_FORMATS ? false : (push!(WARNED_FORMATS, dir); true))
-    first_time || return nothing
+    warn_once!(WARNED_FORMATS, dir) || return nothing
     @warn "Runtests: $(relpath_or_path(dir)) holds $(plural(others, "run state")) of another version of Runtests; " *
         "this version does not read them, so the durations and failures they recorded are not used"
     return nothing
@@ -1512,10 +1635,12 @@ with_runs_read(f, root::AbstractString) = with(f, RUNS_READ => (String(root) => 
 # the run state a replay names.
 function runs_with(root::AbstractString, base::Union{Nothing, RunStateRecord})
     read = RUNS_READ[]
-    runs = read !== nothing && read.first == root ? copy(read.second) : project_runs(root)
+    cached = read !== nothing && read.first == root
+    runs = cached ? read.second : project_runs(root)
     (base === nothing || any(((f, _),) -> samefile(f, base.path), runs)) && return runs
-    push!(runs, base.path => base)
-    return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
+    out = cached ? copy(runs) : runs
+    push!(out, base.path => base)
+    return sort!(out; by = ((f, rs),) -> (rs.start_unix, f))
 end
 
 # Of `runs`, the ones whose verdicts count: from the base run on, when there is one.
@@ -1608,19 +1733,159 @@ a run state is judged by what is left once the older ones have gone. Each item's
 newest verdict stays, which is also what a replay's base is read against: the
 verdicts after the base, newest first.
 """
+# Recompute the kept-facts tuple for one item from its sorted `(run_idx, item_idx)`
+# occurrences, scanning newest-to-oldest over `alive` runs and stopping once all four
+# last-writer-wins channels are filled. Returns `(facts_tuple, min_run_visited)` where
+# `min_run_visited > 0` means every channel was decided by runs `>= min_run_visited`.
+function eval_item_kept(occ::Vector{Tuple{Int32, Int32}}, runs::Vector{Pair{String, RunStateRecord}},
+                        counts::BitVector, alive::BitVector)
+    present = false
+    has_v = false; v = Int8(-1); vat = 0.0; vseed = UInt64(0)
+    has_sec = false; sec = 0.0
+    has_hash = false; hash = UInt32(0)
+    has_unr = false; unr = false
+    min_r = Int32(0)
+    for k in lastindex(occ):-1:firstindex(occ)
+        r, i = occ[k]
+        alive[r] || continue
+        present = true
+        rs = runs[r].second
+        it, st = rs.items[i], rs.statuses[i]
+        if !has_sec && timed(st.state) && st.elapsed > 0
+            sec = Float64(st.elapsed)
+            has_sec = true
+        end
+        if !has_hash && !(st.state === UNSEEN || st.state === RUNNING || st.state === CANCELLED)
+            hash = it.hash
+            has_hash = true
+        end
+        if counts[r]
+            if !has_v || !has_unr
+                found = verdict(rs, i)
+                if !has_v && found !== nothing
+                    v = Int8(found)
+                    vat = rs.start_unix
+                    vseed = found ? it.seed : UInt64(0)
+                    has_v = true
+                end
+                if !has_unr
+                    unr = st.state === UNSEEN || st.state === CANCELLED || (st.state === RUNNING && found === nothing)
+                    has_unr = true
+                end
+            end
+        end
+        if has_v && has_sec && has_hash && has_unr
+            min_r = r
+            break
+        end
+    end
+    return (present, v, vat, vseed, sec, hash, unr), min_r
+end
+
+in_names(::Nothing, ::String) = true
+in_names(names, name::String) = name in names
+
 function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates; names = nothing)
     # Nothing to weigh: the facts of every item need not be built to keep every run.
     isempty(candidates) && return String[]
-    kept = copy(runs)
-    now = kept_facts(item_facts(kept), names)
+    R = length(runs)
+    active = BitVector(undef, R)
+    counts = BitVector(undef, R)
+    now_t = time()
+    for r in 1:R
+        rs = runs[r].second
+        act = !(rs.dry_run || rs.aborted)
+        active[r] = act
+        counts[r] = act && !is_live(rs; now = now_t)
+    end
+
+    # Resolve candidate indices in `runs` (preserving order and duplicate-removal semantics).
+    cand_set = Set{String}()
+    for f in candidates
+        push!(cand_set, String(f))
+    end
+    # Only items that appear in at least one active candidate run can ever change facts.
+    name_to_id = Dict{String, Int32}()
+    run_ids = Vector{Vector{Int32}}(undef, R)
+    for r in 1:R
+        run_ids[r] = Int32[]
+        (active[r] && runs[r].first in cand_set) || continue
+        rs = runs[r].second
+        n = min(length(rs.items), length(rs.statuses))
+        ids = run_ids[r]
+        sizehint!(ids, n)
+        for i in 1:n
+            nm = rs.items[i].name
+            in_names(names, nm) || continue
+            id = get(name_to_id, nm, Int32(0))
+            if id == 0
+                id = Int32(length(name_to_id) + 1)
+                name_to_id[nm] = id
+            end
+            push!(ids, id)
+        end
+    end
+
+    M = length(name_to_id)
+    occ = [Tuple{Int32, Int32}[] for _ in 1:M]
+    if M > 0
+        for r in 1:R
+            active[r] || continue
+            rs = runs[r].second
+            for i in 1:min(length(rs.items), length(rs.statuses))
+                id = get(name_to_id, rs.items[i].name, Int32(0))
+                id == 0 || push!(occ[id], (Int32(r), Int32(i)))
+            end
+        end
+    end
+
+    alive = copy(active)
+    target = Vector{Tuple{Bool, Int8, Float64, UInt64, Float64, UInt32, Bool}}(undef, M)
+    min_needed = zeros(Int32, M)
+    for id in 1:M
+        target[id], min_needed[id] = eval_item_kept(occ[id], runs, counts, alive)
+    end
+
+    removed = falses(R)
+    updated_ids = Int32[]
+    updated_mins = Int32[]
     out = String[]
     for f in candidates
-        k = findfirst(((g, _),) -> g == f, kept)
-        k === nothing && continue
-        without = deleteat!(copy(kept), k)
-        kept_facts(item_facts(without), names) == now || continue
-        push!(out, f)
-        kept = without
+        r = 0
+        for j in 1:R
+            if !removed[j] && runs[j].first == f
+                r = j
+                break
+            end
+        end
+        r == 0 && continue
+        if !active[r]
+            removed[r] = true
+            push!(out, String(f))
+            continue
+        end
+        alive[r] = false
+        ok = true
+        empty!(updated_ids); empty!(updated_mins)
+        for id in run_ids[r]
+            # Fast path: every fact channel for `id` is already decided by alive runs newer than `r`.
+            r < min_needed[id] && continue
+            got, new_min = eval_item_kept(occ[id], runs, counts, alive)
+            if got != target[id]
+                ok = false
+                break
+            end
+            push!(updated_ids, id); push!(updated_mins, new_min)
+        end
+        if ok
+            removed[r] = true
+            for k in eachindex(updated_ids)
+                min_needed[updated_ids[k]] = updated_mins[k]
+            end
+            push!(out, String(f))
+        else
+            alive[r] = true
+        end
     end
     return out
 end
@@ -1725,7 +1990,7 @@ function gone_checkout(dir::AbstractString, temp::AbstractString, parents::Paren
         files = filter!(isfile, [joinpath(dir, d, RUNSTATE_FILE) for d in entries if endswith(d, RUNDATA_EXT)])
         in_temp || time() - maximum(mtime, files; init = 0.0) >= SWEEP_GRACE_S || return nothing
         deleted = filter(files) do f
-            rs = read_run_state(f)
+            rs = read_run_meta(f)
             rs !== nothing && recorded_here(rs) && !is_live(rs)
         end
         going = Set(basename(dirname(f)) for f in deleted)
@@ -1791,8 +2056,13 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     runs = runs_with(root, base)
     facts = item_facts(runs; base)
     isempty(facts) && return History()
-    over = [rs for (_, rs) in since_base(runs, base) if !rs.dry_run && !rs.aborted && !is_live(rs)]
-    starts = sort!([rs.start_unix for rs in over])
+    now_t = time()
+    # `runs` is already sorted by `(rs.start_unix, f)`.
+    over = RunStateRecord[
+        rs for (_, rs) in runs
+        if (base === nothing || rs.start_unix >= base.start_unix) && !rs.dry_run && !rs.aborted && !is_live(rs; now = now_t)
+    ]
+    starts = Float64[rs.start_unix for rs in over]
     # How many runs that are over started after one that started at `t`.
     ago(t) = length(starts) - searchsortedlast(starts, t)
     failed = Dict{String, Int}()
@@ -1806,7 +2076,7 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     end
     seconds = Dict(n => f.seconds for (n, f) in facts if f.seconds > 0)
     hashes = Dict(n => f.hash for (n, f) in facts if f.hash != 0)
-    recent = sort(over; by = rs -> rs.start_unix)[max(1, end - nruns + 1):end]
+    recent = over[max(1, end - nruns + 1):end]
     return History(seconds, failed, recorded_cold_cost(recent), cancelled, hashes, Set(keys(facts)))
 end
 
@@ -1827,17 +2097,19 @@ function recorded_cold_cost(runs::Vector{RunStateRecord})
     starts, start_s = 0, 0.0
     cold, cold_s, warm, warm_s = 0, 0.0, 0, 0.0
     for rs in runs
-        seq = Dict{Tuple{Int32, Int8}, Int16}()   # (item, attempt) => where it came on its process
+        # Direct integer index per status row replaces a `Dict{Tuple{Int32, Int8}, Int16}`.
+        seq = zeros(Int16, length(rs.statuses))
         for e in rs.events
-            if e.kind === :attempt && e.seq > 0
-                seq[(e.item, e.attempt)] = e.seq
+            if e.kind === :attempt && e.seq > 0 && checkbounds(Bool, rs.statuses, e.item) &&
+                    rs.statuses[e.item].attempt == e.attempt
+                seq[e.item] = e.seq
             elseif e.kind === :worker_up && e.t1 > e.t0
                 starts += 1
                 start_s += e.t1 - e.t0
             end
         end
         for (i, st) in enumerate(rs.statuses)
-            n = get(seq, (Int32(i), st.attempt), Int16(0))
+            n = seq[i]
             if n == 1
                 cold += 1; cold_s += st.compile
             elseif n > 1

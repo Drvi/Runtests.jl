@@ -166,11 +166,11 @@ end
 # peak over every child so far, so a job's number can only move upward.
 function children_maxrss()
     Sys.iswindows() && return 0.0
-    buf = zeros(UInt8, 256)
-    ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), Cint(-1), buf) == 0 || return 0.0
+    buf = Ref{NTuple{32, UInt64}}()
+    ccall(:getrusage, Cint, (Cint, Ptr{Cvoid}), Cint(-1), buf) == 0 || return 0.0
     # `ru_maxrss` follows the two `timeval`s, of two `long`s each (macOS's `int32_t`
     # usec pads its `timeval` out to the same): bytes on macOS, kilobytes elsewhere.
-    peak = GC.@preserve buf unsafe_load(Ptr{Clong}(pointer(buf) + 4 * sizeof(Clong)))
+    peak = GC.@preserve buf unsafe_load(Ptr{Clong}(pointer_from_objref(buf) + 4 * sizeof(Clong)))
     return Sys.isapple() ? Float64(peak) : Float64(peak) * 1024.0
 end
 
@@ -300,9 +300,12 @@ function serve(input::IO = stdin)
             job, (args, flags, caches) = f[2], configs[parse(Int, f[3])]
             pkg = pkgid_from(f[4], f[5])
             strict, exts = f[6] == "1", exts_from(f[7])
+            # Snapshot `caches` before spawning: concurrent `@async` builds yield while
+            # compiling and must not iterate a Dict that the reader or another task mutates.
+            snapshot = copy(caches)
             @async begin
                 status, seconds, path, rss, text = try
-                    compile(pkg, args, flags; strict, loadable_exts = exts, cachepath_cache = caches)
+                    compile(pkg, args, flags; strict, loadable_exts = exts, cachepath_cache = snapshot)
                 catch e
                     (:failed, 0.0, nothing, 0.0, sprint(showerror, e))
                 end

@@ -79,18 +79,24 @@ end
 # What names a keyword's `\$(...)` in the answer, the same in this process and in the
 # coordinator, which reads the template with a parser of its own: the code as it prints
 # without its line numbers.
-interpolation_key(@nospecialize ex) = string(unlined(ex))
+interpolation_key(@nospecialize ex) = string(unlined(ex))::String
 
 unlined(@nospecialize ex) = ex isa Expr ? Expr(ex.head, Any[unlined(a) for a in ex.args if !(a isa LineNumberNode)]...) : ex
 
-# A loop variable named outside a `$`: a slip, as nothing binds it in the item. Not
-# a name inside quoted code, nor a keyword's name in a call.
-function bare_mention(@nospecialize(ex), vars)
-    ex isa Symbol && return ex in vars
-    ex isa Expr || return false
-    (ex.head === :$ || ex.head === :quote) && return false
-    ex.head === :kw && return bare_mention(ex.args[2], vars)
-    return any(a -> bare_mention(a, vars), ex.args)
+# First loop variable in `vars` (not in `bound`) named outside `$` / `quote` / kwarg name, or `nothing`.
+function first_bare_mention(@nospecialize(ex), vars::Vector{Symbol}, bound::Union{Nothing, Set{Symbol}} = nothing)
+    if ex isa Symbol
+        (ex in vars && (bound === nothing || !(ex in bound))) && return ex
+        return nothing
+    end
+    ex isa Expr || return nothing
+    (ex.head === :$ || ex.head === :quote) && return nothing
+    ex.head === :kw && return first_bare_mention(ex.args[2], vars, bound)
+    for a in ex.args
+        v = first_bare_mention(a, vars, bound)
+        v === nothing || return v
+    end
+    return nothing
 end
 
 # The names `ex` binds anywhere in it, over-counted rather than under: what an
@@ -225,20 +231,18 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
     end
     for kw in keywords
         kw isa Expr && kw.head === :(=) || continue
-        for v in vars
-            bare_mention(kw.args[2], [v]) && throw(TemplateError(line,
-                "`$(kw.args[1])` names the loop variable `$v`, which nothing binds in the item: write `\$$v` " *
-                "where its value goes, or `\$(...)` around what is computed from it as the template expands"))
-        end
+        v = first_bare_mention(kw.args[2], vars)
+        v === nothing || throw(TemplateError(line,
+            "`$(kw.args[1])` names the loop variable `$v`, which nothing binds in the item: write `\$$v` " *
+            "where its value goes, or `\$(...)` around what is computed from it as the template expands"))
         header_interpolations(header!, kw.args[2])
     end
     interpolations(use!, body, vars, line)
     bound = bound_names!(Set{Symbol}(), body)
-    for v in vars
-        v in bound || !bare_mention(body, [v]) || throw(TemplateError(line,
-            "`$v` in the body names a loop variable, which nothing binds in the item: write `\$$v` " *
-            "where its value goes, `\"\$(\$$v)\"` in a string, or bind it first, as in `$v = \$$v`"))
-    end
+    v = first_bare_mention(body, vars, bound)
+    v === nothing || throw(TemplateError(line,
+        "`$v` in the body names a loop variable, which nothing binds in the item: write `\$$v` " *
+        "where its value goes, `\"\$(\$$v)\"` in a string, or bind it first, as in `$v = \$$v`"))
     # The loop runs among the packages, by name. The name and the values are written as
     # the item will see them, among its imports, and the values' code is checked there,
     # where nothing the loop itself defined, a closure in its header say, is any more
@@ -321,6 +325,16 @@ end
 # package the body imports, by name and nothing more, so the loop says `Dates.Day`
 # where the item, after its `using Dates`, says `Day`. What the imports bring into
 # scope is the item's.
+# Unwrap an argument of `using`/`import` to `(qualified_spec, root_symbol)` for
+# absolute imports (`A`, `A.B`, `A: x`, `A as B`), or `nothing` for relative `.A`.
+function absolute_import_spec(@nospecialize(a))
+    p = a isa Expr && a.head === :(:) ? a.args[1] : a
+    path = p isa Expr && p.head === :as ? p.args[1] : p
+    (path isa Expr && path.head === :. && !isempty(path.args) && path.args[1] isa Symbol && path.args[1] !== :.) ||
+        return nothing
+    return p, path.args[1]::Symbol
+end
+
 # The packages the body's imports name, in the order written: `A` of `using A.B: c` and
 # of `import A as B`, and nothing of a relative `using .A`.
 function imported_packages(body::Expr)
@@ -328,11 +342,9 @@ function imported_packages(body::Expr)
     for ex in body.args
         is_import(ex) || continue
         for a in ex.args
-            p = a isa Expr && a.head === :(:) ? a.args[1] : a
-            path = p isa Expr && p.head === :as ? p.args[1] : p
-            (path isa Expr && path.head === :. && !isempty(path.args) && path.args[1] isa Symbol && path.args[1] !== :.) ||
-                continue
-            name = String(path.args[1])
+            spec = absolute_import_spec(a)
+            spec === nothing && continue
+            name = String(spec[2])
             name in out || push!(out, name)
         end
     end
@@ -346,11 +358,9 @@ function loop_module(body::Expr, project::String, line::Int)
         is_import(ex) || continue
         for a in ex.args
             # `A: x, y` binds names of `A`; the loop gets `A` itself.
-            p = a isa Expr && a.head === :(:) ? a.args[1] : a
-            path = p isa Expr && p.head === :as ? p.args[1] : p
             # A relative path names a module of the item's own, which the loop has none of.
-            path isa Expr && path.head === :. && !isempty(path.args) && path.args[1] !== :. || continue
-            push!(imports, Expr(:import, p))
+            spec = absolute_import_spec(a)
+            spec === nothing || push!(imports, Expr(:import, spec[1]))
         end
     end
     m = Module(:Template)

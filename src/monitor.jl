@@ -86,10 +86,8 @@ Base.@kwdef mutable struct MemStats
     phases::Vector{PhaseStats} = [PhaseStats() for _ in instances(RunPhase)]
     peak_total_bytes::Int64 = 0
     peak_total_at::Float64 = 0.0
-    peak_total_phase::RunPhase = PHASE_SETUP
     peak_single_bytes::Int64 = 0
     peak_single_pid::Int32 = 0
-    peak_single_item::String = ""
     nprocs_peak::Int = 0
     machine_peak_used::Int64 = 0
     machine_total::Int64 = 0
@@ -167,7 +165,6 @@ mutable struct Monitor
     # does not.
     @atomic quiet::Bool
     @atomic phase::RunPhase
-    @atomic enabled::Bool
     const interval::Float64
     const print_interval::Float64
     const tty::Bool
@@ -187,17 +184,18 @@ mutable struct Monitor
     const tree_rss::Vector{Int64}
     const attempt_peak::Vector{Int64}
     const attempt_key::Vector{Int64}
+    # Reusable scratch tables for the 5 Hz sampling loop (single-writer monitor task).
+    const scratch_roots::Vector{Int32}
+    const scratch_rss::Dict{Int32, Int64}
+    const scratch_tree::Dict{Int32, Int64}
     # Where the status line is assembled, reused for the same reason. `lineio`
     # carries the colour setting into it: written to the buffer directly, every
     # `printstyled` in the line would come out plain.
     const linebuf::IOBuffer
     const lineio::IO
     const color::Bool
-    # `strftime` builds a string per call and the clock moves once a second, while
-    # this line is redrawn after every line the run prints. On a terminal only under
-    # `run.printer`, which every redraw holds; off one only by the monitor's task.
+    # Second when `columns` was last refreshed (clock text itself comes from `clock_now`).
     clock_at::Int
-    clock_text::String
     last_print::Float64
     next_print::Float64      # when the next scheduled report is due
     done_reported::Int       # the items finished at the last report
@@ -224,7 +222,11 @@ const TTY_OVERRIDE = ScopedValue{Union{Nothing, Bool}}(nothing)
 
 # `displaysize` falls back to `COLUMNS` when the stream is not a terminal, which is
 # how a test says how wide to pretend the screen is.
-terminal_columns(tty::Bool) = tty ? displaysize(stdout)[2] : 0
+function terminal_columns(tty::Bool)
+    tty || return 0
+    io = stdout
+    return io isa Base.TTY ? displaysize(io)[2] : displaysize()[2]
+end
 
 """
     is_tty() -> Bool
@@ -253,9 +255,10 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
         run, stats, fill(Sample(), RING_SAMPLES), 0,
         Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
         nothing, false, false,
-        PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
-        zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n), linebuf,
-        IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0, 0.0,
+        PHASE_SETUP, interval, print_interval, tty, terminal_columns(tty),
+        zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n),
+        Int32[], Dict{Int32, Int64}(), Dict{Int32, Int64}(),
+        linebuf, IOContext(linebuf, :color => color), color, 0, 0.0, 0.0, 0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
     )
 end
@@ -345,7 +348,6 @@ function start_monitor!(m::Monitor)
                 # Ctrl-C, when this was the task its thread last ran: the run is
                 # stopping, and needs no monitor to do it.
                 is_interrupt(e) && return RuntestsWorkers.forward_interrupt(e)
-                @atomic m.enabled = false
                 @warn "Runtests: the resource monitor stopped; the run continues without it" exception = e
             end
         end
@@ -387,8 +389,9 @@ end
 # not seen end, including one still connecting or shutting down, which no slot holds.
 # Their children — `Pkg`'s precompilation workers, anything a test item starts — are
 # found from there, because they spend the same memory budget.
-function tree_roots(m::Monitor)
-    roots = Int32[Int32(getpid())]
+function tree_roots!(roots::Vector{Int32}, m::Monitor)
+    empty!(roots)
+    push!(roots, Int32(getpid()))
     append!(roots, RuntestsWorkers.live_worker_pids())
     # Each slot's worker heads its own tree, which its memory is counted by.
     for slot in run_of(m).slots
@@ -404,11 +407,11 @@ function sample!(m::Monitor)
     used, total = machine_memory()
     total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0; nworkers = 0
     if PER_PROCESS_OK[]
-        roots = tree_roots(m)
+        roots = tree_roots!(m.scratch_roots, m)
         # One walk of the whole tree, each process with the worker it descends from, or
         # this process for what no worker started.
-        rss_of = Dict{Int32, Int64}()
-        tree_of = Dict{Int32, Int64}()
+        rss_of = empty!(m.scratch_rss)
+        tree_of = empty!(m.scratch_tree)
         for (pid, root) in process_owners(roots; children = child_lister())
             rss = process_rss(pid)
             rss <= 0 && continue
@@ -466,18 +469,18 @@ function update_stats!(m::Monitor, s::Sample)
     st.machine_total = s.machine_total
     s.machine_used > st.machine_peak_used && (st.machine_peak_used = s.machine_used)
     s.nprocs > st.nprocs_peak && (st.nprocs_peak = Int(s.nprocs))
+    changed = false
     if s.total_rss > st.peak_total_bytes
         st.peak_total_bytes = s.total_rss
         st.peak_total_at = Float64(s.t)
-        st.peak_total_phase = s.phase
-        write_memory!((@atomic run_of(m).runstate), st)
+        changed = true
     end
     if s.largest_rss > st.peak_single_bytes
         st.peak_single_bytes = s.largest_rss
         st.peak_single_pid = s.largest_pid
-        st.peak_single_item = item_on_pid(m, s.largest_pid)
-        write_memory!((@atomic run_of(m).runstate), st)
+        changed = true
     end
+    changed && write_memory!((@atomic run_of(m).runstate), st)
     # The stages are different memory regimes, and a figure for the whole run
     # hides which of them was the expensive one.
     ps = phase_stats(st, s.phase)
@@ -492,31 +495,6 @@ end
 
 # The run this monitor watches, with its type restored. See the note on the field.
 run_of(m::Monitor) = m.run::Run
-
-# The running item that started first, the one a run that has stopped moving is
-# most likely stuck on, or 0 when none is running. An item's start is written before
-# its slot takes it, so a slot read here holding an item has its start already.
-function oldest_running(m::Monitor)
-    run = run_of(m)
-    oldest, since = ItemIdx(0), Inf32
-    for slot in run.slots
-        i = @atomic slot.current
-        i == 0 && continue
-        t = run.statuses.start[i]
-        t < since && ((oldest, since) = (i, t))
-    end
-    return oldest
-end
-
-function item_on_pid(m::Monitor, pid::Int32)
-    for slot in run_of(m).slots
-        # Read once each: the slot's own task changes both while this runs.
-        w, i = (@atomic slot.worker), (@atomic slot.current)
-        (w === nothing || i == 0) && continue
-        Int32(w.pid) == pid && return run_of(m).plan.items.name[i]
-    end
-    return ""
-end
 
 ### Printing ###############################################################
 
@@ -568,9 +546,10 @@ end
 function print_int(io::IO, n::Integer, width::Integer = 0)
     neg = n < 0
     neg && (n = -n)
-    pad_to(io, width, ndigits(n) + neg)
+    d = ndigits(n)
+    pad_to(io, width, d + neg)
     neg && write(io, UInt8('-'))
-    for k in (ndigits(n) - 1):-1:0
+    for k in (d - 1):-1:0
         write(io, UInt8('0') + UInt8((n ÷ 10^k) % 10))
     end
     return nothing
@@ -637,13 +616,33 @@ function print_status_line(io::IO, m::Monitor)
     # Unpadded: on a healthy run it is one digit.
     print_int(io, failed)
     print(io, " failed")
+    # Single pass over `run.slots`: live worker count, oldest running item, and any artifact collector.
+    live_workers = 0
+    oldest = ItemIdx(0)
+    oldest_since = Inf32
+    collecting = ItemIdx(0)
+    for sl in run.slots
+        (@atomic sl.worker) !== nothing && (live_workers += 1)
+        ci = @atomic sl.current
+        if ci != 0
+            ts = @atomic sl.started
+            ts == 0f0 && (ts = run.statuses.start[ci])
+            if ts < oldest_since
+                oldest, oldest_since = ci, ts
+            end
+        end
+        if collecting == 0
+            col = @atomic sl.collecting
+            col != 0 && (collecting = col)
+        end
+    end
     if queued > 0
         # No test worker runs yet: the workers are the queue's helpers, if it has any.
         helpers = @atomic QUEUE_PROGRESS.helpers
         helpers > 0 && print_workers(io, @atomic(QUEUE_PROGRESS.live), helpers)
     elseif !solo && (@atomic m.phase) !== PHASE_SETUP
         # The test workers, from the stage that starts them on.
-        print_workers(io, count(sl -> (@atomic sl.worker) !== nothing, run.slots), length(run.slots))
+        print_workers(io, live_workers, length(run.slots))
     end
     if PER_PROCESS_OK[] && s.total_rss > 0
         if solo
@@ -688,24 +687,15 @@ function print_status_line(io::IO, m::Monitor)
     # only field that changes width.
     print(io, " · ", phase_name(s.phase), " ")
     print_age(io, run.t0 + Float64(s.t) - r.phase_entered)
-    oldest = oldest_running(m)
     oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], RUNNING_WIDTH))
     # A producer that takes long is not an item that hangs, and is said apart from one.
-    collecting = collecting_item(m)
     collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
-    compiling = oldest_compiling()
-    isempty(compiling) ||
-        (print(io, " · precompiling "); print_clipped(io, compiling, RUNNING_WIDTH))
-    return nothing
-end
-
-# An item whose failed attempt's producers a slot's worker is running, or 0 for none.
-function collecting_item(m::Monitor)
-    for slot in run_of(m).slots
-        i = @atomic slot.collecting
-        i == 0 || return i
+    if queued > 0
+        compiling = oldest_compiling()
+        isempty(compiling) ||
+            (print(io, " · precompiling "); print_clipped(io, compiling, RUNNING_WIDTH))
     end
-    return ItemIdx(0)
+    return nothing
 end
 
 """
@@ -815,15 +805,15 @@ end
 status_line(m::Monitor) =
     sprint(io -> print_status_line(IOContext(io, :color => m.color), m))
 
-# The wall clock as this line writes it, formatted once a second.
+# The wall clock as this line writes it (shared with `clock_now`), refreshing
+# terminal width once a second when on a TTY.
 function clock_text(m::Monitor)
     sec = unsafe_trunc(Int, time())
     if sec != m.clock_at
         m.clock_at = sec
-        m.clock_text = Libc.strftime("%H:%M:%S", sec)
         m.columns = terminal_columns(m.tty)
     end
-    return m.clock_text
+    return clock_now()
 end
 
 # Clipped but not padded: the pinned line is erased before it is redrawn, so
@@ -906,6 +896,17 @@ end
 clear_status_line(m::Union{Nothing, Monitor}) =
     (m !== nothing && m.tty && (print(stdout, "\r\e[2K"); flush(stdout)); nothing)
 
+# Assemble the clipped status line at the end of `m.linebuf` and rewind to start.
+function append_status!(m::Monitor)
+    buf = m.linebuf
+    print(m.lineio, "\r\e[2K")
+    at = position(buf)
+    print_status_line(m.lineio, m)
+    clip_status!(m, at)
+    seekstart(buf)
+    return buf
+end
+
 """
     status_update!(m, text) -> IOBuffer
 
@@ -914,16 +915,10 @@ status line again, assembled whole and written once. Written as three pieces, a
 run that prints fast mostly shows a half-erased status line.
 """
 function status_update!(m::Monitor, text::AbstractString)
-    buf = m.linebuf
-    truncate(buf, 0)
+    truncate(m.linebuf, 0)
     print(m.lineio, "\r\e[2K", text)
     endswith(text, "\n") || print(m.lineio, "\n")
-    print(m.lineio, "\r\e[2K")
-    at = position(buf)
-    print_status_line(m.lineio, m)
-    clip_status!(m, at)
-    seekstart(buf)
-    return buf
+    return append_status!(m)
 end
 
 """
@@ -955,14 +950,8 @@ function redraw_status(m::Union{Nothing, Monitor})
     (m === nothing || !drawing(m)) && return nothing
     # Assembled in the monitor's buffer and written once. Safe to share: every
     # caller holds the printer lock.
-    buf = m.linebuf
-    truncate(buf, 0)
-    print(m.lineio, "\r\e[2K")
-    at = position(buf)
-    print_status_line(m.lineio, m)
-    clip_status!(m, at)
-    seekstart(buf)
-    write(stdout, buf)
+    truncate(m.linebuf, 0)
+    write(stdout, append_status!(m))
     flush(stdout)
     return nothing
 end
@@ -977,56 +966,48 @@ the edge is the one a reader can act on.
 function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
     st = m.stats
     finish = time()
-    solo = single_process(run_of(m).plan)
+    run = run_of(m)
+    solo = single_process(run.plan)
     if PER_PROCESS_OK[]
-        # Every stage the run entered gets a line, whether or not a sample landed in
-        # it: a stage that went by faster than the sampler is still a stage the run
-        # went through. Except reporting, which is shutting the workers down and
-        # writing the run state — a tenth of a second, whose memory is whatever was
-        # left once the workers had gone. It earns a line only when it took long
-        # enough to mean something went wrong on the way out.
-        shown(phase) = let ps = phase_stats(st, phase)
-            ps.entered != 0 &&
-                !(phase === PHASE_REPORT && phase_seconds(st, phase, finish) < REPORT_WORTH_SAYING)
-        end
-        # Two passes: the columns are as wide as the widest thing that will go in
-        # them, so `5m57.7s` next to `12.0s` does not push a whole line right of
-        # the one above it.
+        rows = NamedTuple{(:phase, :ps, :name, :time_text, :procs), Tuple{RunPhase, PhaseStats, String, String, String}}[]
         name_width, time_width, procs_width = 0, 0, 0
         for phase in instances(RunPhase)
-            shown(phase) || continue
             ps = phase_stats(st, phase)
-            name_width = max(name_width, length(phase_name(phase)))
-            time_width = max(time_width, length(fmt_seconds(phase_seconds(st, phase, finish))))
-            (solo || ps.peak_total <= 0) && continue
-            procs_width = max(procs_width, length(procs_text(ps)))
+            ps.entered == 0 && continue
+            secs = phase_seconds(st, phase, finish)
+            phase === PHASE_REPORT && secs < REPORT_WORTH_SAYING && continue
+            nm = phase_name(phase)
+            tt = fmt_seconds(secs)
+            pt = (!solo && ps.peak_total > 0) ? procs_text(ps) : ""
+            name_width = max(name_width, length(nm))
+            time_width = max(time_width, length(tt))
+            procs_width = max(procs_width, length(pt))
+            push!(rows, (; phase, ps, name = nm, time_text = tt, procs = pt))
         end
-        for phase in instances(RunPhase)
-            shown(phase) || continue
-            ps = phase_stats(st, phase)
-            seconds = phase_seconds(st, phase, finish)
-            more_follows = ps.starts > nslots(run_of(m).plan) ||
-                (phase === PHASE_TEST && sum(run_of(m).statuses.elapsed; init = 0.0f0) > 0)
-            print(io, indent, rpad(phase_name(phase), name_width), FIELD)
-            print(io, lpad(fmt_seconds(seconds), time_width))
+        total_elapsed = sum(run.statuses.elapsed; init = 0.0f0)
+        for row in rows
+            ps = row.ps
+            starts = ps.starts
+            has_compile = row.phase === PHASE_TEST && total_elapsed > 0
+            more_follows = starts > nslots(run.plan) || has_compile
+            print(io, indent, rpad(row.name, name_width), FIELD, lpad(row.time_text, time_width))
             if ps.peak_total > 0
                 print(io, FIELD, solo ? "rss " : "tree max ")
                 print_bytes(io, ps.peak_total, BYTES_WIDTH)
                 if !solo
                     print(io, FIELD, "child max ")
                     print_bytes(io, ps.peak_single, BYTES_WIDTH)
-                    text = procs_text(ps)
-                    print(io, FIELD, text)
-                    # Padded only to line up a field that follows; a line that ends
-                    # here ends at its last character.
-                    more_follows && pad_to(io, procs_width, length(text))
+                    print(io, FIELD, row.procs)
+                    more_follows && pad_to(io, procs_width, length(row.procs))
                 end
             end
             # Only when workers were replaced rather than reused: otherwise this is
             # the worker count again, said twice.
-            ps.starts > nslots(run_of(m).plan) &&
-                print(io, FIELD, plural(ps.starts, "worker start"))
-            phase === PHASE_TEST && print_compile_share(io, run_of(m))
+            starts > nslots(run.plan) && print(io, FIELD, plural(starts, "worker start"))
+            if has_compile
+                share = round(Int, 100 * sum(run.statuses.compile; init = 0.0f0) / total_elapsed)
+                print(io, FIELD, share, "% compile")
+            end
             println(io)
         end
         solo || println(

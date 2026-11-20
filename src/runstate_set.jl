@@ -45,7 +45,6 @@ function package_plan(p::Plan, k::Integer)
                         [p.packages.suite_names[k]])
     return Plan(
         items, units, abs_files, relfiles,
-        String[string(relfiles[items.fileidx[n]], ":", items.line[n]) for n in eachindex(is)],
         p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{UnitIdx}[], Int32[], p.gate_limit, p.cold,
         sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[]
     )
@@ -53,11 +52,12 @@ end
 
 # The settings a package's items ran with in a run of several packages: its own, and
 # the run's for what is the run's (`RUN_WIDE_KEYS`) and how the run was made.
+const PACKAGE_OWN_FIELDS = (
+    (s.field for s in SETTING_SPECS if s.scope === :pkg)...,
+    :profiles, :groups, :order_first, :order_last, :throttle, :item_seeds, :config_file,
+)
 function under_run_settings(own::RunConfig, run::RunConfig)
-    from_own = (:threads, :timeout_s, :init_timeout_s, :test_end_timeout_s, :artifacts_timeout_s, :retries,
-                :item_failfast, :profiles, :groups, :order_first, :order_last, :throttle, :item_seeds, :config_file,
-                :skip_environment)
-    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(n -> getfield(fieldname(RunConfig, n) in from_own ? own : run, n),
+    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(n -> getfield(fieldname(RunConfig, n) in PACKAGE_OWN_FIELDS ? own : run, n),
                                                       fieldcount(RunConfig)))
     return RunConfig(; fields...)
 end
@@ -71,7 +71,7 @@ directory, each holding only that package's items by their index in its own plan
 run as one of its own. A write about an item goes to its package's run state. A
 worker belongs to no package: its start goes to the run state of the package of the
 first item it runs, and its end to the run state of each package it ran items of, so
-that a worker that runs no item is in none.
+that a worker that runs no item is in none. One shared heartbeat beats every open file.
 """
 struct RunStateSet
     files::Vector{Union{Nothing, RunStateFile}}   # per package; nothing for one that could not be opened
@@ -80,6 +80,34 @@ struct RunStateSet
     lock::ReentrantLock                           # guards `up` and `served`
     up::Dict{Int32, Tuple{Int, Float64, Float64}} # by pid: a worker's slot, start and ready, until its first item
     served::Dict{Int32, Vector{Int32}}            # by pid: the packages a live worker ran items of
+    heartbeat::Base.RefValue{Union{Nothing, Tuple{Timer, Task}}}
+end
+
+function start_set_heartbeat(files::Vector{Union{Nothing, RunStateFile}})
+    any(!isnothing, files) || return nothing
+    timer = Timer(HEARTBEAT_S; interval = HEARTBEAT_S)
+    task = shielded(() -> Threads.@spawn beat_set(files, timer))
+    return (timer, task)
+end
+
+function beat_set(files::Vector{Union{Nothing, RunStateFile}}, timer::Timer)
+    while true
+        try
+            wait(timer)
+            any_open = false
+            for rsf in files
+                (rsf !== nothing && isopen(rsf.io)) || continue
+                any_open = true
+                update!(io -> write(io, RS_MAGIC), rsf, 0)
+            end
+            any_open || break
+        catch e
+            e isa EOFError && break
+            is_interrupt(e) || break
+            RuntestsWorkers.forward_interrupt(e)
+        end
+    end
+    return nothing
 end
 
 function write_status!(set::RunStateSet, i::Integer, state::ItemState, attempt::Integer, slot::Integer;
@@ -121,8 +149,15 @@ function append_event!(set::RunStateSet, kind::UInt8, state::Integer, slot::Inte
 end
 
 write_memory!(set::RunStateSet, m) = (foreach(f -> write_memory!(f, m), set.files); nothing)
-finish_run_state!(set::RunStateSet, ending::RunEnding = ENDING_FINISHED; kwargs...) =
-    (foreach(f -> finish_run_state!(f, ending; kwargs...), set.files); nothing)
+function finish_run_state!(set::RunStateSet, ending::RunEnding = ENDING_FINISHED; exiting::Bool = false)
+    beating = set.heartbeat[]
+    if beating !== nothing
+        set.heartbeat[] = nothing
+        exiting || (close(first(beating)); wait(last(beating)))
+    end
+    foreach(f -> finish_run_state!(f, ending; exiting), set.files)
+    return nothing
+end
 mark_ending!(set::RunStateSet, ending::RunEnding) = (foreach(f -> mark_ending!(f, ending), set.files); nothing)
 
 """
@@ -141,32 +176,39 @@ function open_runstate_set(p::Plan, start::Float64, runid::AbstractString; workt
     workspace = p.root
     participants = join((string(p.packages.name[k], '\t', p.packages.uuid[k], '\t', rel_slash(p.packages.root[k], workspace),
                                 '\t', p.packages.isolated[k]) for k in 1:n), '\n')
-    files = Union{Nothing, RunStateFile}[]
+    # Compress the shared active manifest once for all `n` package records, and run one
+    # shared heartbeat timer instead of `n` separate timers/tasks.
+    manifest = Vector{UInt8}(environment_manifest())
+    shared_env = (manifest, isempty(manifest) ? UInt8[] : zlib_compress(manifest))
+    # Partition item indices by package in one O(nitems) pass.
+    by_pkg = [Int[] for _ in 1:n]
+    local_item = Vector{ItemIdx}(undef, nitems(p))
+    for i in 1:nitems(p)
+        k = p.items.package[i]
+        push!(by_pkg[k], i)
+        local_item[i] = ItemIdx(length(by_pkg[k]))
+    end
+    files = Vector{Union{Nothing, RunStateFile}}(undef, n)
     for k in 1:n
-        environments = join((environment_of_item(p, i) for i in 1:nitems(p) if p.items.package[i] == k), '\n')
+        environments = join((environment_of_item(p, i) for i in by_pkg[k]), '\n')
         meta = ["combined_run" => String(runid), "participants" => participants,
                 "isolated" => string(p.packages.isolated[k]), "environments" => environments,
                 "worktree" => String(worktree)]
         path = nothing
-        file = try
+        files[k] = try
             path = new_runstate_path(p.packages.root[k])
-            init_run_state(path, plans[k]; start, meta, worker_projects = worker_projects[k])
+            init_run_state(path, plans[k]; start, meta, worker_projects = worker_projects[k],
+                           heartbeat = false, shared_env)
         catch e
             is_interrupt(e) && rethrow()
             path === nothing || remove_runstate(path)
             @warn "Runtests: could not open a run state file for $(p.packages.name[k]); continuing without one" exception = e
             nothing
         end
-        push!(files, file)
-    end
-    local_item = zeros(ItemIdx, nitems(p))
-    seen = zeros(Int, n)
-    for i in 1:nitems(p)
-        k = p.items.package[i]
-        local_item[i] = (seen[k] += 1)
     end
     return RunStateSet(files, copy(p.items.package), local_item, ReentrantLock(),
-                       Dict{Int32, Tuple{Int, Float64, Float64}}(), Dict{Int32, Vector{Int32}}())
+                       Dict{Int32, Tuple{Int, Float64, Float64}}(), Dict{Int32, Vector{Int32}}(),
+                       Ref{Union{Nothing, Tuple{Timer, Task}}}(start_set_heartbeat(files)))
 end
 
 # The environment directory of item `i`, relative to its package's root, or empty for
@@ -203,20 +245,25 @@ function replay_records(path::String, ps::Participants; announce::Bool = true)
     records = Union{Nothing, RunStateRecord}[]
     why = String[]
     exported = exported_siblings(path, ps.name, id)
+    rels = String[rel_slash(r, ps.workspace) for r in ps.root]
     for k in eachindex(ps.root)
-        rel = rel_slash(ps.root[k], ps.workspace)
+        rel = rels[k]
         if !haskey(recorded, rel)
             push!(records, nothing); push!(why, "it was not in the replayed run")
             continue
         end
         project = project_id(ps.root[k])
-        rs = get(given.meta, "project_id", "") == project ? given :
-            something(get(exported, project, nothing), findfirst_record(ps.root[k], id), Some(nothing))
+        rs = if get(given.meta, "project_id", "") == project
+            given
+        else
+            found = get(exported, project, nothing)
+            found === nothing ? findfirst_record(ps.root[k], id) : found
+        end
         push!(records, rs)
         push!(why, rs === nothing ? "its run state of the replayed run is gone" : "")
     end
-    present = Set(rel_slash(ps.root[k], ps.workspace) for k in eachindex(ps.root) if records[k] !== nothing)
-    in_workspace = Set(rel_slash(r, ps.workspace) for r in ps.root)
+    present = Set(rels[k] for k in eachindex(ps.root) if records[k] !== nothing)
+    in_workspace = Set(rels)
     gone = sort!([name for (rel, name) in recorded if rel in in_workspace && !(rel in present)])
     all(isnothing, records) && throw(ConfigError(string(
         "no package of the workspace at ", ps.workspace, " has a run state of the run that ", basename(path),
@@ -245,21 +292,32 @@ function exported_siblings(path::AbstractString, names, id::AbstractString)
         isdir(dir) || continue
         for d in readdir(dir; join = true)
             endswith(d, RUNDATA_EXT) || continue
-            rs = read_run_state(joinpath(d, RUNSTATE_FILE))
-            (rs === nothing || get(rs.meta, "combined_run", "") != id) && continue
-            get!(found, get(rs.meta, "project_id", ""), rs)
+            fp = joinpath(d, RUNSTATE_FILE)
+            rm = read_run_meta(fp)
+            (rm === nothing || get(rm.meta, "combined_run", "") != id) && continue
+            proj = get(rm.meta, "project_id", "")
+            haskey(found, proj) && continue
+            rs = read_run_state(fp)
+            rs === nothing || (found[proj] = rs)
         end
     end
     return found
 end
 
 # The run state of the combined run `id` in the run state directory of the package at
-# `root`, or `nothing`.
+# `root`, or `nothing`. Matches via lightweight `read_run_meta`, full-reading only on hit.
 function findfirst_record(root::AbstractString, id::AbstractString)
-    for (_, rs) in project_runs(root)
-        get(rs.meta, "combined_run", "") == id && return rs
+    project = project_id(root)
+    matches = Tuple{Float64, String}[]
+    for f in runstate_files(root)
+        rm = read_run_meta(f)
+        rm === nothing && continue
+        get(rm.meta, "project_id", "") == project || continue
+        get(rm.meta, "combined_run", "") == id && push!(matches, (rm.start_unix, f))
     end
-    return nothing
+    isempty(matches) && return nothing
+    sort!(matches)
+    return read_run_state(first(matches)[2])
 end
 
 # A replay's settings: each package's under its run state's profiles, `[order]`, flags
@@ -280,9 +338,8 @@ function replayed_configs(run::RunConfig, cfgs::Vector{RunConfig}, records::Vect
     end
     flags = split(get(given.meta, "julia_flags", ""), ' '; keepempty = false)
     julia_flags = isempty(flags) || flags == code_flags() ? String[] : String.(flags)
-    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(run, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; julia_flags, replayed_manifest = recorded_manifest(given),
-                                        replayed_from = given.path))...), replayed
+    return with_config(run; julia_flags, replayed_manifest = recorded_manifest(given),
+                       replayed_from = given.path), replayed
 end
 
 # Each replayed item in the environment directory of the current checkout, said where

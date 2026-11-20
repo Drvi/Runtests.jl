@@ -145,8 +145,12 @@ Base.length(ps::Packages) = length(ps.name)
 function single_package(cfg::RunConfig, root::AbstractString, suite_names::Vector{String})
     project = isempty(root) ? nothing : project_file(root)
     t = project === nothing ? Dict{String, Any}() : parse_project(project)
-    uuid = something(tryparse(Base.UUID, string(get(t, "uuid", ""))), Base.UUID(0))
-    return Packages([string(get(t, "name", ""))], [uuid], [String(root)], [false], [cfg], [suite_names])
+    raw_uuid = get(t, "uuid", "")
+    raw_name = get(t, "name", "")
+    uuid_str = raw_uuid isa AbstractString ? String(raw_uuid) : ""
+    name_str = raw_name isa AbstractString ? String(raw_name) : ""
+    uuid = something(tryparse(Base.UUID, uuid_str), Base.UUID(0))
+    return Packages(String[name_str], Base.UUID[uuid], String[String(root)], Bool[false], RunConfig[cfg], Vector{String}[suite_names])
 end
 
 struct Plan
@@ -154,7 +158,6 @@ struct Plan
     units::Units
     files::Vector{String}
     relfiles::Vector{String}    # `files` relative to the project
-    locations::Vector{String}   # `file:line` per item
     profiles::Vector{Profile}
     profile_package::Vector{Int32}   # per profile: the package that declares it
     pools::Vector{Pool}
@@ -187,7 +190,7 @@ item_cfg(p::Plan, i::Integer) = p.packages.cfg[p.items.package[i]]
 
 # Where an item is, as the run reports it.
 itemfile(p::Plan, i::Integer) = p.relfiles[p.items.fileidx[i]]
-itemlocation(p::Plan, i::Integer) = p.locations[i]
+itemlocation(p::Plan, i::Integer) = string(itemfile(p, i), ":", p.items.line[i])
 
 """
     History
@@ -232,25 +235,33 @@ function plan(
     validate_order(raw, packages)
 
     profiles, profile_package, profile_idx = profile_table(packages, raw)
-    units, gate_limit = build_units(raw, profile_idx, histories, packages)
+    draft, gate_limit = build_draft(raw, profile_idx, histories, packages)
     # Pools in order of estimated completion, the latest first: the order they get
     # their first workers in, and the pickup order of those left without one.
-    pools = pool_units(units, profiles, profile_package, packages)
-    estimate = pool_estimate(pools, units, histories, gate_limit)
-    order = sortperm(eachindex(pools); by = k -> (-estimate(k, 1), minimum(u -> units[u].profile, pools[k])))
-    pools = pools[order]
+    raw_pools, raw_min_prof = pool_units(draft.profile, profiles, profile_package, packages)
+    cold = combined_cold(histories)
+    estimate = pool_estimate(raw_pools, draft, gate_limit, cold)
+    order = sortperm(eachindex(raw_pools); by = k -> (-estimate(k, 1), raw_min_prof[k]))
+    pools = raw_pools[order]
+    min_prof = raw_min_prof[order]
     slots = count_slots(pools, (k, n) -> estimate(order[k], n), cfg)
     # What a unit of a gate counts as when ordered: its gate's work over its limit.
-    gate_floor = zeros(length(gate_limit))
-    for d in units
-        d.gate == 0 || (gate_floor[d.gate] += d.est_s)
+    gate_floor = Float64[]
+    if !isempty(gate_limit)
+        gate_floor = zeros(length(gate_limit))
+        for u in eachindex(raw)
+            g = draft.gate[u]
+            g == 0 || (gate_floor[g] += draft.est_s[u])
+        end
+        gate_floor ./= gate_limit
     end
-    gate_floor ./= gate_limit
+    has_order = any(c -> !isempty(c.order_first) || !isempty(c.order_last), packages.cfg)
+    pin = has_order ? build_pins(packages) : nothing
     for (k, pool) in enumerate(pools)
-        order_pool!(pool, units, slots[k], packages, histories, gate_floor)
+        order_pool!(pool, raw, draft, slots[k], histories, gate_floor, pin)
     end
-    return materialize(units, pools, slots, profiles, profile_package, cfg, packages, root, selection,
-                       sort(suite_names), histories, gate_limit)
+    return materialize(raw, draft, pools, min_prof, slots, profiles, profile_package, cfg, packages, root, selection,
+                       sort(suite_names), cold, gate_limit)
 end
 
 # The file the settings came from, as a message names it.
@@ -289,6 +300,7 @@ end
 function validate_order(raw, packages::Packages)
     for k in eachindex(packages.name)
         cfg = packages.cfg[k]
+        isempty(cfg.order_first) && isempty(cfg.order_last) && continue
         names = union!(Set(packages.suite_names[k]), (it.name for it in raw if it.package == k))
         # A replay hands its items out in the order the recording did, which can name
         # items renamed or deleted since: the replay says which, and the order applies
@@ -372,42 +384,67 @@ function profile_table(packages::Packages, raw::Vector{RawItem})
     return profiles, Int32[k for (k, _, _) in keys_], idx
 end
 
-# A unit under construction: its items, and what the scheduler decides with.
-mutable struct UnitDraft
-    const items::Vector{RawItem}
-    const profile::ProfileIdx
-    const exclusive::Bool
-    const throttle::Symbol
-    const gate::Int32
-    const est_s::Float64
-    key::Tuple{Int, Int, Float64, Float64, String, Int32}   # its place in its pool; see `order_pool!`
-    why::Why
-    failed_ago::Int32
-    cancelled::Bool   # whether its last failure was a cancel rather than a verdict
-    changed_at::Int   # which of `items` was edited since its last run, or never ran, 0 for none
-    changed_new::Bool # whether that one never ran
+# Flat SoA scratch buffers indexed `1:length(raw)`, replacing per-item heap
+# structs during planning.
+struct PlanDraft
+    profile::Vector{ProfileIdx}
+    gate::Vector{Int32}
+    est_s::Vector{Float64}
+    file_rank::Vector{Int32}   # sorted file path rank so `order_pool!` compares `Int32`
+    key::Vector{Tuple{Int8, Int, Float64, Float64, Int32, Int32}}
+    why::Vector{Why}
+    failed_ago::Vector{Int32}
+    cancelled::Vector{Bool}
+    changed::Vector{Bool}
+    changed_new::Vector{Bool}
 end
 
 # Each item is a unit of its own. An item that names a throttle is a unit of its gate,
 # which every package naming the throttle shares, as a limit on what the machine runs
 # at once: those packages must give it one limit, 1 where `[throttle]` names none.
-# Gates are numbered in the order of their names. Returns the units and each gate's
-# limit.
-function build_units(raw::Vector{RawItem}, profile_idx, histories::Vector{History}, packages::Packages)
-    uses = sort!(unique!([(it.package, it.throttle) for it in raw if it.throttle !== NO_THROTTLE]))
-    check_shared_limits(uses, [cfg.throttle for cfg in packages.cfg],
-                        [config_name(packages, k) for k in eachindex(packages.name)])
-    names = sort!(unique!([n for (_, n) in uses]))
-    gate = Dict(n => Int32(g) for (g, n) in enumerate(names))
-    gate_limit = Int32[get(packages.cfg[first(k for (k, m) in uses if m === n)].throttle, n, 1) for n in names]
-    units = map(raw) do it
-        UnitDraft(
-            [it], profile_idx[(it.package, it.profile, it.environment)], it.exclusive, it.throttle,
-            it.throttle === NO_THROTTLE ? Int32(0) : gate[it.throttle], get(histories[it.package].seconds, it.name, 0.0),
-            (0, 0, 0.0, 0.0, "", Int32(0)), IN_FILE_ORDER, Int32(-1), false, 0, false
-        )
+# Gates are numbered in the order of their names.
+function build_draft(raw::Vector{RawItem}, profile_idx, histories::Vector{History}, packages::Packages)
+    n = length(raw)
+    uses = Tuple{Int32, Symbol}[]
+    for it in raw
+        it.throttle === NO_THROTTLE || push!(uses, (it.package, it.throttle))
     end
-    return units, gate_limit
+    gate = Dict{Symbol, Int32}()
+    gate_limit = Int32[]
+    if !isempty(uses)
+        sort!(unique!(uses))
+        seen = check_shared_limits(uses, [cfg.throttle for cfg in packages.cfg],
+                                   [config_name(packages, k) for k in eachindex(packages.name)])
+        names = sort!(collect(keys(seen)))
+        sizehint!(gate, length(names))
+        gate_limit = Vector{Int32}(undef, length(names))
+        for (g, name) in enumerate(names)
+            gate[name] = Int32(g)
+            gate_limit[g] = Int32(seen[name])
+        end
+    end
+
+    # Assign dense sorted file ranks once so `order_pool!` sorts bitstype keys.
+    ufiles = sort!(unique!(String[it.file for it in raw]))
+    rank_of = Dict{String, Int32}(f => Int32(i) for (i, f) in enumerate(ufiles))
+
+    u_profile = Vector{ProfileIdx}(undef, n)
+    u_gate = zeros(Int32, n)
+    u_est = Vector{Float64}(undef, n)
+    u_rank = Vector{Int32}(undef, n)
+    for i in 1:n
+        it = raw[i]
+        u_profile[i] = profile_idx[(it.package, it.profile, it.environment)]
+        it.throttle === NO_THROTTLE || (u_gate[i] = gate[it.throttle])
+        u_est[i] = get(histories[it.package].seconds, it.name, 0.0)
+        u_rank[i] = rank_of[it.file]
+    end
+    draft = PlanDraft(
+        u_profile, u_gate, u_est, u_rank,
+        Vector{Tuple{Int8, Int, Float64, Float64, Int32, Int32}}(undef, n),
+        fill(IN_FILE_ORDER, n), fill(Int32(-1), n), falses(n), falses(n), falses(n)
+    )
+    return draft, gate_limit
 end
 
 """
@@ -430,23 +467,37 @@ function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol,
             join(map(said, ks), "; "), ". Give it the same limit in each"
         )))
     end
-    return nothing
+    return seen
 end
 
-# The units of each pool: one pool for each `pool_key` of the units' profiles. In the
-# order of their first profile.
-function pool_units(units::Vector{UnitDraft}, profiles::Vector{Profile}, profile_package::Vector{Int32}, packages::Packages)
+const PoolKey = Tuple{Tuple{Vector{String}, String, Vector{Pair{String, String}}, Expr, String, String},
+                      Tuple{Symbol, Int, String}}
+
+# The units of each pool: one pool for each `pool_key` of the units' profiles, in the
+# order of their first profile, paired with each pool's representative (minimum) profile.
+function pool_units(u_profile::Vector{ProfileIdx}, profiles::Vector{Profile},
+                    profile_package::Vector{Int32}, packages::Packages)
     # A profile's pool depends on the profile alone: its key is made once per profile.
-    pool_of = Dict{Any, Int}()
-    of_profile = map(eachindex(profiles)) do j
+    pool_of = Dict{PoolKey, Int}()
+    of_profile = Vector{Int}(undef, length(profiles))
+    for j in eachindex(profiles)
         k = profile_package[j]
-        get!(pool_of, pool_key(profiles[j], k, packages.root[k], packages.isolated[k]), length(pool_of) + 1)
+        of_profile[j] = get!(pool_of, pool_key(profiles[j], k, packages.root[k], packages.isolated[k]),
+                             length(pool_of) + 1)
     end
-    pools = [Int[] for _ in 1:length(pool_of)]
-    for (u, d) in enumerate(units)
-        push!(pools[of_profile[d.profile]], u)
+    raw_pools = [Int[] for _ in 1:length(pool_of)]
+    for u in eachindex(u_profile)
+        push!(raw_pools[of_profile[u_profile[u]]], u)
     end
-    return sort!(filter!(!isempty, pools); by = pool -> minimum(u -> units[u].profile, pool))
+    pools = Vector{Int}[]
+    min_prof = ProfileIdx[]
+    for pool in raw_pools
+        isempty(pool) && continue
+        push!(pools, pool)
+        push!(min_prof, minimum(u -> u_profile[u], pool))
+    end
+    perm = sortperm(min_prof)
+    return pools[perm], min_prof[perm]
 end
 
 """
@@ -461,13 +512,14 @@ the same directory (`init_dir`): its package's root, or the workspace root for a
 profile that the workspace shares. The profiles of an isolated package, which runs
 in its own test environment, are its own.
 """
-function pool_key(prof::Profile, k::Integer, root::AbstractString, isolated::Bool)
-    owner = isolated ? (:package, Int(k)) : isempty(prof.init.args) ? nothing : (:init_dir, init_dir(prof, root))
+function pool_key(prof::Profile, k::Integer, root::AbstractString, isolated::Bool)::PoolKey
+    owner = isolated ? (:package, Int(k), "") :
+        isempty(prof.init.args) ? (:none, 0, "") : (:init_dir, 0, String(init_dir(prof, root)))
     return (start_configuration(prof), owner)
 end
 
 """
-    pool_estimate(pools, units, histories) -> completion(k, n)
+    pool_estimate(pools, draft, gate_limit, cold) -> completion(k, n)
 
 The estimated completion of pool `k` with `n` workers, in seconds: the time a worker
 takes to be ready for its first item, as earlier runs measured it, then the larger of
@@ -475,22 +527,40 @@ the pool's work shared among its workers, its longest unit and each gate's work 
 over the gate's limit, which no number of workers shortens. An item without a
 recorded duration counts as the typical item.
 """
-function pool_estimate(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, histories::Vector{History},
-                       gate_limit::Vector{Int32})
-    recorded(it) = get(histories[it.package].seconds, it.name, 0.0)
-    typical = typical_estimate([recorded(it) for d in units for it in d.items])
-    est(u) = sum(it -> (s = recorded(it); s > 0 ? s : typical), units[u].items; init = 0.0)
-    work = [sum(est, pool; init = 0.0) for pool in pools]
-    longest = [maximum(est, pool; init = 0.0) for pool in pools]
-    throttled = map(pools) do pool
-        gate_work = zeros(length(gate_limit))
+function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit::Vector{Int32}, cold::ColdCost)
+    typical = typical_estimate(draft.est_s)
+    est(u) = (s = draft.est_s[u]; s > 0 ? s : typical)
+    np = length(pools)
+    work = Vector{Float64}(undef, np)
+    longest = Vector{Float64}(undef, np)
+    throttled = zeros(Float64, np)
+    has_gates = !isempty(gate_limit)
+    gate_work = has_gates ? Vector{Float64}(undef, length(gate_limit)) : Float64[]
+    for k in 1:np
+        pool = pools[k]
+        w = 0.0
+        l = 0.0
+        has_gates && fill!(gate_work, 0.0)
         for u in pool
-            g = units[u].gate
-            g == 0 || (gate_work[g] += est(u))
+            e = est(u)
+            w += e
+            e > l && (l = e)
+            if has_gates
+                g = draft.gate[u]
+                g == 0 || (gate_work[g] += e)
+            end
         end
-        maximum(gate_work ./ gate_limit; init = 0.0)
+        work[k] = w
+        longest[k] = l
+        if has_gates
+            t = 0.0
+            for g in eachindex(gate_limit)
+                v = gate_work[g] / gate_limit[g]
+                v > t && (t = v)
+            end
+            throttled[k] = t
+        end
     end
-    cold = combined_cold(histories)
     ready = cold.start_s + cold.compile_s
     return (k, n) -> ready + max(work[k] / n, longest[k], throttled[k])
 end
@@ -533,15 +603,28 @@ end
 edited(it::RawItem, h::History) = (r = get(h.hashes, it.name, UInt32(0)); r != 0 && it.hash != 0 && r != it.hash)
 never_ran(it::RawItem, h::History) = !isempty(h.known) && !(it.name in h.known)
 
-const HEAD_CLASSES = Int(PINNED_FIRST):Int(LONG)
-const TAIL_CLASS = Int(PINNED_LAST)
+const HEAD_CLASSES = Int8(PINNED_FIRST):Int8(LONG)
+const TAIL_CLASS = Int8(PINNED_LAST)
 
 # Under this many seconds a unit is never long, whatever its share: started last, it
 # ends the run a moment later, and a suite of quick items would otherwise be all head.
 const LONG_FLOOR_S = 3.0
 
+function build_pins(packages::Packages)
+    pin = [Dict{String, Int}() for _ in eachindex(packages.name)]
+    for (k, cfg) in enumerate(packages.cfg)
+        for (i, n) in enumerate(cfg.order_first)
+            pin[k][n] = i - length(cfg.order_first) - 1
+        end
+        for (i, n) in enumerate(cfg.order_last)
+            pin[k][n] = i
+        end
+    end
+    return pin
+end
+
 """
-    order_pool!(pool, units, nslots, packages, histories, gate_floor)
+    order_pool!(pool, raw, draft, nslots, histories, gate_floor, pin)
 
 Sort a pool's units into the order they are handed out, by class and then within
 it:
@@ -567,44 +650,48 @@ Classes 0–3 are the pool's head, 4 its body and 5 its tail. The class is recor
 values are these numbers. Each package's `[order]` names its own items; in a pool
 that serves several packages, see [`order_blocks!`](@ref).
 """
-function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, packages::Packages,
-                     histories::Vector{History}, gate_floor::Vector{Float64})
-    pin = [Dict{String, Int}() for _ in eachindex(packages.name)]
-    for (k, cfg) in enumerate(packages.cfg)
-        for (i, n) in enumerate(cfg.order_first)
-            pin[k][n] = i - length(cfg.order_first) - 1
+function order_pool!(pool::Vector{Int}, raw::Vector{RawItem}, draft::PlanDraft, nslots::Int,
+                     histories::Vector{History}, gate_floor::Vector{Float64},
+                     pin::Union{Nothing, Vector{Dict{String, Int}}})
+    pinned = nothing
+    if pin !== nothing
+        pinned = Dict{Int, Int}()
+        for u in pool
+            it = raw[u]
+            p = get(pin[it.package], it.name, 0)
+            p == 0 || (pinned[u] = p)
         end
-        for (i, n) in enumerate(cfg.order_last)
-            pin[k][n] = i
-        end
+        isempty(pinned) ? (pinned = nothing) : order_blocks!(pinned, pool, raw, draft.est_s)
     end
-    pinned = Dict{Int, Int}(u => (p = minimum(it -> get(pin[it.package], it.name, typemax(Int)), units[u].items);
-                                  p == typemax(Int) ? 0 : p) for u in pool)
-    order_blocks!(pinned, pool, units)
-    share = sum(u -> units[u].est_s, pool; init = 0.0) / max(nslots, 1)
+    share = sum(u -> draft.est_s[u], pool; init = 0.0) / max(nslots, 1)
     for u in pool
-        d = units[u]
-        history = histories[d.items[1].package]
-        p = pinned[u]
-        at = (d.items[1].file, d.items[1].line)
-        ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
-        d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
-        d.cancelled = ago != typemax(Int) && d.items[k].name in history.cancelled
-        d.changed_at = something(findfirst(it -> edited(it, history) || never_ran(it, history), d.items), 0)
-        d.changed_new = d.changed_at > 0 && never_ran(d.items[d.changed_at], history)
-        urgency = d.changed_at > 0 ? 0 : ago
-        est = d.gate == 0 ? d.est_s : max(d.est_s, gate_floor[d.gate])
+        it = raw[u]
+        history = histories[it.package]
+        p = pinned === nothing ? 0 : get(pinned, u, 0)
+        ago = get(history.failed, it.name, typemax(Int))
+        draft.failed_ago[u] = ago == typemax(Int) ? Int32(-1) : Int32(ago)
+        draft.cancelled[u] = ago != typemax(Int) && it.name in history.cancelled
+        is_new = never_ran(it, history)
+        is_changed = is_new || edited(it, history)
+        draft.changed[u] = is_changed
+        draft.changed_new[u] = is_new
+        urgency = is_changed ? 0 : ago
+        est_s = draft.est_s[u]
+        g = draft.gate[u]
+        est = g == 0 ? est_s : max(est_s, gate_floor[g])
         long = est >= LONG_FLOOR_S && est > share / 4
-        d.why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : d.exclusive ? SANDBOXED :
+        why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : it.exclusive ? SANDBOXED :
             urgency < typemax(Int) ? RECENT : long ? LONG : IN_FILE_ORDER
-        by_length = long && d.why in (RECENT, LONG)
-        d.key = (Int(d.why), d.why === RECENT ? urgency : p, by_length ? -est : 0.0, by_length ? -d.est_s : 0.0, at...)
+        draft.why[u] = why
+        by_length = long && (why === RECENT || why === LONG)
+        draft.key[u] = (Int8(why), why === RECENT ? urgency : p, by_length ? -est : 0.0,
+                        by_length ? -est_s : 0.0, draft.file_rank[u], it.line)
     end
-    return sort!(pool; by = u -> units[u].key)
+    return sort!(pool; by = u -> draft.key[u])
 end
 
 """
-    order_blocks!(pinned, pool, units)
+    order_blocks!(pinned, pool, raw, est_s)
 
 Where `[order]` puts the units of a pool that several packages' lists pin: each
 package's `first` items stay one block of the head, in the order of its list, and
@@ -612,20 +699,20 @@ the blocks go the longest estimated first; the same for `last` and the tail.
 `pinned` holds each unit's place, below 0 in the head and above 0 in the tail, each
 ascending in the order handed out, and is shifted in place.
 """
-function order_blocks!(pinned::Dict{Int, Int}, pool::Vector{Int}, units::Vector{UnitDraft})
+function order_blocks!(pinned::Dict{Int, Int}, pool::Vector{Int}, raw::Vector{RawItem}, est_s::Vector{Float64})
     for side in (-1, 1)
-        on_side = [u for u in pool if sign(pinned[u]) == side]
+        on_side = [u for u in pool if sign(get(pinned, u, 0)) == side]
         est = Dict{Int32, Float64}()
         for u in on_side
-            k = units[u].items[1].package
-            est[k] = get(est, k, 0.0) + units[u].est_s
+            k = raw[u].package
+            est[k] = get(est, k, 0.0) + est_s[u]
         end
         length(est) > 1 || continue
         ranked = sort!(collect(keys(est)); by = k -> (-est[k], k))
         rank = Dict{Int32, Int}(k => r for (r, k) in enumerate(ranked))
         span = maximum(u -> abs(pinned[u]), on_side) + 1
         for u in on_side
-            r = rank[units[u].items[1].package]
+            r = rank[raw[u].package]
             pinned[u] += side < 0 ? -(length(ranked) - r) * span : (r - 1) * span
         end
     end
@@ -649,78 +736,137 @@ nearest its ideal place, so that one worker walks a whole file. A unit with no
 estimate counts as a typical one.
 """
 function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{Int32}, n::Int)
+    n == 0 && return UnitRange{UnitIdx}[]
+    n == 1 && return UnitRange{UnitIdx}[body]
     m = length(body)
-    guess = typical_estimate(est[body])
-    cum = cumsum([e > 0 ? e : guess for e in est[body]])
-    between_files = [j for j in 1:(m - 1) if file[body[j]] != file[body[j + 1]]]
-    at = isempty(between_files) ? collect(1:(m - 1)) : between_files
-    cuts = [isempty(at) ? m : at[argmin(abs.(cum[at] .- k * cum[end] / n))] for k in 1:(n - 1)]
-    edges = [0; cuts; m]
-    return [body[(edges[k] + 1):edges[k + 1]] for k in 1:n]
+    bview = view(est, body)
+    guess = typical_estimate(bview)
+    cum = Vector{Float64}(undef, m)
+    acc = 0.0
+    for j in 1:m
+        e = bview[j]
+        acc += e > 0 ? e : guess
+        cum[j] = acc
+    end
+    between_files = Int[]
+    for j in 1:(m - 1)
+        file[body[j]] != file[body[j + 1]] && push!(between_files, j)
+    end
+    has_files = !isempty(between_files)
+    # `cum` is strictly increasing, so binary search finds the nearest cut in O(log |at|).
+    out = Vector{UnitRange{UnitIdx}}(undef, n)
+    prev = 0
+    total = m == 0 ? 0.0 : cum[m]
+    for k in 1:(n - 1)
+        target = k * total / n
+        cut = if m <= 1
+            m
+        elseif has_files
+            lo, hi = 1, length(between_files) + 1
+            while lo < hi
+                mid = (lo + hi) >>> 1
+                if cum[between_files[mid]] < target
+                    lo = mid + 1
+                else
+                    hi = mid
+                end
+            end
+            if lo == 1
+                between_files[1]
+            elseif lo > length(between_files)
+                between_files[end]
+            else
+                a, b = between_files[lo - 1], between_files[lo]
+                abs(cum[a] - target) <= abs(cum[b] - target) ? a : b
+            end
+        else
+            idx = searchsortedfirst(cum, target)
+            if idx == 1
+                1
+            elseif idx >= m
+                m - 1
+            else
+                abs(cum[idx - 1] - target) <= abs(cum[idx] - target) ? idx - 1 : idx
+            end
+        end
+        out[k] = body[(prev + 1):cut]
+        prev = cut
+    end
+    out[n] = body[(prev + 1):m]
+    return out
 end
 
 function materialize(
-        units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
-        profiles::Vector{Profile}, profile_package::Vector{Int32}, cfg::RunConfig, packages::Packages,
-        root::AbstractString, selection::AbstractString, suite_names::Vector{String}, histories::Vector{History},
-        gate_limit::Vector{Int32}
+        raw::Vector{RawItem}, draft::PlanDraft, pools::Vector{Vector{Int}}, min_prof::Vector{ProfileIdx},
+        slots::Vector{Int}, profiles::Vector{Profile}, profile_package::Vector{Int32}, cfg::RunConfig,
+        packages::Packages, root::AbstractString, selection::AbstractString, suite_names::Vector{String},
+        cold::ColdCost, gate_limit::Vector{Int32}
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
     # is indexed by.
-    name = String[]; fileidx = Int32[]; line = Int32[]
-    tags = Symbol[]; tag_span = UnitRange{Int32}[]
-    setups = Symbol[]; setup_span = UnitRange{Int32}[]
-    code = Expr[]; skip = Any[]; timeout = Int32[]; retries = Int32[]
-    failfast = Int8[]; est = Float64[]; item_unit = UnitIdx[]
-    item_hash = UInt32[]; item_seed_ = UInt64[]; item_package = Int32[]
+    n = length(raw)
+    name = Vector{String}(undef, n); fileidx = Vector{Int32}(undef, n); line = Vector{Int32}(undef, n)
+    tags = Symbol[]; tag_span = Vector{UnitRange{Int32}}(undef, n)
+    setups = Symbol[]; setup_span = Vector{UnitRange{Int32}}(undef, n)
+    code = Vector{Expr}(undef, n); skip = Vector{Any}(undef, n)
+    timeout = Vector{Int32}(undef, n); retries = Vector{Int32}(undef, n)
+    failfast = Vector{Int8}(undef, n); est = Vector{Float64}(undef, n); item_unit = Vector{UnitIdx}(undef, n)
+    item_hash = Vector{UInt32}(undef, n); item_seed_ = Vector{UInt64}(undef, n); item_package = Vector{Int32}(undef, n)
     files = String[]; fileids = Dict{String, Int32}()
-    uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
-    uthrottle = Symbol[]; ugate = Int32[]; uest = Float64[]; ufile = Int32[]
-    uwhy = Why[]; uago = Int32[]; ucancelled = Bool[]; uchanged = ItemIdx[]; unew = Bool[]
-    all_setups = Symbol[]
-    ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
+    uspan = Vector{UnitRange{ItemIdx}}(undef, n); uprofile = Vector{ProfileIdx}(undef, n); uexcl = Vector{Bool}(undef, n)
+    uthrottle = Vector{Symbol}(undef, n); ugate = Vector{Int32}(undef, n); uest = Vector{Float64}(undef, n)
+    uwhy = Vector{Why}(undef, n); uago = Vector{Int32}(undef, n); ucancelled = Vector{Bool}(undef, n)
+    uchanged = Vector{ItemIdx}(undef, n); unew = Vector{Bool}(undef, n)
+    all_setups = Set{Symbol}()
+    ps = Vector{Pool}(undef, length(pools))
+    slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
+    pos = 0
     for (k, pool) in enumerate(pools)
-        start = length(uspan)
+        start = pos
+        nhead = 0
+        ntail = 0
         for u in pool
-            d = units[u]
-            ifirst = ItemIdx(length(name) + 1)
-            for it in d.items
-                push!(name, it.name)
-                fid = get!(fileids, it.file) do
-                    push!(files, it.file); Int32(length(files))
-                end
-                push!(fileidx, fid); push!(line, it.line)
-                push!(tag_span, span!(tags, it.tags))
-                push!(setup_span, span!(setups, it.setups))
-                append!(all_setups, it.setups)
-                push!(code, it.code); push!(skip, it.skip)
-                push!(timeout, it.timeout_s); push!(retries, it.retries)
-                push!(failfast, it.failfast); push!(est, get(histories[it.package].seconds, it.name, 0.0))
-                push!(item_unit, UnitIdx(length(uspan) + 1))
-                push!(item_hash, it.hash); push!(item_package, it.package)
-                # The run's seed is every package's; a failure's own is its package's.
-                push!(item_seed_, get(packages.cfg[it.package].item_seeds, it.name, cfg.seed))
+            pos += 1
+            it = raw[u]
+            name[pos] = it.name
+            fid = get!(fileids, it.file) do
+                push!(files, it.file); Int32(length(files))
             end
-            push!(uspan, ifirst:ItemIdx(length(name)))
-            push!(uprofile, d.profile); push!(uexcl, d.exclusive)
-            push!(uthrottle, d.throttle); push!(ugate, d.gate); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
-            push!(uwhy, d.why); push!(uago, d.failed_ago)
-            push!(ucancelled, d.cancelled)
-            push!(uchanged, d.changed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.changed_at - 1))
-            push!(unew, d.changed_new)
+            fileidx[pos] = fid; line[pos] = it.line
+            tag_span[pos] = span!(tags, it.tags)
+            setup_span[pos] = span!(setups, it.setups)
+            isempty(it.setups) || union!(all_setups, it.setups)
+            code[pos] = it.code; skip[pos] = it.skip
+            timeout[pos] = it.timeout_s; retries[pos] = it.retries
+            failfast[pos] = it.failfast
+            e = draft.est_s[u]
+            est[pos] = e
+            item_unit[pos] = UnitIdx(pos)
+            item_hash[pos] = it.hash; item_package[pos] = it.package
+            # The run's seed is every package's; a failure's own is its package's.
+            item_seed_[pos] = get(packages.cfg[it.package].item_seeds, it.name, cfg.seed)
+
+            idx = ItemIdx(pos)
+            uspan[pos] = idx:idx
+            uprofile[pos] = draft.profile[u]; uexcl[pos] = it.exclusive
+            uthrottle[pos] = it.throttle; ugate[pos] = draft.gate[u]; uest[pos] = e
+            cls = draft.key[u][1]
+            cls in HEAD_CLASSES && (nhead += 1)
+            cls == TAIL_CLASS && (ntail += 1)
+            uwhy[pos] = draft.why[u]; uago[pos] = draft.failed_ago[u]
+            ucancelled[pos] = draft.cancelled[u]
+            uchanged[pos] = draft.changed[u] ? idx : ItemIdx(0)
+            unew[pos] = draft.changed_new[u]
         end
-        nhead = count(u -> units[u].key[1] in HEAD_CLASSES, pool)
-        ntail = count(u -> units[u].key[1] == TAIL_CLASS, pool)
-        stop = length(uspan)
         between(a, b) = UnitIdx(a):UnitIdx(b)
-        body = between(start + nhead + 1, stop - ntail)
+        body = between(start + nhead + 1, pos - ntail)
         # Its workers start with the configuration of its first profile, which its
         # other profiles share.
-        push!(ps, Pool(minimum(u -> units[u].profile, pool), between(start + 1, start + nhead), body,
-                       between(stop - ntail + 1, stop)))
+        ps[k] = Pool(min_prof[k], between(start + 1, start + nhead), body,
+                     between(pos - ntail + 1, pos))
         slots[k] == 0 && push!(pending, Int32(k))
-        for r in stretches(body, uest, ufile, slots[k])
+        for r in stretches(body, uest, fileidx, slots[k])
             push!(slot_pool, Int32(k)); push!(slot_units, r)
         end
     end
@@ -732,9 +878,9 @@ function materialize(
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
         items, Units(uspan, uprofile, uexcl, uthrottle, ugate, uest, uwhy, uago, ucancelled, uchanged, unew),
-        files, relfiles, String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
-        profiles, profile_package, ps, slot_pool, slot_units, pending, gate_limit, combined_cold(histories),
-        sort!(unique!(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
+        files, relfiles,
+        profiles, profile_package, ps, slot_pool, slot_units, pending, gate_limit, cold,
+        sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
     )
 end
 

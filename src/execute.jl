@@ -1,18 +1,11 @@
-# Running a plan: one task per slot. A slot takes its pool's head first, then walks
-# its own stretch of the pool's body, takes half of the largest stretch left when
-# its own is done, then the pool's tail. When its own pool has nothing left it
-# may rebind, restarting its process under another pool's profile. It estimates
-# completion with and without that worker, including its start and compilation
-# cost, and rebinds only when the estimate says a pool finishes sooner. `workers` caps
-# live processes throughout: the run takes longer rather than start a process the
-# caller did not authorize.
-
-using Base: SIGKILL
+# Running a plan: one task per slot, worker lifecycle, stall watchdog, attempt
+# recording, and in-process execution. Scheduling lives in `scheduler.jl` and
+# test/profile environment setup in `environments.jl`.
 
 # A slot is its own task's, on the run's thread. The fields other threads read are
-# atomic: `worker`, `current` and `collecting`, which the monitor reads, and
-# `dying_log`, which the worker's output relay reads. `dying_lines` is the relay's
-# while `dying_log` is set, and the slot's again once it has joined the relay.
+# atomic: `worker`, `current`, `attempt`, `started` and `collecting`, which the monitor
+# reads, and `dying_log`, which the worker's output relay reads. `dying_lines` is the
+# relay's while `dying_log` is set, and the slot's again once it has joined the relay.
 mutable struct Slot
     const id::SlotIdx
     profile::ProfileIdx      # the profile its process starts with, by its index in the plan
@@ -23,6 +16,11 @@ mutable struct Slot
     # The attempt at `current` in flight. Whoever records that attempt's outcome
     # clears `current`: the slot, or `record_stopped_item!` when the run stops.
     @atomic attempt::Int8
+    # When the attempt in flight began, seconds from `run.t0` (0 when idle), read by
+    # the monitor without touching `Statuses.start`, which keeps any earlier verdict.
+    @atomic started::Float32
+    attempt_pid::Int32       # process running `current` (run's thread only)
+    attempt_seq::Int16       # 1-based item sequence on that worker (run's thread only)
     # A process killed for a timeout prints its signal and backtrace after its item
     # has stopped capturing. Those lines belong in `dying_log`, the log of the item
     # that was running (empty otherwise), and wait in `dying_lines` until the
@@ -39,368 +37,11 @@ mutable struct Slot
     @atomic collecting::ItemIdx
 end
 
-"""
-    PoolStats
-
-What the run has measured of one pool, for deciding where a slot whose own pool
-has run dry does the most good: how long the pool's workers took to be ready; the
-compile time of items that ran first on a fresh process, and of items that ran on
-one that had run others; and how long its items took, against their recorded
-durations where they had one.
-"""
-mutable struct PoolStats
-    starts::Int
-    start_s::Float64
-    cold::Int                    # items that ran first on a fresh process
-    cold_compile_s::Float64
-    warm::Int                    # items that ran on a process that had run others
-    warm_compile_s::Float64
-    items::Int
-    took_s::Float64
-    estimated_s::Float64         # the recorded durations of the items that had one
-    estimated_took_s::Float64    # and what those items took
-end
-PoolStats() = PoolStats(0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0)
-
-"""
-    Queues
-
-Every cursor a run has, behind one lock: each pool's head and tail, and each slot's
-stretch of its pool's body; and what the run has measured of each pool, which the
-slots write and a slot whose pool ran dry reads. Each claim takes the lock so the
-cursors and pool statistics remain consistent.
-
-A unit of a gate (`Units`) whose gate runs as many units as its limit allows is set
-aside when a cursor passes it, in its pool's `set_aside`, and handed out from there,
-before anything else of the pool, once a unit of the gate ends. A slot whose pool
-holds only units set aside moves to a pool with a unit it can start now, if there is
-one, and otherwise waits on `room`. A pool that its last slot leaves so is `parked`
-until a slot takes it up again, which one does before any slot is done.
-"""
-mutable struct Queues
-    const lock::ReentrantLock
-    const room::Threads.Condition    # on `lock`: a gate's unit ended, a set-aside unit left, or the run stopped
-    const pools::Vector{Pool}
-    const head::Vector{UnitIdx}      # per pool: its next head unit
-    const tail::Vector{UnitIdx}      # per pool: its next tail unit
-    const from::Vector{UnitIdx}      # per slot: the next unit of its stretch
-    const to::Vector{UnitIdx}        # per slot: the last unit of its stretch
-    const pool::Vector{Int32}        # per slot: the pool it serves
-    const pending::Vector{Int32}     # pools no slot serves yet, in pickup order
-    const parked::Vector{Int32}      # pools with only set-aside units left that no slot serves
-    const claimed::BitVector         # per unit: handed out already
-    const serving::Vector{Int}       # per pool: slots working for it
-    const est::Vector{Float64}       # per unit: the recorded seconds of its items
-    const unrecorded::Vector{Int32}  # per unit: its items without a recorded duration
-    const typical::Float64           # an unrecorded item, before its pool has timed any
-    const stats::Vector{PoolStats}   # per pool
-    const prior::ColdCost            # what a fresh worker cost in earlier runs
-    const gate::Vector{Int32}        # per unit: its gate, 0 for none
-    const gate_limit::Vector{Int32}  # per gate: how many of its units run at once
-    const gate_running::Vector{Int32}    # per gate: how many of its units are handed out and not ended
-    const set_aside::Vector{Vector{UnitIdx}}  # per pool: units passed while their gate was full, in order
-    # Per pool: `gate_ends` when its set-aside units were last found all held back. Only
-    # a gate's unit ending lets one go, so until `gate_ends` moves on they still are.
-    const aside_blocked_at::Vector{Int}
-    gate_ends::Int                   # units of gates that have ended
-    cancelled::Bool
-    paused::Bool        # the memory guard is holding new work back
-end
-
-function Queues(p::Plan)
-    lock = ReentrantLock()
-    return Queues(lock, Threads.Condition(lock), p)
-end
-Queues(lock::ReentrantLock, room::Threads.Condition, p::Plan) = Queues(
-    lock, room, p.pools,
-    UnitIdx[first(k.head) for k in p.pools], UnitIdx[first(k.tail) for k in p.pools],
-    UnitIdx[first(r) for r in p.slot_units], UnitIdx[last(r) for r in p.slot_units],
-    copy(p.slot_pool), copy(p.pending), Int32[], falses(length(p.units)),
-    [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
-    p.units.est_s, Int32[count(i -> p.items.est_s[i] == 0, span) for span in p.units.span],
-    typical_estimate(p.items.est_s),
-    [PoolStats() for _ in p.pools], p.cold, p.units.gate, p.gate_limit, zeros(Int32, length(p.gate_limit)),
-    [UnitIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0, false, false
-)
-
-struct Claim
-    kind::Symbol        # :unit, :rebind, :done, :wait (`claim!`)
-    unit::UnitIdx
-    pool::Int32
-end
-Claim(kind::Symbol) = Claim(kind, UnitIdx(0), Int32(0))
-
-gate_full(q::Queues, u::Integer) = (g = q.gate[u]; g != 0 && q.gate_running[g] >= q.gate_limit[g])
-
-# Unit `u`, handed out. Every unit is handed out exactly once; a second time is a
-# scheduling bug, stopped here rather than run twice.
-function hand_out!(q::Queues, u::UnitIdx)
-    q.claimed[u] && error("Runtests internal error: unit $u was handed out twice")
-    q.claimed[u] = true
-    g = q.gate[u]
-    g == 0 || (q.gate_running[g] += Int32(1))
-    return Claim(:unit, u, Int32(0))
-end
-
-# The first unit from cursor `i` up to `stop` that its gate lets run, moving the
-# cursor past it and setting aside, for pool `k`, the units before it that their
-# gate does not; 0 when the cursor passes `stop`.
-function next!(q::Queues, cursor::Vector{UnitIdx}, i::Integer, stop::Integer, k::Integer)
-    while cursor[i] <= stop
-        u = cursor[i]
-        cursor[i] += UnitIdx(1)
-        gate_full(q, u) || return u
-        push!(q.set_aside[k], u)
-    end
-    return UnitIdx(0)
-end
-
-# The first unit pool `k` set aside that its gate now lets run, taken off the list,
-# or 0.
-function take_set_aside!(q::Queues, k::Integer)
-    aside = q.set_aside[k]
-    (isempty(aside) || q.aside_blocked_at[k] == q.gate_ends) && return UnitIdx(0)
-    j = findfirst(u -> !gate_full(q, u), aside)
-    if j === nothing
-        q.aside_blocked_at[k] = q.gate_ends
-        return UnitIdx(0)
-    end
-    u = popat!(aside, j)
-    # A slot waiting only because this unit was set aside can now finish or move on.
-    isempty(aside) && notify(q.room)
-    return u
-end
-
-# The next unit for slot `s`, or what it does instead. A slot whose pool has only
-# units their gates hold back waits here, until a gate's unit ends, the memory guard
-# asks for its worker or the run stops, and then gets `:wait`: its loop looks at
-# those before it claims again. The claim and the wait are under one hold of the
-# lock, so a unit that ends in between still wakes it.
-function claim!(q::Queues, s::Integer)
-    @lock q.lock begin
-        c = claim_now!(q, s)
-        c.kind === :wait && wait(q.room)
-        return c
-    end
-end
-
-# Every slot waiting in `claim!` looks again.
-wake_waiting!(q::Queues) = @lock q.lock (notify(q.room); nothing)
-
-function claim_now!(q::Queues, s::Integer)
-    q.cancelled && return Claim(:done)
-    k = q.pool[s]
-    u = next_unit!(q, s, k)
-    u == 0 || return hand_out!(q, u)
-    if !isempty(q.set_aside[k])
-        # What is left of its pool waits for a gate. The slot moves to a pool with a
-        # unit it can start now, if there is one; a pool that loses its last slot so
-        # waits in `parked` for another.
-        j = next_pool(q, k; now = true)
-        j == 0 && return Claim(:wait)
-        q.serving[k] == 1 && push!(q.parked, Int32(k))
-        return rebind!(q, s, k, j)
-    end
-    # Its own pool has nothing left: the slot moves to another, whose profile its
-    # next process is started with.
-    j = next_pool(q, k; now = false)
-    if j == 0
-        q.serving[k] -= 1
-        return Claim(:done)
-    end
-    return rebind!(q, s, k, j)
-end
-
-# The next unit slot `s` of pool `k` can start, or 0: one set aside whose gate has
-# room, then the pool's head, its own stretch, the second half of the largest
-# stretch left in the pool, and the tail.
-function next_unit!(q::Queues, s::Integer, k::Integer)
-    u = take_set_aside!(q, k)
-    u == 0 || return u
-    u = next!(q, q.head, k, last(q.pools[k].head), k)
-    u == 0 || return u
-    u = next!(q, q.from, s, q.to[s], k)
-    u == 0 || return u
-    # Its own stretch is done: take the second half of the largest stretch left
-    # in the pool, so both slots go on walking neighbouring units. A stretch of
-    # one gives it up too, so a slow slot's last unit does not wait behind the
-    # one it is running. Never across pools: a unit run under another profile's
-    # flags is not the test that was declared. A stretch whose units all wait for
-    # their gate is set aside whole, and the next largest taken.
-    while true
-        victim, most = 0, 0
-        for v in eachindex(q.pool)
-            q.pool[v] == k || continue
-            r = q.to[v] - q.from[v] + 1
-            r > most && ((victim, most) = (v, r))
-        end
-        victim == 0 && break
-        q.from[s] = q.from[victim] + UnitIdx(most ÷ 2)
-        q.to[s] = q.to[victim]
-        q.to[victim] = q.from[s] - UnitIdx(1)
-        u = next!(q, q.from, s, q.to[s], k)
-        u == 0 || return u
-    end
-    return next!(q, q.tail, k, last(q.pools[k].tail), k)
-end
-
-# Slot `s` leaves pool `k` for pool `j`. A pool no slot served yet gives it its whole
-# body to walk; one that slots served already, an empty stretch: it takes what is left
-# of the pool's head, then the second half of the largest stretch, as any of the
-# pool's slots would.
-function rebind!(q::Queues, s::Integer, k::Integer, j::Integer)
-    at = findfirst(==(j), q.pending)
-    if at === nothing
-        filter!(!=(j), q.parked)
-        q.from[s], q.to[s] = UnitIdx(1), UnitIdx(0)
-    else
-        deleteat!(q.pending, at)
-        q.from[s], q.to[s] = first(q.pools[j].body), last(q.pools[j].body)
-    end
-    q.pool[s] = j
-    q.serving[k] -= 1
-    q.serving[j] += 1
-    return Claim(:rebind, UnitIdx(0), j)
-end
-
-# The pool a slot leaving pool `k` goes to, or 0: one no slot serves yet, then a
-# parked one with a unit it can start now, then the one where it does the most good
-# (`neediest_pool`). With `now`, for a slot that would otherwise wait, only a pool
-# with a unit it can start now; without, for one that would otherwise be done, last a
-# parked pool whose units still wait for their gate, which no slot may leave behind.
-function next_pool(q::Queues, k::Integer; now::Bool)
-    for j in q.pending
-        (!now || startable(q, j)) && return Int(j)
-    end
-    for j in q.parked
-        startable(q, j) && return Int(j)
-    end
-    j = neediest_pool(q, k)
-    j != 0 && (!now || startable(q, j)) && return j
-    return now || isempty(q.parked) ? 0 : Int(q.parked[1])
-end
-
-startable(q::Queues, j::Integer) =
-    any(u -> !q.claimed[u] && !gate_full(q, u), first(q.pools[j].head):last(q.pools[j].tail))
-
-# Unit `u` ended, with all its attempts: its gate can run another.
-function unit_ended!(q::Queues, u::UnitIdx)
-    g = q.gate[u]
-    g == 0 && return nothing
-    @lock q.lock begin
-        q.gate_running[g] -= Int32(1)
-        q.gate_ends += 1
-        notify(q.room)
-    end
-    return nothing
-end
-
-# The pool a slot whose own pool `k` has run dry does the most good in, or 0 for
-# none: of the pools that one more worker makes finish sooner, the one that finishes
-# last. Each pool is played out (`finish_time`): its unclaimed units, in the order they
-# are handed out, each to whichever of its workers is free first, its own workers free
-# now and the new one once it has started its process and compiled what the others
-# have (`cold_cost`). Units are whole, so a worker that is ready only after the others
-# have claimed the last of them makes the pool finish no sooner. Nor does one that
-# could take only units that their gates hold back (`gated_work`). A parked pool is
-# `next_pool`'s to choose.
-function neediest_pool(q::Queues, k::Integer)
-    best, latest = 0, 0.0
-    for j in eachindex(q.pools)
-        (j == k || j in q.parked) && continue
-        units = unclaimed_work(q, j)
-        isempty(units) && continue
-        n = q.serving[j]
-        floor, saturated = gated_work(q, j)
-        saturated && continue
-        without = n == 0 ? Inf : max(floor, finish_time(units, zeros(n)))
-        with = max(floor, finish_time(units, [zeros(n); cold_cost(q, j)]))
-        with < without && without > latest && ((best, latest) = (j, without))
-    end
-    return best
-end
-
-# When the last of `units`, durations in seconds in the order they are handed out,
-# ends, on workers free from the times `free`, each taking the next unit as it is free.
-function finish_time(units::Vector{Float64}, free::Vector{Float64})
-    free = copy(free)
-    for d in units
-        _, w = findmin(free)
-        free[w] += d
-    end
-    return maximum(free)
-end
-
-# Pool `j`'s unclaimed units, each its estimated seconds, in the order they are handed
-# out: its head, its body, its tail, which are consecutive. A recorded duration is
-# scaled by how this run's items took against theirs. An item without one counts as
-# the pool's average item so far. Before the pool has timed any, it counts as the
-# typical recorded item, as in the plan.
-function unclaimed_work(q::Queues, j::Integer)
-    seconds = unit_seconds(q, j)
-    pool = q.pools[j]
-    return Float64[seconds(u) for u in first(pool.head):last(pool.tail) if !q.claimed[u]]
-end
-
-# The least time pool `j`'s unclaimed units take, however many workers serve it, as
-# the units of each gate run at most its limit at a time; and whether those units
-# are all of gates whose limits the pool's workers can already fill, which another
-# worker therefore does not speed up.
-function gated_work(q::Queues, j::Integer)
-    isempty(q.gate_limit) && return 0.0, false
-    seconds = unit_seconds(q, j)
-    work = zeros(length(q.gate_limit))
-    saturated = true
-    pool = q.pools[j]
-    for u in first(pool.head):last(pool.tail)
-        q.claimed[u] && continue
-        g = q.gate[u]
-        if g == 0
-            saturated = false
-        else
-            work[g] += seconds(u)
-            saturated &= q.gate_limit[g] <= q.serving[j]
-        end
-    end
-    return maximum(work ./ q.gate_limit), saturated
-end
-
-# The estimated seconds of a unit of pool `j`, as `unclaimed_work` counts them.
-function unit_seconds(q::Queues, j::Integer)
-    st = q.stats[j]
-    scale = st.estimated_s > 0 ? st.estimated_took_s / st.estimated_s : 1.0
-    unknown = st.items > 0 ? st.took_s / st.items : q.typical
-    return u -> q.est[u] * scale + q.unrecorded[u] * unknown
-end
-
-# What a fresh worker in pool `j` costs before it is as fast as the pool's others:
-# starting its process, and compiling what they already have. Measured in the pool
-# once the run has seen it there, across the run's pools before that, and taken
-# from earlier runs before the run has seen it at all.
-function cold_cost(q::Queues, j::Integer)
-    st = q.stats[j]
-    starts = sum(x -> x.starts, q.stats)
-    start = st.starts > 0 ? st.start_s / st.starts :
-        starts > 0 ? sum(x -> x.start_s, q.stats) / starts : q.prior.start_s
-    excess(cold_s, cold, warm_s, warm) = max(0.0, cold_s / cold - warm_s / warm)
-    cold, warm = sum(x -> x.cold, q.stats), sum(x -> x.warm, q.stats)
-    compile = st.cold > 0 && st.warm > 0 ? excess(st.cold_compile_s, st.cold, st.warm_compile_s, st.warm) :
-        cold > 0 && warm > 0 ?
-        excess(sum(x -> x.cold_compile_s, q.stats), cold, sum(x -> x.warm_compile_s, q.stats), warm) :
-        q.prior.compile_s
-    return start + compile
-end
-
-# A worker process of slot `s` took `seconds` to be ready for its first item.
-note_start!(q::Queues, s::Integer, seconds::Real) = @lock q.lock begin
-    st = q.stats[q.pool[s]]
-    st.starts += 1
-    st.start_s += seconds
-    nothing
-end
-
-# A slot waiting for a gate stops waiting.
-cancel!(q::Queues) = @lock q.lock (was = q.cancelled; q.cancelled = true; notify(q.room); was)
+Slot(id::SlotIdx, profile::ProfileIdx, worker, started_at::Float64, worker_items::Int,
+     current::ItemIdx, attempt::Int8, dying_log::String, dying_lines::Vector{String},
+     recycle::Bool, collecting::ItemIdx) =
+    Slot(id, profile, worker, started_at, worker_items, current, attempt, 0.0f0, Int32(0), Int16(0),
+         dying_log, dying_lines, recycle, collecting)
 
 # The run stops, for `ending`: said in its run state before anything else, since how a
 # run ended tells what every item it leaves running or unseen means, and then nothing
@@ -409,9 +50,6 @@ function stop!(run, ending::RunEnding)
     mark_ending!(@atomic(run.runstate), ending)
     return cancel!(run.queues)
 end
-is_cancelled(q::Queues) = @lock q.lock q.cancelled
-set_paused!(q::Queues, v::Bool) = @lock q.lock (q.paused = v; nothing)
-is_paused(q::Queues) = @lock q.lock q.paused
 
 # Backpressure: hold new work while the machine is short of memory. Bounded,
 # because the pressure is often someone else's, and a run that quietly stops making
@@ -453,24 +91,26 @@ end
 """
     Statuses
 
-Per-item results, written by whichever slot task owns the item. Arrays rather than
-objects so that the run state can be written straight out of them.
+Per-item committed verdicts, written by whichever slot task owns the item. Arrays
+rather than objects so that the run state can be written straight out of them.
+Once an item has a decisive verdict, a later retry that is skipped or cancelled does
+not overwrite these columns.
 """
 struct Statuses
     counted::Vector{Bool}      # an item is counted as finished once, however many attempts
-    synthetic::Vector{Bool}      # the outcome was written by the coordinator, not by the item
+    synthetic::Vector{Bool}    # the outcome was written by the coordinator, not by the item
     state::Vector{ItemState}
-    start::Vector{Float32}   # seconds from the start of the run to the item's dispatch
+    start::Vector{Float32}     # seconds from the start of the run to the item's dispatch
     attempt::Vector{Int8}
     slot::Vector{SlotIdx}
-    pid::Vector{Int32}       # the process its last attempt ran in, 0 for none
-    # Where its last attempt came among the items its process ran, 1 for a fresh
+    pid::Vector{Int32}         # the process its committed attempt ran in, 0 for none
+    # Where its committed attempt came among the items its process ran, 1 for a fresh
     # process and 0 for none; a fresh process has yet to compile what the others have.
     seq::Vector{Int16}
     elapsed::Vector{Float32}
     compile::Vector{Float32}
-    testsets::Vector{Any}
-    # What its last attempt left of evidence, as `ItemResult.artifacts` says it.
+    testsets::Vector{Union{Nothing, Test.AbstractTestSet}}
+    # What its committed attempt left of evidence, as `ItemResult.artifacts` says it.
     artifacts::Vector{UInt8}
     # The rest of its status row: recompile seconds, MiB allocated and peak resident MiB:
     # of its worker and the processes under it during the attempt, as the monitor
@@ -478,8 +118,6 @@ struct Statuses
     recompile::Vector{Float32}
     alloc_mb::Vector{Float32}
     rss_mb::Vector{Float32}
-    # While a retry runs, the verdict of the latest attempt that decided one (`Decided`).
-    decided::Vector{Any}
     # The latest attempt whose outcome is recorded, 0 for none: a skip after a failure
     # leaves `attempt` at the failure's, and is recorded all the same.
     recorded::Vector{Int8}
@@ -488,22 +126,33 @@ end
 Statuses(n::Integer) = Statuses(
     falses(n), falses(n), fill(UNSEEN, n), zeros(Float32, n), zeros(Int8, n), fill(SlotIdx(0), n),
     zeros(Int32, n), zeros(Int16, n), zeros(Float32, n), zeros(Float32, n),
-    Vector{Any}(nothing, n), zeros(UInt8, n), zeros(Float32, n), zeros(Float32, n), zeros(Float32, n),
-    Vector{Any}(nothing, n), zeros(Int8, n)
+    Vector{Union{Nothing, Test.AbstractTestSet}}(nothing, n), zeros(UInt8, n),
+    zeros(Float32, n), zeros(Float32, n), zeros(Float32, n), zeros(Int8, n)
 )
 
 # A verdict an attempt decided: passed, failed, errored, timed out or broken. A skip or
 # a cancel decides nothing, and leaves an item the verdict of an earlier attempt.
 is_decisive(s::ItemState) = !(s === SKIPPED || s === CANCELLED || s === UNSEEN || s === RUNNING)
 
-# An item's verdict and status row as one attempt left them, kept across a retry.
-const Decided = @NamedTuple{state::ItemState, attempt::Int8, slot::SlotIdx, synthetic::Bool, artifacts::UInt8,
-                            pid::Int32, seq::Int16, start::Float32, elapsed::Float32, compile::Float32,
-                            recompile::Float32, alloc_mb::Float32, rss_mb::Float32, testset::Any}
-
-decided_of(st::Statuses, i::Integer) = Decided((
-    st.state[i], st.attempt[i], st.slot[i], st.synthetic[i], st.artifacts[i], st.pid[i], st.seq[i], st.start[i],
-    st.elapsed[i], st.compile[i], st.recompile[i], st.alloc_mb[i], st.rss_mb[i], st.testsets[i]))
+# Everything observers (`report_item!`, `tell_on_event`, `event_item_finished`) need for
+# one completed attempt, carried explicitly so `Statuses` never needs temporary
+# overwrite-and-rollback when a retry is skipped or cancelled after a decisive attempt.
+struct AttemptOutcome
+    i::ItemIdx
+    slot::SlotIdx
+    attempt::Int8
+    state::ItemState
+    verdict::ItemState
+    pid::Int32
+    elapsed::Float64
+    stats::RuntestsWorkers.PerfStats
+    testset::Test.AbstractTestSet
+    synthetic::Bool
+    artifacts::UInt8
+    note::String
+    ended::Float64
+    n::Int
+end
 
 mutable struct Run
     const plan::Plan
@@ -535,6 +184,9 @@ mutable struct Run
     # test environment of a standalone run, the union environment of a combined one,
     # or an isolated package's own test project.
     const package_projects::Vector{String}
+    # Precomputed per-profile skip flags (`skips_environment`) and package name width.
+    const skipped_profiles::BitVector
+    const package_width::Int32
     # The name column, chosen once from every name the run will print, and each
     # item's name as it is written there (see `item_names`).
     const name_width::Int32
@@ -684,11 +336,21 @@ function execute_here(p::Plan, target, on_event)
     for i in 1:nitems(p)
         local_item[i] = (seen[p.items.package[i]] += 1)
     end
+    # Precompute once per run rather than walking `.git` on every item or taking
+    # `maximum(textwidth, ...)` on every printed RUN/DONE line.
+    root_for_names = any(k -> !isempty(p.packages.cfg[k].skip_environment), 1:npkg) ? naming_root(p.root) : ""
+    skipped_profiles = BitVector(
+        !isempty(p.profiles[j].environment) &&
+        !isempty(p.packages.cfg[p.profile_package[j]].skip_environment) &&
+        (rel_slash(p.profiles[j].environment, root_for_names) in p.packages.cfg[p.profile_package[j]].skip_environment)
+        for j in eachindex(p.profiles)
+    )
+    package_width = Int32(maximum(textwidth, p.packages.name; init = 0))
     # As its first `@async` would: the run's tasks share this thread from here.
     current_task().sticky = true
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, [joinpath(d, "item_") for d in logdirs],
-        artifacts_prefixes, local_item, String[], column, names,
+        artifacts_prefixes, local_item, String[], skipped_profiles, package_width, column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event,
         ReentrantLock(), Threads.threadid()
@@ -751,7 +413,7 @@ function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
                 # long as this process lasts. Why it ended goes beside it.
                 testing = Ref(false)
                 try
-                    run_testing(run, p, target, setup_paths, testing)
+                    run_testing(run, p, setup_paths, testing)
                 catch e
                     if !testing[]
                         shielded() do
@@ -777,7 +439,7 @@ end
 # package's plan (`package_plan`), for the package's run state to keep a snapshot of.
 # Empty for an environment the run skips, which starts no worker.
 worker_projects(run::Run, k::Integer) = String[
-    skips_environment(run.plan, j) ? "" : worker_project(run, j)
+    run.skipped_profiles[j] ? "" : worker_project(run, j)
     for j in eachindex(run.plan.profiles) if run.plan.profile_package[j] == k]
 
 # Why a run stopped before it opened its run state, as `setup-<run>.log` in
@@ -799,7 +461,7 @@ end
 
 # Setup, then the items. `testing` is set once the items' own `finally` is in place
 # to finish the run state.
-function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, testing::Ref{Bool})
+function run_testing(run::Run, p::Plan, setup_paths::Vector{String}, testing::Ref{Bool})
     cfg = p.cfg
     check_replayed_environment(run)
     return with_load_path(setup_paths) do
@@ -820,9 +482,9 @@ function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, tes
         testing[] = true
         try
             if cfg.workers == 0
-                run_in_process(run, target)
+                run_in_process(run)
             else
-                run_on_workers(run, target)
+                run_on_workers(run)
             end
             # Stopped with nothing in flight to interrupt: the slots saw their
             # workers go and ended on their own.
@@ -879,251 +541,6 @@ function run_testing(run::Run, p::Plan, target, setup_paths::Vector{String}, tes
         run
     end
 end
-
-"""
-    with_test_env(f, target)
-
-Run `f` with the package's test environment active, and restore whatever was
-active afterwards. The environment is:
-
-1. the active one, when the call came from `<root>/test/runtests.jl`; `Pkg.test`
-   normally builds that environment with the test dependencies;
-2. the active one, when it is the package's own `test/Project.toml`, because
-   activating that is a deliberate choice;
-3. the package's `test/Project.toml`, when it is a member of the workspace the
-   package is in, which shares its manifest, as `Pkg.test` uses it;
-4. otherwise a test environment built by `TestEnv`.
-
-The last two are cached for the session.
-
-Outside `test/runtests.jl`, the package's plain project is not reused because it
-lacks test-only dependencies. A call from that file assumes its active project
-already supplies them.
-"""
-function with_test_env(f, target, run = nothing)
-    # Building it is `Pkg`'s to narrate, and it draws its own progress by moving
-    # the cursor. Ours comes down while it does.
-    monitor = run === nothing ? nothing : run.monitor
-    env = with_status_line_off(monitor) do
-        test_env_for(target, run === nothing ? nothing : () -> say(run, "resolving the test environment"))
-    end
-    env === nothing && return f()
-    current = Base.active_project()
-    Base.set_active_project(env)
-    try
-        return f()
-    finally
-        Base.set_active_project(current)
-    end
-end
-
-"""
-    test_env_for(target) -> Union{Nothing,String}
-
-The environment the target's items resolve against, or `nothing` when the active
-one is it. `activate` asks too, and must agree with a run.
-"""
-function test_env_for(target, announce = nothing)
-    current = Base.active_project()
-    if current !== nothing
-        running_from_runtests(target) && return nothing
-        testproj = joinpath(target.testdir, "Project.toml")
-        isfile(testproj) && abspath(current) == abspath(testproj) && return nothing
-    end
-    env = test_env(target, announce)::String
-    (current !== nothing && abspath(current) == abspath(env)) && return nothing
-    return env
-end
-
-# `f(Pkg, TestEnv)`, loading them the first time any call needs them rather than with
-# this package: a worker process loads this package too, and Pkg alone would double
-# the time a worker takes to start. Loaded during the call, their functions are newer
-# than its caller, so `f` runs in the latest world.
-const PKG_ID = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
-const TESTENV_ID = Base.PkgId(Base.UUID("1e6cf692-eddd-4d53-88a5-2d735e33781b"), "TestEnv")
-with_pkg(f) = Base.invokelatest(f, Base.require(PKG_ID), Base.require(TESTENV_ID))
-
-# Test environments, kept for the session and keyed by project file: building one
-# costs a resolve, seconds at the REPL. It costs no compilation: caches are keyed by
-# package versions and flags, not by environment, so a new environment with the same
-# versions reuses them. The stamp is what it was generated from, so a test dependency
-# added mid-session rebuilds it.
-const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Tuple{String, Float64}}}}()
-const TEST_ENVS_LOCK = ReentrantLock()
-
-function test_env(target, announce = nothing)
-    proj = abspath(target.project)
-    return @lock TEST_ENVS_LOCK begin
-        cached = get(TEST_ENVS, proj, nothing)
-        if cached !== nothing && isfile(cached[1]) && cached[2] == env_stamp(target)
-            return cached[1]
-        end
-        # Announced only when building: a cache hit is immediate, and at the REPL
-        # the hit is the point.
-        announce === nothing || announce()
-        original = Base.active_project()
-        failure = try
-            # `Pkg` would precompile the new environment for this process's flags
-            # only; the precompile queue does it once for every set of flags the pools
-            # use, and the time reported against this stays the resolve's.
-            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-                testproj = joinpath(target.testdir, "Project.toml")
-                if in_package_workspace(testproj, proj)
-                    # It shares the package's manifest, so `Pkg.test` runs it as it
-                    # is, without a sandbox.
-                    with_pkg() do Pkg, _
-                        Pkg.activate(testproj; io = devnull)
-                        Pkg.instantiate(; allow_autoprecomp = false)
-                    end
-                else
-                    with_pkg() do Pkg, TestEnv
-                        Pkg.activate(proj; io = devnull)
-                        TestEnv.activate()
-                    end
-                end
-            end
-            # What activating made active: a project, or it would have thrown.
-            env = Base.active_project()::String
-            # Stamped *after* generating it: resolving writes the package's manifest,
-            # so a stamp taken beforehand never matches again and every call would
-            # rebuild the environment it was supposed to cache.
-            TEST_ENVS[proj] = (env, env_stamp(target))
-            return env
-        catch e
-            is_interrupt(e) && rethrow()
-            e
-        finally
-            Base.set_active_project(original)
-        end
-        # Thrown after the `catch`: from inside it, Julia would print the error again
-        # under "caused by", and once more for each attempt that `TestEnv` makes.
-        throw(ConfigError("could not build a test environment for $(relpath_or_path(proj)): " * sprint(showerror, failure)))
-    end
-end
-
-# The package's project and the test project, each with the manifest Julia reads for
-# it: `Manifest-v1.x.toml` before `Manifest.toml`, a workspace's shared one. Paths
-# as well as times, so a manifest that takes over from another changes the stamp.
-function env_stamp(target)
-    proj = abspath(target.project)
-    testproj = joinpath(target.testdir, "Project.toml")
-    stamped(path) = (path, mtime_or_zero(path))
-    manifest(project) = something(isfile(project) ? Base.project_file_manifest_path(project) : nothing, "")
-    return (stamped(proj), stamped(manifest(proj)), stamped(testproj), stamped(manifest(testproj)))
-end
-
-mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
-
-# Whether `test/Project.toml` is a member of a workspace, and of the one the package
-# is in: the package's own, or one that lists both, as a monorepo's root does,
-# directly or through the package's own. Julia's loader finds a member's manifest by
-# following its workspace parents, so the outermost roots decide.
-function in_package_workspace(testproj, proj)
-    isfile(testproj) || return false
-    @static if isdefined(Base, :base_project)
-        Base.base_project(testproj) === nothing && return false
-        return samefile(outermost_workspace(testproj), outermost_workspace(proj))
-    else
-        return false   # workspaces came with Julia 1.12
-    end
-end
-
-# The project at the top of the workspaces that `project` is a member of, or
-# `project` itself when it is a member of none, as every project is before Julia 1.12.
-function outermost_workspace(project)
-    @static if isdefined(Base, :base_project)
-        while true
-            parent = Base.base_project(project)
-            (parent === nothing || samefile(parent, project)) && return project
-            project = parent
-        end
-    else
-        return project
-    end
-end
-
-# A call from `test/runtests.jl` reuses the active project. `Pkg.test` normally
-# runs that file in an environment it built for the purpose.
-function running_from_runtests(target)
-    source = get(task_local_storage(), :SOURCE_PATH, nothing)
-    source === nothing && return false
-    return abspath(String(source)) == abspath(joinpath(target.testdir, "runtests.jl"))
-end
-
-# A replay runs against this machine's environment, which may not be the one the
-# run state was recorded in. Every package whose version differs is named: it is
-# the first thing to rule out when a replay does not fail the way the original did.
-function check_replayed_environment(run::Run)
-    cfg = run.plan.cfg
-    if !isempty(cfg.julia_flags)
-        here = join(nondefault_flags(code_flags()), " ")
-        say(run, string("the workers compile with the Julia flags the run state recorded, ",
-                        join(nondefault_flags(cfg.julia_flags), " "), ", where this process has ",
-                        isempty(here) ? "none of them" : here))
-        cfg.workers == 0 && @warn "Runtests: the run state was recorded with the Julia flags " *
-            "$(join(cfg.julia_flags, " ")), and `workers = 0` runs the items in this process, which has " *
-            "$(join(code_flags(), " ")); give it one worker or more to run them as they were run"
-    end
-    recorded = cfg.replayed_manifest
-    isempty(recorded) && return nothing
-    env = Base.active_project()
-    here = manifest_versions(read_text(env === nothing ? nothing : Base.project_file_manifest_path(env)))
-    there = manifest_versions(recorded)
-    diffs, by_path = String[], String[]
-    for name in sort!(collect(union(keys(here), keys(there))))
-        h, t = get(here, name, nothing), get(there, name, nothing)
-        if h !== nothing && t !== nothing && (h.path || t.path)
-            push!(by_path, name)
-        elseif !same_code(h, t)
-            push!(diffs, string(name, ": ", code_text(t), " when recorded, ", code_text(h), " here"))
-        end
-    end
-    # Its path is the recording machine's, and its source may differ under the same one.
-    isempty(by_path) || say(run, "tracked by path, so not compared with the recorded run: ", join(by_path, ", "))
-    # The test environment's manifest is what the run state compares by. A profile with
-    # a project of its own, as one of an environment directory has, has a snapshot of
-    # its own in the run state, which this does not compare.
-    own = length(run.profile_projects)
-    own == 0 || say(run, "not compared with the recorded run: the environments of ", plural(own, "profile"),
-                    " with a project of their own")
-    isempty(diffs) && return say(run, "the test environment matches the one the run state was recorded in")
-    @warn "Runtests: the test environment differs from the one the run state was recorded in:\n" *
-        join(("  " * d for d in first(diffs, 40)), "\n") * (length(diffs) > 40 ? "\n  …" : "")
-    return nothing
-end
-
-# What identifies a package's code in a manifest: its UUID, version and source tree
-# (`git-tree-sha1`), as far as the manifest has them, or `path` for one tracked by path.
-const ManifestCode = @NamedTuple{uuid::String, version::String, tree::String, path::Bool}
-
-# Package name => its code (`ManifestCode`), from a manifest's text.
-function manifest_versions(text::AbstractString)
-    out = Dict{String, ManifestCode}()
-    isempty(text) && return out
-    toml = try
-        TOML.parse(text)
-    catch
-        return out
-    end
-    for (name, entries) in get(Dict{String, Any}, toml, "deps")
-        entries isa AbstractVector || continue
-        for entry in entries
-            entry isa AbstractDict || continue
-            field(k) = (v = get(entry, k, ""); v isa AbstractString ? String(v) : string(v))
-            out[name] = (; uuid = field("uuid"), version = field("version"), tree = field("git-tree-sha1"),
-                         path = haskey(entry, "path"))
-        end
-    end
-    return out
-end
-
-# Whether two manifests give a package the same code: the same UUID and version, and the
-# same source tree where both name one. A package that one of them lacks differs.
-same_code(a, b) = a !== nothing && b !== nothing && a.uuid == b.uuid && a.version == b.version &&
-    (isempty(a.tree) || isempty(b.tree) || a.tree == b.tree)
-
-code_text(c) = c === nothing ? "absent" :
-    string(isempty(c.version) ? "stdlib" : c.version, isempty(c.tree) ? "" : string(" (tree ", first(c.tree, 10), ")"))
 
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
@@ -1332,548 +749,9 @@ function warn_sandboxed_workers(p::Plan)
     return nothing
 end
 
-function project_name_of(projectfile::AbstractString)
-    try
-        return get(TOML.parsefile(projectfile), "name", nothing)
-    catch
-        return nothing
-    end
-end
-
-# The setups directory is an implicit environment, so putting it on LOAD_PATH is
-# all that `using MySetup` needs. Done for the duration of the run rather than
-# permanently: a test run should not leave the caller's session changed.
-function with_load_path(f, setup_path::AbstractString)
-    isdir(setup_path) || return f()
-    setup_path in LOAD_PATH && return f()
-    push!(LOAD_PATH, setup_path)
-    try
-        return f()
-    finally
-        i = findlast(==(setup_path), LOAD_PATH)
-        i === nothing || deleteat!(LOAD_PATH, i)
-    end
-end
-
-with_load_path(f, setup_paths::Vector{String}) =
-    isempty(setup_paths) ? f() : with_load_path(() -> with_load_path(f, setup_paths[2:end]), setup_paths[1])
-
-# The environment a run's items resolve against, active for the length of `f`: the
-# test environment of a standalone run (`with_test_env`), the union environment of a
-# combined one (`with_union_env`). `run.package_projects` says, for each package, the
-# project its items run in.
-function with_run_env(f, target, run::Run)
-    is_combined(run.plan) && return with_union_env(f, run)
-    return with_test_env(target, run) do
-        push!(run.package_projects, something(Base.active_project(), ""))
-        f()
-    end
-end
-
-"""
-    profile_projects!(run, p)
-
-Give every pool's profile that declares preferences, or runs in an environment
-directory, a project of its own. A package takes its preferences from the
-environment that owns it, and a stacked environment is not consulted, so a profile's
-preferences have to arrive as the worker's own project: the test environment's
-`Project.toml` and `Manifest.toml`, over a `LocalPreferences.toml` of the
-environment's preferences with the profile's on top. Preferences are part of a
-cache's identity, so these projects keep caches of their own. A pool in an
-environment directory runs in a copy of it instead (see
-[`environment_project`](@ref)).
-"""
-function profile_projects!(run::Run, p::Plan)
-    for (j, prof) in enumerate(p.profiles)
-        skips_environment(p, j) && continue
-        env = run.package_projects[p.profile_package[j]]
-        announce = () -> say(run, "resolving the environment of ", relpath_or_path(prof.environment, p.root))
-        # An environment directory gets the package of its own suite.
-        dir = profile_project(prof, env, p.packages.root[p.profile_package[j]], announce)
-        dir === nothing || (run.profile_projects[ProfileIdx(j)] = dir)
-    end
-    return nothing
-end
-
-# The project `prof`'s workers run in, or `nothing` for a profile without
-# preferences or an environment, whose workers run in the environment `env` itself.
-# For one with an environment, see `environment_project`, which `root`, the package
-# under test, and `announce` are for. Otherwise in the system's temporary files,
-# keyed by `env`'s path and the preferences file, and never beside `env`, which can
-# be the package's own `test/`. The preferences file is in the key because profiles
-# of one name in two packages of a combined run share `env` and can name different
-# files. Rewritten on every call, so it follows the environment and the preferences
-# file.
-function profile_project(prof::Profile, env, root = nothing, announce = nothing)
-    isempty(prof.environment) || return environment_project(prof, root, announce)
-    (env === nothing || isempty(prof.preferences)) && return nothing
-    root = dirname(env)
-    key = crc32c(string(abspath(env), '\0', abspath(prof.preferences)))
-    dir = joinpath(tempdir(), "runtests_profiles", string(key; base = 16, pad = 8), String(prof.name))
-    mkpath(dir)
-    copy_env_files(dir, env)
-    own = joinpath(root, "LocalPreferences.toml")
-    merged = isfile(own) ? TOML.parsefile(own) : Dict{String, Any}()
-    for (pkg, table) in TOML.parsefile(prof.preferences)
-        # Per package, not per key: a half-overridden preferences table is a
-        # configuration nobody wrote down.
-        merged[pkg] = table
-    end
-    open(io -> TOML.print(io, merged), joinpath(dir, "LocalPreferences.toml"), "w")
-    return dir
-end
-
-# The projects of profiles that name an environment, kept for the session as the
-# test environment is, and keyed by the environment, the package and the
-# preferences: building one is a resolve.
-const ENVIRONMENT_PROJECTS = Dict{NTuple{3, String}, Tuple{String, Vector{Float64}}}()
-const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
-
-"""
-    environment_project(prof, root, announce = nothing) -> String
-
-Create the project in which workers run a profile that names an environment
-directory. Copy the environment into a temporary directory, add the package at
-`root` by path, apply the profile's preferences over the environment's
-`LocalPreferences.toml`, and resolve it. Developing the package by path lets
-resolution use its `[sources]` entries. The source environment is not modified.
-
-Keep the result for this session and rebuild it when an input file changes: the
-environment's files, the package's project, the preferences, or the project of a
-package held by path. Call `announce` before building.
-"""
-function environment_project(prof::Profile, root, announce = nothing)
-    root === nothing && throw(ConfigError(
-        "the tests in $(relpath_or_path(prof.environment)) run in an environment of their own, and there is no package here to test in it"
-    ))
-    key = (prof.environment, String(root), prof.preferences)
-    return @lock ENVIRONMENT_PROJECTS_LOCK begin
-        cached = get(ENVIRONMENT_PROJECTS, key, nothing)
-        if cached !== nothing && isdir(cached[1]) && cached[2] == environment_stamp(cached[1], prof, root)
-            return cached[1]
-        end
-        announce === nothing || announce()
-        dir = mktempdir(; prefix = "runtests_environment_")
-        write_environment(dir, prof, root)
-        resolve_environment(dir, prof)
-        # Stamped once resolved: the packages it holds by path are in its manifest.
-        ENVIRONMENT_PROJECTS[key] = (dir, environment_stamp(dir, prof, root))
-        return dir
-    end
-end
-
-# The environment `prof` names, written into `dir` with its paths made absolute, the
-# package at `root` added by path, and the preferences laid over its own.
-function write_environment(dir::AbstractString, prof::Profile, root::AbstractString)
-    src = prof.environment
-    projfile = something(project_file(src), joinpath(src, "Project.toml"))
-    project = absolute_paths!(TOML.parsefile(projfile), src)
-    own = project_file(root)
-    pkg = own === nothing ? Dict{String, Any}() : TOML.parsefile(own)
-    name, uuid = get(pkg, "name", nothing), get(pkg, "uuid", nothing)
-    if name isa String && uuid isa String
-        get!(Dict{String, Any}, project, "deps")[name] = uuid
-        get!(Dict{String, Any}, project, "sources")[name] = Dict{String, Any}("path" => abspath(root))
-    end
-    open(io -> TOML.print(io, project; sorted = true), joinpath(dir, "Project.toml"), "w")
-    manifest = Base.project_file_manifest_path(projfile)
-    if manifest !== nothing && isfile(manifest)
-        # A manifest's paths are its own directory's, which for a member of a
-        # workspace is the workspace's.
-        open(io -> TOML.print(io, absolute_paths!(TOML.parsefile(manifest), dirname(manifest)); sorted = true),
-             joinpath(dir, "Manifest.toml"), "w")
-    end
-    own_prefs = joinpath(src, "LocalPreferences.toml")
-    prefs = isfile(own_prefs) ? TOML.parsefile(own_prefs) : Dict{String, Any}()
-    if !isempty(prof.preferences)
-        for (p, table) in TOML.parsefile(prof.preferences)
-            prefs[p] = table   # per package, as in `profile_project`
-        end
-    end
-    isempty(prefs) || open(io -> TOML.print(io, prefs), joinpath(dir, "LocalPreferences.toml"), "w")
-    return nothing
-end
-
-# `Pkg` would precompile for this process's flags only, as for the test environment;
-# the precompile queue does it once for every set the pools use.
-function resolve_environment(dir::AbstractString, prof::Profile)
-    original = Base.active_project()
-    failure = try
-        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
-            with_pkg() do Pkg, _
-                Pkg.activate(dir; io = devnull)
-                Pkg.resolve(; io = devnull)
-                Pkg.instantiate(; io = devnull)
-            end
-        end
-        nothing
-    catch e
-        is_interrupt(e) && rethrow()
-        e
-    finally
-        Base.set_active_project(original)
-    end
-    # Thrown after the `catch`, as in `test_env`, so that the error prints once.
-    failure === nothing || throw(ConfigError(string(
-        "could not build the environment of ", relpath_or_path(prof.environment), ": ", sprint(showerror, failure)
-    )))
-    return nothing
-end
-
-# When the files an environment directory's copy was built from were last written: the
-# environment's own, with the manifest that `write_environment` read, the package's
-# project, the preferences, and the project of every package the built one at `dir`
-# holds by path, which is how a package's siblings in a monorepo come in.
-function environment_stamp(dir::AbstractString, prof::Profile, root::AbstractString)
-    files = String[joinpath(prof.environment, f) for f in
-                   ("Project.toml", "JuliaProject.toml", "Manifest.toml", "JuliaManifest.toml", "LocalPreferences.toml")]
-    projfile = project_file(prof.environment)
-    manifest = projfile === nothing ? nothing : Base.project_file_manifest_path(projfile)
-    manifest === nothing || push!(files, manifest)
-    push!(files, joinpath(root, "Project.toml"), joinpath(root, "JuliaProject.toml"))
-    isempty(prof.preferences) || push!(files, prof.preferences)
-    manifest = joinpath(dir, "Manifest.toml")
-    if isfile(manifest)
-        for (_, entries) in get(Dict{String, Any}, TOML.parsefile(manifest), "deps")
-            entries isa AbstractVector || continue
-            for entry in entries
-                path = entry isa AbstractDict ? get(entry, "path", nothing) : nothing
-                path isa AbstractString || continue
-                at = normpath(joinpath(dir, path))
-                push!(files, joinpath(at, "Project.toml"), joinpath(at, "JuliaProject.toml"))
-            end
-        end
-    end
-    return Float64[mtime_or_zero(f) for f in files]
-end
-
-"""
-    copy_env_files(dir, project)
-
-Write the project file `project`, and the manifest that Julia reads for it, into `dir`
-as `Project.toml` and `Manifest.toml`, every path made absolute from the directory of
-its own file. The manifest is a versioned `Manifest-v1.x.toml` before `Manifest.toml`,
-and a workspace's shared one for a member of it, as for `write_environment`. `dir` is
-elsewhere, so a relative path would resolve from the wrong directory, and a worker whose
-project cannot find a developed package dies before it is ready.
-"""
-function copy_env_files(dir::AbstractString, project::AbstractString)
-    open(io -> TOML.print(io, absolute_paths!(TOML.parsefile(project), dirname(project)); sorted = true),
-         joinpath(dir, "Project.toml"), "w")
-    manifest = Base.project_file_manifest_path(project)
-    if manifest !== nothing && isfile(manifest)
-        open(io -> TOML.print(io, absolute_paths!(TOML.parsefile(manifest), dirname(manifest)); sorted = true),
-             joinpath(dir, "Manifest.toml"), "w")
-    else
-        # An earlier call's, for a project that has since lost its manifest.
-        rm(joinpath(dir, "Manifest.toml"); force = true)
-    end
-    return nothing
-end
-
-"""
-    absolute_paths!(data, root) -> data
-
-Rewrite every `path` in a parsed project or manifest as absolute, reading relative
-ones from `root`. The whole table is walked: in these files a `path` is a
-filesystem path wherever it appears.
-"""
-function absolute_paths!(data::AbstractDict, root::AbstractString)
-    for (key, value) in data
-        if key == "path" && value isa AbstractString
-            # A package tracked at the environment's own directory is written `.`,
-            # which `abspath` turns into a path with a separator on the end.
-            p = abspath(root, value)
-            data[key] = isdirpath(p) ? dirname(p) : p
-        elseif value isa AbstractDict
-            absolute_paths!(value, root)
-        elseif value isa AbstractVector
-            for entry in value
-                entry isa AbstractDict && absolute_paths!(entry, root)
-            end
-        end
-    end
-    return data
-end
-
-# The run precompiles what every worker is about to need, in one queue
-# (`precompile_queued`): otherwise the workers hit the same cold cache at once and
-# serialize on Julia's precompilation lock, and a worker under flags with no cache
-# compiles everything it loads itself, one package at a time, while the run looks
-# stalled on its first item.
-function precompile_phase(run::Run, p::Plan)
-    # Each set of julia arguments is asked of a process of its own, so once.
-    asked = Dict{Vector{String}, Union{Nothing, Base.CacheFlags}}()
-    flags_of(prof) = (args = worker_julia_args(run, prof); get!(() -> profile_flags(prof, args), asked, args))
-    precompile_queued(run, p, flags_of)
-    return nothing
-end
-
-# Every field, in order, as a tuple of literals: the set differs between versions (1.14
-# adds `coverage`, and `coverage_path`, a path that can hold a space, or `nothing`).
-const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(repr(ntuple(i -> getfield(f, i), nfields(f))))"
-
-"""
-    cache_flags_for(julia_args) -> Base.CacheFlags
-
-The cache flags a worker started with `julia_args` will have, asked of a process
-started the same way: which arguments reach the cache key is Julia's business and
-changes between versions, and a wrong answer precompiles for the wrong key.
-"""
-function cache_flags_for(julia_args::Cmd)
-    out = read(
-        `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e $CACHE_FLAGS_CODE`,
-        String
-    )
-    flags = PrecompileHelper.cache_flags_from(out)
-    flags === nothing && error("Runtests: could not read the cache flags of `julia $julia_args`: $out")
-    return flags
-end
-
-const PrecompileConfig = Pair{Cmd, Base.CacheFlags}
-const TEST_ENVIRONMENT = "the test environment"
-
-# What the pools of one project need compiled under one set of cache flags: every
-# dependency of the project (`whole`), or `names` and their dependencies. `load_path`
-# is the load path of the first pool that needs it. `subject` is the project as a
-# message names it, and `profiles` the profiles a message names. In a run of several
-# packages, `by` holds what each tested package needs of it: names, or `nothing` for
-# all of it.
-const PrecompileNeed = @NamedTuple{project::String, load_path::Vector{String}, config::PrecompileConfig, whole::Bool,
-                                   names::Set{String}, subject::String, profiles::Set{String},
-                                   by::Dict{String, Union{Nothing, Set{String}}}}
-
-# Tested package `name` needs `names` of a project, or all of it (`nothing`).
-function ask!(by::Dict{String, Union{Nothing, Set{String}}}, name::AbstractString, names)
-    have = get!(Set{String}, by, name)
-    have === nothing && return nothing
-    names === nothing ? (by[name] = nothing) : union!(have, names)
-    return nothing
-end
-
-# The needs of the run's pools, one for each project and set of cache flags, and the
-# sets of flags besides this process's. In a run of one package a pool needs its
-# whole project, as a pool in an environment directory does. In a combined run a
-# pool needs the test dependencies of the packages its items belong to, so the julia
-# arguments of one package's profile do not compile the rest of the workspace's. An
-# item whose profile has a `precompile` list needs the packages of the list that its
-# project holds, and Runtests. A pool can hold items of several profiles, so each
-# item's own profile decides. A name in a list that no project of the profile's items
-# holds is a `ConfigError`: misspelled, it would compile nothing.
-function precompile_needs(run::Run, p::Plan, flags_of)
-    needs = PrecompileNeed[]
-    others = PrecompileConfig[]
-    # A run without a project holds an empty path for it.
-    file_of(project) = isempty(project) ? nothing : isdir(project) ? project_file(project) : project
-    env_deps = Dict{String, Set{String}}()
-    deps_of(project) = get!(env_deps, project) do
-        file = file_of(project)
-        file === nothing && return Set{String}()
-        return Set{String}(keys(get(parse_project(file), "deps", Dict{String, Any}())))
-    end
-    # Every package that the precompiler can find in `project`: its own, its
-    # dependencies and theirs.
-    env_packages = Dict{String, Set{String}}()
-    packages_of(project) = get!(env_packages, project) do
-        file = file_of(project)
-        file === nothing && return Set{String}()
-        names = copy(deps_of(project))
-        own = get(parse_project(file), "name", nothing)
-        own isa String && push!(names, own)
-        manifest = Base.project_file_manifest_path(file)
-        if manifest !== nothing && isfile(manifest)
-            data = TOML.parsefile(manifest)
-            # Format 1 has the packages at the top level.
-            entries = get(data, "deps", nothing)
-            union!(names, keys(entries isa AbstractDict ? entries : data))
-        end
-        return names
-    end
-    # The names of each profile's list, by package and profile, until a project of its
-    # items holds them.
-    unheld = Dict{Tuple{Int32, Symbol}, Set{String}}()
-    # The names the items of package `k` can load: the package, its test project's
-    # dependencies and Runtests.
-    names_of = Dict{Int32, Set{String}}()
-    test_dep_names(k::Integer) = get!(names_of, Int32(k)) do
-        names = Set{String}([p.packages.name[k], "Runtests"])
-        test = project_file(joinpath(p.packages.root[k], "test"))
-        test === nothing || union!(names, keys(get(parse_project(test), "deps", Dict{String, Any}())))
-        return names
-    end
-    # The packages whose names each need holds already.
-    held = Set{Tuple{Int, Int32}}()
-    combined = is_combined(p)
-    for pool in p.pools
-        j = pool.profile
-        skips_environment(p, j) && continue
-        prof = p.profiles[j]
-        args = worker_julia_args(run, prof)
-        flags = isempty(args) ? Base.CacheFlags() : flags_of(prof)
-        # Flags that could not be read were said; those workers compile for themselves.
-        flags === nothing && continue
-        project = worker_project(run, j)
-        own = haskey(run.profile_projects, ProfileIdx(j))
-        k = p.profile_package[j]
-        subject = !isempty(prof.environment) ? string("the environment of ", relpath_or_path(prof.environment, p.root)) :
-            p.packages.isolated[k] ? string(TEST_ENVIRONMENT, " of ", p.packages.name[k]) : TEST_ENVIRONMENT
-        whole = !is_combined(p) || !isempty(prof.environment)
-        for u in first(pool.head):last(pool.tail)
-            here = single_process(p) && !needs_worker(p, u)
-            default = here || flags == Base.CacheFlags()
-            config = default ? (`` => Base.CacheFlags()) : (Cmd(args) => flags)
-            default || flags in last.(others) || push!(others, config)
-            i = findfirst(n -> n.project == project && last(n.config) == last(config), needs)
-            if i === nothing
-                load_path = here ? copy(LOAD_PATH) : worker_load_path(run, j)
-                push!(needs, (; project, load_path, config, whole = false, names = Set{String}(), subject,
-                              profiles = Set{String}(), by = Dict{String, Union{Nothing, Set{String}}}()))
-                i = lastindex(needs)
-            end
-            unit_profile = p.units.profile[u]
-            listed = p.profiles[unit_profile].precompile
-            if listed !== nothing
-                held_here = intersect(listed, packages_of(project))
-                setdiff!(get!(() -> Set{String}(listed), unheld, (p.profile_package[unit_profile], p.profiles[unit_profile].name)),
-                         held_here)
-                union!(needs[i].names, held_here)
-                isempty(held_here) || ((own || !default) && push!(needs[i].profiles, String(prof.name)))
-                # A worker loads Runtests before it connects. Where the project does not
-                # hold it, `precompile_queue` compiles it in this process's environment.
-                "Runtests" in deps_of(project) && push!(needs[i].names, "Runtests")
-                combined && ask!(needs[i].by, p.packages.name[p.profile_package[unit_profile]],
-                                 "Runtests" in deps_of(project) ? push!(copy(held_here), "Runtests") : held_here)
-                continue
-            end
-            # A profile in a project of its own is named, and one with flags of its own.
-            (own || !default) && push!(needs[i].profiles, String(prof.name))
-            if whole
-                needs[i].whole || (needs[i] = merge(needs[i], (; whole = true)))
-                combined && ask!(needs[i].by, p.packages.name[k], nothing)
-                continue
-            end
-            for item in p.units.span[u]
-                package = p.items.package[item]
-                (i, package) in held && continue
-                push!(held, (i, package))
-                asked = intersect(test_dep_names(package), deps_of(project))
-                union!(needs[i].names, asked)
-                combined && ask!(needs[i].by, p.packages.name[package], asked)
-            end
-        end
-    end
-    for ((k, name), names) in sort!(collect(unheld); by = first)
-        isempty(names) && continue
-        throw(ConfigError(string(
-            "`precompile` of profile `", name, "`", is_combined(p) ? string(" of ", p.packages.name[k]) : "", " names ",
-            join(("`$n`" for n in sort!(collect(names))), ", "), ", which ",
-            length(names) == 1 ? "is not a package" : "are not packages", " of the environment of its items"
-        )))
-    end
-    return needs, others
-end
-
-# The julia arguments a worker of profile `prof` starts with: its own, and under
-# coverage those that count the package's lines. A process that compiles for the
-# workers starts with them too. From 1.14 the cache flags hold the path whose lines
-# are counted, and a package there needs a cache built under them. The lines that
-# compiling runs, the package's top level, are counted as they are when a worker
-# compiles the package itself.
-worker_julia_args(run::Run, prof::Profile) =
-    run.plan.cfg.coverage ? [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.scratch))] : prof.julia_args
-
-# The cache flags of the workers of `prof`, which start with `args`, or `nothing`
-# (said once) when they cannot be read, in which case the workers compile what they
-# need themselves.
-function profile_flags(prof::Profile, args::Vector{String})
-    return try
-        isempty(args) ? Base.CacheFlags() : cache_flags_for(Cmd(args))
-    catch e
-        is_interrupt(e) && rethrow()
-        @warn "Runtests: could not read the cache flags of profile `$(prof.name)`; its \
-               workers will compile what they need themselves" exception = e
-        nothing
-    end
-end
-
-const SetupNeed = @NamedTuple{name::Symbol, args::Cmd, flags::Base.CacheFlags, dir::String, profiles::Set{String},
-                              packages::Set{String}}
-
-# The setups the items load, by the project they load them in, in the order of the
-# pools: the project, the load path there, and each setup with the julia arguments and
-# cache flags it is loaded under, the directory of setups it comes from, and the
-# profiles that a line of output names, as `precompile_needs` names them for packages:
-# those with flags or a project of their own.
-function setup_needs(run::Run, p::Plan, flags_of)
-    out = @NamedTuple{project::String, load_path::Vector{String}, needs::Vector{SetupNeed}}[]
-    combined = is_combined(p)
-    for pool in p.pools, u in first(pool.head):last(pool.tail)
-        j = pool.profile
-        skips_environment(p, j) && continue
-        # A profile with a `precompile` list leaves its setups to its workers: compiled
-        # here, a setup would build each dependency that has no cache, one at a time.
-        p.profiles[p.units.profile[u]].precompile === nothing || continue
-        here = single_process(p) && !needs_worker(p, u)
-        flags = here ? Base.CacheFlags() : flags_of(p.profiles[j])
-        # Flags that could not be read were said; those workers compile for themselves.
-        flags === nothing && continue
-        project = here ? something(Base.active_project(), "") : worker_project(run, j)
-        k = findfirst(c -> c.project == project, out)
-        if k === nothing
-            push!(out, (; project, load_path = here ? copy(LOAD_PATH) : worker_load_path(run, j), needs = SetupNeed[]))
-            k = lastindex(out)
-        end
-        needs = out[k].needs
-        args = here ? `` : Cmd(worker_julia_args(run, p.profiles[j]))
-        named = haskey(run.profile_projects, ProfileIdx(j)) || (!here && flags != Base.CacheFlags())
-        for i in p.units.span[u], name in setups_of(p.items, i)
-            at = findfirst(n -> n.name === name && n.flags == flags, needs)
-            if at === nothing
-                push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR),
-                              profiles = Set{String}(), packages = Set{String}()))
-                at = lastindex(needs)
-            end
-            named && push!(needs[at].profiles, String(p.profiles[j].name))
-            combined && push!(needs[at].packages, p.packages.name[p.items.package[i]])
-        end
-    end
-    return out
-end
-
-# `f()` with `project` active, none for `""`, and `load_path` as the load path, as a
-# worker started with them has both; afterwards, both as they were.
-function in_worker_environment(f, project::AbstractString, load_path::Vector{String})
-    original_project, original_path = Base.active_project(), copy(LOAD_PATH)
-    try
-        Base.set_active_project(isempty(project) ? nothing : project)
-        copy!(LOAD_PATH, load_path)
-        return f()
-    finally
-        copy!(LOAD_PATH, original_path)
-        Base.set_active_project(original_project)
-    end
-end
-
-# The names of the modules setup `pkg` loads, as far as is known before it compiles:
-# the `[deps]` of a setup that is a package, which Julia holds it to, and the imports
-# in the source of one that is not, which miss those of included files and of
-# generated code.
-function setup_dependencies(pkg::Base.PkgId)
-    path = Base.locate_package(pkg)
-    path === nothing && return Set{String}()
-    if pkg.uuid === nothing
-        ex = parse_source(path)
-        return ex === nothing ? Set{String}() : Set{String}(String(root) for root in imported_roots(ex))
-    end
-    project = project_file(dirname(dirname(path)))
-    project === nothing && return Set{String}()
-    deps = get(parse_project(project), "deps", nothing)
-    return deps isa AbstractDict ? Set{String}(keys(deps)) : Set{String}()
-end
-
 ### Workers ################################################################
 
-function run_on_workers(run::Run, target)
+function run_on_workers(run::Run)
     # On the run's own thread, as the watchdog is. Interrupting a slot, which an
     # interrupt and a stall both do, schedules its task, and scheduling a task that
     # is running on another thread corrupts the scheduler; a task on this thread
@@ -1886,7 +764,7 @@ function run_on_workers(run::Run, target)
             @async begin
                 s = $slot
                 try
-                    run_slot(run, s, target)
+                    run_slot(run, s)
                 catch e
                     if is_interrupt(e)
                         RuntestsWorkers.forward_interrupt(e)
@@ -1975,16 +853,16 @@ function record_stopped_item!(run::Run, slot::Slot; observe::Bool = true)
     # to leave this one unrecorded.
     if run.statuses.recorded[i] < attempt
         state, note = (@atomic run.stalled) ? (TIMEDOUT, STALLED_NOTE) : (CANCELLED, "the run was stopped")
+        start_off, pid, seq = (@atomic slot.started), slot.attempt_pid, slot.attempt_seq
         if observe
-            record_error!(run, i, slot, attempt, state, note)
+            record_error!(run, i, slot, attempt, state, note, start_off, pid, seq)
         else
             ended = time()
-            kept, _, _ = persist_attempt!(run, i, slot.id, attempt, state, error_testset(run, i, note, ended),
-                                          RuntestsWorkers.PerfStats(), true; ended)
-            kept === nothing || restore_decided!(run, i, kept)
+            persist_attempt!(run, i, slot.id, attempt, state, error_testset(run, i, note, start_off, ended),
+                             RuntestsWorkers.PerfStats(), true, start_off, pid, seq, note; ended)
         end
     end
-    @atomic slot.current = ItemIdx(0)
+    release_item!(slot)
     return nothing
 end
 
@@ -2111,7 +989,7 @@ function stall!(run::Run, limit::Real)
     return nothing
 end
 
-function run_slot(run::Run, slot::Slot, target)
+function run_slot(run::Run, slot::Slot)
     while true
         recycle_worker!(run, slot)
         wait_while_paused(run.queues, slot)
@@ -2129,7 +1007,7 @@ function run_slot(run::Run, slot::Slot, target)
             continue
         end
         try
-            run_unit!(run, slot, claim.unit, target)
+            run_unit!(run, slot, claim.unit)
         finally
             unit_ended!(run.queues, claim.unit)
         end
@@ -2145,18 +1023,18 @@ function recycle_worker!(run::Run, slot::Slot)
     return nothing
 end
 
-function ensure_worker!(run::Run, slot::Slot, target, exclusive::Bool)
+function ensure_worker!(run::Run, slot::Slot, exclusive::Bool)
     # Read once: a second read could find what another task stored since.
     w = @atomic slot.worker
     (w === nothing || w.terminated) || return w
-    w = start_worker(run, slot, target, exclusive)
+    w = start_worker(run, slot, exclusive)
     @atomic slot.worker = w
     return w
 end
 
 const WORKER_START_RETRIES = 2
 
-function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
+function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
     prof = run.plan.profiles[slot.profile]
     last_err = nothing
     for attempt in 1:(WORKER_START_RETRIES + 1)
@@ -2280,9 +1158,9 @@ end
 # An item's RUN or DONE line, drawn from what this run knows about the item.
 item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
     slot_id, i, nitems(run.plan), run.names[i], run.name_width, attempt,
-    attempts_for(run.plan, run.plan.items.unit[i]), something(how, run.plan.locations[i]);
+    attempts_for(run.plan, run.plan.items.unit[i]), something(how, itemlocation(run.plan, i));
     package = is_combined(run.plan) ? run.plan.packages.name[run.plan.items.package[i]] : "",
-    package_width = maximum(textwidth, run.plan.packages.name)
+    package_width = run.package_width
 )
 
 """
@@ -2428,6 +1306,31 @@ function died_how(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
         how *= string(", stopped after ", replace(String(by), '_' => ' '))
     end
     return string(how, memory_note(run.monitor, slot.id, w.pid))
+end
+
+# Shared worker teardown after a failed remote RPC (item dispatch, `test_end`, or
+# artifact collection). Returns `:timeout`, `:died`, or `:alive` (worker still usable).
+function resolve_worker_failure!(run::Run, slot::Slot, w::Union{Nothing, RuntestsWorkers.Worker}, e,
+                                 dying_log::String; is_worker::Bool = w !== nothing)
+    if e isa TimeoutException
+        if w !== nothing
+            print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
+            RuntestsWorkers.inspect!(w)
+            @atomic slot.dying_log = dying_log
+            RuntestsWorkers.terminate!(w, :timeout)
+            wait(w)   # a replacement must not overlap the process it replaces
+            flush_dying_log!(slot)
+            (@atomic slot.worker) === w && (@atomic slot.worker = nothing)
+        end
+        return :timeout
+    elseif w !== nothing && w.terminated
+        wait(w)   # its exit status is known once its process is reaped
+        (@atomic slot.worker) === w && (@atomic slot.worker = nothing)
+        return :died
+    elseif w === nothing && is_worker
+        return :died
+    end
+    return :alive
 end
 
 mutable struct LiveRun
@@ -2580,16 +1483,16 @@ end
 
 # The attempt policy, the same wherever the unit runs: on a pool worker, on a
 # sandbox worker, or in this process under `workers=0`.
-function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
+function run_unit!(run::Run, slot::Slot, u::UnitIdx)
     p = run.plan
     max_attempts = attempts_for(p, u)
     for attempt in 1:max_attempts
-        run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
+        run_unit_once!(run, slot, u, Int8(attempt), max_attempts)
         note_attempt!(run, slot, u)
         has_non_pass(run, u) || return nothing
         # Another attempt only for an item that failed in this one. An item this attempt
-        # skipped or cancelled holds an earlier attempt's verdict (`record!`), which
-        # another attempt would not change.
+        # skipped or cancelled keeps an earlier attempt's verdict (`persist_attempt!`),
+        # which another attempt would not change.
         st = run.statuses
         failed_now = any(i -> is_decisive(st.state[i]) && is_non_pass(st.state[i]) && st.attempt[i] == attempt,
                          p.units.span[u])
@@ -2603,7 +1506,6 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
         # A run stopped meanwhile, by another item's failfast or a profile whose
         # `init` failed, retries nothing: the attempt's verdict is the item's.
         is_cancelled(run.queues) && return nothing
-        reset_unit!(run, u)
     end
     return nothing
 end
@@ -2643,32 +1545,6 @@ end
 has_non_pass(run::Run, u::UnitIdx) =
     any(i -> is_non_pass(run.statuses.state[i]), run.plan.units.span[u])
 
-function reset_unit!(run::Run, u::UnitIdx)
-    st = run.statuses
-    for i in run.plan.units.span[u]
-        is_decisive(st.state[i]) && (st.decided[i] = decided_of(st, i))
-        set_state!(run, i, UNSEEN)
-    end
-    return nothing
-end
-
-# An attempt that decided nothing after one that did: the item takes back that
-# attempt's verdict in this process. Its status row holds it already (`write_decided_row`).
-function restore_decided!(run::Run, i::ItemIdx, d::Decided)
-    st = run.statuses
-    set_state!(run, i, d.state)
-    st.attempt[i], st.slot[i], st.synthetic[i], st.artifacts[i] = d.attempt, d.slot, d.synthetic, d.artifacts
-    st.pid[i], st.seq[i], st.start[i], st.elapsed[i], st.compile[i] = d.pid, d.seq, d.start, d.elapsed, d.compile
-    st.recompile[i], st.alloc_mb[i], st.rss_mb[i], st.testsets[i] = d.recompile, d.alloc_mb, d.rss_mb, d.testset
-    return nothing
-end
-
-write_decided_row(run::Run, i::ItemIdx, d::Decided) = write_status!(
-    run.runstate, i, d.state, d.attempt, d.slot;
-    start_off = d.start, elapsed = d.elapsed, compile = d.compile, recompile = d.recompile,
-    alloc_mb = d.alloc_mb, peak_rss_mb = d.rss_mb, pid = d.pid
-)
-
 # Every write of an item's state goes through here, so that `run.nonpass`, which
 # the status line reads from other threads, is always the count of the states.
 function set_state!(run::Run, i::Integer, state::ItemState)
@@ -2681,9 +1557,9 @@ end
 
 # One attempt at the unit's item: on the slot's worker, or here when there is no pool
 # and the unit did not ask for a process of its own.
-function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8, max_attempts::Int)
+function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, attempt::Int8, max_attempts::Int)
     p = run.plan
-    skipped = skips_environment(p, p.units.profile[u])
+    skipped = run.skipped_profiles[p.units.profile[u]]
     exclusive = p.units.exclusive[u] && !skipped
     attempt_item! = skipped ? attempt_skipped! :
         single_process(p) && !needs_worker(p, u) ? attempt_here! : attempt_on_worker!
@@ -2691,17 +1567,11 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
     # that has already run other items.
     exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
     for i in p.units.span[u]
-        # Every item is unseen when the loop reaches it: `reset_unit!` puts them
-        # back before each retry. One a stopped run does not reach keeps the verdict
-        # of an earlier attempt, which its status row still holds.
         if is_cancelled(run.queues)
-            d = run.statuses.decided[i]
-            run.statuses.decided[i] = nothing
-            d === nothing ? set_state!(run, i, CANCELLED) : restore_decided!(run, i, d::Decided)
+            is_decisive(run.statuses.state[i]) || set_state!(run, i, CANCELLED)
             continue
         end
-        # A worker lost in the attempt is gone already.
-        attempt_item!(run, slot, i, target, attempt, max_attempts) || return nothing
+        attempt_item!(run, slot, i, attempt, max_attempts) || return nothing
     end
     exclusive && stop_worker!(run, slot)
     return nothing
@@ -2716,119 +1586,127 @@ function hold_item!(slot::Slot, i::ItemIdx, attempt::Int8)
     return nothing
 end
 
-# When and in which process an attempt began, marked running before it is sent:
-# if this process is killed, the file says which item was in flight, which is the
-# truth and usually the answer. An outcome the run decides is timed from here.
-function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer)
-    st = run.statuses
-    now = time()
-    st.start[i] = Float32(now - run.t0)
-    st.pid[i] = Int32(pid)
-    pid == 0 || @lock run.lock push!(run.item_pids, Int32(pid))
-    pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
-    run.events === nothing || event_item_started(run, i, attempt, slot, pid)
-    tell_on_event(run, i, :started, RUNNING, attempt, slot, now, 0.0, RuntestsWorkers.PerfStats(), false)
+function release_item!(slot::Slot)
+    @atomic slot.started = 0.0f0
+    @atomic slot.current = ItemIdx(0)
     return nothing
 end
 
-# One attempt at item `i` on the slot's worker, starting one when it has none.
-# `false` when the worker is gone and the rest of its unit cannot be trusted.
-function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::Int8, max_attempts::Int)
-    p = run.plan
-    w = try
-        ensure_worker!(run, slot, target, p.units.exclusive[p.items.unit[i]])
-    catch e
-        is_interrupt(e) && rethrow()
-        run.statuses.seq[i] = 0
-        hold_item!(slot, i, attempt)
-        began!(run, i, slot.id, attempt, 0)
-        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
-        @atomic slot.current = ItemIdx(0)
-        return false
+# When and in which process an attempt began, marked running before it is sent:
+# if this process is killed, the file says which item was in flight, which is the
+# truth and usually the answer. An outcome the run decides is timed from here.
+function began!(run::Run, slot::Union{Nothing, Slot}, i::ItemIdx, slot_id::SlotIdx, attempt::Int8,
+                pid::Int32, seq::Int16)
+    now = time()
+    start_off = Float32(now - run.t0)
+    if slot !== nothing
+        @atomic slot.started = start_off
+        slot.attempt_pid = pid
+        slot.attempt_seq = seq
     end
-    spec = item_spec(run, i, slot, attempt)
-    run.statuses.seq[i] = Int16(min(slot.worker_items + 1, typemax(Int16)))
-    hold_item!(slot, i, attempt)
-    began!(run, i, slot.id, attempt, w.pid)
-    result = try
-        dispatch(run, w, spec, item_timeout(p, i))
-    catch e
-        # An interrupt leaves it set: the slot is unwinding, and what it was
-        # running is the one thing `record_stopped_item!` needs from it. So does
-        # one that comes while the failure is handled, which waits for the worker
-        # to exit: the item is the slot's until its outcome is recorded.
-        is_interrupt(e) && rethrow()
-        survived = handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
-        @atomic slot.current = ItemIdx(0)
-        return survived
+    if pid != 0
+        run.plan.cfg.coverage && @lock run.lock push!(run.item_pids, pid)
+        write_status!(run.runstate, i, RUNNING, attempt, slot_id; start_off, pid)
     end
-    slot.worker_items += 1
-    # The body's verdict is the item's, recorded before the profile's `test_end` runs on
-    # the same worker. The slot still holds the item, whose output the hook's joins, and
-    # the attempt is reported with that output.
-    recorded = persist_result!(run, i, slot, attempt, result, max_attempts)
-    survived = run_test_end!(run, slot, i, attempt, spec, result, w)
+    run.events === nothing || event_item_started(run, i, attempt, slot_id, pid)
+    tell_on_event(run, i, :started, RUNNING, attempt, slot_id, pid, now, 0.0, RuntestsWorkers.PerfStats(), false)
+    return start_off
+end
+
+# Post-body completion shared by worker and in-process attempts: persist the body's
+# verdict, run `test_end`, notify observers, release the slot, and finish artifacts.
+function complete_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_attempts::Int,
+                           spec::ItemSpec, res::ItemResult, w::Union{Nothing, RuntestsWorkers.Worker},
+                           start_off::Float32, pid::Int32, seq::Int16)
+    recorded = persist_result!(run, i, slot, attempt, res, start_off, pid, seq, max_attempts)
+    survived = run_test_end!(run, slot, i, attempt, spec, res, w)
     observe_attempt!(run, recorded)
-    @atomic slot.current = ItemIdx(0)
+    release_item!(slot)
     if !survived
         # The hook took the worker: no producer can run, and what the attempt wrote goes
         # as its verdict says.
-        if result.artifacts != 0
-            result.state === PASSED ? discard_evidence(attempt_artifacts(run, i, attempt)) :
+        if res.artifacts != 0
+            res.state === PASSED ? discard_evidence(attempt_artifacts(run, i, attempt)) :
                 evidence_after_loss!(run, i, attempt, "the worker was lost in the profile's `test_end`")
         end
         return false
     end
     # Then the evidence, before a retry or a sandbox's end.
-    return finish_attempt!(run, slot, i, attempt, result, w)
+    return finish_attempt!(run, slot, i, attempt, res, w)
+end
+
+# One attempt at item `i` on the slot's worker, starting one when it has none.
+# `false` when the worker is gone and the rest of its unit cannot be trusted.
+function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_attempts::Int)
+    p = run.plan
+    w = try
+        ensure_worker!(run, slot, p.units.exclusive[p.items.unit[i]])
+    catch e
+        is_interrupt(e) && rethrow()
+        hold_item!(slot, i, attempt)
+        start_off = began!(run, slot, i, slot.id, attempt, Int32(0), Int16(0))
+        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e), start_off, Int32(0), Int16(0))
+        release_item!(slot)
+        return false
+    end
+    spec = item_spec(run, i, attempt)
+    pid = Int32(w.pid)
+    seq = Int16(min(slot.worker_items + 1, typemax(Int16)))
+    hold_item!(slot, i, attempt)
+    start_off = began!(run, slot, i, slot.id, attempt, pid, seq)
+    result = try
+        dispatch(run, w, spec, item_timeout(p, i))
+    catch e
+        # An interrupt leaves `slot.current` set: the slot is unwinding, and what it was
+        # running is what `record_stopped_item!` needs from it.
+        is_interrupt(e) && rethrow()
+        survived = handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts, start_off, pid, seq)
+        release_item!(slot)
+        return survived
+    end
+    slot.worker_items += 1
+    return complete_attempt!(run, slot, i, attempt, max_attempts, spec, result, w, start_off, pid, seq)
 end
 
 # One attempt at item `i` of an environment the run skips (`skips_environment`): the
 # run records the item as skipped itself. No process runs it, so none is started.
-function attempt_skipped!(run::Run, _, i::ItemIdx, _, attempt::Int8, _)
+function attempt_skipped!(run::Run, _, i::ItemIdx, attempt::Int8, _)
     p = run.plan
-    began!(run, i, SlotIdx(0), attempt, 0)
-    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + run.statuses.start[i])
+    start_off = began!(run, nothing, i, SlotIdx(0), attempt, Int32(0), Int16(0))
+    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + start_off)
     Test.record(ts, Test.Broken(:skipped, p.items.name[i]))
     ended = time()
     finished_at!(ts, ended)
     printline(run, item_line(run, nothing, i, attempt, (; state = SKIPPED, elapsed_ns = 0, compile_ns = 0, maxrss = 0)))
     record!(run, i, SlotIdx(0), attempt, SKIPPED, ts, RuntestsWorkers.PerfStats(), true,
+            start_off, Int32(0), Int16(0),
             string("the run skips ", environment_name(p.profiles[p.units.profile[p.items.unit[i]]].environment)); ended)
     return true
 end
 
 # One attempt at item `i` in this process. There is no second process to kill, so
 # nothing times out, and no worker to lose, so the unit always goes on.
-function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_attempts::Int)
-    spec = item_spec(run, i, slot, attempt)
+function attempt_here!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_attempts::Int)
+    spec = item_spec(run, i, attempt)
+    pid = Int32(getpid())
     hold_item!(slot, i, attempt)
-    began!(run, i, slot.id, attempt, getpid())
+    start_off = began!(run, slot, i, slot.id, attempt, pid, Int16(0))
     printline(run, item_line(run, nothing, i, attempt, nothing))
     res = try
         r = run_item(spec)
         printline(run, item_line(run, nothing, i, attempt, outcome(r)))
         r
     catch e
-        if is_interrupt(e)
-            (@atomic run.stalled) && record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
-            rethrow()
-        end
+        is_interrupt(e) && rethrow()
         record_error!(
             run, i, slot, attempt, ERRORED,
-            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "in this process"))
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "in this process")),
+            start_off, pid, Int16(0)
         )
-        @atomic slot.current = ItemIdx(0)
+        release_item!(slot)
         return true
     end
-    # The body's verdict is the item's, recorded before the profile's `test_end` runs, and
-    # reported with what the hook printed.
-    recorded = persist_result!(run, i, slot, attempt, res, max_attempts)
-    run_test_end!(run, slot, i, attempt, spec, res, nothing)
-    observe_attempt!(run, recorded)
-    @atomic slot.current = ItemIdx(0)
-    finish_attempt!(run, slot, i, attempt, res, nothing)
-    return true
+    return complete_attempt!(run, slot, i, attempt, max_attempts, spec, res, nothing, start_off, pid, Int16(0))
 end
 
 # The item on the slot's worker, within the item's limit. Its profile's `test_end`
@@ -2875,23 +1753,15 @@ end
 # worker is still fit to use.
 function test_end_lost!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, e, w::Union{Nothing, RuntestsWorkers.Worker})
     slot_id = w === nothing ? nothing : slot.id
-    if w !== nothing && e isa TimeoutException
-        print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
-        RuntestsWorkers.inspect!(w)   # where it was, into the attempt's log
-        @atomic slot.dying_log = item_log(run, i, attempt)
-        RuntestsWorkers.terminate!(w, :timeout)
-        wait(w)   # a replacement must not overlap the process it replaces
-        flush_dying_log!(slot)
-        @atomic slot.worker = nothing
+    outcome = resolve_worker_failure!(run, slot, w, e, item_log(run, i, attempt); is_worker = w !== nothing)
+    if outcome === :timeout
         say_test_end(run, slot_id, i, attempt, sprint(showerror, e), "")
         return false
-    elseif w === nothing || !w.terminated
+    elseif outcome === :alive
         msg = e isa RuntestsWorkers.RemoteException ? e.msg : sprint(showerror, e)
         say_test_end(run, slot_id, i, attempt, string("did not complete: ", first(eachsplit(msg, '\n'))), msg)
         return true
     end
-    wait(w)   # its exit status is known once its process is reaped
-    @atomic slot.worker = nothing
     # A stopped run took the worker away itself: the hook did nothing wrong.
     (stopped_meanwhile(slot) || is_cancelled(run.queues)) && return false
     how = died_how(run, slot, w)
@@ -2962,74 +1832,55 @@ stopped_meanwhile(slot::Slot) = @atomic(slot.current) == ItemIdx(0)
 # cannot be trusted, `true` when the item failed on a process still fit to use.
 function handle_dispatch_failure!(
         run::Run, slot::Slot, i::ItemIdx, attempt::Int8, e,
-        max_attempts::Int
+        max_attempts::Int, start_off::Float32, pid::Int32, seq::Int16
     )
-    w = slot.worker
+    w = @atomic slot.worker
     item = run.plan.items.name[i]
     # What the monitor saw the attempt's worker and its children hold, taken while the
     # slot and the pid still name the attempt: the worker reports no figures of its own.
     tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, i, attempt, w.pid)
     peak_rss = tree > 0 ? tree : nothing
-    if e isa TimeoutException
-        ended = time()   # the item held its worker until here; inspecting it is ours
-        if w !== nothing
-            print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
-            RuntestsWorkers.inspect!(w)   # where was it: every thread's and task's backtrace, into the item's log
-            # `wait` below joins the task relaying this worker's output, so
-            # everything the process says on its way down has been filed by the
-            # time the item is reported.
-            @atomic slot.dying_log = item_log(run, i, attempt)
-            RuntestsWorkers.terminate!(w, :timeout)
-            wait(w)   # a replacement must not overlap the process it replaces
-            flush_dying_log!(slot)
-        end
-        @atomic slot.worker = nothing
+    ended = time()   # the item held its worker until here; inspecting/reaping is ours
+    outcome = resolve_worker_failure!(run, slot, w, e, item_log(run, i, attempt); is_worker = true)
+    if outcome === :timeout
         stopped_meanwhile(slot) && return false
         artifacts = evidence_after_loss!(run, i, attempt, sprint(showerror, e))
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
-            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker"));
-            ended, artifacts, peak_rss
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker")),
+            start_off, pid, seq; ended, artifacts, peak_rss
         )
         return false
-    elseif w !== nothing && !w.terminated
+    elseif outcome === :alive
         # The request failed but the process is fine: a result that would not
         # serialize, a `skip` expression that threw. The worker keeps everything
         # it has compiled, and the item is an ordinary error.
         artifacts = evidence_after_loss!(run, i, attempt, "its result could not be read")
-        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e); artifacts, peak_rss)
+        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e), start_off, pid, seq; artifacts, peak_rss)
         return true
-    else
-        ended = time()
-        how = ""
-        if w !== nothing
-            wait(w)   # its exit status is known once its process is reaped
-            if stopped_meanwhile(slot)
-                @atomic slot.worker = nothing
-                return false
-            end
-            how = died_how(run, slot, w)
-            print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
-        end
-        @atomic slot.worker = nothing
-        # Whatever took the worker recorded the item already (`record_stopped_item!`).
-        stopped_meanwhile(slot) && return false
-        # A stopped run took this worker away itself: the item neither failed nor
-        # ran, and is counted with the ones that never started.
-        if is_cancelled(run.queues)
-            record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped"; ended, peak_rss)
-        else
-            what = e isa RuntestsWorkers.WorkerTerminatedException ?
-                string("the worker running this item died: ", how) : sprint(showerror, e)
-            artifacts = evidence_after_loss!(run, i, attempt, what)
-            record_error!(
-                run, i, slot, attempt, ERRORED,
-                string(what, " · ", retry_note(attempt, max_attempts, false, "on a new worker"));
-                ended, artifacts, peak_rss
-            )
-        end
-        return false
     end
+    # Whatever took the worker recorded the item already (`record_stopped_item!`).
+    stopped_meanwhile(slot) && return false
+    how = ""
+    if w !== nothing
+        how = died_how(run, slot, w)
+        print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
+    end
+    # A stopped run took this worker away itself: the item neither failed nor
+    # ran, and is counted with the ones that never started.
+    if is_cancelled(run.queues)
+        record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped", start_off, pid, seq; ended, peak_rss)
+    else
+        what = e isa RuntestsWorkers.WorkerTerminatedException ?
+            string("the worker running this item died: ", how) : sprint(showerror, e)
+        artifacts = evidence_after_loss!(run, i, attempt, what)
+        record_error!(
+            run, i, slot, attempt, ERRORED,
+            string(what, " · ", retry_note(attempt, max_attempts, false, "on a new worker")),
+            start_off, pid, seq; ended, artifacts, peak_rss
+        )
+    end
+    return false
 end
 
 # The profile of item `i`'s own unit. A pool's workers start with the configuration
@@ -3037,7 +1888,7 @@ end
 # them, `test_end` and the name an item sees, is the item's own.
 item_profile(p::Plan, i::Integer) = p.profiles[p.units.profile[p.items.unit[i]]]
 
-function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
+function item_spec(run::Run, i::ItemIdx, attempt::Int8)
     p = run.plan
     # The directory is this run's own and (item, attempt) is unique within it, so
     # nothing is there to clear first.
@@ -3107,7 +1958,7 @@ function note_skip(run::Run, i::ItemIdx, attempt::Int8, note::AbstractString)
 end
 
 """
-    record!(run, i, slot, attempt, state, testset, stats, synthetic, note)
+    record!(run, i, slot, attempt, state, testset, stats, synthetic, start_off, pid, seq, note)
 
 Everything that follows from one attempt's outcome, in one place: the item's
 status in memory and on disk, the count of finished items, and the item's report.
@@ -3119,85 +1970,85 @@ report, an editor and `on_event` can each stop the run.
 function record!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
         testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool,
-        note::AbstractString; ended::Float64 = time(), artifacts::UInt8 = 0x00, peak_rss::Union{Nothing, Int64} = nothing
+        start_off::Float32, pid::Int32, seq::Int16, note::AbstractString;
+        ended::Float64 = time(), artifacts::UInt8 = 0x00, peak_rss::Union{Nothing, Int64} = nothing
     )
-    kept, elapsed, n = persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic; ended, artifacts, peak_rss)
-    observe_attempt!(run, (; i, slot, attempt, state, stats, synthetic, note, ended, elapsed, n, kept))
+    o = persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic, start_off, pid, seq, note;
+                         ended, artifacts, peak_rss)
+    observe_attempt!(run, o)
     return nothing
 end
 
 # Everything that is told of an attempt once it is recorded: the report, the attempt's
-# log for a skip, `on_event` and an editor, from the statuses, which hold the attempt
-# until the item takes back an earlier verdict.
-function observe_attempt!(run::Run, o)
-    (; i, slot, attempt, state, stats, synthetic, note, ended, elapsed, n, kept) = o
-    try
-        report_item!(run, i, state, n, note)
-        # After the item's report, which shows its log: the reason is for whoever reads
-        # the run's directory later, and a skip has no block to show it in.
-        state === SKIPPED && note_skip(run, i, attempt, note)
-        tell_on_event(run, i, :finished, state, attempt, slot, ended, elapsed, stats, !synthetic)
-        # An editor shows the item's verdict, which is this attempt's unless it decided nothing.
-        run.events === nothing ||
-            event_item_finished(run, i, state, attempt, slot, note; verdict = kept === nothing ? state : kept.state)
-    finally
-        kept === nothing || restore_decided!(run, i, kept::Decided)
-    end
+# log for a skip, `on_event` and an editor.
+function observe_attempt!(run::Run, o::AttemptOutcome)
+    report_item!(run, o)
+    # After the item's report, which shows its log: the reason is for whoever reads
+    # the run's directory later, and a skip has no block to show it in.
+    o.state === SKIPPED && note_skip(run, o.i, o.attempt, o.note)
+    tell_on_event(run, o.i, :finished, o.state, o.attempt, o.slot, o.pid, o.ended, o.elapsed, o.stats, !o.synthetic)
+    run.events === nothing || event_item_finished(run, o)
     return nothing
 end
 
 """
-    persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic; ended, artifacts)
-        -> (kept, elapsed, n)
+    persist_attempt!(run, i, slot, attempt, state, testset, stats, synthetic, start_off, pid, seq, note;
+                     ended, artifacts, peak_rss) -> AttemptOutcome
 
 An attempt's outcome in the statuses and in the run state: its status row and its
-attempt event. A skip or a cancel after an attempt that decided the item leaves it
-that verdict, `kept`: its row holds that verdict from here, and the statuses hold
-this attempt until the caller takes the verdict back (`restore_decided!`). `elapsed`
-is the attempt's time, and `n` how many items are finished. Takes no lock that
-reporting does, so the exit hook can use it.
+attempt event. A skip or a cancel after an attempt that decided the item leaves
+`Statuses[i]` untouched and restores its status row in the run state (overwriting the
+`RUNNING` marker written by `began!`). Takes no lock that reporting does, so the exit
+hook can use it.
 """
 function persist_attempt!(
         run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
-        testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool;
+        testset::Test.AbstractTestSet, stats::RuntestsWorkers.PerfStats, synthetic::Bool,
+        start_off::Float32, pid::Int32, seq::Int16, note::AbstractString;
         ended::Float64 = time(), artifacts::UInt8 = 0x00, peak_rss::Union{Nothing, Int64} = nothing
     )
     (state === UNSEEN || state === RUNNING) && error("Runtests internal error: item $i recorded as $state")
     st = run.statuses
-    set_state!(run, i, state)
-    st.synthetic[i] = synthetic
-    st.artifacts[i] = artifacts
-    st.attempt[i] = attempt
     st.recorded[i] = attempt
-    st.slot[i] = slot
     # An outcome the item reported took what the item measured; one the run decided
     # took as long as the item held its worker.
-    elapsed = synthetic ? max(0.0, ended - run.t0 - st.start[i]) : stats.elapsed_ns / 1.0e9
-    st.elapsed[i] = elapsed
-    st.compile[i] = stats.compile_ns / 1.0e9
-    st.recompile[i] = stats.recompile_ns / 1.0e9
-    st.alloc_mb[i] = stats.bytes / 2^20
-    st.rss_mb[i] = something(peak_rss, Int64(stats.maxrss)) / 2^20
-    st.testsets[i] = testset
+    elapsed = synthetic ? max(0.0, ended - run.t0 - start_off) : stats.elapsed_ns / 1.0e9
+    compile = Float32(stats.compile_ns / 1.0e9)
+    recompile = Float32(stats.recompile_ns / 1.0e9)
+    alloc_mb = Float32(stats.bytes / 2^20)
+    rss_mb = Float32(something(peak_rss, Int64(stats.maxrss)) / 2^20)
     # What the run prints of a failure, kept beside the item's output for whoever
     # reads the run state later; a cancel or a skip has nothing of its own to say.
     is_non_pass(state) && state !== CANCELLED && write_failure_report(run, i, attempt, testset)
-    kept = is_decisive(state) ? nothing : st.decided[i]
-    st.decided[i] = nothing
-    if kept === nothing
-        write_status!(
-            run.runstate, i, state, attempt, slot;
-            start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],
-            recompile = st.recompile[i], alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i], pid = st.pid[i]
-        )
-    else
-        write_decided_row(run, i, kept::Decided)
+    # Commit to `Statuses[i]` unless an earlier attempt already decided this item and
+    # this attempt decided nothing (skip/cancel).
+    if is_decisive(state) || !is_decisive(st.state[i])
+        set_state!(run, i, state)
+        st.synthetic[i] = synthetic
+        st.artifacts[i] = artifacts
+        st.attempt[i] = attempt
+        st.slot[i] = slot
+        st.pid[i] = pid
+        st.seq[i] = seq
+        st.start[i] = start_off
+        st.elapsed[i] = Float32(elapsed)
+        st.compile[i] = compile
+        st.recompile[i] = recompile
+        st.alloc_mb[i] = alloc_mb
+        st.rss_mb[i] = rss_mb
+        st.testsets[i] = testset
     end
-    append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0;
-                  item = i, attempt, seq = st.seq[i], compile = st.compile[i], recompile = st.recompile[i],
-                  alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i])
+    write_status!(
+        run.runstate, i, st.state[i], st.attempt[i], st.slot[i];
+        start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],
+        recompile = st.recompile[i], alloc_mb = st.alloc_mb[i], peak_rss_mb = st.rss_mb[i], pid = st.pid[i]
+    )
+    append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, pid, start_off, ended - run.t0;
+                  item = i, attempt, seq, compile, recompile, alloc_mb, peak_rss_mb = rss_mb)
     @atomic run.last_finish = time()
-    return kept, elapsed, count_done!(run, i)
+    n = count_done!(run, i)
+    return AttemptOutcome(i, slot, attempt, state, st.state[i], pid, elapsed, stats, testset,
+                          synthetic, artifacts, String(note), ended, n)
 end
 
 """
@@ -3264,13 +2115,13 @@ events_dir(run::Run, k::Integer) = joinpath(run.logdirs[k], "events")
 # a function to call. A call that throws is reported and is the last: the function
 # is the caller's code, and a run goes on whatever its observer does.
 function tell_on_event(
-        run::Run, i::ItemIdx, kind::Symbol, state::ItemState, attempt::Int8, slot::Integer, at::Float64,
-        elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool
+        run::Run, i::ItemIdx, kind::Symbol, state::ItemState, attempt::Int8, slot::Integer, pid::Integer,
+        at::Float64, elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool
     )
     (@atomic run.on_event) === nothing && return nothing
     p = run.plan
     event = TestItemEvent(
-        kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, run.statuses.pid[i],
+        kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, pid,
         at, Symbol(state_name(state)), measured, elapsed, stats.cpu_ns / 1.0e9, stats.compile_ns / 1.0e9,
         stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss,
         p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]], events_dir(run, p.items.package[i])
@@ -3295,7 +2146,7 @@ end
 # the attempt's log as well.
 function persist_result!(
         run::Run, i::ItemIdx, slot::Slot, attempt::Int8, res::ItemResult,
-        max_attempts::Int = 1
+        start_off::Float32, pid::Int32, seq::Int16, max_attempts::Int = 1
     )
     # Only worth saying when there is a policy to state: a plain failure with no
     # retries configured explains itself.
@@ -3304,9 +2155,9 @@ function persist_result!(
     ended = time()
     w = @atomic slot.worker
     tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, i, attempt, w.pid)
-    kept, elapsed, n = persist_attempt!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false;
-                                        ended, artifacts = res.artifacts, peak_rss = tree > 0 ? tree : nothing)
-    return (; i, slot = slot.id, attempt, state = res.state, stats = res.stats, synthetic = false, note, ended, elapsed, n, kept)
+    return persist_attempt!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false,
+                            start_off, pid, seq, note;
+                            ended, artifacts = res.artifacts, peak_rss = tree > 0 ? tree : nothing)
 end
 
 # Where a unit's next attempt runs after one that failed with its process intact: a
@@ -3317,16 +2168,17 @@ next_attempt_where(p::Plan, u::UnitIdx) =
     single_process(p) && !needs_worker(p, u) ? "in this process" : "on the same worker"
 
 # `peak_rss`: what the monitor sampled of the attempt, which no worker reported.
-record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString;
+record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString,
+              start_off::Float32, pid::Int32, seq::Int16;
               ended::Float64 = time(), artifacts::UInt8 = 0x00, peak_rss::Union{Nothing, Int64} = nothing) =
-    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), RuntestsWorkers.PerfStats(), true, msg;
-            ended, artifacts, peak_rss)
+    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, start_off, ended),
+            RuntestsWorkers.PerfStats(), true, start_off, pid, seq, msg; ended, artifacts, peak_rss)
 
 # The testset of an outcome the run decided: one error saying why, at the item's
 # own line, so the summary and the verdict count it like any other error.
-function error_testset(run::Run, i::ItemIdx, msg::AbstractString, ended::Float64)
+function error_testset(run::Run, i::ItemIdx, msg::AbstractString, start_off::Float32, ended::Float64)
     p = run.plan
-    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + run.statuses.start[i])
+    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + start_off)
     finish_quietly(add_error!(ts, msg, source_of(p, i)))
     finished_at!(ts, ended)
     return ts
@@ -3370,7 +2222,7 @@ function init_in_process!(run::Run)
     return nothing
 end
 
-function run_in_process(run::Run, target)
+function run_in_process(run::Run)
     p = run.plan
     @lock run.lock push!(run.tasks, current_task())
     slot = run.slots[1]
@@ -3382,7 +2234,7 @@ function run_in_process(run::Run, target)
         # decides which do — started and stopped around it.
         slot.profile = p.units.profile[u]
         try
-            run_unit!(run, slot, u, target)
+            run_unit!(run, slot, u)
         finally
             stop_worker!(run, slot)
         end
@@ -3390,4 +2242,3 @@ function run_in_process(run::Run, target)
     check_finished(run)
     return nothing
 end
-

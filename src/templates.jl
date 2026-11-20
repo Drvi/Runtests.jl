@@ -48,15 +48,19 @@ struct Stamp
 end
 
 # The stamp of the test file at `path`, or `nothing` when `chores` did not write it.
-# Only a file that mentions one near its top is read in full.
+# Only a file that mentions one near its top is read in full, without reopening it.
 function read_stamp(path::AbstractString)
-    head = try
-        open(io -> String(read(io, 1024)), path)
+    text = try
+        open(path) do io
+            head = String(read(io, 1024))
+            occursin("# runtests-expansion ", head) || return nothing
+            return eof(io) ? head : head * read(io, String)
+        end
     catch
         return nothing
     end
-    occursin("# runtests-expansion ", head) || return nothing
-    lines = split(canonical_text(read(path, String)), '\n'; limit = STAMP_LINE + 1)
+    text === nothing && return nothing
+    lines = split(canonical_text(text), '\n'; limit = STAMP_LINE + 1)
     length(lines) >= STAMP_LINE || return nothing
     m = match(STAMP, lines[STAMP_LINE])
     m === nothing && return nothing
@@ -103,14 +107,16 @@ that was edited by hand, or whose template is gone.
 """
 function expansion_errors(files::Vector{String}, templates::Vector{String})
     errors = ScanError[ScanError(t, 0, clash_message(t, other)) for (t, other) in expansion_clashes(templates)]
+    stamps = Dict{String, Union{Nothing, Stamp}}()
+    stamp_of(f) = get!(() -> read_stamp(f), stamps, f)
     for t in templates
         o = expansion_of(t)
-        state = isfile(o) ? (read_stamp(o) === nothing ? :in_the_way : :current) : :missing
+        state = isfile(o) ? (stamp_of(o) === nothing ? :in_the_way : :current) : :missing
         state === :missing && push!(errors, ScanError(t, 0, expansion_message(state, t)))
         state === :in_the_way && push!(errors, ScanError(o, 0, expansion_message(state, t)))
     end
     for f in files
-        stamp = read_stamp(f)
+        stamp = stamp_of(f)
         stamp === nothing && continue
         t = template_of(f)
         state = isfile(t) ? expansion_state(t, stamp) : :orphan
@@ -172,15 +178,57 @@ name a literal, each `\$x` replaced by the code of `x`'s value and each other `\
 of its keywords by the code of what it computed, the rest as written. The stamp on
 its third line is what a run checks it by.
 """
+# Invariant structure of one `@testtemplate` node, extracted once for all its instances.
+struct TemplateSlots
+    name_range::UnitRange{Int}
+    loop_range::UnitRange{Int}
+    body_range::UnitRange{Int}
+    expr::Expr
+    # Sorted interpolation sites: (byte range, in_header, interpolated arg AST).
+    sites::Vector{Tuple{UnitRange{Int}, Bool, Any}}
+end
+
+function extract_template_slots(text::String, node)
+    kids = children_of(node)
+    loop = kids[end]
+    body = children_of(loop)[2]
+    sites = Tuple{UnitRange{Int}, Bool, Any}[]
+    for k in 3:(length(kids) - 1)
+        collect_interpolation_sites!(sites, text, kids[k], true)
+    end
+    collect_interpolation_sites!(sites, text, body, false)
+    sort!(sites; by = s -> first(s[1]))
+    return TemplateSlots(byte_range(kids[2]), byte_range(loop), byte_range(body), Expr(node), sites)
+end
+
+function collect_interpolation_sites!(out, text::String, node, in_header::Bool)
+    r = byte_range(node)
+    isempty(r) && return out
+    c = codeunits(text)[first(r)]
+    if c == UInt8('$') || c == UInt8(':') || c == UInt8('q')
+        e = Expr(node)
+        if e isa Expr && e.head === :$ && length(e.args) == 1
+            push!(out, (r, in_header, e.args[1]))
+            return out
+        end
+        e isa Expr && e.head === :quote && return out
+    end
+    foreach(k -> collect_interpolation_sites!(out, text, k, in_header), children_of(node))
+    return out
+end
+
 function render_expansion(template::AbstractString, text::String, items::Vector)
     nodes = declaration_nodes(JuliaSyntax.parseall(JuliaSyntax.SyntaxNode, text; filename = String(template)))
     length(nodes) == length(items) ||
         error("the expanding process read $(length(items)) `@testtemplate`s in the template, and Runtests $(length(nodes))")
     pieces = String[]
-    for (node, item) in zip(nodes, items), inst in item["instances"]
-        values = Dict{Symbol, String}(Symbol(v) => String(code) for (v, code) in inst["values"])
-        computed = Dict{String, String}(String(k) => String(code) for (k, code) in inst["computed"])
-        push!(pieces, render_instance(text, node, String(inst["name"]), values, computed))
+    for (node, item) in zip(nodes, items)
+        slots = extract_template_slots(text, node)
+        for inst in item["instances"]
+            values = Dict{Symbol, String}(Symbol(v) => String(code) for (v, code) in inst["values"])
+            computed = Dict{String, String}(String(k) => String(code) for (k, code) in inst["computed"])
+            push!(pieces, render_instance(text, slots, String(inst["name"]), values, computed))
+        end
     end
     body = string("\n", join(pieces, "\n\n"), "\n")
     # With `/` on every system: the header is part of the file that is committed.
@@ -199,20 +247,19 @@ end
 # own code does with those values in place, or the code would be binding to what
 # surrounds it. Code in parentheses cannot, so the text has them where it would
 # otherwise not read so: `-$x` of a `1` reads as the literal `-1`.
-function render_instance(text::String, node, name::String, values::Dict{Symbol, String}, computed::Dict{String, String})
-    kids = children_of(node)
-    loop = kids[end]
-    body = children_of(loop)[2]
+function render_instance(text::String, slots::TemplateSlots, name::String,
+                         values::Dict{Symbol, String}, computed::Dict{String, String})
+    parsed = Dict{String, Any}()
+    parse_once(code::String) = get!(() -> Meta.parse(code), parsed, code)
     at = Pair{UnitRange{Int}, String}[]
-    for k in 3:(length(kids) - 1)
-        interpolation_ranges!(at, text, kids[k], values, computed)
+    for (r, in_header, arg) in slots.sites
+        code = interpolated_code(arg, values, in_header ? computed : nothing)
+        code === nothing || push!(at, r => code)
     end
-    interpolation_ranges!(at, text, body, values, nothing)
-    sort!(at; by = first ∘ first)
-    ranges = (byte_range(kids[2]), byte_range(loop), byte_range(body))
-    want = instance_code(Expr(node), values, computed)
+    want = instance_code(slots.expr, values, computed, parse_once)
     for parenthesize in (false, true)
-        instance = splice_instance(text, name, ranges..., at, parenthesize)
+        instance = splice_instance(text, name, slots.name_range, slots.loop_range, slots.body_range, at,
+                                   parenthesize, parse_once)
         reads_as(instance, want) && return instance
     end
     error("$(repr(name)): written in, the values do not read as the template's code does with them in " *
@@ -221,7 +268,7 @@ end
 
 # The instance's text: the header up to the `for` becoming `@testitem <name> ... begin`,
 # and each interpolation in the keywords and the body replaced.
-function splice_instance(text, name, name_range, loop_range, body_range, at, parenthesize::Bool)
+function splice_instance(text, name, name_range, loop_range, body_range, at, parenthesize::Bool, parse_once = Meta.parse)
     out = IOBuffer()
     print(out, "@testitem ", repr(name))
     k = 1
@@ -230,7 +277,7 @@ function splice_instance(text, name, name_range, loop_range, body_range, at, par
         while k <= length(at) && first(first(at[k])) <= last(region)
             r, code = at[k]
             print(out, byte_slice(text, from:(first(r) - 1)), parenthesize ? string("(", code, ")") :
-                as_operand(code, byte_before(text, first(r)), byte_before(text, last(r) + 2)))
+                as_operand(code, byte_before(text, first(r)), byte_before(text, last(r) + 2), parse_once(code)))
             from = last(r) + 1
             k += 1
         end
@@ -238,25 +285,6 @@ function splice_instance(text, name, name_range, loop_range, body_range, at, par
     end
     print(out, byte_slice(text, (last(body_range) + 1):last(loop_range)))
     return String(take!(out))
-end
-
-# The byte range of each interpolation under `node` that is the template's, with the
-# code that replaces it (see `interpolated_code`); none from inside a quoted
-# expression, where every `$` is the quote's.
-function interpolation_ranges!(out, text::String, node, values, computed)
-    r = byte_range(node)
-    isempty(r) && return out
-    c = codeunits(text)[first(r)]
-    if c == UInt8('$') || c == UInt8(':') || c == UInt8('q')
-        e = Expr(node)
-        if e isa Expr && e.head === :$ && length(e.args) == 1
-            code = interpolated_code(e.args[1], values, computed)
-            code === nothing || (push!(out, r => code); return out)
-        end
-        e isa Expr && e.head === :quote && return out
-    end
-    foreach(k -> interpolation_ranges!(out, text, k, values, computed), children_of(node))
-    return out
 end
 
 # The code that replaces `\$a`: a loop variable's value from `values`, and in the
@@ -277,8 +305,7 @@ end
 # as `Day(1)` stand alone anywhere; a number does unless a sign comes before it, `-$x` of a `1` reading
 # as the literal `-1`, or a `.` or a name after it; a quoted symbol does unless a `.`
 # comes after it; anything else, a range or another operator's call, gets them.
-function as_operand(code::String, before::UInt8, after::UInt8)
-    ex = Meta.parse(code)
+function as_operand(code::String, before::UInt8, after::UInt8, @nospecialize(ex = Meta.parse(code)))
     joins(c) = c == UInt8('.') || UInt8('0') <= c <= UInt8('9') || UInt8('a') <= c <= UInt8('z') ||
         UInt8('A') <= c <= UInt8('Z') || c == UInt8('_')
     alone = ex isa Symbol || ex isa Bool || ex isa AbstractString || ex isa AbstractChar ||
@@ -292,22 +319,22 @@ end
 # The byte before position `i`, a space at either end of the text.
 byte_before(text::String, i::Int) = 2 <= i <= ncodeunits(text) + 1 ? codeunits(text)[i - 1] : UInt8(' ')
 
-function substitute(@nospecialize(ex), values, computed)
+function substitute(@nospecialize(ex), values, computed, parse_once = Meta.parse)
     ex isa Expr || return ex
     ex.head === :quote && return ex
     if ex.head === :$ && length(ex.args) == 1
         code = interpolated_code(ex.args[1], values, computed)
-        code === nothing || return Meta.parse(code)
+        code === nothing || return parse_once(code)
     end
-    return Expr(ex.head, Any[substitute(a, values, computed) for a in ex.args]...)
+    return Expr(ex.head, Any[substitute(a, values, computed, parse_once) for a in ex.args]...)
 end
 
 # The keywords and the body of a `@testtemplate` call, its interpolations' values in
 # place, as the item that instance is should read.
-function instance_code(template::Expr, values::Dict{Symbol, String}, computed::Dict{String, String})
-    args = Any[a for a in template.args[2:end] if !(a isa LineNumberNode)]
-    return Expander.unlined(Expr(:block, Any[substitute(a, values, computed) for a in args[2:(end - 1)]]...,
-                            substitute(args[end].args[2], values, nothing)))
+function instance_code(template::Expr, values::Dict{Symbol, String}, computed::Dict{String, String}, parse_once = Meta.parse)
+    args = Expander.call_args(template)
+    return Expander.unlined(Expr(:block, Any[substitute(a, values, computed, parse_once) for a in args[2:(end - 1)]]...,
+                            substitute(args[end].args[2], values, nothing, parse_once)))
 end
 
 function reads_as(instance::String, want::Expr)
@@ -318,7 +345,7 @@ function reads_as(instance::String, want::Expr)
         return false
     end
     got isa Expr && got.head === :macrocall || return false
-    args = Any[a for a in got.args[2:end] if !(a isa LineNumberNode)]
+    args = Expander.call_args(got)
     return Expander.unlined(Expr(:block, args[2:(end - 1)]..., args[end])) == want
 end
 
@@ -350,7 +377,7 @@ function expand_templates(target, templates::Vector{String})
         read_config(target.testdir).init_timeout_s
     catch e
         e isa ConfigError || rethrow()
-        30 * 60
+        DEFAULT_TIMEOUT_S
     end
     request, response = tempname() * ".toml", tempname() * ".toml"
     try
@@ -445,7 +472,12 @@ end
 # deleted, or to be, and of problems a person has to fix.
 function chore_templates!(io::IO, target, fix::Bool)
     files, _, templates = walk_test_dir(target.testdir)
-    orphans = String[f for f in files if !isfile(template_of(f)) && read_stamp(f) !== nothing]
+    orphans = Pair{String, Stamp}[]
+    for f in files
+        isfile(template_of(f)) && continue
+        st = read_stamp(f)
+        st === nothing || push!(orphans, f => st)
+    end
     if isempty(templates) && isempty(orphans)
         println(io, "templates: none")
         return (0, 0)
@@ -495,8 +527,7 @@ function chore_templates!(io::IO, target, fix::Bool)
                     string("from ", relpath_or_path(t), ", which changed since it was expanded")))
         end
     end
-    for f in orphans
-        stamp = read_stamp(f)::Stamp
+    for (f, stamp) in orphans
         if stamp.actual != stamp.expansion
             push!(problems, f => "expanded from $(relpath_or_path(template_of(f))), which is gone, and edited since: delete it by hand if it is no longer wanted")
         else

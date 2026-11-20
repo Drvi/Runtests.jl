@@ -99,6 +99,28 @@ print_environment() = println(
     get(ENV, "CI", "") == "true" ? " · CI" : ""
 )
 
+"""
+    with_temp_test_depot(f)
+
+Prepend a temporary writable depot for Runtests' own test suite so precompile caches of
+throwaway fixture packages and setups do not accumulate in the user's `~/.julia/compiled/`.
+Existing caches and registries are still read from the remaining `DEPOT_PATH` entries.
+"""
+function with_temp_test_depot(f)
+    get(ENV, "RUNTESTS_TEST_DEPOT", "") == "1" && return f()
+    pathsep = Sys.iswindows() ? ";" : ":"
+    depot = mktempdir(; prefix = "runtests_test_depot_")
+    pushfirst!(DEPOT_PATH, depot)
+    try
+        return withenv("RUNTESTS_TEST_DEPOT" => "1", "JULIA_DEPOT_PATH" => join(DEPOT_PATH, pathsep)) do
+            f()
+        end
+    finally
+        filter!(!=(depot), DEPOT_PATH)
+        rm(depot; force = true, recursive = true)
+    end
+end
+
 if !isempty(ARGS)
     # A child, or someone running one file by hand. The hook makes the signal a
     # hung file is sent print every task's backtrace, which is where it is stuck.
@@ -112,17 +134,19 @@ if !isempty(ARGS)
         flush(stderr)
         ccall(:jl_print_task_backtraces, Cvoid, (Cint,), 0)
     end
-    foreach(run_file, ARGS)
+    with_temp_test_depot(() -> foreach(run_file, ARGS))
 elseif default_jobs() <= 1
     print_environment()
-    @testset "Runtests" begin
-        for file in TEST_FILES
-            println(stdout, "[tests] running ", file)
-            run_file(file)
+    with_temp_test_depot() do
+        @testset "Runtests" begin
+            for file in TEST_FILES
+                println(stdout, "[tests] running ", file)
+                run_file(file)
+            end
         end
     end
 else
     print_environment()
-    results, memory = run_in_parallel(@__FILE__, TEST_FILES, default_jobs())
+    results, memory = with_temp_test_depot(() -> run_in_parallel(@__FILE__, TEST_FILES, default_jobs()))
     report_files(results; memory, jobs = default_jobs())
 end

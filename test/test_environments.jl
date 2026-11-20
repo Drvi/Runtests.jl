@@ -627,16 +627,16 @@ end
             end
         end
 
-        @testset "the environment is stacked over the test environment, as Pkg.test stacks its sandbox" begin
-            # The worker loads RuntestsWorkers through the test environment's manifest,
-            # which the environment's copy need not have.
+        @testset "the environment is isolated from the test environment via a Runtests-only base project" begin
+            # `stacked_load_path` inserts a base project right after `@` once.
             stacked = Runtests.Private.stacked_load_path
             @test stacked(["@", "@v#.#", "@stdlib"], "/t/Project.toml") == ["@", "/t/Project.toml", "@v#.#", "@stdlib"]
-            # Once: under `Pkg.test` the load path names the sandbox already.
             @test stacked(["@", "/t"], "/t/Project.toml") == ["@", "/t"]
             @test stacked(["@", "/t/Project.toml"], "/t/Project.toml") == ["@", "/t/Project.toml"]
             @test stacked(["@stdlib"], "/t/Project.toml") == ["/t/Project.toml", "@stdlib"]
             @test stacked(["@", "@stdlib"], nothing) == ["@", "@stdlib"]
+            base_env = Runtests.Private.runtests_base_env()
+            @test base_env !== nothing && isfile(base_env)
             given(prof) = split(Dict(Runtests.Private.worker_env(1, 1, "/w", prof))["JULIA_LOAD_PATH"],
                                 Sys.iswindows() ? ';' : ':')
             test_env = joinpath(mktempdir(), "Project.toml")
@@ -644,22 +644,50 @@ end
             active = Base.active_project()
             try
                 Base.set_active_project(test_env)
-                @test test_env in given(Profile(:default; environment = qa))
+                lp = given(Profile(:default; environment = qa))
+                @test base_env in lp
+                @test !(test_env in lp)
                 @test given(Profile(:plain)) == LOAD_PATH
             finally
                 Base.set_active_project(active)
             end
-            # An item run here has what its workers have.
+            # An item run here has what its workers have: its own env + Runtests, not `test_env`.
             with_activated(dir) do env
                 prof = in_environment(read_config(joinpath(dir, "test")).profiles[:default], qa)
                 before = copy(LOAD_PATH)
                 Runtests.Private.with_interactive_env(Runtests.Private.interactive_target(), prof) do
                     @test Base.active_project() != env
-                    @test env in LOAD_PATH
+                    @test !(env in LOAD_PATH)
+                    @test base_env in LOAD_PATH
                     @test Base.find_package("EnvRunTools") !== nothing
+                    @test Base.find_package("Runtests") !== nothing
                 end
                 @test Base.active_project() == env
                 @test LOAD_PATH == before
+            end
+            # A package declared only in `test/Project.toml` is not visible to `test/qa/`.
+            iso = env_pkg("EnvStrictIso",
+                "test/qa/qa_tests.jl" => """
+                @testitem "cannot see test-only dep" begin
+                    @test Base.find_package("OnlyInTestEnv") === nothing
+                    @test Base.find_package("EnvStrictIsoTools") !== nothing
+                end
+                """)
+            only_dep = joinpath(iso, "lib", "OnlyInTestEnv")
+            mkpath(joinpath(only_dep, "src"))
+            write(joinpath(only_dep, "Project.toml"), "name = \"OnlyInTestEnv\"\nuuid = \"9a9b9c9d-1111-4111-8111-111111111111\"\nversion = \"0.1.0\"\n")
+            write(joinpath(only_dep, "src", "OnlyInTestEnv.jl"), "module OnlyInTestEnv\nend\n")
+            write(joinpath(iso, "test", "Project.toml"), """
+                [deps]
+                OnlyInTestEnv = "9a9b9c9d-1111-4111-8111-111111111111"
+                Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                [sources]
+                OnlyInTestEnv = {path = "../lib/OnlyInTestEnv"}
+                """)
+            with_runstate_dir() do _
+                (states, _, _), _ = capture_run(() -> run_states(iso; workers = 1, monitor = false))
+                @test states["cannot see test-only dep"] === PASSED
             end
         end
 

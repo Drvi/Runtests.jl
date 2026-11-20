@@ -1242,7 +1242,7 @@ end
 # rather than inherited: a `JULIA_PROJECT` the caller happened to have set would
 # otherwise win over the test environment this run just built.
 function worker_env(run_id, slot_id, project, prof::Profile;
-                    load_path = isempty(prof.environment) ? LOAD_PATH : stacked_load_path(LOAD_PATH, Base.active_project()))
+                    load_path = isempty(prof.environment) ? LOAD_PATH : isolated_load_path(LOAD_PATH, Base.active_project()))
     env = ["RUNTESTS_RUN_ID" => string(run_id), "RUNTESTS_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(load_path, PATHSEP)]
     project === nothing || push!(env, "JULIA_PROJECT" => project)
     return append!(env, prof.env)
@@ -1255,7 +1255,8 @@ worker_project(run::Run, j::Integer) =
 
 # The load path of the workers of profile `j`: this process's, which holds the setups
 # of every package that shares workers; for an isolated package, with its own setups
-# in their place. In an environment directory, stacked over its package's project.
+# in their place. In an environment directory, stacked over the minimal `Runtests`-only
+# base environment so undeclared dependencies from the test environment do not leak in.
 function worker_load_path(run::Run, j::Integer)
     p = run.plan
     k = p.profile_package[j]
@@ -1267,7 +1268,7 @@ function worker_load_path(run::Run, j::Integer)
         isdir(own) && push!(load_path, own)
     end
     isempty(p.profiles[j].environment) && return load_path
-    return stacked_load_path(load_path, run.package_projects[k])
+    return isolated_load_path(load_path, run.package_projects[k])
 end
 
 # Where the workers of profile `j` start: where its `init` runs, for a profile with

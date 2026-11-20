@@ -1553,10 +1553,9 @@ end
 
 wall_microseconds() = (tv = Libc.TimeVal(); tv.sec * 1_000_000 + tv.usec)
 
-# The records of the runs in the run state directory of `root`, oldest first: one in
-# each `<run>.rundata` directory, which a run that is starting may not have written yet.
-function runstate_files(root::AbstractString)
-    dir = runstate_dir(root)
+# The records of the runs in directory `dir`, oldest first: one in each `<run>.rundata`
+# directory, which a run that is starting may not have written yet.
+function runstate_files_in(dir::AbstractString)
     # Another process can delete the directory between any two calls.
     files = try
         [joinpath(dir, d, RUNSTATE_FILE) for d in readdir(dir) if endswith(d, RUNDATA_EXT)]
@@ -1573,6 +1572,8 @@ function runstate_files(root::AbstractString)
     end
     return sort!(filter!(is_record, files))   # names start with a unix timestamp, so this is oldest-first
 end
+
+runstate_files(root::AbstractString) = runstate_files_in(runstate_dir(root))
 
 const KEEP_RUNS = 20
 
@@ -2126,7 +2127,9 @@ only; durations still come from every run.
 function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{Nothing, RunStateRecord} = nothing)
     runs = runs_with(root, base)
     facts = item_facts(runs; base)
-    isempty(facts) && return History()
+    if isempty(facts)
+        return base === nothing ? borrowed_history(root, nruns) : History()
+    end
     now_t = time()
     # `runs` is already sorted by `(rs.start_unix, f)`.
     over = RunStateRecord[
@@ -2149,6 +2152,54 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     hashes = Dict(n => f.hash for (n, f) in facts if f.hash != 0)
     recent = over[max(1, end - nruns + 1):end]
     return History(seconds, failed, recorded_cold_cost(recent), cancelled, hashes, Set(keys(facts)))
+end
+
+# When a checkout has no run states of its own, borrow durations and worker cold cost
+# (never failures, hashes or known-item sets) from the newest sibling checkout under
+# `runstate_root()` that shares the same package UUID. Only runs when `root` has a real
+# UUID and `RUNTESTS_RUNSTATE_DIR` is not set.
+function borrowed_history(root::AbstractString, nruns::Int = HISTORY_RUNS)
+    isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", "")) || return History()
+    pid = project_id(root)
+    tryparse(Base.UUID, pid) === nothing && return History()
+    base_dir = runstate_root()
+    isdir(base_dir) || return History()
+    own_dir = abspath(runstate_dir(root))
+    best_time = -Inf
+    best_files = String[]
+    entries = try
+        readdir(base_dir; join = true)
+    catch e
+        e isa Base.IOError || rethrow()
+        return History()
+    end
+    for d in entries
+        isdir(d) || continue
+        abspath(d) == own_dir && continue
+        files = runstate_files_in(d)
+        isempty(files) && continue
+        rm = read_run_meta(last(files))
+        (rm === nothing || get(rm.meta, "project_id", "") != pid) && continue
+        if rm.start_unix > best_time
+            best_time = rm.start_unix
+            best_files = files
+        end
+    end
+    isempty(best_files) && return History()
+    runs = Pair{String, RunStateRecord}[]
+    for f in best_files
+        rs = read_run_state(f; full = false)
+        rs !== nothing && of_project(rs, pid) && push!(runs, f => rs)
+    end
+    sort!(runs; by = p -> (p.second.start_unix, p.first))
+    facts = item_facts(runs)
+    isempty(facts) && return History()
+    now_t = time()
+    over = RunStateRecord[rs for (_, rs) in runs if !rs.dry_run && !rs.aborted && !is_live(rs; now = now_t)]
+    seconds = Dict(n => f.seconds for (n, f) in facts if f.seconds > 0)
+    recent = over[max(1, end - nruns + 1):end]
+    return History(seconds, Dict{String, Int}(), recorded_cold_cost(recent), Set{String}(),
+                   Dict{String, UInt32}(), Set{String}())
 end
 
 """

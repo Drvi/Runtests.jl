@@ -257,7 +257,7 @@ function in_profile_environment(f, target, prof::Union{Nothing, Profile})
     (prof === nothing || isempty(prof.environment)) && return f()
     project = profile_project(prof, Base.active_project(), target.root)
     return in_worker_environment(f, joinpath(project, "Project.toml"),
-                                 stacked_load_path(LOAD_PATH, Base.active_project()))
+                                 isolated_load_path(LOAD_PATH, Base.active_project()))
 end
 
 # An item's RUN or DONE line: one item, so no count, and a name column its own width.

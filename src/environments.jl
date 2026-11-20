@@ -616,6 +616,159 @@ function profile_project(prof::Profile, env, root = nothing, announce = nothing)
     return dir
 end
 
+# A minimal synthetic project containing only `Runtests` and its transitive dependencies
+# (copied from the manifest that loaded `Runtests` in this process). Environment directories
+# (`test/qa/`) stack over this instead of over the package's test environment, so workers
+# can load `RuntestsWorkers` without leaking undeclared dependencies from `test/Project.toml`.
+const RUNTESTS_BASE_ENV = Ref{String}("")
+const RUNTESTS_BASE_ENV_LOCK = ReentrantLock()
+
+function runtests_base_env()
+    return @lock RUNTESTS_BASE_ENV_LOCK begin
+        cached = RUNTESTS_BASE_ENV[]
+        !isempty(cached) && isfile(cached) && return cached
+        built = build_runtests_base_env()
+        built === nothing || (RUNTESTS_BASE_ENV[] = built)
+        built
+    end
+end
+
+function enqueue_manifest_deps!(queue::Vector{Tuple{String, String}}, src_deps::AbstractDict, d)
+    if d isa AbstractDict
+        for (dn, du) in d
+            push!(queue, (String(dn), string(du)))
+        end
+    elseif d isa AbstractVector
+        for dn in d
+            es = get(src_deps, String(dn), nothing)
+            if es isa AbstractVector && length(es) == 1 && es[1] isa AbstractDict
+                push!(queue, (String(dn), string(get(es[1], "uuid", ""))))
+            end
+        end
+    end
+    return nothing
+end
+
+function build_runtests_base_env()
+    pkgid = RuntestsWorkers.PKGID
+    rt_uuid = string(pkgid.uuid)
+    rt_root = pkgdir(Base.moduleroot(@__MODULE__))
+    candidates = String[]
+    active = Base.active_project()
+    active === nothing || push!(candidates, active)
+    for p in Base.load_path()
+        pf = isdir(p) ? project_file(p) : p
+        pf === nothing || push!(candidates, pf)
+    end
+    if rt_root !== nothing
+        pf = project_file(rt_root)
+        pf === nothing || push!(candidates, pf)
+    end
+    for pf in candidates
+        isfile(pf) || continue
+        mf = Base.project_file_manifest_path(pf)
+        (mf === nothing || !isfile(mf)) && continue
+        toml = try
+            TOML.parsefile(mf)
+        catch
+            continue
+        end
+        src_deps = manifest_entries(toml)
+        in_manifest = any(
+            e -> e isa AbstractDict && string(get(e, "uuid", "")) == rt_uuid,
+            get(src_deps, pkgid.name, Any[])
+        )
+        is_root = get(parse_project(pf), "uuid", "") == rt_uuid
+        (in_manifest || is_root) || continue
+
+        visited = Set{String}()
+        kept = Dict{String, Vector{Dict{String, Any}}}()
+        queue = Tuple{String, String}[]
+
+        if in_manifest
+            push!(queue, (pkgid.name, rt_uuid))
+        else
+            rt_root === nothing && continue
+            rt_pf = project_file(rt_root)
+            rt_pf === nothing && continue
+            rt_proj = parse_project(rt_pf)
+            rt_deps = get(Dict{String, Any}, rt_proj, "deps")
+            rt_weak = get(Dict{String, Any}, rt_proj, "weakdeps")
+            rt_ext = get(Dict{String, Any}, rt_proj, "extensions")
+            rt_entry = Dict{String, Any}(
+                "uuid" => rt_uuid,
+                "version" => string(get(rt_proj, "version", "0.1.0")),
+                "path" => abspath(rt_root),
+                "deps" => sort!(String[string(k) for k in keys(rt_deps)]),
+            )
+            isempty(rt_weak) || (rt_entry["weakdeps"] = Dict{String, Any}(string(k) => string(v) for (k, v) in rt_weak))
+            isempty(rt_ext) || (rt_entry["extensions"] = Dict{String, Any}(string(k) => v for (k, v) in rt_ext))
+            kept[pkgid.name] = Dict{String, Any}[rt_entry]
+            push!(visited, rt_uuid)
+            enqueue_manifest_deps!(queue, src_deps, rt_deps)
+            enqueue_manifest_deps!(queue, src_deps, rt_weak)
+        end
+
+        mf_dir = dirname(abspath(mf))
+        while !isempty(queue)
+            name, uuid = popfirst!(queue)
+            (isempty(uuid) || uuid in visited) && continue
+            es = get(src_deps, name, nothing)
+            es isa AbstractVector || continue
+            idx = findfirst(e -> e isa AbstractDict && string(get(e, "uuid", "")) == uuid, es)
+            idx === nothing && continue
+            push!(visited, uuid)
+            copied = deepcopy(es[idx]::Dict{String, Any})
+            if haskey(copied, "path") && copied["path"] isa AbstractString && !isabspath(copied["path"])
+                copied["path"] = abspath(joinpath(mf_dir, copied["path"]))
+            end
+            push!(get!(Vector{Dict{String, Any}}, kept, name), copied)
+            haskey(copied, "deps") && enqueue_manifest_deps!(queue, src_deps, copied["deps"])
+            haskey(copied, "weakdeps") && enqueue_manifest_deps!(queue, src_deps, copied["weakdeps"])
+        end
+
+        dir = mktempdir(; prefix = "runtests_base_")
+        proj_out = joinpath(dir, "Project.toml")
+        man_out = joinpath(dir, "Manifest.toml")
+        open(proj_out, "w") do io
+            # Both `Runtests` (for `RuntestsWorkers`) and `Test` (injected into every `@testitem`,
+            # and absent from `LOAD_PATH` when `Pkg.test` strips `@stdlib`).
+            TOML.print(io, Dict("deps" => Dict(
+                pkgid.name => rt_uuid,
+                "Test" => "8dfed614-e22c-5e08-85e1-65c5234f0b40",
+            )); sorted = true)
+        end
+        out_manifest = Dict{String, Any}("deps" => kept)
+        for k in ("julia_version", "manifest_format")
+            haskey(toml, k) && (out_manifest[k] = toml[k])
+        end
+        open(man_out, "w") do io
+            TOML.print(io, out_manifest; sorted = true)
+        end
+        return proj_out
+    end
+    return nothing
+end
+
+# The load path of an item in an environment directory: that environment (`@`) stacked
+# over the minimal `Runtests`-only base environment (stripping `test_env` if present),
+# so undeclared dependencies from `test/Project.toml` are never visible.
+function isolated_load_path(load_path::Vector{String}, test_env::Union{Nothing, String})
+    base = runtests_base_env()
+    base === nothing && return stacked_load_path(load_path, test_env)
+    out = copy(load_path)
+    if test_env !== nothing
+        tf = abspath(test_env)
+        td = dirname(tf)
+        filter!(out) do p
+            (p == "@" || startswith(p, "@")) && return true
+            ap = abspath(p)
+            return ap != tf && ap != td
+        end
+    end
+    return stacked_load_path(out, base)
+end
+
 # The projects of profiles that name an environment, kept for the session as the
 # test environment is, and keyed by the environment, the package and the
 # preferences: building one is a resolve.

@@ -1796,6 +1796,57 @@ end
         @test Runtests.Private.code_text(m["Foo"]) == "1.2.3 (tree aaaaaaaaaa)"
     end
 
+    @testset "a checkout without history borrows durations (not failures) from another checkout with the same UUID" begin
+        depot = mktempdir()
+        pushfirst!(DEPOT_PATH, depot)
+        try
+            withenv("RUNTESTS_RUNSTATE_DIR" => nothing) do
+                uuid = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+                make_clone(tag) = begin
+                    d = joinpath(mktempdir(), tag)
+                    mkpath(joinpath(d, "src")); mkpath(joinpath(d, "test"))
+                    write(joinpath(d, "Project.toml"), "name = \"SameUuid\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n")
+                    write(joinpath(d, "src", "SameUuid.jl"), "module SameUuid\nend\n")
+                    write(joinpath(d, "test", "a_test.jl"), """
+                        @testitem "slow" begin
+                            @test true
+                        end
+                        @testitem "fails" begin
+                            @test false
+                        end
+                        """)
+                    d
+                end
+                c1, c2 = make_clone("checkout1"), make_clone("checkout2")
+                p1 = a_plan(c1)
+                rs1 = init_run_state(new_runstate_path(c1; start_us = 1_000_000_000_000_000), p1; start = 100.0)
+                i_slow = findfirst(==("slow"), p1.items.name)
+                i_fail = findfirst(==("fails"), p1.items.name)
+                write_status!(rs1, i_slow, PASSED, 1, 1; elapsed = 12.5, start_off = 0.0, pid = 1)
+                write_status!(rs1, i_fail, FAILED, 1, 1; elapsed = 1.5, start_off = 12.5, pid = 1)
+                finish_run_state!(rs1)
+                # Checkout 2 has no runs of its own: borrows durations, never failures or hashes.
+                h2 = history(c2)
+                @test h2.seconds["slow"] ≈ 12.5
+                @test h2.seconds["fails"] ≈ 1.5
+                @test isempty(h2.failed)
+                @test isempty(h2.hashes)
+                @test isempty(h2.known)
+                # Once checkout 2 has its own run, its own history takes over completely.
+                p2 = a_plan(c2)
+                rs2 = init_run_state(new_runstate_path(c2; start_us = 2_000_000_000_000_000), p2; start = 200.0)
+                write_status!(rs2, findfirst(==("slow"), p2.items.name), PASSED, 1, 1; elapsed = 3.0, start_off = 0.0, pid = 2)
+                finish_run_state!(rs2)
+                h2_own = history(c2)
+                @test h2_own.seconds["slow"] ≈ 3.0
+                @test !haskey(h2_own.seconds, "fails")
+            end
+        finally
+            filter!(!=(depot), DEPOT_PATH)
+            rm(depot; force = true, recursive = true)
+        end
+    end
+
     @testset "a run state lying next to the project does not change the next run" begin
         with_runstate_dir() do _
             dir = make_pkg("NotReplayed", "test/a_test.jl" => """@testitem "x" begin\n @test true\nend\n""")

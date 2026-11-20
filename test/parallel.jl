@@ -99,6 +99,7 @@ function child_command(runner::AbstractString, file::AbstractString)
         cmd,
         "JULIA_LOAD_PATH" => join(LOAD_PATH, pathsep),
         "JULIA_DEPOT_PATH" => join(DEPOT_PATH, pathsep),
+        "RUNTESTS_TEST_DEPOT" => "1",
         # A child's output is shown only when its file fails, so it can afford to
         # print everything it captured along the way.
         "RUNTESTS_TEST_ECHO" => "1",

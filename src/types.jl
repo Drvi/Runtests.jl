@@ -1,5 +1,4 @@
 const ItemIdx = Int32
-const UnitIdx = Int32
 const ProfileIdx = Int16
 const SlotIdx = Int16
 

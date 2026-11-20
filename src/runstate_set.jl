@@ -11,12 +11,8 @@ state holds. It has no pools or slots: the run's slots served every package.
 """
 function package_plan(p::Plan, k::Integer)
     is = [i for i in 1:nitems(p) if p.items.package[i] == k]
-    us = unique!([p.items.unit[i] for i in is])
     js = [j for j in eachindex(p.profiles) if p.profile_package[j] == k]
-    item = Dict{ItemIdx, ItemIdx}(ItemIdx(i) => ItemIdx(n) for (n, i) in enumerate(is))
-    unit = Dict{UnitIdx, UnitIdx}(u => UnitIdx(n) for (n, u) in enumerate(us))
     profile = Dict{ProfileIdx, ProfileIdx}(ProfileIdx(j) => ProfileIdx(n) for (n, j) in enumerate(js))
-    local_item(i) = i == 0 ? ItemIdx(0) : item[i]
     files = unique!([p.items.fileidx[i] for i in is])
     file = Dict{Int32, Int32}(f => Int32(n) for (n, f) in enumerate(files))
     tags, tag_span, setups, setup_span = Symbol[], UnitRange{Int32}[], Symbol[], UnitRange{Int32}[]
@@ -28,14 +24,9 @@ function package_plan(p::Plan, k::Integer)
     items = Items(
         it.name[is], Int32[file[it.fileidx[i]] for i in is], it.line[is], tags, tag_span, setups, setup_span,
         it.code[is], it.skip[is], it.timeout_s[is], it.retries[is], it.failfast[is], it.est_s[is],
-        UnitIdx[unit[it.unit[i]] for i in is], it.hash[is], it.seed[is], ones(Int32, length(is))
-    )
-    un = p.units
-    units = Units(
-        UnitRange{ItemIdx}[item[ItemIdx(first(un.span[u]))]:item[ItemIdx(last(un.span[u]))] for u in us],
-        ProfileIdx[profile[un.profile[u]] for u in us], un.exclusive[us], un.throttle[us], un.gate[us], un.est_s[us], un.why[us],
-        un.failed_ago[us], un.cancelled[us],
-        ItemIdx[local_item(un.changed_item[u]) for u in us], un.changed_new[us]
+        ProfileIdx[profile[it.profile[i]] for i in is], it.exclusive[is], it.throttle[is], it.gate[is],
+        it.why[is], it.failed_ago[is], it.cancelled[is], it.changed[is], it.changed_new[is],
+        it.hash[is], it.seed[is], ones(Int32, length(is))
     )
     root = p.packages.root[k]
     cfg = under_run_settings(p.packages.cfg[k], p.cfg)
@@ -44,8 +35,8 @@ function package_plan(p::Plan, k::Integer)
     packages = Packages([p.packages.name[k]], [p.packages.uuid[k]], [root], [p.packages.isolated[k]], [cfg],
                         [p.packages.suite_names[k]])
     return Plan(
-        items, units, abs_files, relfiles,
-        p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{UnitIdx}[], Int32[], p.gate_limit, p.cold,
+        items, abs_files, relfiles,
+        p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{ItemIdx}[], Int32[], p.gate_limit, p.cold,
         sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[]
     )
 end
@@ -214,7 +205,7 @@ end
 # The environment directory of item `i`, relative to its package's root, or empty for
 # its package's test environment.
 function environment_of_item(p::Plan, i::Integer)
-    env = p.profiles[p.units.profile[p.items.unit[i]]].environment
+    env = p.profiles[p.items.profile[i]].environment
     return isempty(env) ? "" : rel_slash(env, p.packages.root[p.items.package[i]])
 end
 

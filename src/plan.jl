@@ -1,12 +1,29 @@
-# Turning scanned items into a plan: units, pool order and initial worker slots,
+# Turning scanned items into a plan: pool order and initial worker slots,
 # decided before anything starts. A dry run prints it; drained slots can later
 # restart for another pool when doing so shortens estimated completion.
+
+"""
+    Why
+
+The class [`order_pool!`](@ref) sorts an item into, in the order the classes are
+handed out: what the dry run says about why an item runs where it does.
+"""
+@enum Why::UInt8 begin
+    PINNED_FIRST    # `[order] first`
+    SANDBOXED       # needs a process of its own
+    RECENT          # failing, a stopped run did not finish it, or it changed or is new since its last run
+    LONG            # long enough to decide how long the run takes
+    IN_FILE_ORDER   # everything else
+    PINNED_LAST     # `[order] last`
+end
 
 """
     Items
 
 Per-item data in plan order, as parallel arrays: the scheduler works with indices
-and never touches the bulky `code` and `skip`.
+and never touches the bulky `code` and `skip`. An item that names a throttle has
+that throttle's `gate`: the scheduler runs at most `Plan.gate_limit[gate]` of the
+gate's items at once.
 """
 struct Items
     name::Vector{String}
@@ -21,13 +38,21 @@ struct Items
     timeout_s::Vector{Int32}
     retries::Vector{Int32}
     failfast::Vector{Int8}
-    est_s::Vector{Float64}   # the newest duration a run recorded; 0 for none
-    unit::Vector{UnitIdx}
-    hash::Vector{UInt32}     # see `RawItem`
+    est_s::Vector{Float64}      # the newest duration a run recorded; 0 for none
+    profile::Vector{ProfileIdx}
+    exclusive::Vector{Bool}
+    throttle::Vector{Symbol}    # the throttle the item names, NO_THROTTLE for none
+    gate::Vector{Int32}         # a throttle with a limit above 1, 0 for none
+    why::Vector{Why}            # where `order_pool!` put it, and so why
+    failed_ago::Vector{Int32}   # runs since it last did not pass, -1 for none recorded
+    cancelled::Vector{Bool}     # whether that was a cancel rather than a verdict
+    changed::Vector{Bool}       # edited since its last run or never run
+    changed_new::Vector{Bool}   # whether it has never run
+    hash::Vector{UInt32}        # see `RawItem`
     # The seed each item draws its numbers from, mixed with its name: the run's, or
     # for an item `runtestsf` runs again, the one it failed with.
     seed::Vector{UInt64}
-    package::Vector{Int32}   # the package whose suite holds it, an index into `Plan.packages`
+    package::Vector{Int32}      # the package whose suite holds it, an index into `Plan.packages`
 end
 
 Base.length(it::Items) = length(it.name)
@@ -35,49 +60,11 @@ tags_of(it::Items, i) = view(it.tags, it.tag_span[i])
 setups_of(it::Items, i) = view(it.setups, it.setup_span[i])
 
 """
-    Why
-
-The class [`order_pool!`](@ref) sorts a unit into, in the order the classes are
-handed out: what the dry run says about why an item runs where it does.
-"""
-@enum Why::UInt8 begin
-    PINNED_FIRST    # `[order] first`
-    SANDBOXED       # needs a process of its own
-    RECENT          # failing, a stopped run did not finish it, or it changed or is new since its last run
-    LONG            # long enough to decide how long the run takes
-    IN_FILE_ORDER   # everything else
-    PINNED_LAST     # `[order] last`
-end
-
-"""
-    Units
-
-The schedulable thing: one item, as the one-item range `span`, which the run state
-records. The unit of an item that names a throttle has that throttle's `gate`: the
-scheduler runs at most `Plan.gate_limit[gate]` of the gate's units at once.
-"""
-struct Units
-    span::Vector{UnitRange{ItemIdx}}
-    profile::Vector{ProfileIdx}
-    exclusive::Vector{Bool}
-    throttle::Vector{Symbol}    # the throttle its items name, NO_THROTTLE for none
-    gate::Vector{Int32}         # a throttle with a limit above 1, 0 for none
-    est_s::Vector{Float64}
-    why::Vector{Why}            # where `order_pool!` put it, and so why
-    failed_ago::Vector{Int32}   # runs since its item last did not pass, -1 for none recorded
-    cancelled::Vector{Bool}         # whether that was a cancel rather than a verdict
-    changed_item::Vector{ItemIdx}   # its item, if edited since its last run or never run; 0 for none
-    changed_new::Vector{Bool}       # whether that item has never run
-end
-
-Base.length(u::Units) = length(u.span)
-
-"""
     Pool
 
-Units whose profiles have one worker start configuration, possibly from several
+Items whose profiles have one worker start configuration, possibly from several
 profiles or packages, in the order they are handed out as three runs of consecutive
-unit indices. `profile` names the representative profile used to start workers;
+item indices. `profile` names the representative profile used to start workers;
 each item retains its own profile for `test_end`:
 
 - `head` goes first, in order, to whichever of the pool's workers asks next;
@@ -89,9 +76,9 @@ What goes where is decided by [`order_pool!`](@ref).
 """
 struct Pool
     profile::ProfileIdx
-    head::UnitRange{UnitIdx}
-    body::UnitRange{UnitIdx}
-    tail::UnitRange{UnitIdx}
+    head::UnitRange{ItemIdx}
+    body::UnitRange{ItemIdx}
+    tail::UnitRange{ItemIdx}
 end
 
 """
@@ -155,16 +142,15 @@ end
 
 struct Plan
     items::Items
-    units::Units
     files::Vector{String}
     relfiles::Vector{String}    # `files` relative to the project
     profiles::Vector{Profile}
     profile_package::Vector{Int32}   # per profile: the package that declares it
     pools::Vector{Pool}
     slot_pool::Vector{Int32}                 # slot -> pool
-    slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its stretch of its pool's body
+    slot_items::Vector{UnitRange{ItemIdx}}   # slot -> its stretch of its pool's body
     pending::Vector{Int32}                   # pools with no slot yet, in pickup order
-    gate_limit::Vector{Int32}                # per gate (`Units`): how many of its units run at once
+    gate_limit::Vector{Int32}                # per gate (`Items`): how many of its items run at once
     cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
@@ -735,9 +721,9 @@ number of units when nothing is estimated — each cut made at the file boundary
 nearest its ideal place, so that one worker walks a whole file. A unit with no
 estimate counts as a typical one.
 """
-function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{Int32}, n::Int)
-    n == 0 && return UnitRange{UnitIdx}[]
-    n == 1 && return UnitRange{UnitIdx}[body]
+function stretches(body::UnitRange{ItemIdx}, est::Vector{Float64}, file::Vector{Int32}, n::Int)
+    n == 0 && return UnitRange{ItemIdx}[]
+    n == 1 && return UnitRange{ItemIdx}[body]
     m = length(body)
     bview = view(est, body)
     guess = typical_estimate(bview)
@@ -754,7 +740,7 @@ function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{
     end
     has_files = !isempty(between_files)
     # `cum` is strictly increasing, so binary search finds the nearest cut in O(log |at|).
-    out = Vector{UnitRange{UnitIdx}}(undef, n)
+    out = Vector{UnitRange{ItemIdx}}(undef, n)
     prev = 0
     total = m == 0 ? 0.0 : cum[m]
     for k in 1:(n - 1)
@@ -802,7 +788,7 @@ function materialize(
         packages::Packages, root::AbstractString, selection::AbstractString, suite_names::Vector{String},
         cold::ColdCost, gate_limit::Vector{Int32}
     )
-    # Pool by pool, in the order each hands out its units: item index order is the
+    # Pool by pool, in the order each hands out its items: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
     # is indexed by.
     n = length(raw)
@@ -811,16 +797,16 @@ function materialize(
     setups = Symbol[]; setup_span = Vector{UnitRange{Int32}}(undef, n)
     code = Vector{Expr}(undef, n); skip = Vector{Any}(undef, n)
     timeout = Vector{Int32}(undef, n); retries = Vector{Int32}(undef, n)
-    failfast = Vector{Int8}(undef, n); est = Vector{Float64}(undef, n); item_unit = Vector{UnitIdx}(undef, n)
+    failfast = Vector{Int8}(undef, n); est = Vector{Float64}(undef, n)
+    profile = Vector{ProfileIdx}(undef, n); exclusive = Vector{Bool}(undef, n)
+    throttle = Vector{Symbol}(undef, n); gate = Vector{Int32}(undef, n)
+    why = Vector{Why}(undef, n); failed_ago = Vector{Int32}(undef, n); cancelled = Vector{Bool}(undef, n)
+    changed = Vector{Bool}(undef, n); changed_new = Vector{Bool}(undef, n)
     item_hash = Vector{UInt32}(undef, n); item_seed_ = Vector{UInt64}(undef, n); item_package = Vector{Int32}(undef, n)
     files = String[]; fileids = Dict{String, Int32}()
-    uspan = Vector{UnitRange{ItemIdx}}(undef, n); uprofile = Vector{ProfileIdx}(undef, n); uexcl = Vector{Bool}(undef, n)
-    uthrottle = Vector{Symbol}(undef, n); ugate = Vector{Int32}(undef, n); uest = Vector{Float64}(undef, n)
-    uwhy = Vector{Why}(undef, n); uago = Vector{Int32}(undef, n); ucancelled = Vector{Bool}(undef, n)
-    uchanged = Vector{ItemIdx}(undef, n); unew = Vector{Bool}(undef, n)
     all_setups = Set{Symbol}()
     ps = Vector{Pool}(undef, length(pools))
-    slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
+    slot_pool = Int32[]; slot_items = UnitRange{ItemIdx}[]; pending = Int32[]
     pos = 0
     for (k, pool) in enumerate(pools)
         start = pos
@@ -840,46 +826,42 @@ function materialize(
             code[pos] = it.code; skip[pos] = it.skip
             timeout[pos] = it.timeout_s; retries[pos] = it.retries
             failfast[pos] = it.failfast
-            e = draft.est_s[u]
-            est[pos] = e
-            item_unit[pos] = UnitIdx(pos)
-            item_hash[pos] = it.hash; item_package[pos] = it.package
-            # The run's seed is every package's; a failure's own is its package's.
-            item_seed_[pos] = get(packages.cfg[it.package].item_seeds, it.name, cfg.seed)
-
-            idx = ItemIdx(pos)
-            uspan[pos] = idx:idx
-            uprofile[pos] = draft.profile[u]; uexcl[pos] = it.exclusive
-            uthrottle[pos] = it.throttle; ugate[pos] = draft.gate[u]; uest[pos] = e
+            est[pos] = draft.est_s[u]
+            profile[pos] = draft.profile[u]; exclusive[pos] = it.exclusive
+            throttle[pos] = it.throttle; gate[pos] = draft.gate[u]
             cls = draft.key[u][1]
             cls in HEAD_CLASSES && (nhead += 1)
             cls == TAIL_CLASS && (ntail += 1)
-            uwhy[pos] = draft.why[u]; uago[pos] = draft.failed_ago[u]
-            ucancelled[pos] = draft.cancelled[u]
-            uchanged[pos] = draft.changed[u] ? idx : ItemIdx(0)
-            unew[pos] = draft.changed_new[u]
+            why[pos] = draft.why[u]; failed_ago[pos] = draft.failed_ago[u]
+            cancelled[pos] = draft.cancelled[u]
+            changed[pos] = draft.changed[u]
+            changed_new[pos] = draft.changed_new[u]
+            item_hash[pos] = it.hash; item_package[pos] = it.package
+            # The run's seed is every package's; a failure's own is its package's.
+            item_seed_[pos] = get(packages.cfg[it.package].item_seeds, it.name, cfg.seed)
         end
-        between(a, b) = UnitIdx(a):UnitIdx(b)
+        between(a, b) = ItemIdx(a):ItemIdx(b)
         body = between(start + nhead + 1, pos - ntail)
         # Its workers start with the configuration of its first profile, which its
         # other profiles share.
         ps[k] = Pool(min_prof[k], between(start + 1, start + nhead), body,
                      between(pos - ntail + 1, pos))
         slots[k] == 0 && push!(pending, Int32(k))
-        for r in stretches(body, uest, fileidx, slots[k])
-            push!(slot_pool, Int32(k)); push!(slot_units, r)
+        for r in stretches(body, est, fileidx, slots[k])
+            push!(slot_pool, Int32(k)); push!(slot_items, r)
         end
     end
 
     items = Items(
         name, fileidx, line, tags, tag_span, setups, setup_span,
-        code, skip, timeout, retries, failfast, est, item_unit, item_hash, item_seed_, item_package
+        code, skip, timeout, retries, failfast, est,
+        profile, exclusive, throttle, gate, why, failed_ago, cancelled, changed, changed_new,
+        item_hash, item_seed_, item_package
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uthrottle, ugate, uest, uwhy, uago, ucancelled, uchanged, unew),
-        files, relfiles,
-        profiles, profile_package, ps, slot_pool, slot_units, pending, gate_limit, cold,
+        items, files, relfiles,
+        profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, cold,
         sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
     )
 end

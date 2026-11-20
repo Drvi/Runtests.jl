@@ -63,6 +63,7 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("collect_coverage", P.collect_coverage, (P.Run,)),
             ("finish_attempt!", P.finish_attempt!, (P.Run, P.Slot, P.ItemIdx, Int8, W.ItemResult, W.Worker)),
             ("finish_here!", P.finish_here!, (W.ItemSpec, W.ItemResult)),
+            ("run_test_end (EndSpec)", W.run_test_end, (W.EndSpec, Expr)),
             ("platform self-check", P.Platform.ensure_checked!, ()),
             ("show(RunTestSet)", show, (IOBuffer, P.RunTestSet)),
             ("show(RunStateRecord)", show, (IOBuffer, P.RunStateRecord)),
@@ -99,6 +100,7 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("Platform.process_owners", P.Platform.process_owners, (Vector{Int32},)),
             ("read_message", W.read_message, (TCPSocket, W.FrameReader)),
             ("encode_message!", W.encode_message!, (IOBuffer, UInt64, UInt8, W.ItemSpec)),
+            ("encode_message! (EndSpec)", W.encode_message!, (IOBuffer, UInt64, UInt8, Tuple{W.EndSpec, Expr})),
         )
         JET.test_opt(f, types; target_modules = OURS)
     end
@@ -116,7 +118,7 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("bytes_within", P.bytes_within, (Vector{UInt8}, Int, Int, Int)),
             ("header_field", W.header_field, (Vector{UInt8}, Type{UInt64}, Int)),
             ("verdict", P.verdict, (P.RunStateRecord, Int)),
-            ("gate_full", P.gate_full, (P.Queues, P.UnitIdx)),
+            ("gate_full", P.gate_full, (P.Queues, P.ItemIdx)),
             ("environment_of", P.environment_of, (String, Vector{Pair{String, String}})),
             ("idle_worker_seconds", P.idle_worker_seconds, (P.RunStateRecord,)),
             apple_allocs...,
@@ -138,6 +140,8 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("removable_runs", P.removable_runs, (Vector{Pair{String, P.RunStateRecord}}, Vector{String})),
             ("serve_requests", W.serve_requests, (TCPSocket,)),
             ("process_responses", W.process_responses, (W.Worker,)),
+            ("read_run_state", P.read_run_state, (String,)),
+            ("read_run_meta", P.read_run_meta, (String,)),
         )
         @test !occursin("Core.Box", string(only(code_lowered(f, types))))
     end

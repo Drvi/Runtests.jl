@@ -44,30 +44,29 @@ until a slot takes it up again, which one does before any slot is done.
 """
 mutable struct Queues
     const lock::ReentrantLock
-    const room::Threads.Condition    # on `lock`: a gate's unit ended, a set-aside unit left, or the run stopped
+    const room::Threads.Condition    # on `lock`: a gate's item ended, a set-aside item left, or the run stopped
     const pools::Vector{Pool}
-    const head::Vector{UnitIdx}      # per pool: its next head unit
-    const tail::Vector{UnitIdx}      # per pool: its next tail unit
-    const from::Vector{UnitIdx}      # per slot: the next unit of its stretch
-    const to::Vector{UnitIdx}        # per slot: the last unit of its stretch
+    const head::Vector{ItemIdx}      # per pool: its next head item
+    const tail::Vector{ItemIdx}      # per pool: its next tail item
+    const from::Vector{ItemIdx}      # per slot: the next item of its stretch
+    const to::Vector{ItemIdx}        # per slot: the last item of its stretch
     const pool::Vector{Int32}        # per slot: the pool it serves
     const pending::Vector{Int32}     # pools no slot serves yet, in pickup order
-    const parked::Vector{Int32}      # pools with only set-aside units left that no slot serves
-    const claimed::BitVector         # per unit: handed out already
+    const parked::Vector{Int32}      # pools with only set-aside items left that no slot serves
+    const claimed::BitVector         # per item: handed out already
     const serving::Vector{Int}       # per pool: slots working for it
-    const est::Vector{Float64}       # per unit: the recorded seconds of its items
-    const unrecorded::Vector{Int32}  # per unit: its items without a recorded duration
+    const est::Vector{Float64}       # per item: its recorded seconds, 0 for unrecorded
     const typical::Float64           # an unrecorded item, before its pool has timed any
     const stats::Vector{PoolStats}   # per pool
     const prior::ColdCost            # what a fresh worker cost in earlier runs
-    const gate::Vector{Int32}        # per unit: its gate, 0 for none
-    const gate_limit::Vector{Int32}  # per gate: how many of its units run at once
-    const gate_running::Vector{Int32}    # per gate: how many of its units are handed out and not ended
-    const set_aside::Vector{Vector{UnitIdx}}  # per pool: units passed while their gate was full, in order
-    # Per pool: `gate_ends` when its set-aside units were last found all held back. Only
-    # a gate's unit ending lets one go, so until `gate_ends` moves on they still are.
+    const gate::Vector{Int32}        # per item: its gate, 0 for none
+    const gate_limit::Vector{Int32}  # per gate: how many of its items run at once
+    const gate_running::Vector{Int32}    # per gate: how many of its items are handed out and not ended
+    const set_aside::Vector{Vector{ItemIdx}}  # per pool: items passed while their gate was full, in order
+    # Per pool: `gate_ends` when its set-aside items were last found all held back. Only
+    # a gate's item ending lets one go, so until `gate_ends` moves on they still are.
     const aside_blocked_at::Vector{Int}
-    gate_ends::Int                   # units of gates that have ended
+    gate_ends::Int                   # items of gates that have ended
     @atomic cancelled::Bool
     @atomic paused::Bool             # the memory guard is holding new work back
 end
@@ -78,62 +77,61 @@ function Queues(p::Plan)
 end
 Queues(lock::ReentrantLock, room::Threads.Condition, p::Plan) = Queues(
     lock, room, p.pools,
-    UnitIdx[first(k.head) for k in p.pools], UnitIdx[first(k.tail) for k in p.pools],
-    UnitIdx[first(r) for r in p.slot_units], UnitIdx[last(r) for r in p.slot_units],
-    copy(p.slot_pool), copy(p.pending), Int32[], falses(length(p.units)),
+    ItemIdx[first(k.head) for k in p.pools], ItemIdx[first(k.tail) for k in p.pools],
+    ItemIdx[first(r) for r in p.slot_items], ItemIdx[last(r) for r in p.slot_items],
+    copy(p.slot_pool), copy(p.pending), Int32[], falses(nitems(p)),
     [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
-    p.units.est_s, Int32[count(i -> p.items.est_s[i] == 0, span) for span in p.units.span],
-    typical_estimate(p.items.est_s),
-    [PoolStats() for _ in p.pools], p.cold, p.units.gate, p.gate_limit, zeros(Int32, length(p.gate_limit)),
-    [UnitIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0, false, false
+    p.items.est_s, typical_estimate(p.items.est_s),
+    [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, zeros(Int32, length(p.gate_limit)),
+    [ItemIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0, false, false
 )
 
 struct Claim
-    kind::Symbol        # :unit, :rebind, :done, :wait (`claim!`)
-    unit::UnitIdx
+    kind::Symbol        # :item, :rebind, :done, :wait (`claim!`)
+    item::ItemIdx
     pool::Int32
 end
-Claim(kind::Symbol) = Claim(kind, UnitIdx(0), Int32(0))
+Claim(kind::Symbol) = Claim(kind, ItemIdx(0), Int32(0))
 
-gate_full(q::Queues, u::Integer) = (g = q.gate[u]; g != 0 && q.gate_running[g] >= q.gate_limit[g])
+gate_full(q::Queues, i::Integer) = (g = q.gate[i]; g != 0 && q.gate_running[g] >= q.gate_limit[g])
 
-# Unit `u`, handed out. Every unit is handed out exactly once; a second time is a
+# Item `i`, handed out. Every item is handed out exactly once; a second time is a
 # scheduling bug, stopped here rather than run twice.
-function hand_out!(q::Queues, u::UnitIdx)
-    q.claimed[u] && error("Runtests internal error: unit $u was handed out twice")
-    q.claimed[u] = true
-    g = q.gate[u]
+function hand_out!(q::Queues, i::ItemIdx)
+    q.claimed[i] && error("Runtests internal error: item $i was handed out twice")
+    q.claimed[i] = true
+    g = q.gate[i]
     g == 0 || (q.gate_running[g] += Int32(1))
-    return Claim(:unit, u, Int32(0))
+    return Claim(:item, i, Int32(0))
 end
 
-# The first unit from cursor `i` up to `stop` that its gate lets run, moving the
-# cursor past it and setting aside, for pool `k`, the units before it that their
+# The first item from cursor `i` up to `stop` that its gate lets run, moving the
+# cursor past it and setting aside, for pool `k`, the items before it that their
 # gate does not; 0 when the cursor passes `stop`.
-function next!(q::Queues, cursor::Vector{UnitIdx}, i::Integer, stop::Integer, k::Integer)
+function next!(q::Queues, cursor::Vector{ItemIdx}, i::Integer, stop::Integer, k::Integer)
     while cursor[i] <= stop
-        u = cursor[i]
-        cursor[i] += UnitIdx(1)
-        gate_full(q, u) || return u
-        push!(q.set_aside[k], u)
+        item = cursor[i]
+        cursor[i] += ItemIdx(1)
+        gate_full(q, item) || return item
+        push!(q.set_aside[k], item)
     end
-    return UnitIdx(0)
+    return ItemIdx(0)
 end
 
-# The first unit pool `k` set aside that its gate now lets run, taken off the list,
+# The first item pool `k` set aside that its gate now lets run, taken off the list,
 # or 0.
 function take_set_aside!(q::Queues, k::Integer)
     aside = q.set_aside[k]
-    (isempty(aside) || q.aside_blocked_at[k] == q.gate_ends) && return UnitIdx(0)
-    j = findfirst(u -> !gate_full(q, u), aside)
+    (isempty(aside) || q.aside_blocked_at[k] == q.gate_ends) && return ItemIdx(0)
+    j = findfirst(item -> !gate_full(q, item), aside)
     if j === nothing
         q.aside_blocked_at[k] = q.gate_ends
-        return UnitIdx(0)
+        return ItemIdx(0)
     end
-    u = popat!(aside, j)
-    # A slot waiting only because this unit was set aside can now finish or move on.
+    item = popat!(aside, j)
+    # A slot waiting only because this item was set aside can now finish or move on.
     isempty(aside) && notify(q.room)
-    return u
+    return item
 end
 
 # The next unit for slot `s`, or what it does instead. A slot whose pool has only
@@ -200,9 +198,9 @@ function next_unit!(q::Queues, s::Integer, k::Integer)
             r > most && ((victim, most) = (v, r))
         end
         victim == 0 && break
-        q.from[s] = q.from[victim] + UnitIdx(most ÷ 2)
+        q.from[s] = q.from[victim] + ItemIdx(most ÷ 2)
         q.to[s] = q.to[victim]
-        q.to[victim] = q.from[s] - UnitIdx(1)
+        q.to[victim] = q.from[s] - ItemIdx(1)
         u = next!(q, q.from, s, q.to[s], k)
         u == 0 || return u
     end
@@ -217,7 +215,7 @@ function rebind!(q::Queues, s::Integer, k::Integer, j::Integer)
     at = findfirst(==(j), q.pending)
     if at === nothing
         filter!(!=(j), q.parked)
-        q.from[s], q.to[s] = UnitIdx(1), UnitIdx(0)
+        q.from[s], q.to[s] = ItemIdx(1), ItemIdx(0)
     else
         deleteat!(q.pending, at)
         q.from[s], q.to[s] = first(q.pools[j].body), last(q.pools[j].body)
@@ -225,7 +223,7 @@ function rebind!(q::Queues, s::Integer, k::Integer, j::Integer)
     q.pool[s] = j
     q.serving[k] -= 1
     q.serving[j] += 1
-    return Claim(:rebind, UnitIdx(0), j)
+    return Claim(:rebind, ItemIdx(0), j)
 end
 
 # The pool a slot leaving pool `k` goes to, or 0: one no slot serves yet, then a
@@ -248,9 +246,9 @@ end
 startable(q::Queues, j::Integer) =
     any(u -> !q.claimed[u] && !gate_full(q, u), first(q.pools[j].head):last(q.pools[j].tail))
 
-# Unit `u` ended, with all its attempts: its gate can run another.
-function unit_ended!(q::Queues, u::UnitIdx)
-    g = q.gate[u]
+# Item `i` ended, with all its attempts: its gate can run another.
+function item_ended!(q::Queues, i::ItemIdx)
+    g = q.gate[i]
     g == 0 && return nothing
     @lock q.lock begin
         q.gate_running[g] -= Int32(1)
@@ -305,28 +303,28 @@ finish_time(units::Vector{Float64}, free::Vector{Float64}) = finish_time!(units,
 # the pool's average item so far. Before the pool has timed any, it counts as the
 # typical recorded item, as in the plan.
 function unclaimed_work(q::Queues, j::Integer)
-    seconds = unit_seconds(q, j)
+    seconds = item_seconds(q, j)
     pool = q.pools[j]
-    return Float64[seconds(u) for u in first(pool.head):last(pool.tail) if !q.claimed[u]]
+    return Float64[seconds(i) for i in first(pool.head):last(pool.tail) if !q.claimed[i]]
 end
 
-# The least time pool `j`'s unclaimed units take, however many workers serve it, as
-# the units of each gate run at most its limit at a time; and whether those units
+# The least time pool `j`'s unclaimed items take, however many workers serve it, as
+# the items of each gate run at most its limit at a time; and whether those items
 # are all of gates whose limits the pool's workers can already fill, which another
 # worker therefore does not speed up.
 function gated_work(q::Queues, j::Integer)
     isempty(q.gate_limit) && return 0.0, false
-    seconds = unit_seconds(q, j)
+    seconds = item_seconds(q, j)
     work = zeros(length(q.gate_limit))
     saturated = true
     pool = q.pools[j]
-    for u in first(pool.head):last(pool.tail)
-        q.claimed[u] && continue
-        g = q.gate[u]
+    for i in first(pool.head):last(pool.tail)
+        q.claimed[i] && continue
+        g = q.gate[i]
         if g == 0
             saturated = false
         else
-            work[g] += seconds(u)
+            work[g] += seconds(i)
             saturated &= q.gate_limit[g] <= q.serving[j]
         end
     end
@@ -338,12 +336,12 @@ function gated_work(q::Queues, j::Integer)
     return best, saturated
 end
 
-# The estimated seconds of a unit of pool `j`, as `unclaimed_work` counts them.
-function unit_seconds(q::Queues, j::Integer)
+# The estimated seconds of an item of pool `j`, as `unclaimed_work` counts them.
+function item_seconds(q::Queues, j::Integer)
     st = q.stats[j]
     scale = st.estimated_s > 0 ? st.estimated_took_s / st.estimated_s : 1.0
     unknown = st.items > 0 ? st.took_s / st.items : q.typical
-    return u -> q.est[u] * scale + q.unrecorded[u] * unknown
+    return i -> (e = q.est[i]; e > 0 ? e * scale : unknown)
 end
 
 # What a fresh worker in pool `j` costs before it is as fast as the pool's others:

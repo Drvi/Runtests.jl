@@ -14,7 +14,7 @@ item_text(name; opts = "") = "@testitem $(repr(name)) $opts begin\n    @test tru
 mono(ws; kwargs...) = prepare_mono((ws,); announce = false, kwargs...)
 # Item `name` of package `pkg` in plan `p`, and the pool of its unit.
 item_of(p, pkg, name) = only(i for i in 1:nitems(p) if p.packages.name[p.items.package[i]] == pkg && p.items.name[i] == name)
-pool_of(p, i) = (u = p.items.unit[i]; findfirst(pl -> first(pl.head) <= u <= last(pl.tail), p.pools))
+pool_of(p, i) = findfirst(pl -> first(pl.head) <= i <= last(pl.tail), p.pools)
 
 # What a combined run reads of each participant's suite: its items, the participant
 # of each, and its profiles, setups and configuration file.
@@ -477,13 +477,13 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test pool("A", "init") != pool("B", "init")
             @test length(unique([pool("A", "a1"), pool("A", "qa"), pool("C", "c1")])) == 3
             # A throttle is one for every package that names it: `:db` is one gate, of one.
-            gate(pkg, name) = p.units.gate[p.items.unit[item_of(p, pkg, name)]]
+            gate(pkg, name) = p.items.gate[item_of(p, pkg, name)]
             @test gate("A", "db1") == gate("A", "db2") == gate("B", "db1") != 0
             @test p.gate_limit[gate("A", "db1")] == 1
             # An item runs under its own package's profile.
-            prof(pkg, name) = p.profiles[p.units.profile[p.items.unit[item_of(p, pkg, name)]]]
+            prof(pkg, name) = p.profiles[p.items.profile[item_of(p, pkg, name)]]
             @test prof("A", "fast").julia_args == ["--check-bounds=yes"] && prof("B", "fast").julia_args == ["--check-bounds=no"]
-            @test p.profile_package[p.units.profile[p.items.unit[item_of(p, "B", "init")]]] == 2
+            @test p.profile_package[p.items.profile[item_of(p, "B", "init")]] == 2
             # The run's seed is every package's.
             p7 = mono(ws; seed = 7).plan
             @test all(==(7), p7.items.seed)
@@ -499,7 +499,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             )
             ws = build(3)
             p = mono(ws).plan
-            gates = [p.units.gate[p.items.unit[item_of(p, pkg, n)]] for (pkg, n) in (("A", "a1"), ("A", "a2"), ("B", "b1"))]
+            gates = [p.items.gate[item_of(p, pkg, n)] for (pkg, n) in (("A", "a1"), ("A", "a2"), ("B", "b1"))]
             @test allequal(gates) && only(unique(gates)) != 0 && p.gate_limit == [3]
             # Each package's run state records its own limits, for a replay.
             for k in 1:2

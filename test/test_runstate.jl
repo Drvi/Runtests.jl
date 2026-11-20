@@ -294,11 +294,77 @@ end
         broken = joinpath(mktempdir(), "broken.runstate")
         for n in 0:length(full)
             write(broken, full[1:n])
-            rs = read_run_state(broken)       # must not throw, whatever n is
-            rs === nothing && continue
-            @test length(rs.statuses) == nitems(p)
+            for full_mode in (true, false)
+                rs = read_run_state(broken; full = full_mode)   # must not throw, whatever n is
+                rs === nothing && continue
+                @test length(rs.statuses) == nitems(p)
+            end
+            Runtests.Private.read_run_meta(broken)              # must not throw either
         end
         @test true    # reaching here is the assertion
+    end
+
+    @testset "concurrent readers stay consistent while a writer updates the file in place" begin
+        p = a_plan()
+        path = joinpath(mktempdir(), "run.runstate")
+        rsf = init_run_state(path, p; heartbeat = false)
+        done = Threads.Atomic{Bool}(false)
+        errors = Any[]
+        reads = Threads.Atomic{Int}(0)
+        reader = Threads.@spawn begin
+            try
+                while !done[]
+                    for full_mode in (false, true)
+                        rs = read_run_state(path; full = full_mode)
+                        rs === nothing && error("unexpected nothing while file is open (full=$full_mode)")
+                        length(rs.items) == nitems(p) || error("item count mismatch: $(length(rs.items))")
+                        length(rs.statuses) == nitems(p) || error("status count mismatch: $(length(rs.statuses))")
+                        all(s -> isfinite(s.elapsed) && s.elapsed >= 0, rs.statuses) || error("non-finite elapsed")
+                        if full_mode
+                            isfinite(rs.memory.peak_total_mb) && rs.memory.peak_total_mb >= 0 ||
+                                error("non-finite memory summary")
+                        end
+                    end
+                    meta = Runtests.Private.read_run_meta(path)
+                    meta === nothing && error("unexpected nothing from read_run_meta")
+                    Threads.atomic_add!(reads, 1)
+                    yield()
+                end
+            catch e
+                push!(errors, e)
+            end
+        end
+        # Drive in-place status, memory, event, and ending writes while the reader polls.
+        stats = Runtests.Private.MemStats()
+        for round in 1:25
+            for i in 1:nitems(p)
+                write_status!(rsf, i, RUNNING, 1, 1; start_off = Float32(round), pid = Int32(1000 + round))
+                write_status!(rsf, i, PASSED, 1, 1; start_off = Float32(round), elapsed = 0.05f0,
+                              compile = 0.01f0, pid = Int32(1000 + round))
+                Runtests.Private.append_event!(rsf, Runtests.Private.EVENT_ATTEMPT, UInt8(PASSED),
+                                               1, Int32(1000 + round), Float32(round), Float32(round + 0.05);
+                                               item = i, attempt = 1, seq = round)
+            end
+            stats.peak_total_bytes = Int64(round * 10_000_000)
+            stats.peak_single_bytes = Int64(round * 5_000_000)
+            stats.peak_total_at = Float64(round)
+            Runtests.Private.write_memory!(rsf, stats)
+            yield()
+        end
+        Runtests.Private.mark_ending!(rsf, Runtests.Private.ENDING_FINISHED)
+        finish_run_state!(rsf)
+        done[] = true
+        wait(reader)
+        @test isempty(errors)
+        @test reads[] > 0
+        final_full = read_run_state(path; full = true)
+        final_hot = read_run_state(path; full = false)
+        @test final_full.closed && final_hot.closed
+        @test !final_full.truncated && !final_hot.truncated
+        @test length(final_full.events) == 25 * nitems(p)
+        @test length(final_hot.events) == 25 * nitems(p)
+        @test [s.state for s in final_hot.statuses] == fill(PASSED, nitems(p))
+        @test final_full.memory.peak_total_mb > 0
     end
 
     @testset "a completion the writer did not finish is read as incomplete evidence" begin
@@ -362,6 +428,10 @@ end
             rs = read_run_state(garbled)
             # What is read of it can be shown, however little that is.
             @test (rs === nothing || sprint(show, MIME"text/plain"(), rs) isa String)
+            rs_hot = read_run_state(garbled; full = false)
+            @test (rs_hot === nothing || rs_hot isa Runtests.Private.RunStateRecord)
+            meta = Runtests.Private.read_run_meta(garbled)
+            @test (meta === nothing || meta isa Runtests.Private.RunStateMeta)
         end
         @test read_run_state(joinpath(mktempdir(), "not_a_file")) === nothing
         write(garbled, "not a run state at all")
@@ -488,7 +558,7 @@ end
             @test isempty(h.failed)
             # the next plan sees those timings
             p2, _ = prepare((pkg,); workers=2, logs=:issues)
-            @test any(>(0), p2.units.est_s)
+            @test any(>(0), p2.items.est_s)
         end
     end
 
@@ -502,7 +572,7 @@ end
             end
             @test history(pkg).seconds == Dict("x" => 0.5, "y" => 2.0, "z" => 3.0)
             p, _ = prepare((pkg,); announce = false)
-            @test all(>(0), p.units.est_s)
+            @test all(>(0), p.items.est_s)
         end
     end
 
@@ -734,7 +804,7 @@ end
                 end
                 @test history(pkg).failed == Dict("b" => Runtests.Private.HISTORY_RUNS + 3)
                 p, _ = prepare((pkg,); announce = false)
-                why(n) = p.units.why[p.items.unit[findfirst(==(n), p.items.name)]]
+                why(n) = p.items.why[findfirst(==(n), p.items.name)]
                 @test why("b") === Runtests.Private.RECENT
                 @test why("c") === Runtests.Private.IN_FILE_ORDER
             end
@@ -754,7 +824,7 @@ end
         @testset "an edit stays marked until the item runs, and a fresh checkout marks nothing" begin
             pkg = make_pkg("Edits", "test/a_test.jl" => items("a"), "test/b_test.jl" => items("b"))
             whys(dir) = (p = first(prepare((dir,); announce = false));
-                         Dict(p.items.name[i] => Runtests.Private.why_text(p, p.items.unit[i]) for i in eachindex(p.items.name)))
+                         Dict(p.items.name[i] => Runtests.Private.why_text(p, i) for i in eachindex(p.items.name)))
             with_runstate_dir() do _
                 capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
                 @test whys(pkg) == Dict("a" => "", "b" => "")
@@ -1493,7 +1563,7 @@ end
             # Deleted since: the recorded limit of two, where this checkout gives 1.
             write(joinpath(dir, "test", "TestItems.toml"), "")
             r = replayed()
-            @test r.cfg.throttle == Dict(:db => 2) && r.gate_limit == [2] && length(r.units) == 2
+            @test r.cfg.throttle == Dict(:db => 2) && r.gate_limit == [2] && nitems(r) == 2
             # Changed since: the recorded limit still.
             write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ndb = 5\n")
             @test replayed().gate_limit == [2]

@@ -92,9 +92,10 @@ end
 const PRECOMPILE_SIGNATURES = (
     (run_item, (ItemSpec,)),
     (run_test_end, (ItemSpec, Expr)),
+    (run_test_end, (EndSpec, Expr)),
     (handle_request, (Frame,)),
     (send_request, (Worker, UInt8, ItemSpec)),
-    (send_request, (Worker, UInt8, Tuple{ItemSpec, Expr})),
+    (send_request, (Worker, UInt8, Tuple{EndSpec, Expr})),
     (send_request, (Worker, UInt8, Tuple{Int32, Int8, Bool})),
     (remote_run, (Worker, ItemSpec)),
     (remote_end, (Worker, ItemSpec, Expr)),

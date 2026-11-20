@@ -57,7 +57,7 @@ item_json(p::Plan, i::Integer) = (; package = p.packages.name[p.items.package[i]
 function event_item_started(run, i::ItemIdx, attempt::Integer, slot::Integer, pid::Integer)
     p = run.plan
     emit(run.events, "item_started"; id = run.events.run_id, item_json(p, i)...,
-         attempt = Int(attempt), attempts = attempts_for(p, p.items.unit[i]), worker = Int(slot), pid = Int(pid))
+         attempt = Int(attempt), attempts = attempts_for(p, i), worker = Int(slot), pid = Int(pid))
     return nothing
 end
 
@@ -70,7 +70,7 @@ function event_item_finished(run, o)
     failures = [failure_json(p, r) for r in collect_failures(o.testset)]
     log = item_log(run, i, max(o.attempt, 1))
     emit(run.events, "item_finished"; id = run.events.run_id, item_json(p, i)...,
-         attempt = Int(o.attempt), attempts = attempts_for(p, p.items.unit[i]), worker = Int(o.slot),
+         attempt = Int(o.attempt), attempts = attempts_for(p, i), worker = Int(o.slot),
          pid = Int(o.pid), state = state_name(o.state), verdict = state_name(o.verdict),
          elapsed = Float32(o.elapsed), compile = Float32(o.stats.compile_ns / 1.0e9),
          note = o.note, log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)

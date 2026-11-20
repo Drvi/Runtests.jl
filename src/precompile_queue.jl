@@ -146,18 +146,18 @@ function precompile_needs(run::Run, p::Plan, flags_of)
                               profiles = Set{String}(), by = Dict{String, Union{Nothing, Set{String}}}()))
                 i = lastindex(needs)
             end
-            unit_profile = p.units.profile[u]
-            listed = p.profiles[unit_profile].precompile
+            item_profile = p.items.profile[u]
+            listed = p.profiles[item_profile].precompile
             if listed !== nothing
                 held_here = intersect(listed, packages_of(project))
-                setdiff!(get!(() -> Set{String}(listed), unheld, (p.profile_package[unit_profile], p.profiles[unit_profile].name)),
+                setdiff!(get!(() -> Set{String}(listed), unheld, (p.profile_package[item_profile], p.profiles[item_profile].name)),
                          held_here)
                 union!(needs[i].names, held_here)
                 isempty(held_here) || ((own || !default) && push!(needs[i].profiles, String(prof.name)))
                 # A worker loads Runtests before it connects. Where the project does not
                 # hold it, `precompile_queue` compiles it in this process's environment.
                 "Runtests" in deps_of(project) && push!(needs[i].names, "Runtests")
-                combined && ask!(needs[i].by, p.packages.name[p.profile_package[unit_profile]],
+                combined && ask!(needs[i].by, p.packages.name[p.profile_package[item_profile]],
                                  "Runtests" in deps_of(project) ? push!(copy(held_here), "Runtests") : held_here)
                 continue
             end
@@ -168,14 +168,12 @@ function precompile_needs(run::Run, p::Plan, flags_of)
                 combined && ask!(needs[i].by, p.packages.name[k], nothing)
                 continue
             end
-            for item in p.units.span[u]
-                package = p.items.package[item]
-                (i, package) in held && continue
-                push!(held, (i, package))
-                asked = intersect(test_dep_names(package), deps_of(project))
-                union!(needs[i].names, asked)
-                combined && ask!(needs[i].by, p.packages.name[package], asked)
-            end
+            package = p.items.package[u]
+            (i, package) in held && continue
+            push!(held, (i, package))
+            asked = intersect(test_dep_names(package), deps_of(project))
+            union!(needs[i].names, asked)
+            combined && ask!(needs[i].by, p.packages.name[package], asked)
         end
     end
     for ((k, name), names) in sort!(collect(unheld); by = first)
@@ -235,11 +233,11 @@ function setup_needs(run::Run, p::Plan, flags_of)
         pool_args = Cmd(worker_julia_args(run, prof))
         own_project = haskey(run.profile_projects, ProfileIdx(j))
         prof_name = String(prof.name)
-        for u in first(pool.head):last(pool.tail)
+        for i in first(pool.head):last(pool.tail)
             # A profile with a `precompile` list leaves its setups to its workers: compiled
             # here, a setup would build each dependency that has no cache, one at a time.
-            p.profiles[p.units.profile[u]].precompile === nothing || continue
-            here = single && !needs_worker(p, u)
+            p.profiles[p.items.profile[i]].precompile === nothing || continue
+            here = single && !needs_worker(p, i)
             flags = here ? default_flags : pool_flags
             # Flags that could not be read were said; those workers compile for themselves.
             flags === nothing && continue
@@ -252,7 +250,7 @@ function setup_needs(run::Run, p::Plan, flags_of)
             needs = out[k].needs
             args = here ? `` : pool_args
             named = own_project || (!here && flags != default_flags)
-            for i in p.units.span[u], name in setups_of(p.items, i)
+            for name in setups_of(p.items, i)
                 at = findfirst(n -> n.name === name && n.flags == flags, needs)
                 if at === nothing
                     push!(needs, (; name, args, flags, dir = joinpath(p.packages.root[p.items.package[i]], "test", TESTSETUPS_DIR),

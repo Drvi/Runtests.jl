@@ -48,13 +48,15 @@ mutable struct PhaseStats
     # maxima from different instants, printed side by side, contradict each other.
     nprocs_at_peak::Int
     workers_at_peak::Int       # of those, the live workers
+    nprocs_peak::Int           # most processes ever sampled in this stage
     # Processes started during this stage. A stage that replaces a worker per item
     # churns through many more than are ever alive together.
     starts::Int
 end
 
-PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, nprocs_at_peak = 0, workers_at_peak = 0, starts = 0) =
-    PhaseStats(entered, peak_total, peak_single, nprocs_at_peak, workers_at_peak, starts)
+PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, nprocs_at_peak = 0, workers_at_peak = 0,
+           nprocs_peak = 0, starts = 0) =
+    PhaseStats(entered, peak_total, peak_single, nprocs_at_peak, workers_at_peak, nprocs_peak, starts)
 
 """
     CpuReading
@@ -124,16 +126,14 @@ function phase_seconds(st::MemStats, p::RunPhase, finish::Float64)
     return max(0.0, ends - entered)
 end
 
-const RING_SAMPLES = 300      # 60 s of history at 5 Hz, allocated once
-
 """
     Reading
 
 What the monitor has measured, as of its newest sample, for readers on other
 threads: the status line, which whoever prints redraws, and the report of a worker
 that died. Built whole by the monitor's task and published through one atomic
-field, so a reader sees one sample's figures together; the ring, the statistics and
-the peaks it is built from stay the monitor's own.
+field, so a reader sees one sample's figures together; the statistics and peaks it
+is built from stay the monitor's own.
 """
 struct Reading
     sample::Sample
@@ -155,8 +155,7 @@ mutable struct Monitor
     # restores it, or every access from the sampling loop is a dynamic lookup.
     const run::Any
     const stats::MemStats
-    const samples::Vector{Sample}
-    ring_head::Int
+    last_sample::Sample
     # See `Reading`: the only way into what the monitor measures from another thread.
     @atomic reading::Reading
     task::Union{Nothing, Task}
@@ -252,7 +251,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     @atomic phase_stats(stats, PHASE_SETUP).entered = entered
     n = nslots(run.plan)
     return Monitor(
-        run, stats, fill(Sample(), RING_SAMPLES), 0,
+        run, stats, Sample(),
         Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
         nothing, false, false,
         PHASE_SETUP, interval, print_interval, tty, terminal_columns(tty),
@@ -451,11 +450,7 @@ function sample!(m::Monitor)
     load1 = Float32(cpu_load())
     cpu_pct = load1 >= 0 ? -1.0f0 : cpu_percent!(m, time())
     s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1, cpu_pct)
-    # The sample before the head that points at it: a reader between the two would
-    # get the slot's previous contents, a sample from minutes ago.
-    head = mod1(m.ring_head + 1, RING_SAMPLES)
-    m.samples[head] = s
-    m.ring_head = head
+    m.last_sample = s
     update_stats!(m, s)
     st = m.stats
     @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes,
@@ -490,6 +485,7 @@ function update_stats!(m::Monitor, s::Sample)
         ps.workers_at_peak = Int(s.nworkers)
     end
     s.largest_rss > ps.peak_single && (ps.peak_single = s.largest_rss)
+    s.nprocs > ps.nprocs_peak && (ps.nprocs_peak = Int(s.nprocs))
     return nothing
 end
 
@@ -867,7 +863,7 @@ progress_due(done::Integer, reported::Integer, now::Float64, last_print::Float64
 
 function maybe_print(m::Monitor)
     now = time()
-    s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
+    s = m.last_sample
     if m.tty
         now - m.last_print < 0.5 && return nothing
         m.last_print = now
@@ -1072,7 +1068,7 @@ const GUARD_HYSTERESIS = 0.02
 function guard!(m::Monitor)
     run = run_of(m)
     threshold = run.plan.cfg.memory_threshold
-    s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
+    s = m.last_sample
     s.machine_total > 0 || return nothing
     pressure = s.machine_used / s.machine_total
     now = time()

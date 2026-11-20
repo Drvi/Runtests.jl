@@ -32,7 +32,7 @@ function plan_block(p::Plan, order)
         print_profiles(io, p)
         print_env_settings(io, p.cfg)
         print_coverage_setting(io, p.cfg)
-        estimated = any(>(0), p.units.est_s)
+        estimated = any(>(0), p.items.est_s)
         if !single_process(p)
             estimated && println(io, "estimated work: ",
                                  join(("w$s $(est_text(w))" for (s, w) in enumerate(order.work)), " · "))
@@ -141,20 +141,14 @@ another profile's items first pays what the recorded runs say a fresh worker cos
 estimated busy seconds, without what it waits for a gate. A run without workers takes the units in plan order.
 """
 function run_order(p::Plan)
-    typical = typical_estimate(p.units.est_s)
-    est = [e > 0 ? e : typical for e in p.units.est_s]
+    typical = typical_estimate(p.items.est_s)
+    est = [e > 0 ? e : typical for e in p.items.est_s]
     items = Tuple{Float64, Int, ItemIdx}[]
-    function started!(t, s, u)
-        span = p.units.span[u]
-        for (k, i) in enumerate(span)
-            push!(items, (t + (k - 1) * est[u] / length(span), s, i))
-        end
-    end
     if single_process(p)
         t = 0.0
-        for u in UnitIdx(1):UnitIdx(length(p.units))
-            started!(t, 1, u)
-            t += est[u]
+        for i in ItemIdx(1):ItemIdx(nitems(p))
+            push!(items, (t, 1, i))
+            t += est[i]
         end
         return (; items, work = [t])
     end
@@ -162,18 +156,18 @@ function run_order(p::Plan)
     free = zeros(nslots(p))
     waited = zeros(nslots(p))   # what of `free` a worker spent waiting for a gate, not working
     done = falses(nslots(p))
-    gated = Tuple{Float64, UnitIdx}[]   # the units of gates handed out, and when each ends
+    gated = Tuple{Float64, ItemIdx}[]   # the items of gates handed out, and when each ends
     while !all(done)
         # The next worker to ask is the first free, and the lowest numbered of those.
         s = argmin(k -> (done[k], free[k], k), 1:nslots(p))
         # What ended by then lets its gate run another.
-        for (t, u) in gated
-            t <= free[s] && unit_ended!(q, u)
+        for (t, item) in gated
+            t <= free[s] && item_ended!(q, item)
         end
         filter!(((t, _),) -> t > free[s], gated)
         claim = @lock q.lock claim_now!(q, s)
         if claim.kind === :wait
-            # It waits for the first of the gates' units to end.
+            # It waits for the first of the gates' items to end.
             isempty(gated) && error("Runtests internal error: a worker waits for a gate that runs nothing")
             t = minimum(first, gated)
             waited[s] += t - free[s]
@@ -182,9 +176,9 @@ function run_order(p::Plan)
         end
         claim.kind === :done && (done[s] = true; continue)
         claim.kind === :rebind && (free[s] += cold_cost(q, claim.pool); continue)
-        started!(free[s], s, claim.unit)
-        free[s] += est[claim.unit]
-        q.gate[claim.unit] == 0 || push!(gated, (free[s], claim.unit))
+        push!(items, (free[s], s, claim.item))
+        free[s] += est[claim.item]
+        q.gate[claim.item] == 0 || push!(gated, (free[s], claim.item))
     end
     return (; items = sort!(items; by = x -> (x[1], x[2])), work = free .- waited)
 end
@@ -209,35 +203,36 @@ Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
 worker's stretch, where file order put it. `work` is each gate's, which a caller
 with many rows sums once.
 """
-function why_text(p::Plan, u::UnitIdx, work::Vector{Float64} = gate_work(p))
-    why = p.units.why[u]
-    throttle = p.units.throttle[u]
+function why_text(p::Plan, i::Integer, work::Vector{Float64} = gate_work(p))
+    it = p.items
+    why = it.why[i]
+    throttle = it.throttle[i]
     why === PINNED_FIRST && return "[order] first"
     why === PINNED_LAST && return "[order] last"
     why === SANDBOXED && return "sandbox"
     if why === LONG
-        g = p.units.gate[u]
-        # A gate's unit is as long as its own estimate or its gate's work over its
+        g = it.gate[i]
+        # A gate's item is as long as its own estimate or its gate's work over its
         # limit, whichever is longer (`order_pool!`).
         floor = g == 0 ? 0.0 : work[g] / p.gate_limit[g]
-        p.units.est_s[u] < floor && return string("long: throttle `", throttle, "` est ", est_text(floor), ", ",
-                                                  p.gate_limit[g], " at a time")
-        return string("long: est ", est_text(p.units.est_s[u]),
+        it.est_s[i] < floor && return string("long: throttle `", throttle, "` est ", est_text(floor), ", ",
+                                             p.gate_limit[g], " at a time")
+        return string("long: est ", est_text(it.est_s[i]),
                       throttle === NO_THROTTLE ? "" : string(" (throttle: `", throttle, "`)"))
     end
     why === RECENT || return ""
-    ago = p.units.failed_ago[u]
-    how = p.units.cancelled[u] ? "cancelled" : "failed"
+    ago = it.failed_ago[i]
+    how = it.cancelled[i] ? "cancelled" : "failed"
     failed = ago < 0 ? "" : ago == 0 ? "$how in the last run" : string(how, " ", ago + 1, " runs ago")
-    changed = p.units.changed_item[u] == 0 ? "" : p.units.changed_new[u] ? "new" : "edited since its last run"
+    changed = !it.changed[i] ? "" : it.changed_new[i] ? "new" : "edited since its last run"
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
-# Each gate's recorded work: its units' estimates, summed.
+# Each gate's recorded work: its items' estimates, summed.
 function gate_work(p::Plan)
     work = zeros(length(p.gate_limit))
-    for (u, g) in pairs(p.units.gate)
-        g == 0 || (work[g] += p.units.est_s[u])
+    for (i, g) in pairs(p.items.gate)
+        g == 0 || (work[g] += p.items.est_s[i])
     end
     return work
 end
@@ -246,13 +241,12 @@ end
 # its throttle's limit, and the setups it loads.
 function details_text(p::Plan, i::Integer)
     it = p.items
-    u = it.unit[i]
     parts = String[]
-    g = p.units.gate[u]
-    g == 0 || push!(parts, string("throttle `", p.units.throttle[u], "`, ", p.gate_limit[g], " at a time"))
+    g = it.gate[i]
+    g == 0 || push!(parts, string("throttle `", it.throttle[i], "`, ", p.gate_limit[g], " at a time"))
     # A sandbox is the reason it goes early, unless something else put it there.
-    p.units.exclusive[u] && p.units.why[u] !== SANDBOXED && push!(parts, "sandbox")
-    prof = p.profiles[p.units.profile[u]]
+    it.exclusive[i] && it.why[i] !== SANDBOXED && push!(parts, "sandbox")
+    prof = p.profiles[it.profile[i]]
     prof.name === DEFAULT_PROFILE || push!(parts, string("profile `", prof.name, "`"))
     it.timeout_s[i] == USE_RUN_DEFAULT || push!(parts, string("timeout ", it.timeout_s[i], "s"))
     it.retries[i] == USE_RUN_DEFAULT || push!(parts, string("retries ", it.retries[i]))
@@ -366,7 +360,7 @@ function print_plan_table(io::IO, p::Plan, order)
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     work = gate_work(p)
-    whys = [why_text(p, it.unit[i], work) for i in rows]
+    whys = [why_text(p, i, work) for i in rows]
     details = [details_text(p, i) for i in rows]
     columns = Tuple{String, Vector{String}}[]
     push!(columns, ("#", [string(i) for i in 1:n]))
@@ -999,7 +993,7 @@ function print_evidence_kept(io::IO, run)
     println(io, "artifacts of ", plural(length(kept), "failed attempt"), ":")
     for (i, attempt) in kept
         # Which attempt, where the item could have had several.
-        which = attempts_for(p, p.items.unit[i]) > 1 ? string(" attempt ", attempt) : ""
+        which = attempts_for(p, i) > 1 ? string(" attempt ", attempt) : ""
         print(io, "  ", repr(p.items.name[i]), which, ": ")
         printstyled(io, attempt_artifacts(run, i, attempt); color = :light_black)
         println(io)

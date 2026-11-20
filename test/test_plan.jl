@@ -16,19 +16,18 @@ end
 
 # The order items would run in if the workers' queues were concatenated.
 dispatch_order(p) = [p.items.name[i] for i in 1:nitems(p)]
-slot_names(p, s) = [p.items.name[i] for u in p.slot_units[s] for i in p.units.span[u]]
+slot_names(p, s) = [p.items.name[i] for i in p.slot_items[s]]
 # Every item in the order the plan hands them out: each pool's head, its slots' stretches
 # (the whole body for a pool still waiting for a slot), then its tail.
 planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
-              for r in [[pool.head]; [p.slot_units[s] for s in 1:nslots(p) if p.slot_pool[s] == k];
+              for r in [[pool.head]; [p.slot_items[s] for s in 1:nslots(p) if p.slot_pool[s] == k];
                         k in p.pending ? [pool.body] : UnitRange{Int32}[]; [pool.tail]]
-              for u in r for i in p.units.span[u]]
+              for i in r]
 
 @testset "plan" begin
-    @testset "every item lands in exactly one unit, handed out exactly once" begin
+    @testset "every item lands in the plan, handed out exactly once" begin
         p = make_plan()
         @test nitems(p) == 6
-        @test length(p.units) == 6
         @test sort(dispatch_order(p)) == sort([i.name for i in read_items()])
         assigned = planned(p)
         @test sort(assigned) == sort(dispatch_order(p))
@@ -85,7 +84,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
 
     @testset "workers are capped by the work available" begin
         p = make_plan(; workers=64)
-        @test nslots(p) <= length(p.units)
+        @test nslots(p) <= nitems(p)
         # and no pool has more slots than it has units to hand out
         for (k, pool) in enumerate(p.pools)
             @test count(==(k), p.slot_pool) <= length(pool.head) + length(pool.body) + length(pool.tail)
@@ -145,7 +144,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # Over a quarter of a slot's share, but a matter of seconds: not long.
         p = plan_dir(dir; history=History(Dict("a1" => 2.0), Dict{String,Int}()))
         @test isempty(only(p.pools).head)
-        @test p.units.why[p.items.unit[findfirst(==("a1"), p.items.name)]] === Runtests.Private.IN_FILE_ORDER
+        @test p.items.why[findfirst(==("a1"), p.items.name)] === Runtests.Private.IN_FILE_ORDER
         # A sandboxed unit goes before any of them: its process is fresh anyway.
         write(joinpath(dir, "test", "c_test.jl"), items("c1") * "@testitem \"alone\" sandbox=true begin\n    @test true\nend\n")
         @test first(dispatch_order(plan_dir(dir; history=h))) == "alone"
@@ -163,7 +162,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                               "test/b_test.jl" => items("b1", "b2"),
                               "test/TestItems.toml" => "[order]\nfirst = [\"b2\"]\nlast = [\"a1\"]\n"))
         q = Runtests.Private.Queues(p)
-        next(s) = (c = Runtests.Private.claim!(q, s); c.kind === :unit ? p.items.name[first(p.units.span[c.unit])] : c.kind)
+        next(s) = (c = Runtests.Private.claim!(q, s); c.kind === :item ? p.items.name[c.item] : c.kind)
         @test [next(2), next(2), next(1)] == ["b2", "b1", "a2"]
         @test next(2) == "a5"                                   # the second half of a3–a6
         @test [next(1), next(1), next(1)] == ["a3", "a4", "a6"] # then the one unit slot 2 had left
@@ -201,7 +200,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                 rng = Xoshiro(seed)
                 q = Runtests.Private.Queues(p)
                 serves = copy(p.slot_pool)      # the pool each slot's process was started for
-                handed = zeros(Int, length(p.units))
+                handed = zeros(Int, nitems(p))
                 live = collect(1:nslots(p))
                 while !isempty(live)
                     s = rand(rng, live)
@@ -215,31 +214,30 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                             push!(wrong, "seed $seed: slot $s rebound to pool $(c.pool), which had nothing left")
                         serves[s] = c.pool
                     else
-                        handed[c.unit] += 1
-                        starts(p, p.units.profile[c.unit]) == starts(p, p.pools[serves[s]].profile) ||
-                            push!(wrong, "seed $seed: slot $s, serving pool $(serves[s]), took unit $(c.unit)")
+                        handed[c.item] += 1
+                        starts(p, p.items.profile[c.item]) == starts(p, p.pools[serves[s]].profile) ||
+                            push!(wrong, "seed $seed: slot $s, serving pool $(serves[s]), took item $(c.item)")
                     end
                 end
-                all(==(1), handed) || push!(wrong, "seed $seed: units handed out $(handed)")
+                all(==(1), handed) || push!(wrong, "seed $seed: items handed out $(handed)")
             end
             @test isempty(wrong)
         end
     end
 
-    @testset "every item is a unit of its own, and an item of a throttle is a unit of its gate" begin
+    @testset "an item of a throttle belongs to its gate" begin
         dir = make_pkg("Gated",
             "test/a_test.jl" => declared("g1", "g2", "g3"; opts = "throttle=:g") * declared("c1", "c2"; opts = "throttle=:c") *
                                 declared("a1"),
             "test/TestItems.toml" => "[throttle]\ng = 2\nunused = 3\n")
         p = plan_dir(dir; workers = 3)
-        @test length(p.units) == nitems(p) && all(r -> length(r) == 1, p.units.span)
-        unit(n) = p.items.unit[findfirst(==(n), p.items.name)]
-        gate(n) = p.units.gate[unit(n)]
-        @test all(n -> p.units.throttle[unit(n)] === :g, ("g1", "g2", "g3")) && allequal(gate.(["g1", "g2", "g3"]))
+        item(n) = findfirst(==(n), p.items.name)
+        gate(n) = p.items.gate[item(n)]
+        @test all(n -> p.items.throttle[item(n)] === :g, ("g1", "g2", "g3")) && allequal(gate.(["g1", "g2", "g3"]))
         # `c` has no limit in [throttle], so 1: one of its items at a time.
-        @test gate("c1") == gate("c2") != gate("g1") && p.units.throttle[unit("c1")] === :c
+        @test gate("c1") == gate("c2") != gate("g1") && p.items.throttle[item("c1")] === :c
         @test p.gate_limit[gate("g1")] == 2 && p.gate_limit[gate("c1")] == 1
-        @test p.units.throttle[unit("a1")] === NO_THROTTLE && gate("a1") == 0
+        @test p.items.throttle[item("a1")] === NO_THROTTLE && gate("a1") == 0
         # The dry run says which, on each item's row.
         out = sprint(print_plan, p)
         row(n) = only(l for l in split(out, '\n') if occursin(repr(n), l))
@@ -258,38 +256,38 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         walked = Runtests.Private.walk_test_dir(testdir)
         raw = scan(walked.tests, Filter(), setup_modules(testdir); environments = walked.environments)
         p = plan(raw, read_config(testdir; nunits = length(raw)); root = dir)
-        unit(n) = p.items.unit[findfirst(==(n), p.items.name)]
-        @test p.units.exclusive[unit("s1")]
-        @test allequal(p.units.gate[unit(n)] for n in ("s1", "m1", "q1")) && p.gate_limit == [1]
-        @test length(unique(p.units.profile[unit(n)] for n in ("s1", "m1", "q1"))) == 3
+        item(n) = findfirst(==(n), p.items.name)
+        @test p.items.exclusive[item("s1")]
+        @test allequal(p.items.gate[item(n)] for n in ("s1", "m1", "q1")) && p.gate_limit == [1]
+        @test length(unique(p.items.profile[item(n)] for n in ("s1", "m1", "q1"))) == 3
     end
 
-    @testset "a gate's units start early and together, and bound how soon their pool can finish" begin
-        # Eight units of ten seconds that one at a time take eighty: longer than the
+    @testset "a gate's items start early and together, and bound how soon their pool can finish" begin
+        # Eight items of ten seconds that one at a time take eighty: longer than the
         # pool's share among four workers, so they go first, in file order.
         dir = make_pkg("GateFirst",
             "test/a_test.jl" => declared(("a$i" for i in 1:8)...),
             "test/g_test.jl" => declared(("g$i" for i in 1:8)...; opts = "throttle=:g"),
             "test/TestItems.toml" => "[throttle]\ng = 1\n")
         h = History(Dict(n => 10.0 for n in [["a$i" for i in 1:8]; ["g$i" for i in 1:8]]), Dict{String, Int}())
-        # At 1 the throttle is one unit of eighty seconds, long by itself.
+        # At 1 the throttle is eighty seconds of gated work, long by itself.
         p = plan_dir(dir; history = h, workers = 4)
-        @test p.units.why[p.items.unit[findfirst(==("g1"), p.items.name)]] === Runtests.Private.LONG
+        @test p.items.why[findfirst(==("g1"), p.items.name)] === Runtests.Private.LONG
         write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ng = 2\n")
         p = plan_dir(dir; history = h, workers = 4)
-        gated = [p.items.unit[findfirst(==("g$i"), p.items.name)] for i in 1:8]
-        @test all(u -> p.units.why[u] === Runtests.Private.LONG, gated)
+        gated = [findfirst(==("g$i"), p.items.name) for i in 1:8]
+        @test all(i -> p.items.why[i] === Runtests.Private.LONG, gated)
         @test gated == collect(first(p.pools[1].head):(first(p.pools[1].head) + 7))
         @test occursin("throttle `g` est 40.0s, 2 at a time", Runtests.Private.why_text(p, gated[1]))
-        # Unthrottled, each is a ten-second unit and none is long.
+        # Unthrottled, each is a ten-second item and none is long.
         write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ng = 8\n")
         p = plan_dir(dir; history = h, workers = 4)
-        @test all(i -> p.units.why[p.items.unit[findfirst(==("g$i"), p.items.name)]] === Runtests.Private.IN_FILE_ORDER, 1:8)
+        @test all(i -> p.items.why[findfirst(==("g$i"), p.items.name)] === Runtests.Private.IN_FILE_ORDER, 1:8)
     end
 
-    @testset "however the slots take turns, a gate never runs more than its limit, and every unit runs once" begin
+    @testset "however the slots take turns, a gate never runs more than its limit, and every item runs once" begin
         # A gate of two in two pools, beside a gate of one and plain items, with slots
-        # fewer than the pools to more than one per pool. A slot runs one unit at a time and
+        # fewer than the pools to more than one per pool. A slot runs one item at a time and
         # claims again only once it ended, as `run_slot` does.
         dir = make_pkg("GateTurns",
             "test/a_test.jl" => declared("a1", "a2", "a3") * declared(("g$i" for i in 1:5)...; opts = "throttle=:g"),
@@ -303,14 +301,14 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             for seed in 1:200
                 rng = Xoshiro(seed)
                 q = P.Queues(p)
-                current = zeros(Int32, nslots(p))   # the unit each slot runs, 0 for none
-                handed = zeros(Int, length(p.units))
+                current = zeros(Int32, nslots(p))   # the item each slot runs, 0 for none
+                handed = zeros(Int, nitems(p))
                 live = collect(1:nslots(p))
                 steps = 0
                 while !isempty(live) && (steps += 1) < 100_000
                     s = rand(rng, live)
                     if current[s] != 0
-                        P.unit_ended!(q, current[s])
+                        P.item_ended!(q, current[s])
                         current[s] = 0
                         continue
                     end
@@ -318,26 +316,26 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                     if c.kind === :done
                         filter!(!=(s), live)
                     elseif c.kind === :wait
-                        # Only while a unit of a gate runs: its end lets the slot go on.
-                        any(u -> u != 0 && p.units.gate[u] != 0, current) ||
+                        # Only while an item of a gate runs: its end lets the slot go on.
+                        any(i -> i != 0 && p.items.gate[i] != 0, current) ||
                             push!(wrong, "seed $seed: slot $s waits, and no gate runs anything")
-                    elseif c.kind === :unit
-                        current[s] = c.unit
-                        handed[c.unit] += 1
-                        g = p.units.gate[c.unit]
-                        running = count(u -> u != 0 && p.units.gate[u] == g, current)
+                    elseif c.kind === :item
+                        current[s] = c.item
+                        handed[c.item] += 1
+                        g = p.items.gate[c.item]
+                        running = count(i -> i != 0 && p.items.gate[i] == g, current)
                         g == 0 || running <= p.gate_limit[g] ||
-                            push!(wrong, "seed $seed: $running units of gate $g run at once")
+                            push!(wrong, "seed $seed: $running items of gate $g run at once")
                     end
                 end
                 steps < 100_000 || push!(wrong, "seed $seed: the slots stopped making progress")
-                all(==(1), handed) || push!(wrong, "seed $seed: units handed out $(handed)")
+                all(==(1), handed) || push!(wrong, "seed $seed: items handed out $(handed)")
             end
             @test isempty(wrong)
         end
     end
 
-    @testset "a slot whose pool holds only units their gate holds back waits, and takes nothing as it wakes" begin
+    @testset "a slot whose pool holds only items their gate holds back waits, and takes nothing as it wakes" begin
         dir = make_pkg("GateWait", "test/a_test.jl" => declared("g1", "g2", "g3", "g4"; opts = "throttle=:g"),
                        "test/TestItems.toml" => "[throttle]\ng = 2\n")
         # A third worker would only wait: the gate's work over its limit bounds the run.
@@ -346,18 +344,18 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         P = Runtests.Private
         q = P.Queues(p)
         first_ = P.claim!(q, 1); second = P.claim!(q, 2)
-        @test first_.kind === :unit && second.kind === :unit
+        @test first_.kind === :item && second.kind === :item
         @test (@lock q.lock P.claim_now!(q, 1)).kind === :wait
         waiting(s) = (t = Threads.@spawn P.claim!(q, s); sleep(0.2); @test !istaskdone(t); t)
-        # A unit of the gate that ends wakes it, and it goes back to its loop, which
+        # An item of the gate that ends wakes it, and it goes back to its loop, which
         # looks at the memory guard before it claims: the place stays free meanwhile.
         t = waiting(1)
         P.set_paused!(q, true)
-        P.unit_ended!(q, first_.unit)
+        P.item_ended!(q, first_.item)
         @test fetch(t).kind === :wait && q.gate_running == [1]
         P.set_paused!(q, false)
         third = P.claim!(q, 1)
-        @test third.kind === :unit && allunique([first_.unit, second.unit, third.unit]) && q.gate_running == [2]
+        @test third.kind === :item && allunique([first_.item, second.item, third.item]) && q.gate_running == [2]
         # The memory guard asking for its worker wakes it as well.
         t = waiting(1)
         P.wake_waiting!(q)
@@ -406,23 +404,23 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         p = plan_dir(dir; history = h, workers = 3)
         P = Runtests.Private
         q = P.Queues(p)
-        pool_of(name) = (u = p.items.unit[findfirst(==(name), p.items.name)];
-                         findfirst(k -> u in first(p.pools[k].head):last(p.pools[k].tail), eachindex(p.pools)))
+        pool_of(name) = (i = findfirst(==(name), p.items.name);
+                         findfirst(k -> i in first(p.pools[k].head):last(p.pools[k].tail), eachindex(p.pools)))
         t_slots = [s for s in 1:nslots(p) if p.slot_pool[s] == pool_of("t1")]
         s_slot = only(s for s in 1:nslots(p) if p.slot_pool[s] == pool_of("s1"))
         @test length(t_slots) == 2
-        @test all(s -> P.claim!(q, s).kind === :unit, t_slots)
-        @test P.claim!(q, s_slot).kind === :unit
+        @test all(s -> P.claim!(q, s).kind === :item, t_slots)
+        @test P.claim!(q, s_slot).kind === :item
         # Its own pool done, it would only wait for the gate there.
         @test P.claim!(q, s_slot).kind === :done
     end
 
-    @testset "a gate's long units go longest first" begin
+    @testset "a gate's long items go longest first" begin
         dir = make_pkg("GateLongest", "test/a_test.jl" => declared("g1", "g2", "g3", "g4"; opts = "throttle=:g"),
                        "test/TestItems.toml" => "[throttle]\ng = 2\n")
         h = History(Dict("g1" => 10.0, "g2" => 10.0, "g3" => 10.0, "g4" => 30.0), Dict{String, Int}())
         p = plan_dir(dir; history = h, workers = 2)
-        @test [p.items.name[first(p.units.span[u])] for u in p.pools[1].head] == ["g4", "g1", "g2", "g3"]
+        @test [p.items.name[i] for i in p.pools[1].head] == ["g4", "g1", "g2", "g3"]
         order = Runtests.Private.run_order(p)
         @test maximum(t + p.items.est_s[i] for (t, _, i) in order.items) == 30.0
     end
@@ -494,7 +492,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         s = findfirst(==(pool_named(:dry)), p.slot_pool)
         claim!, Q = Runtests.Private.claim!, Runtests.Private.Queues
         q = Q(p)
-        @test claim!(q, s).kind === :unit
+        @test claim!(q, s).kind === :item
         c = claim!(q, s)
         @test c.kind === :rebind && c.pool == pool_named(:many)
         # With `many` all handed out, no move makes a pool finish sooner: the slot is
@@ -545,7 +543,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         known = History(second, Dict{String, Int}())
         Q, claim!, cold_cost, ColdCost = Runtests.Private.Queues, Runtests.Private.claim!, Runtests.Private.cold_cost,
             Runtests.Private.ColdCost
-        profile_of(p, c) = p.profiles[p.units.profile[c.unit]].name
+        profile_of(p, c) = p.profiles[p.items.profile[c.item]].name
         pool_named(p, name) = findfirst(k -> p.profiles[k.profile].name === name, p.pools)
         tiny_slot(p) = findfirst(==(pool_named(p, :tiny)), p.slot_pool)
 
@@ -561,9 +559,9 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test profile_of(p, claim!(q, s)) === :tiny
         c = claim!(q, s)
         @test c.kind === :rebind && c.pool == default
-        # From there it takes default units, as one of the pool's own slots would.
+        # From there it takes default items, as one of the pool's own slots would.
         c = claim!(q, s)
-        @test c.kind === :unit && profile_of(p, c) === :default
+        @test c.kind === :item && profile_of(p, c) === :default
         @test q.serving[default] == 3
 
         # A fresh default worker that takes longer to be ready than the six seconds
@@ -935,7 +933,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
     end
 
     @testset "the dry run says why an item goes where it does" begin
-        whys(p) = Dict(p.items.name[i] => Runtests.Private.why_text(p, p.items.unit[i]) for i in 1:nitems(p))
+        whys(p) = Dict(p.items.name[i] => Runtests.Private.why_text(p, i) for i in 1:nitems(p))
         # From the recorded runs: one item failed in the newest, one three runs back,
         # and one took far longer than the rest.
         h = History(Dict("uses setup" => 100.0, "add works" => 0.1, "mul works" => 0.1),

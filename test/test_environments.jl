@@ -41,8 +41,8 @@ uuid_of(project_dir) = TOML.parsefile(joinpath(project_dir, "Project.toml"))["uu
 # Each item's profile, environment and whether it has a process of its own, by name.
 function pools_of(p)
     return Dict(begin
-                    prof = p.profiles[p.units.profile[p.items.unit[i]]]
-                    p.items.name[i] => (prof.name, prof.environment, p.units.exclusive[p.items.unit[i]])
+                    prof = p.profiles[p.items.profile[i]]
+                    p.items.name[i] => (prof.name, prof.environment, p.items.exclusive[i])
                 end for i in 1:nitems(p))
 end
 

@@ -66,6 +66,33 @@ ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, a
     ItemSpec(index, name, file, line, code, skip, failfast, project_name, profile, attempt, full_stacktraces,
              logpath, seed, artifacts, "")
 
+"""
+    EndSpec
+
+Lightweight item metadata sent over `KIND_END` for a profile's `test_end` hook,
+omitting the item's `code::Expr`, `skip`, `failfast` and `artifacts` path.
+"""
+struct EndSpec
+    index            :: Int32
+    name             :: String
+    file             :: String
+    line             :: Int32
+    project_name     :: String
+    profile          :: Symbol
+    attempt          :: Int8
+    full_stacktraces :: Bool
+    logpath          :: String
+    seed             :: UInt64
+    root             :: String
+end
+
+EndSpec(s::ItemSpec) = EndSpec(
+    s.index, s.name, s.file, s.line, s.project_name, s.profile,
+    s.attempt, s.full_stacktraces, s.logpath, s.seed, s.root
+)
+
+const AnyItemSpec = Union{ItemSpec, EndSpec}
+
 struct ItemResult
     index   :: Int32
     state   :: ItemState
@@ -225,7 +252,7 @@ Evaluate a profile's `test_end` expression in a fresh module, after the item
 `spec` describes. Its results and its cost belong to the profile rather than the
 item, and the coordinator times it against a limit of its own.
 """
-function run_test_end(spec::ItemSpec, test_end::Expr)
+function run_test_end(spec::AnyItemSpec, test_end::Expr)
     ts = Test.DefaultTestSet(string(spec.name, " test_end"))
     stats = in_item(spec) do
         try
@@ -241,7 +268,7 @@ end
 # The scope an item's user code runs in: the item is visible to `current_testitem`,
 # and its testsets print nothing here, because under a run the coordinator prints
 # them. Straight from a REPL there is no coordinator, and `printing` says so.
-function in_item(f, spec::ItemSpec; printing::Bool=false)
+function in_item(f, spec::AnyItemSpec; printing::Bool=false)
     info = TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile)
     return in_dir(spec.root) do
         with(CURRENT_TESTITEM => info) do
@@ -399,7 +426,7 @@ end
 
 # `artifacts`, an item's body's `AttemptArtifacts`, is in scope while the block runs, and
 # closed once it returns; `nothing` for what is not an item's body.
-function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString,
+function eval_block!(ts::Test.AbstractTestSet, spec::AnyItemSpec, code::Expr, modname::AbstractString,
                      enter=nothing, artifacts=nothing)
     stats = Ref(PerfStats())
     prelude = item_prelude(spec)
@@ -573,7 +600,7 @@ is_failfast_error(err) = isdefined(Test, :FailFastError) && err isa Test.FailFas
 # already has, bound in the module rather than found by name, so that `@test` works
 # whether or not the test environment declares `Test`, and a worker does not load
 # Runtests, the whole coordinator, to reach it; and the package under test.
-function item_prelude(spec::ItemSpec)
+function item_prelude(spec::AnyItemSpec)
     prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
     isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
     return prelude

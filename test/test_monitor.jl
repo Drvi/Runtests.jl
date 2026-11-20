@@ -307,7 +307,7 @@ end
         # process in it, and `child max` labelled a reading from the newest sample
         # as a record.
         m = run.monitor
-        s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
+        s = m.last_sample
         if Runtests.Private.Platform.PER_PROCESS_OK[] && s.total_rss > 0
             @test occursin(
                 "tree mem " * sprint(io -> print_bytes(io, s.total_rss, Runtests.Private.TOTAL_WIDTH)), line
@@ -500,11 +500,10 @@ end
         m = Monitor(run)
         limit = p.cfg.memory_threshold
         function reading(pressure)
-            m.samples[1] = Runtests.Private.Sample(
+            m.last_sample = Runtests.Private.Sample(
                 1.0f0, PHASE_TEST, Int16(1), Int16(0), 0, 0, Int32(0),
                 round(Int64, pressure * 2^30), Int64(2^30), 0.0f0, -1.0f0
             )
-            m.ring_head = 1
         end
         reading(limit / 2)
         Runtests.Private.guard!(m)
@@ -865,7 +864,7 @@ end
         # the setup stage that spawned it: some sample of that stage has it, though
         # not necessarily the one that set the stage's peak, which can come after it
         # has gone. Windows lists no child processes.
-        Sys.iswindows() || @test any(s -> s.phase === PHASE_SETUP && s.nprocs >= 2, run.monitor.samples)
+        Sys.iswindows() || @test Runtests.Private.phase_stats(st, PHASE_SETUP).nprocs_peak >= 2
         @test phase_peak(st, PHASE_SETUP) > 0
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("setup", summary)

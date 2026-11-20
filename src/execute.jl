@@ -694,7 +694,7 @@ give an item a process to itself, and it loads the packages of one environment.
 Such an item gets a worker even under `workers=0`; passing it here would pass a test
 that never ran as written.
 """
-needs_worker(p::Plan, u::UnitIdx) = p.units.exclusive[u] || !is_plain(p.profiles[p.units.profile[u]])
+needs_worker(p::Plan, i::ItemIdx) = p.items.exclusive[i] || !is_plain(p.profiles[p.items.profile[i]])
 
 """
     skips_environment(p, j) -> Bool
@@ -719,8 +719,8 @@ is_plain(prof::Profile) = prof.name === DEFAULT_PROFILE && isempty(prof.environm
 
 # Whether any of the run's items runs under a profile other than the default, or in
 # an environment other than the test environment.
-uses_profiles(p::Plan) = any(i -> p.profiles[i].name !== DEFAULT_PROFILE, p.units.profile)
-uses_environments(p::Plan) = any(i -> !isempty(p.profiles[i].environment), p.units.profile)
+uses_profiles(p::Plan) = any(j -> p.profiles[j].name !== DEFAULT_PROFILE, p.items.profile)
+uses_environments(p::Plan) = any(j -> !isempty(p.profiles[j].environment), p.items.profile)
 
 # How a worker's UP line names profile `j`, "" for not at all. In a run of several
 # profiles, every profile is named, the default too, because a slot can move from one
@@ -739,8 +739,8 @@ end
 function warn_sandboxed_workers(p::Plan)
     single_process(p) || return nothing
     names = String[]
-    for u in UnitIdx(1):UnitIdx(length(p.units))
-        needs_worker(p, u) && append!(names, (p.items.name[i] for i in p.units.span[u]))
+    for i in ItemIdx(1):ItemIdx(nitems(p))
+        needs_worker(p, i) && push!(names, p.items.name[i])
     end
     isempty(names) && return nothing
     @warn "Runtests: workers=0, but these items need a process this one cannot be, for a sandbox, " *
@@ -1007,9 +1007,9 @@ function run_slot(run::Run, slot::Slot)
             continue
         end
         try
-            run_unit!(run, slot, claim.unit)
+            run_item!(run, slot, claim.item)
         finally
-            unit_ended!(run.queues, claim.unit)
+            item_ended!(run.queues, claim.item)
         end
     end
     stop_worker!(run, slot)
@@ -1158,7 +1158,7 @@ end
 # An item's RUN or DONE line, drawn from what this run knows about the item.
 item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
     slot_id, i, nitems(run.plan), run.names[i], run.name_width, attempt,
-    attempts_for(run.plan, run.plan.items.unit[i]), something(how, itemlocation(run.plan, i));
+    attempts_for(run.plan, i), something(how, itemlocation(run.plan, i));
     package = is_combined(run.plan) ? run.plan.packages.name[run.plan.items.package[i]] : "",
     package_width = run.package_width
 )
@@ -1477,30 +1477,29 @@ Base.showerror(io::IO, e::TimeoutException) = print(
 
 # An item's own keyword wins over the run default, the same way `timeout` and
 # `failfast` do.
-attempts_for(p::Plan, u::UnitIdx) = 1 + maximum(p.units.span[u]) do i
-    p.items.retries[i] == USE_RUN_DEFAULT ? item_cfg(p, i).retries : Int(p.items.retries[i])
-end
+attempts_for(p::Plan, i::Integer) =
+    1 + (p.items.retries[i] == USE_RUN_DEFAULT ? item_cfg(p, i).retries : Int(p.items.retries[i]))
 
-# The attempt policy, the same wherever the unit runs: on a pool worker, on a
+# The attempt policy, the same wherever the item runs: on a pool worker, on a
 # sandbox worker, or in this process under `workers=0`.
-function run_unit!(run::Run, slot::Slot, u::UnitIdx)
+function run_item!(run::Run, slot::Slot, i::ItemIdx)
     p = run.plan
-    max_attempts = attempts_for(p, u)
+    max_attempts = attempts_for(p, i)
     for attempt in 1:max_attempts
-        run_unit_once!(run, slot, u, Int8(attempt), max_attempts)
-        note_attempt!(run, slot, u)
-        has_non_pass(run, u) || return nothing
+        run_item_once!(run, slot, i, Int8(attempt), max_attempts)
+        note_attempt!(run, slot, i)
+        st = run.statuses
+        state = st.state[i]
+        is_non_pass(state) || return nothing
         # Another attempt only for an item that failed in this one. An item this attempt
         # skipped or cancelled keeps an earlier attempt's verdict (`persist_attempt!`),
         # which another attempt would not change.
-        st = run.statuses
-        failed_now = any(i -> is_decisive(st.state[i]) && is_non_pass(st.state[i]) && st.attempt[i] == attempt,
-                         p.units.span[u])
+        failed_now = is_decisive(state) && st.attempt[i] == attempt
         if attempt == max_attempts || !failed_now
             # Failfast waits for the last attempt: stopping the run under a retry
             # would record the failure as a cancellation.
             p.cfg.failfast && stop!(run, ENDING_FAILFAST) === false &&
-                print_failfast(run, first(i for i in p.units.span[u] if is_non_pass(run.statuses.state[i])))
+                print_failfast(run, i)
             return nothing
         end
         # A run stopped meanwhile, by another item's failfast or a profile whose
@@ -1510,40 +1509,34 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx)
     return nothing
 end
 
-# What one attempt at unit `u` on `slot` measured, for the scheduler: how long each
-# item took against its recorded duration, and its compile time, as a fresh process's
-# first item or a later one. Only an attempt whose items all ran and timed
-# themselves counts: an outcome the run decided took as long as it was allowed.
-function note_attempt!(run::Run, slot::Slot, u::UnitIdx)
+# What one attempt at item `i` on `slot` measured, for the scheduler: how long it
+# took against its recorded duration, and its compile time, as a fresh process's
+# first item or a later one. Only an attempt that ran and timed itself counts:
+# an outcome the run decided took as long as it was allowed.
+function note_attempt!(run::Run, slot::Slot, i::ItemIdx)
     st = run.statuses
-    span = run.plan.units.span[u]
-    any(i -> st.synthetic[i] || st.state[i] === UNSEEN || st.state[i] === CANCELLED, span) && return nothing
-    recorded = run.plan.items.est_s
+    (st.synthetic[i] || st.state[i] === UNSEEN || st.state[i] === CANCELLED) && return nothing
+    recorded = run.plan.items.est_s[i]
+    took = Float64(st.elapsed[i])
     q = run.queues
     @lock q.lock begin
         ps = q.stats[q.pool[slot.id]]
-        for i in span
-            took = Float64(st.elapsed[i])
-            ps.items += 1
-            ps.took_s += took
-            if recorded[i] > 0
-                ps.estimated_s += recorded[i]
-                ps.estimated_took_s += took
-            end
-            if st.seq[i] == 1
-                ps.cold += 1
-                ps.cold_compile_s += st.compile[i]
-            elseif st.seq[i] > 1
-                ps.warm += 1
-                ps.warm_compile_s += st.compile[i]
-            end
+        ps.items += 1
+        ps.took_s += took
+        if recorded > 0
+            ps.estimated_s += recorded
+            ps.estimated_took_s += took
+        end
+        if st.seq[i] == 1
+            ps.cold += 1
+            ps.cold_compile_s += st.compile[i]
+        elseif st.seq[i] > 1
+            ps.warm += 1
+            ps.warm_compile_s += st.compile[i]
         end
     end
     return nothing
 end
-
-has_non_pass(run::Run, u::UnitIdx) =
-    any(i -> is_non_pass(run.statuses.state[i]), run.plan.units.span[u])
 
 # Every write of an item's state goes through here, so that `run.nonpass`, which
 # the status line reads from other threads, is always the count of the states.
@@ -1555,22 +1548,20 @@ function set_state!(run::Run, i::Integer, state::ItemState)
     return nothing
 end
 
-# One attempt at the unit's item: on the slot's worker, or here when there is no pool
-# and the unit did not ask for a process of its own.
-function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, attempt::Int8, max_attempts::Int)
+# One attempt at item `i`: on the slot's worker, or here when there is no pool
+# and the item did not ask for a process of its own.
+function run_item_once!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_attempts::Int)
     p = run.plan
-    skipped = run.skipped_profiles[p.units.profile[u]]
-    exclusive = p.units.exclusive[u] && !skipped
+    skipped = run.skipped_profiles[p.items.profile[i]]
+    exclusive = p.items.exclusive[i] && !skipped
     attempt_item! = skipped ? attempt_skipped! :
-        single_process(p) && !needs_worker(p, u) ? attempt_here! : attempt_on_worker!
+        single_process(p) && !needs_worker(p, i) ? attempt_here! : attempt_on_worker!
     # A sandbox is a process to itself, and the slot may arrive holding a worker
     # that has already run other items.
     exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
-    for i in p.units.span[u]
-        if is_cancelled(run.queues)
-            is_decisive(run.statuses.state[i]) || set_state!(run, i, CANCELLED)
-            continue
-        end
+    if is_cancelled(run.queues)
+        is_decisive(run.statuses.state[i]) || set_state!(run, i, CANCELLED)
+    else
         attempt_item!(run, slot, i, attempt, max_attempts) || return nothing
     end
     exclusive && stop_worker!(run, slot)
@@ -1640,7 +1631,7 @@ end
 function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_attempts::Int)
     p = run.plan
     w = try
-        ensure_worker!(run, slot, p.units.exclusive[p.items.unit[i]])
+        ensure_worker!(run, slot, p.items.exclusive[i])
     catch e
         is_interrupt(e) && rethrow()
         hold_item!(slot, i, attempt)
@@ -1680,7 +1671,7 @@ function attempt_skipped!(run::Run, _, i::ItemIdx, attempt::Int8, _)
     printline(run, item_line(run, nothing, i, attempt, (; state = SKIPPED, elapsed_ns = 0, compile_ns = 0, maxrss = 0)))
     record!(run, i, SlotIdx(0), attempt, SKIPPED, ts, RuntestsWorkers.PerfStats(), true,
             start_off, Int32(0), Int16(0),
-            string("the run skips ", environment_name(p.profiles[p.units.profile[p.items.unit[i]]].environment)); ended)
+            string("the run skips ", environment_name(p.profiles[p.items.profile[i]].environment)); ended)
     return true
 end
 
@@ -1886,7 +1877,7 @@ end
 # The profile of item `i`'s own unit. A pool's workers start with the configuration
 # of one of its profiles, which every profile of the pool shares; what differs between
 # them, `test_end` and the name an item sees, is the item's own.
-item_profile(p::Plan, i::Integer) = p.profiles[p.units.profile[p.items.unit[i]]]
+item_profile(p::Plan, i::Integer) = p.profiles[p.items.profile[i]]
 
 function item_spec(run::Run, i::ItemIdx, attempt::Int8)
     p = run.plan
@@ -2151,7 +2142,7 @@ function persist_result!(
     # Only worth saying when there is a policy to state: a plain failure with no
     # retries configured explains itself.
     note = (is_non_pass(res.state) && max_attempts > 1) ?
-        retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, run.plan.items.unit[i])) : ""
+        retry_note(attempt, max_attempts, is_cancelled(run.queues), next_attempt_where(run.plan, i)) : ""
     ended = time()
     w = @atomic slot.worker
     tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, i, attempt, w.pid)
@@ -2163,9 +2154,9 @@ end
 # Where a unit's next attempt runs after one that failed with its process intact: a
 # sandbox's process runs one unit and goes, while a pool worker, and this process,
 # carry on with the next attempt.
-next_attempt_where(p::Plan, u::UnitIdx) =
-    p.units.exclusive[u] ? "on a new worker" :
-    single_process(p) && !needs_worker(p, u) ? "in this process" : "on the same worker"
+next_attempt_where(p::Plan, i::ItemIdx) =
+    p.items.exclusive[i] ? "on a new worker" :
+    single_process(p) && !needs_worker(p, i) ? "in this process" : "on the same worker"
 
 # `peak_rss`: what the monitor sampled of the attempt, which no worker reported.
 record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString,
@@ -2214,7 +2205,7 @@ end
 # run. Part of setup: one that throws ends the run before its first item.
 function init_in_process!(run::Run)
     p = run.plan
-    any(u -> !needs_worker(p, u), UnitIdx(1):UnitIdx(length(p.units))) || return nothing
+    any(i -> !needs_worker(p, i), ItemIdx(1):ItemIdx(nitems(p))) || return nothing
     isempty(p.profiles[1].init.args) && return nothing
     @warn "Runtests: the profile's `init` expression is evaluated in this process (workers=0)"
     # In the directory a worker of the profile would evaluate it in.
@@ -2226,15 +2217,15 @@ function run_in_process(run::Run)
     p = run.plan
     @lock run.lock push!(run.tasks, current_task())
     slot = run.slots[1]
-    # Every unit, not just the one slot's queue: a pool that would have had a
+    # Every item, not just the one slot's queue: a pool that would have had a
     # worker of its own has none here, and its items still have to run.
-    for u in UnitIdx(1):UnitIdx(length(p.units))
+    for i in ItemIdx(1):ItemIdx(nitems(p))
         is_cancelled(run.queues) && break
-        # A unit that asked for a process gets one here too — `run_unit_once!`
+        # An item that asked for a process gets one here too — `run_item_once!`
         # decides which do — started and stopped around it.
-        slot.profile = p.units.profile[u]
+        slot.profile = p.items.profile[i]
         try
-            run_unit!(run, slot, u)
+            run_item!(run, slot, i)
         finally
             stop_worker!(run, slot)
         end

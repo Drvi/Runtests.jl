@@ -979,7 +979,8 @@ Evaluate a profile's test-end expression on the worker, after the item `spec`
 describes. Fetching the future returns an `ItemResult` holding whatever the
 expression recorded or threw.
 """
-remote_end(w::Worker, spec, test_end::Expr) = send_request(w, KIND_END, (spec, test_end))
+remote_end(w::Worker, spec::ItemSpec, test_end::Expr) = send_request(w, KIND_END, (EndSpec(spec), test_end))
+remote_end(w::Worker, spec::EndSpec, test_end::Expr) = send_request(w, KIND_END, (spec, test_end))
 
 """
     remote_finish(w::Worker, index, attempt, collect) -> Future

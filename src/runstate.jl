@@ -6,32 +6,34 @@
 # configuration, profiles and seed, and says how the environment differs from the
 # one it was recorded in.
 #
-# Layout:
+# Layout (hot planning prefix first, cold replay data second, append-only events last):
 #
-#   header      96 B, fixed, holds the section offsets
-#   strings     every string in the file, referenced by index
-#   meta        key/value pairs of strings: platform, invocation, environment
-#   profiles    name, julia args, threads, env, init, test_end, preferences path and content
-#   units       n_units x 16 B: item span, profile, exclusive, throttle
-#   items       n_items x 32 B: name, file, line, unit, source hash, seed
-#   environment the test environment's Manifest.toml, zlib-compressed: its length,
-#               the compressed length, then the compressed bytes
-#   workers     each distinct environment the profiles' workers start in: project,
-#               manifest (compressed, or the one above) and LocalPreferences.toml;
-#               then each profile's, by index
-#   policies    each distinct policy of an item as the run resolved it: timeout,
-#               retries, failfast and skip; then each item's, by index
-#   statuses    n_items x 32 B, fixed stride, overwritten in place
-#   memory      fixed block, rewritten whenever a peak is set
-#   events      48 B each, appended: attempts, with what each measured, and worker
-#               events of this record
+#   header       96 B, fixed, holds the section offsets
+#   hot_strings  strings referenced by `meta` and `items`
+#   meta         key/value pairs of strings: platform, invocation, environment
+#   items        n_items x 32 B: name, file, line, throttle, hash, profile, exclusive, seed
+#   statuses     n_items x 32 B, fixed stride, overwritten in place
+#   memory       fixed 64 B block, rewritten in place whenever a peak is set
+#   --- off_cold (planning / history with `full = false` stops reading here) ---
+#   cold_strings strings referenced by `profiles`, `workers` and `policies`
+#   profiles     name, julia args, threads, env, init, test_end, preferences path and content
+#   environment  the test environment's Manifest.toml, zlib-compressed: its length,
+#                the compressed length, then the compressed bytes
+#   workers      each distinct environment the profiles' workers start in: project,
+#                manifest (compressed, or the one above) and LocalPreferences.toml;
+#                then each profile's, by index
+#   policies     each distinct policy of an item as the run resolved it: timeout,
+#                retries, failfast and skip; then each item's, by index
+#   --- off_events ---
+#   events       48 B each, appended: attempts, with what each measured, and worker
+#                events of this record
 #
-# The header says how the run ended (`RunEnding`), written as soon as the run knows,
-# and what each item was left in is read against it (`verdict`).
-#
-# After the run starts only the statuses, the memory block, the events and the
-# header's flags and end time are written, which keeps a crash from corrupting
-# anything else; a reader drops a torn last event.
+# The initial file (everything up to `off_events`, with blank statuses and memory) is
+# written to a sibling `.tmp` file and atomically renamed into place so a concurrent
+# reader never observes a half-initialized file. After the run starts only the statuses,
+# the memory block, the events and the header's ending/end_unix/closed fields are written,
+# keeping a crash or concurrent reader from seeing shifted offsets; a reader drops a torn
+# last event and sanitizes out-of-range status/memory fields.
 #
 # The manifest is most of a file's bytes, and only a replay reads it, so it is
 # stored compressed and inflated only when asked for (`recorded_manifest`):
@@ -152,58 +154,48 @@ function zlib_uncompress(data::Vector{UInt8}, len::Integer)
 end
 
 # The header as it sits on disk: counts and times, then where each section starts.
-# The flags and the end time are rewritten in place when the run finishes, at the
-# offsets this layout gives them.
+# Explicit `pad` keeps `start_unix` 8-byte aligned with no uninitialized padding bytes.
+# The ending, end time, and closed byte are rewritten in place as the run finishes.
 struct Header
     magic::UInt32
     version::UInt32
     flags::UInt32
     n_items::UInt32
-    n_units::UInt32
     n_profiles::UInt16
-    ending::UInt8      # `RunEnding`; rewritten in place as the run learns how it ends
-    closed::UInt8      # `RS_CLOSED` once the writer closed the file, after its last event and `end_unix`; `RS_OPEN` before
+    ending::UInt8           # `RunEnding`; rewritten in place as the run learns how it ends
+    closed::UInt8           # `RS_CLOSED` once the writer closed the file, after its last event and `end_unix`; `RS_OPEN` before
+    pad::UInt32             # explicit zero
     start_unix::Float64
     end_unix::Float64
-    off_strings::UInt32
+    off_strings::UInt32     # hot strings (`meta` + `items`)
     off_meta::UInt32
-    off_profiles::UInt32
-    off_units::UInt32
     off_items::UInt32
     off_status::UInt32
     off_memory::UInt32
-    off_events::UInt32
+    off_cold::UInt32        # cold strings (`profiles`, `workers`, `policies`); end of hot prefix
+    off_profiles::UInt32
     off_environment::UInt32
     off_workers::UInt32
     off_policies::UInt32
+    off_events::UInt32
 end
 @assert sizeof(Header) <= RS_HEADER_BYTES
 
 header_offset(field::Symbol) = Int(fieldoffset(Header, Base.fieldindex(Header, field)))
 
-# One item's place in the plan, and one unit's, as they sit on disk.
+# One item's place in the plan as it sits on disk (32 bytes, natural alignment).
 struct ItemRecord
     name::UInt32
     file::UInt32
     line::UInt32
-    unit::UInt32
-    hash::UInt32   # see `RawItem`
-    pad::UInt32
-    seed::UInt64   # the seed the item's numbers came from, mixed with its name
+    throttle::UInt32
+    hash::UInt32       # see `RawItem`
+    profile::UInt16
+    exclusive::UInt8
+    pad::UInt8         # explicit zero
+    seed::UInt64       # the seed the item's numbers came from, mixed with its name
 end
 @assert sizeof(ItemRecord) == 32
-
-# Sixteen bytes, with explicit zeroed padding after `exclusive` so `write_record`
-# never writes uninitialized stack bytes to disk.
-struct UnitRecord
-    first::UInt32
-    last::UInt32
-    profile::UInt8
-    exclusive::UInt8
-    pad::UInt16
-    throttle::UInt32
-end
-@assert sizeof(UnitRecord) == 16
 
 # Peak memory summary written in-place to the reserved `RS_MEMORY_BYTES` block.
 struct MemoryRecord
@@ -223,8 +215,8 @@ const MemorySummary = @NamedTuple{
 }
 const ZERO_MEMORY = MemorySummary((0.0f0, 0.0f0, 0.0f0, Int32(0), 0.0f0, 0.0f0, Int32(0)))
 memory_summary(r::MemoryRecord) = MemorySummary((
-    r.peak_total_mb, r.peak_total_at, r.peak_single_mb, r.peak_single_pid,
-    r.setup_peak_mb, r.test_peak_mb, r.nprocs_peak
+    recorded(r.peak_total_mb), recorded(r.peak_total_at), recorded(r.peak_single_mb), r.peak_single_pid,
+    recorded(r.setup_peak_mb), recorded(r.test_peak_mb), r.nprocs_peak
 ))
 
 # One item's status as it sits on disk. Every field lands on its natural alignment,
@@ -420,67 +412,55 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
                         heartbeat::Bool = true,
                         shared_env::Union{Nothing, Tuple{Vector{UInt8}, Vector{UInt8}}} = nothing)
     mkpath(dirname(path))
-    io = open(path, "w+")
-    strings = StringTable()
-    # Two per item — its name and its file — plus the profiles and the metadata.
-    sizehint!(strings.index, 2 * nitems(p) + 64)
-    sizehint!(strings.order, 2 * nitems(p) + 64)
+    hot_strings = StringTable()
+    cold_strings = StringTable()
+    # Two per item — its name and its file — plus metadata and throttle names.
+    sizehint!(hot_strings.index, 2 * nitems(p) + 64)
+    sizehint!(hot_strings.order, 2 * nitems(p) + 64)
 
-    # Write all static sections after `strings` sequentially into one `body` buffer;
-    # record each section's offset relative to `body` start, then shift by `off_meta`.
-    body = IOBuffer()
-
-    rel_meta = UInt32(position(body))
+    # Hot prefix sections: `meta` and `items` (followed on disk by `statuses` and `memory`).
+    hot_body = IOBuffer()
     pairs_ = [run_meta(p); meta]
-    write(body, UInt32(length(pairs_)))
+    write(hot_body, UInt32(length(pairs_)))
     for (k, v) in pairs_
-        write(body, intern!(strings, k), intern!(strings, v))
+        write(hot_body, intern!(hot_strings, k), intern!(hot_strings, v))
     end
 
-    rel_profiles = UInt32(position(body))
-    write(body, UInt32(length(p.profiles)))
-    for (j, prof) in enumerate(p.profiles)
-        write(body, intern!(strings, string(prof.name)))
-        write(body, UInt32(length(prof.julia_args)))
-        for a in prof.julia_args
-            write(body, intern!(strings, a))
-        end
-        # As configured, empty for the run's: a replay asked for other threads gives
-        # them to the profiles that take the run's.
-        write(body, intern!(strings, p.packages.cfg[p.profile_package[j]].profiles[prof.name].threads))
-        write(body, UInt32(length(prof.env)))
-        for (k, v) in prof.env
-            write(body, intern!(strings, k))
-            write(body, intern!(strings, v))
-        end
-        write(body, intern!(strings, expr_text(prof.init)))
-        write(body, intern!(strings, expr_text(prof.test_end)))
-        write(body, intern!(strings, prof.preferences))
-        # The content too: the path is one on the machine that ran it.
-        write(body, intern!(strings, read_text(prof.preferences)))
-    end
-
-    rel_units = UInt32(position(body))
-    write(body, UInt32(length(p.units)))
-    uref = Ref{UnitRecord}()
-    for u in 1:length(p.units)
-        span = p.units.span[u]
-        uref[] = UnitRecord(
-            UInt32(first(span)), UInt32(last(span)), UInt8(p.units.profile[u]),
-            UInt8(p.units.exclusive[u]), UInt16(0), intern!(strings, string(p.units.throttle[u]))
-        )
-        write_record(body, uref)
-    end
-
-    rel_items = UInt32(position(body))
-    write(body, UInt32(nitems(p)))
+    rel_items = UInt32(position(hot_body))
+    write(hot_body, UInt32(nitems(p)))
     iref = Ref{ItemRecord}()
     for i in 1:nitems(p)
         iref[] = ItemRecord(
-            intern!(strings, p.items.name[i]), intern!(strings, itemfile(p, i)),
-            UInt32(p.items.line[i]), UInt32(p.items.unit[i]), p.items.hash[i], UInt32(0), p.items.seed[i]
+            intern!(hot_strings, p.items.name[i]), intern!(hot_strings, itemfile(p, i)),
+            UInt32(p.items.line[i]), intern!(hot_strings, string(p.items.throttle[i])),
+            p.items.hash[i], UInt16(p.items.profile[i]), UInt8(p.items.exclusive[i]), UInt8(0),
+            p.items.seed[i]
         )
-        write_record(body, iref)
+        write_record(hot_body, iref)
+    end
+
+    # Cold replay sections: `profiles`, `environment`, `workers`, `policies`.
+    cold_body = IOBuffer()
+    write(cold_body, UInt32(length(p.profiles)))
+    for (j, prof) in enumerate(p.profiles)
+        write(cold_body, intern!(cold_strings, string(prof.name)))
+        write(cold_body, UInt32(length(prof.julia_args)))
+        for a in prof.julia_args
+            write(cold_body, intern!(cold_strings, a))
+        end
+        # As configured, empty for the run's: a replay asked for other threads gives
+        # them to the profiles that take the run's.
+        write(cold_body, intern!(cold_strings, p.packages.cfg[p.profile_package[j]].profiles[prof.name].threads))
+        write(cold_body, UInt32(length(prof.env)))
+        for (k, v) in prof.env
+            write(cold_body, intern!(cold_strings, k))
+            write(cold_body, intern!(cold_strings, v))
+        end
+        write(cold_body, intern!(cold_strings, expr_text(prof.init)))
+        write(cold_body, intern!(cold_strings, expr_text(prof.test_end)))
+        write(cold_body, intern!(cold_strings, prof.preferences))
+        # The content too: the path is one on the machine that ran it.
+        write(cold_body, intern!(cold_strings, read_text(prof.preferences)))
     end
 
     manifest, packed = if shared_env === nothing
@@ -489,41 +469,58 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, st
     else
         shared_env
     end
-    rel_environment = UInt32(position(body))
-    write(body, UInt32(length(manifest)), UInt32(length(packed)), packed)
+    rel_environment = UInt32(position(cold_body))
+    write(cold_body, UInt32(length(manifest)), UInt32(length(packed)), packed)
 
-    rel_workers = UInt32(position(body))
-    write_workers!(body, strings, p, worker_projects, manifest)
+    rel_workers = UInt32(position(cold_body))
+    write_workers!(cold_body, cold_strings, p, worker_projects, manifest)
 
-    rel_policies = UInt32(position(body))
-    write_policies!(body, strings, p)
+    rel_policies = UInt32(position(cold_body))
+    write_policies!(cold_body, cold_strings, p)
 
-    strbuf = IOBuffer()
-    write_strings(strbuf, strings)
+    hot_strbuf = IOBuffer()
+    write_strings(hot_strbuf, hot_strings)
+    cold_strbuf = IOBuffer()
+    write_strings(cold_strbuf, cold_strings)
 
-    off_strings = UInt32(RS_HEADER_BYTES)
-    off_meta = off_strings + UInt32(strbuf.size)
-    off_profiles = off_meta + rel_profiles
-    off_units = off_meta + rel_units
-    off_items = off_meta + rel_items
-    off_environment = off_meta + rel_environment
-    off_workers = off_meta + rel_workers
-    off_policies = off_meta + rel_policies
-    off_status = off_meta + UInt32(body.size)
-    off_memory = off_status + UInt32(RS_STATUS_BYTES * nitems(p))
-    off_events = off_memory + UInt32(RS_MEMORY_BYTES)
+    off_strings     = UInt32(RS_HEADER_BYTES)
+    off_meta        = off_strings + UInt32(hot_strbuf.size)
+    off_items       = off_meta + rel_items
+    off_status      = off_meta + UInt32(hot_body.size)
+    off_memory      = off_status + UInt32(RS_STATUS_BYTES * nitems(p))
+    off_cold        = off_memory + UInt32(RS_MEMORY_BYTES)
+    off_profiles    = off_cold + UInt32(cold_strbuf.size)
+    off_environment = off_profiles + rel_environment
+    off_workers     = off_profiles + rel_workers
+    off_policies    = off_profiles + rel_policies
+    off_events      = off_profiles + UInt32(cold_body.size)
 
-    write_record(io, Ref(Header(
-        RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), nitems(p), length(p.units),
-        length(p.profiles), UInt8(ENDING_NONE), RS_OPEN, start, 0.0, off_strings, off_meta, off_profiles, off_units,
-        off_items, off_status, off_memory, off_events, off_environment, off_workers, off_policies
-    )))
-    write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
-    write(io, take!(strbuf))
-    write(io, take!(body))
-    # `UInt8(UNSEEN) == 0`, so blank statuses and memory are a single zero block.
-    write(io, zeros(UInt8, RS_STATUS_BYTES * nitems(p) + RS_MEMORY_BYTES))
-    flush(io)
+    # Stage the entire initial file in a sibling temp file and atomically rename into
+    # place so a concurrent reader never sees a partially-written header or sections.
+    tmp = string(path, ".tmp")
+    try
+        open(tmp, "w") do io
+            write_record(io, Ref(Header(
+                RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), UInt32(nitems(p)),
+                UInt16(length(p.profiles)), UInt8(ENDING_NONE), RS_OPEN, UInt32(0), start, 0.0,
+                off_strings, off_meta, off_items, off_status, off_memory,
+                off_cold, off_profiles, off_environment, off_workers, off_policies, off_events
+            )))
+            write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
+            write(io, take!(hot_strbuf))
+            write(io, take!(hot_body))
+            # `UInt8(UNSEEN) == 0`, so blank statuses and memory are a single zero block.
+            write(io, zeros(UInt8, RS_STATUS_BYTES * nitems(p) + RS_MEMORY_BYTES))
+            write(io, take!(cold_strbuf))
+            write(io, take!(cold_body))
+            flush(io)
+        end
+        mv(tmp, path; force = true)
+    catch
+        rm(tmp; force = true)
+        rethrow()
+    end
+    io = open(path, "r+")
     rsf = RunStateFile(
         io, String(path), off_status, off_memory, UInt32(nitems(p)),
         ReentrantLock(), Ref{StatusRecord}(), Ref{EventRecord}(), Ref{MemoryRecord}(),
@@ -576,11 +573,10 @@ function write_policies!(io::IO, strings::StringTable, p::Plan)
     table = Dict{PolicyRecord, UInt32}()
     order = PolicyRecord[]
     index = Vector{UInt32}(undef, nitems(p))
-    retries = Int8[attempts_for(p, u) - 1 for u in UnitIdx(1):UnitIdx(length(p.units))]
     for i in 1:nitems(p)
         skip = p.items.skip[i]
         r = PolicyRecord(Int32(item_timeout(p, ItemIdx(i))), intern!(strings, skip isa Expr ? expr_text(skip) : string(skip)),
-                         retries[p.items.unit[i]], Int8(item_failfast(p, i)), UInt16(0))
+                         Int8(attempts_for(p, i) - 1), Int8(item_failfast(p, i)), UInt16(0))
         id = get(table, r, UInt32(0))
         if id == 0
             push!(order, r)
@@ -765,16 +761,11 @@ struct RunStateItem
     name::String
     file::String
     line::Int32
-    unit::Int32
-    hash::UInt32   # 0 when not recorded
-    seed::UInt64
-end
-
-struct RunStateUnit
-    span::UnitRange{Int32}
     profile::Int32
     exclusive::Bool
     throttle::Symbol
+    hash::UInt32   # 0 when not recorded
+    seed::UInt64
 end
 
 struct RunStateStatus
@@ -852,7 +843,6 @@ struct RunStateRecord
     preferences::Dict{Symbol, String}   # profile name => its preferences file's content, as recorded
     manifest_bytes::Int                 # the recorded manifest's length, inflated
     manifest_zlib::Vector{UInt8}        # the manifest as stored; see `recorded_manifest`
-    units::Vector{RunStateUnit}
     items::Vector{RunStateItem}
     statuses::Vector{RunStateStatus}
     memory::MemorySummary
@@ -932,26 +922,80 @@ function writer_gone(rs::Union{RunStateRecord, RunStateMeta})
     return ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == Base.UV_ESRCH
 end
 
-# Read only the header, string table and `meta` section of a run state file
-# (skipping profiles, units, items, compressed manifest, workers, policies, statuses, events).
+# Header section offsets must be monotonic from the end of the fixed header.
+function valid_header_offsets(h::Header)
+    return RS_HEADER_BYTES <= h.off_strings <= h.off_meta <= h.off_items <=
+        h.off_status <= h.off_memory <= h.off_cold <= h.off_profiles <=
+        h.off_environment <= h.off_workers <= h.off_policies <= h.off_events
+end
+
+# Read `n` bytes after the header already copied into `hdr`, returning a single buffer
+# covering `[0 .. RS_HEADER_BYTES + nread)`.
+function read_prefix(io::IO, hdr::Vector{UInt8}, limit::Int)
+    limit <= RS_HEADER_BYTES && return hdr
+    buf = Vector{UInt8}(undef, limit)
+    copyto!(buf, 1, hdr, 1, RS_HEADER_BYTES)
+    nread = readbytes!(io, view(buf, (RS_HEADER_BYTES + 1):limit), limit - RS_HEADER_BYTES)
+    nread == limit - RS_HEADER_BYTES || resize!(buf, RS_HEADER_BYTES + nread)
+    return buf
+end
+
+function load_run_meta(rp::String)
+    return open(rp) do io
+        written = stat(io).mtime
+        hdr = read(io, RS_HEADER_BYTES)
+        length(hdr) == RS_HEADER_BYTES || return nothing
+        h = read_record(IOBuffer(hdr), Header)
+        (h.magic == RS_MAGIC && h.version == RS_VERSION && valid_header_offsets(h)) || return nothing
+        limit = min(Int(h.off_items), Int(filesize(io)))
+        return read_prefix(io, hdr, limit), h, written
+    end
+end
+
+function load_run_state(rp::String, full::Bool)
+    return open(rp) do io
+        written = stat(io).mtime
+        hdr = read(io, RS_HEADER_BYTES)
+        length(hdr) == RS_HEADER_BYTES || return nothing
+        h = read_record(IOBuffer(hdr), Header)
+        (h.magic == RS_MAGIC && h.version == RS_VERSION && valid_header_offsets(h)) || return nothing
+        fsize = Int(filesize(io))
+        if full
+            bytes = read_prefix(io, hdr, fsize)
+            # A live writer may have appended events after `filesize` was queried.
+            eof(io) || append!(bytes, read(io))
+            return rp, h, written, bytes, bytes, Int(h.off_events), fsize
+        else
+            # Hot prefix only `[0 .. off_cold)`, skipping all cold replay sections on disk.
+            hot_limit = min(Int(h.off_cold), fsize)
+            hot_bytes = read_prefix(io, hdr, hot_limit)
+            ev_bytes = if Int(h.off_events) <= fsize
+                seek(io, Int(h.off_events))
+                ev_n = fsize - Int(h.off_events)
+                buf = Vector{UInt8}(undef, ev_n)
+                nread = ev_n > 0 ? readbytes!(io, buf, ev_n) : 0
+                nread == ev_n || resize!(buf, nread)
+                eof(io) || append!(buf, read(io))
+                buf
+            else
+                UInt8[]
+            end
+            return rp, h, written, hot_bytes, ev_bytes, 0, fsize
+        end
+    end
+end
+
+# Read only the header, hot string table and `meta` section of a run state file
+# (skipping items, statuses, memory, cold replay sections and events).
 function read_run_meta(path::AbstractString)
     try
         rp = record_path(path)
-        written = mtime(rp)
-        bytes, h = open(rp) do io
-            hdr = read(io, RS_HEADER_BYTES)
-            length(hdr) == RS_HEADER_BYTES || return nothing
-            hdr_rec = read_record(IOBuffer(hdr), Header)
-            (hdr_rec.magic == RS_MAGIC && hdr_rec.version == RS_VERSION) || return nothing
-            stop = Int(hdr_rec.off_profiles)
-            # Cap read to file size in case `off_profiles` is garbled.
-            fsize = filesize(io)
-            limit = min(stop, Int(fsize))
-            buf = limit > RS_HEADER_BYTES ? vcat(hdr, read(io, limit - RS_HEADER_BYTES)) : hdr
-            return buf, hdr_rec
-        end
+        got = load_run_meta(rp)
+        got === nothing && return nothing
+        bytes, h, written = got
         io = IOBuffer(bytes)
         total = length(bytes)
+        Int(h.off_strings) <= total && Int(h.off_meta) <= total || return nothing
         seek(io, Int(h.off_strings))
         strings = read_strings(io, bytes)
         seek(io, Int(h.off_meta))
@@ -976,87 +1020,76 @@ it. A file that is truncated, from a crashed run, or written by a different
 version gives as much as can be read, or `nothing`. The reader suppresses ordinary
 read and parse errors so a broken old record does not stop a new run, and a record
 that another run deletes while it reads gives `nothing`. An interrupt during parsing
-is rethrown. With `full = false`, skips sections unused by history/pruning
-(`profiles`, `units`, `environment`, `workers`, `policies`, `memory`).
+is rethrown. With `full = false`, reads only the hot planning prefix and appended
+events, skipping `cold_strings`, `profiles`, `environment`, `workers` and `policies`
+on disk.
 """
 function read_run_state(path::AbstractString; full::Bool = true)
     # Another run prunes records at any moment. On Windows a file that is being deleted
     # can refuse even `stat` until every process has closed it, so the look at the path
-    # and at the modification time can fail as the read does.
-    path, bytes, written = try
-        p = record_path(path)
-        p, read(p), mtime(p)
-    catch
+    # and the read can fail alike. Using `stat(io).mtime` on the open descriptor avoids
+    # a second path lookup racing with deletion.
+    loaded = try
+        load_run_state(record_path(path), full)
+    catch e
+        is_interrupt(e) && rethrow()
         return nothing
     end
-    length(bytes) >= RS_HEADER_BYTES || return nothing
-    io = IOBuffer(bytes)
-    total = length(bytes)
+    loaded === nothing && return nothing
+    rp, h, written, hot_bytes, ev_bytes, ev_off, fsize = loaded
+    hot_total = length(hot_bytes)
+    io = IOBuffer(hot_bytes)
     try
-        h = read_record(io, Header)
-        (h.magic == RS_MAGIC && h.version == RS_VERSION) || return nothing
-        n_items = bounded(h.n_items, total)
+        n_items = bounded(h.n_items, max(hot_total, fsize))
 
+        Int(h.off_strings) <= hot_total && Int(h.off_meta) <= hot_total || return nothing
         seek(io, Int(h.off_strings))
-        strings = read_strings(io, bytes)
+        hot_strings = read_strings(io, hot_bytes)
         seek(io, Int(h.off_meta))
         meta = Dict{String, String}()
-        for _ in 1:bounded(read(io, UInt32), total)
-            k = lookup(strings, read(io, UInt32))
-            meta[k] = lookup(strings, read(io, UInt32))
+        for _ in 1:bounded(read(io, UInt32), hot_total)
+            k = lookup(hot_strings, read(io, UInt32))
+            meta[k] = lookup(hot_strings, read(io, UInt32))
         end
 
-        profiles = Dict{Symbol, Profile}()
-        preferences = Dict{Symbol, String}()
-        units = RunStateUnit[]
-        manifest_bytes = 0
-        manifest_zlib = UInt8[]
-        worker_environments = WorkerEnvironment[]
-        profile_environments = Int[]
-        policies = ItemPolicy[]
-        truncated = false
-
-        if full
-            seek(io, Int(h.off_profiles))
-            profiles, preferences = read_profiles_section(io, strings)
-
-            seek(io, Int(h.off_units))
-            # A `Symbol` per throttle name, not per unit: nearly every unit has the same one.
-            throttles = Dict{UInt32, Symbol}()
-            units = map(1:bounded(read(io, UInt32), total)) do _
-                r = read_record(io, UnitRecord)
-                throttle = get(throttles, r.throttle, nothing)
-                throttle === nothing && (throttle = throttles[r.throttle] = Symbol(lookup(strings, r.throttle)))
-                RunStateUnit(Int32(r.first):Int32(r.last), Int32(r.profile), r.exclusive != 0, throttle)
-            end
-        end
-
+        Int(h.off_items) <= hot_total || return nothing
         seek(io, Int(h.off_items))
-        items = map(1:min(bounded(read(io, UInt32), total), n_items)) do _
+        n_rec = min(bounded(read(io, UInt32), hot_total), n_items)
+        items = Vector{RunStateItem}(undef, n_rec)
+        # Fast cache for the common case where every item shares one throttle (usually `NO_THROTTLE`).
+        last_th_id = UInt32(0)
+        last_th_sym = NO_THROTTLE
+        throttles = nothing
+        for idx in 1:n_rec
             r = read_record(io, ItemRecord)
-            RunStateItem(lookup(strings, r.name), lookup(strings, r.file), Int32(r.line), Int32(r.unit), r.hash, r.seed)
-        end
-
-        if full
-            # Kept as stored: inflating it is for whoever asks for it.
-            seek(io, Int(h.off_environment))
-            manifest_bytes = Int(read(io, UInt32))
-            manifest_zlib = read(io, bounded(read(io, UInt32), total))
-
-            # A file cut short in them still gives what comes before, as it does further on.
-            worker_environments, profile_environments, policies = try
-                (read_workers_section(seek(io, Int(h.off_workers)), strings, total, manifest_bytes, manifest_zlib)...,
-                 read_policies_section(seek(io, Int(h.off_policies)), strings, total))
-            catch e
-                e isa EOFError || rethrow()
-                truncated = true
-                (WorkerEnvironment[], Int[], ItemPolicy[])
+            throttle = if r.throttle == last_th_id && idx > 1
+                last_th_sym
+            elseif throttles === nothing
+                sym = Symbol(lookup(hot_strings, r.throttle))
+                if idx == 1
+                    last_th_id = r.throttle
+                    last_th_sym = sym
+                else
+                    throttles = Dict{UInt32, Symbol}(last_th_id => last_th_sym, r.throttle => sym)
+                    last_th_id = r.throttle
+                    last_th_sym = sym
+                end
+                sym
+            else
+                sym = get(throttles, r.throttle, nothing)
+                sym === nothing && (sym = throttles[r.throttle] = Symbol(lookup(hot_strings, r.throttle)))
+                last_th_id = r.throttle
+                last_th_sym = sym
+                sym
             end
+            items[idx] = RunStateItem(lookup(hot_strings, r.name), lookup(hot_strings, r.file), Int32(r.line),
+                                      Int32(r.profile), r.exclusive != 0, throttle, r.hash, r.seed)
         end
 
+        truncated = false
         statuses = Vector{RunStateStatus}(undef, n_items)
         off_st = Int(h.off_status)
-        avail_st = off_st <= total ? min(n_items, (total - off_st) ÷ RS_STATUS_BYTES) : 0
+        avail_st = off_st <= hot_total ? min(n_items, (hot_total - off_st) ÷ RS_STATUS_BYTES) : 0
         if avail_st > 0
             seek(io, off_st)
             for i in 1:avail_st
@@ -1073,7 +1106,7 @@ function read_run_state(path::AbstractString; full::Bool = true)
 
         memory = ZERO_MEMORY
         if full
-            if Int(h.off_memory) + sizeof(MemoryRecord) <= total
+            if Int(h.off_memory) + sizeof(MemoryRecord) <= hot_total
                 seek(io, Int(h.off_memory))
                 memory = memory_summary(read_record(io, MemoryRecord))
             else
@@ -1081,13 +1114,51 @@ function read_run_state(path::AbstractString; full::Bool = true)
             end
         end
 
-        at = Int(h.off_events)
-        n_ev = at <= total ? (total - at) ÷ RS_EVENT_BYTES : 0
+        profiles = Dict{Symbol, Profile}()
+        preferences = Dict{Symbol, String}()
+        manifest_bytes = 0
+        manifest_zlib = UInt8[]
+        worker_environments = WorkerEnvironment[]
+        profile_environments = Int[]
+        policies = ItemPolicy[]
+
+        if full
+            # A file cut short in the cold replay sections still gives the complete hot prefix.
+            try
+                Int(h.off_cold) <= hot_total || throw(EOFError())
+                seek(io, Int(h.off_cold))
+                cold_strings = read_strings(io, hot_bytes)
+                Int(h.off_profiles) <= hot_total || throw(EOFError())
+                seek(io, Int(h.off_profiles))
+                profiles, preferences = read_profiles_section(io, cold_strings)
+
+                Int(h.off_environment) <= hot_total || throw(EOFError())
+                seek(io, Int(h.off_environment))
+                manifest_bytes = Int(read(io, UInt32))
+                manifest_zlib = read(io, bounded(read(io, UInt32), hot_total))
+
+                Int(h.off_workers) <= hot_total || throw(EOFError())
+                worker_environments, profile_environments = read_workers_section(
+                    seek(io, Int(h.off_workers)), cold_strings, hot_total, manifest_bytes, manifest_zlib
+                )
+                Int(h.off_policies) <= hot_total || throw(EOFError())
+                policies = read_policies_section(seek(io, Int(h.off_policies)), cold_strings, hot_total)
+            catch e
+                e isa EOFError || rethrow()
+                truncated = true
+            end
+        else
+            fsize < Int(h.off_events) && (truncated = true)
+        end
+
+        ev_total = length(ev_bytes)
+        n_ev = ev_off <= ev_total ? (ev_total - ev_off) ÷ RS_EVENT_BYTES : 0
         events = Vector{RunStateEvent}(undef, n_ev)
         if n_ev > 0
-            seek(io, at)
+            ev_io = full ? io : IOBuffer(ev_bytes)
+            seek(ev_io, ev_off)
             for i in 1:n_ev
-                e = read_record(io, EventRecord)
+                e = read_record(ev_io, EventRecord)
                 kind = e.kind == EVENT_ATTEMPT ? :attempt : e.kind == EVENT_WORKER_UP ? :worker_up :
                     e.kind == EVENT_WORKER_DOWN ? :worker_down : :unknown
                 state = kind === :attempt && e.state <= UInt8(CANCELLED) ? ItemState(e.state) : UNSEEN
@@ -1098,17 +1169,17 @@ function read_run_state(path::AbstractString; full::Bool = true)
             end
         end
         # Part of an event, which a writer stopped while appending it left.
-        at + n_ev * RS_EVENT_BYTES < total && (truncated = true)
+        ev_off + n_ev * RS_EVENT_BYTES < ev_total && (truncated = true)
         # A verdict whose attempt has no event of the same outcome: the writer stopped
         # between the two writes of a completion. The verdict is kept, and the evidence
         # for it said to be incomplete.
         full && (truncated |= !verdicts_have_events(statuses, events))
         ending = h.ending <= UInt8(typemax(RunEnding)) ? RunEnding(h.ending) : ENDING_NONE
         return RunStateRecord(
-            String(path), h.version, ending !== ENDING_NONE, closed_file(h, ending), h.flags & RS_FLAG_DRY_RUN != 0,
+            String(rp), h.version, ending !== ENDING_NONE, closed_file(h, ending), h.flags & RS_FLAG_DRY_RUN != 0,
             !(ending in (ENDING_NONE, ENDING_FINISHED, ENDING_SETUP_FAILED)), ending === ENDING_SETUP_FAILED, ending,
             h.start_unix, h.end_unix, meta, profiles, preferences, manifest_bytes, manifest_zlib,
-            units, items, statuses, memory, events, worker_environments, profile_environments, policies,
+            items, statuses, memory, events, worker_environments, profile_environments, policies,
             truncated, written
         )
     catch e
@@ -1117,7 +1188,7 @@ function read_run_state(path::AbstractString; full::Bool = true)
         # and no use for a file it cannot read. Reader bugs still surface, because
         # the round-trip tests assert on what a written file reads back as.
         # `JULIA_DEBUG=Runtests` shows what went wrong.
-        @debug "Runtests: could not read run state $(path)" exception = (e, catch_backtrace())
+        @debug "Runtests: could not read run state $(rp)" exception = (e, catch_backtrace())
         return nothing
     end
 end

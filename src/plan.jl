@@ -140,6 +140,42 @@ function single_package(cfg::RunConfig, root::AbstractString, suite_names::Vecto
     return Packages(String[name_str], Base.UUID[uuid], String[String(root)], Bool[false], RunConfig[cfg], Vector{String}[suite_names])
 end
 
+struct ReplayPolicyDiff
+    item::String
+    changes::String
+end
+
+struct ReplayEnvDiff
+    label::String
+    diffs::Vector{String}
+    by_path::Vector{String}
+    prefs_differ::Bool
+    partial::Bool
+end
+
+struct ReplayProfileSnapshot
+    profile_idx::ProfileIdx
+    label::String
+    manifest_bytes::Int
+    manifest_zlib::Vector{UInt8}
+    preferences::String
+    same_as_run::Bool
+end
+
+mutable struct ReplayDiff
+    from::String
+    recorded_rev::String
+    recorded_worktree::String
+    current_rev::String
+    current_worktree::String
+    gone::Vector{String}
+    changed::Vector{String}
+    env_moved::Vector{String}
+    policies::Vector{ReplayPolicyDiff}
+    envs::Vector{ReplayEnvDiff}
+    snapshots::Vector{ReplayProfileSnapshot}
+end
+
 struct Plan
     items::Items
     files::Vector{String}
@@ -162,7 +198,15 @@ struct Plan
     # Lines the run's header adds: in a run of several packages, those left out and a
     # replay that found no run state of some of them.
     notes::Vector{String}
+    # Differences between the replayed run state and this checkout; `nothing` outside replay.
+    replay::Union{Nothing, ReplayDiff}
 end
+
+with_replay(p::Plan, replay::Union{Nothing, ReplayDiff}) = Plan(
+    p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, p.slot_pool,
+    p.slot_items, p.pending, p.gate_limit, p.cold, p.setups, p.cfg, p.packages, p.root,
+    p.startup, p.selection, p.suite_names, p.notes, replay
+)
 
 nslots(p::Plan) = length(p.slot_pool)
 nitems(p::Plan) = length(p.items)
@@ -862,7 +906,7 @@ function materialize(
     return Plan(
         items, files, relfiles,
         profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, cold,
-        sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[]
+        sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[], nothing
     )
 end
 

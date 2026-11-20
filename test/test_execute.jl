@@ -555,6 +555,30 @@ end
         end
     end
 
+    @testset "logs = :eager keeps relayed item output in log files without creating empty files" begin
+        dir = make_pkg("EagerLogs", "test/e_test.jl" => """
+            @testitem "talks" begin
+                println("hello from eager")
+                @test true
+            end
+            @testitem "quiet" begin
+                @test true
+            end
+            """)
+        with_runstate_dir() do _
+            (states, run, p), out = capture_run(() -> run_states(dir; workers = 1, logs = :eager, monitor = false))
+            @test states["talks"] === PASSED && states["quiet"] === PASSED
+            @test occursin("hello from eager", out)
+            @test !occursin("Captured logs", out)
+            i_talks = findfirst(==("talks"), p.items.name)
+            i_quiet = findfirst(==("quiet"), p.items.name)
+            talks_log = Runtests.Private.item_log(run, i_talks, 1)
+            quiet_log = Runtests.Private.item_log(run, i_quiet, 1)
+            @test isfile(talks_log) && occursin("hello from eager", read(talks_log, String))
+            @test !isfile(quiet_log)
+        end
+    end
+
     @testset "what loading the package prints while `skip` is decided is in the item's log" begin
         # A `skip` that is not a literal loads the package to be evaluated, and a
         # package can print as it loads.
@@ -793,6 +817,27 @@ end
             heard(nothing, BASICPKG; workers = 1)
             newest = last(Runtests.Private.runstate_files(BASICPKG))
             @test !ispath(joinpath(dirname(newest), "events"))
+        end
+
+        @testset "finished events carry log and artifacts paths when present" begin
+            pkg = make_pkg("EventPaths", "test/ep_test.jl" => """
+                @testitem "fails with evidence" begin
+                    println("loud failure")
+                    write(joinpath(Main.Runtests.artifacts_dir(), "note.txt"), "kept")
+                    @test false
+                end
+                @testitem "passes quietly" begin
+                    @test true
+                end
+                """)
+            events = Runtests.TestItemEvent[]
+            heard(ev -> push!(events, ev), pkg; workers = 1)
+            started = filter(ev -> ev.kind === :started, events)
+            @test all(ev -> isempty(ev.log) && isempty(ev.artifacts), started)
+            fin = Dict(ev.name => ev for ev in events if ev.kind === :finished)
+            @test isfile(fin["fails with evidence"].log) && occursin("loud failure", read(fin["fails with evidence"].log, String))
+            @test isdir(fin["fails with evidence"].artifacts) && isfile(joinpath(fin["fails with evidence"].artifacts, "files", "note.txt"))
+            @test isempty(fin["passes quietly"].log) && isempty(fin["passes quietly"].artifacts)
         end
 
         @testset "hears what an attempt cost, on a worker and in this process" begin

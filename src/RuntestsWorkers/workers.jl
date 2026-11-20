@@ -744,6 +744,7 @@ function Worker(;
         redirect_io::IO=stdout,
         redirect_fn=(io, pid, line) -> println(io, "      worker ", pid, " | ", line),
         on_exit=nothing,
+        on_output_done=nothing,
     )
     env = Dict{String,String}(env)
     for (k, v) in extra_env
@@ -797,7 +798,7 @@ function Worker(;
         # what the caller's teardown waits for.
         shielded() do
             w.process_watch = Threads.@spawn watch_and_terminate!(w)
-            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc)
+            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, on_output_done)
             w.messages = Threads.@spawn process_responses(w)
         end
         return w
@@ -876,7 +877,7 @@ end
 # `eof` blocks until there is a line or the pipe is closed, and the partial last
 # line of a worker that was killed comes back from `readline`: nothing is polled
 # for and nothing is lost.
-function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process)
+function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process, on_output_done = nothing)
     try
         while true
             try
@@ -897,6 +898,11 @@ function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process)
             end
         end
     finally
+        try
+            on_output_done === nothing || on_output_done()
+        catch e
+            is_interrupt(e) && rethrow()
+        end
         notify(w.output_done)
     end
 end

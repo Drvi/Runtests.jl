@@ -1360,16 +1360,20 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # did not record stays out.
                 r = mono(ws; replay = b_record, item_keys = [("A", "a1"), ("A", "a2")])
                 @test selected(r.plan) == [("A", "a1")]
-                # B's recorded item renamed since: B gives no item, and the replay says
+                # B's recorded item renamed since: B gives no item, and the replay records
                 # which recorded item is gone.
                 b_tests = joinpath(ws, "lib", "B", "test", "b_test.jl")
                 write(b_tests, item_text("b1 renamed") * item_text("b2"))
-                @test_logs (:warn, r"no longer have.*B \"b1\""s) match_mode = :any mono(ws; replay = a_record)
+                r = mono(ws; replay = a_record)
+                @test r.plan.replay !== nothing && r.plan.replay.gone == ["B \"b1\""]
+                @test occursin("1 missing item skipped", Runtests.Private.format_replay_warning(r.plan.replay))
                 write(b_tests, item_text("b1") * item_text("b2"))
                 # A moved environment directory: the item runs in this checkout's, and the
-                # replay says where it ran before.
+                # replay records where it ran before.
                 mv(joinpath(ws, "lib", "A", "test", "qa"), joinpath(ws, "lib", "A", "test", "qa2"))
-                @test_logs (:warn, r"\"qa1\" ran in test/qa in the replayed run, and runs in test/qa2") match_mode = :any mono(ws; replay = a_record)
+                r = mono(ws; replay = a_record)
+                @test any(s -> occursin("\"qa1\" ran in test/qa when recorded, and runs in test/qa2 here", s), r.plan.replay.env_moved)
+                @test occursin("1 item moved environment", Runtests.Private.format_replay_warning(r.plan.replay))
                 # A run state that is gone makes a partial replay, said as one; with none left, there is nothing to replay.
                 rm(b_record)
                 r = mono(ws; replay = a_record)

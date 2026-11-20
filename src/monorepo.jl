@@ -586,7 +586,8 @@ unless the call gives `seed`.
 """
 function prepare_mono(paths = (); packages = nothing, name = nothing, tags = nothing, group = nothing,
                       replay = nothing, item_keys::Union{Nothing, Vector{Tuple{String, String}}} = nothing,
-                      item_seeds::Union{Nothing, Dict{Tuple{String, String}, UInt64}} = nothing, announce::Bool = true, expansions::Bool = true, worker_init = nothing, test_end = nothing,
+                      item_seeds::Union{Nothing, Dict{Tuple{String, String}, UInt64}} = nothing, announce::Bool = true,
+                      dry_run::Bool = false, expansions::Bool = true, worker_init = nothing, test_end = nothing,
                       kwargs...)
     haskey(kwargs, :config) && throw(ArgumentError(
         "`config` names a file to read in place of one package's test/TestItems.toml, and a combined run reads " *
@@ -708,10 +709,9 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     files_seconds = time() - t_files
 
     # What a replay's packages recorded and the checkout no longer has, or has changed:
-    # said once for all of them, by package, as `prepare` says it. A package scanned and
-    # left with no item, all of whose recorded items are renamed, says so too.
+    # collected into `p.replay` for the single replay warning or `dry_run = true`.
+    gone, changed = String[], String[]
     if replayed !== nothing
-        gone, changed = String[], String[]
         for k in 1:n
             rs = replayed.records[k]
             (rs === nothing || !scanned[k]) && continue
@@ -719,10 +719,6 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
             selection isa AbstractSet && append!(gone, string(ps.name[k], " ", repr(m)) for m in sort!(collect(setdiff(selection, suite_names[k]))))
             append!(changed, string(ps.name[k], " ", repr(m)) for m in changed_since(rs, (it for it in items if it.package == k)))
         end
-        isempty(gone) || @warn "Runtests: the run states recorded $(plural(length(gone), "test item")) the packages " *
-            "no longer have, renamed or deleted since, which cannot run again: " * listed(gone)
-        isempty(changed) || @warn "Runtests: $(plural(length(changed), "test item")) changed since the replayed run, " *
-            "and run as the checkout has them now: " * listed(changed)
     end
     # The packages that give items, renumbered in their order.
     kept = [k for k in 1:n if reasons[k] === nothing]
@@ -745,10 +741,11 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
         check_skip_environment(cfg.skip_environment, known_environments, naming,
                                get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
     end
+    env_moved = String[]
+    kept_records = replayed === nothing ? Union{Nothing, RunStateRecord}[] : Union{Nothing, RunStateRecord}[replayed.records[k] for k in kept]
     if replayed !== nothing
-        run_cfg, cfgs = replayed_configs(run_cfg, cfgs, [replayed.records[k] for k in kept], ps.root[kept], replayed.given,
-                                         seeded)
-        check_replayed_environments(items, [replayed.records[k] for k in kept], ps.root[kept])
+        run_cfg, cfgs = replayed_configs(run_cfg, cfgs, kept_records, ps.root[kept], replayed.given, seeded)
+        env_moved = check_replayed_environments(items, kept_records, ps.root[kept])
     end
     # The code a call gives is every package's, and runs in the workspace root, as a
     # shared default's does, so that the packages can share workers.
@@ -770,6 +767,10 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
              packages = Packages(ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], cfgs,
                                  [sort(suite_names[k]) for k in kept]),
              selection = full ? "" : description, suite_names = all_names)
+    if replayed !== nothing
+        p = apply_recorded_replay!(p, replayed.given, kept_records, kwargs;
+                                   gone, changed, env_moved, dry_run)
+    end
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
     skipped = [ps.skipped; [rel_slash(ps.root[k], workspace) => reasons[k] for k in 1:n if reasons[k] !== nothing]]

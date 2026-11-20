@@ -37,7 +37,7 @@ function package_plan(p::Plan, k::Integer)
     return Plan(
         items, abs_files, relfiles,
         p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{ItemIdx}[], Int32[], p.gate_limit, p.cold,
-        sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[]
+        sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[], nothing
     )
 end
 
@@ -333,10 +333,12 @@ function replayed_configs(run::RunConfig, cfgs::Vector{RunConfig}, records::Vect
                        replayed_from = given.path), replayed
 end
 
-# Each replayed item in the environment directory of the current checkout, said where
-# it differs from the one its run state recorded. A run state that does not record one
-# directory for each of its items is not paired with them by guess.
+# Each replayed item in the environment directory of the current checkout, returning
+# descriptions of any item whose environment directory differs from what its run state
+# recorded. A run state that does not record one directory for each of its items is not
+# paired with them by guess.
 function check_replayed_environments(items::Vector{RawItem}, records::Vector, roots::Vector{String})
+    moved = String[]
     for (k, rs) in enumerate(records)
         rs === nothing && continue
         text = get(rs.meta, "environments", nothing)
@@ -354,9 +356,9 @@ function check_replayed_environments(items::Vector{RawItem}, records::Vector, ro
             before = get(was, it.name, nothing)
             now = isempty(it.environment) ? "" : rel_slash(it.environment, roots[k])
             before === nothing || before == now ||
-                @warn "Runtests: $(repr(it.name)) ran in $(isempty(before) ? "the test environment" : before) in the replayed " *
-                      "run, and runs in $(isempty(now) ? "the test environment" : now) of this checkout"
+                push!(moved, string(repr(it.name), " ran in ", isempty(before) ? "the test environment" : before,
+                                    " when recorded, and runs in ", isempty(now) ? "the test environment" : now, " here"))
         end
     end
-    return nothing
+    return moved
 end

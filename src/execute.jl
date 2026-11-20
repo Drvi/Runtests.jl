@@ -1039,6 +1039,7 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
     last_err = nothing
     for attempt in 1:(WORKER_START_RETRIES + 1)
         began = time()
+        relay_state = RelayState()
         w = try
             RuntestsWorkers.Worker(;
                 julia_args = worker_julia_args(run, prof),
@@ -1050,10 +1051,9 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
                 redirect_io = stdout,
                 # Everything the worker writes: its RUN and DONE records, and under
                 # `logs=:eager` whatever its items print.
-                redirect_fn = let within = Ref(false)
-                    (io, pid, line) -> relay!(run, slot, within, line)
-                end,
-                on_exit = w -> worker_ended!(run, slot.id, w)
+                redirect_fn = (io, pid, line) -> relay!(run, slot, relay_state, line),
+                on_exit = w -> worker_ended!(run, slot.id, w),
+                on_output_done = () -> close_relay_log!(relay_state)
             )
         catch e
             is_interrupt(e) && rethrow()
@@ -1124,24 +1124,69 @@ function keep_dying_line!(slot::Slot, line::AbstractString)
     return nothing
 end
 
+# Per-worker relay state, touched only on that worker's `redirect_worker_output` task.
+# Under `logs = :eager`, lines between RUN and DONE are also written lazily to the
+# attempt's log file so the run's directory and exports keep them without extra files
+# for silent items.
+mutable struct RelayState
+    within::Bool
+    log_path::String
+    log_io::Union{Nothing, IOStream}
+end
+RelayState() = RelayState(false, "", nothing)
+
+function close_relay_log!(state::RelayState)
+    io = state.log_io
+    if io !== nothing
+        state.log_io = nothing
+        try
+            close(io)
+        catch e
+            is_interrupt(e) && rethrow()
+        end
+    end
+    return nothing
+end
+
+function write_relay_log!(state::RelayState, line::AbstractString)
+    isempty(state.log_path) && return nothing
+    try
+        io = state.log_io
+        if io === nothing
+            io = open(state.log_path, "a")
+            state.log_io = io
+        end
+        println(io, line)
+        flush(io)
+    catch e
+        is_interrupt(e) && rethrow()
+        close_relay_log!(state)
+        state.log_path = ""
+    end
+    return nothing
+end
+
 """
-    relay!(run, slot, within, line)
+    relay!(run, slot, state, line)
 
 One line of what a worker wrote. Its records of an item starting and finishing
 become the item's RUN and DONE lines; anything else is the item talking, between a
-RUN and its DONE, or the process itself. `within` follows the worker's own stream,
+RUN and its DONE, or the process itself. `state` follows the worker's own stream,
 so it never races with the slot's task. While the process is being put down for a
 timeout, the item is already recorded as timed out: a verdict it still manages to
 send is dropped, and what it says goes with the item's log.
 """
-function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::AbstractString)
+function relay!(run::Run, slot::Slot, state::RelayState, line::AbstractString)
     rec = parse_record(line)
     if !isempty(@atomic slot.dying_log)
+        close_relay_log!(state)
         rec === nothing && keep_dying_line!(slot, line)
         return nothing
     end
     if rec !== nothing
-        within[] = rec.how === nothing
+        close_relay_log!(state)
+        state.within = rec.how === nothing
+        state.log_path = (state.within && run.plan.cfg.logs === :eager) ? item_log(run, rec.i, rec.attempt) : ""
         how = rec.how
         if how !== nothing
             # The memory of the worker and of what it started, as the monitor saw it,
@@ -1152,7 +1197,8 @@ function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::Abstrac
         end
         return printline(run, item_line(run, slot.id, rec.i, rec.attempt, how))
     end
-    return printline(run, string(within[] ? MARK_ITEM : MARK_WORKER, " ", rpad(string("w", slot.id), SLOT_LABEL_WIDTH[]), FIELD, line))
+    state.within && write_relay_log!(state, line)
+    return printline(run, string(state.within ? MARK_ITEM : MARK_WORKER, " ", rpad(string("w", slot.id), SLOT_LABEL_WIDTH[]), FIELD, line))
 end
 
 # An item's RUN or DONE line, drawn from what this run knows about the item.
@@ -1977,7 +2023,11 @@ function observe_attempt!(run::Run, o::AttemptOutcome)
     # After the item's report, which shows its log: the reason is for whoever reads
     # the run's directory later, and a skip has no block to show it in.
     o.state === SKIPPED && note_skip(run, o.i, o.attempt, o.note)
-    tell_on_event(run, o.i, :finished, o.state, o.attempt, o.slot, o.pid, o.ended, o.elapsed, o.stats, !o.synthetic)
+    log_path = item_log(run, o.i, max(o.attempt, 1))
+    log = isfile(log_path) && filesize(log_path) > 0 ? log_path : ""
+    art = is_non_pass(o.state) && o.artifacts != 0 ? attempt_artifacts(run, o.i, max(o.attempt, 1)) : ""
+    tell_on_event(run, o.i, :finished, o.state, o.attempt, o.slot, o.pid, o.ended, o.elapsed, o.stats, !o.synthetic;
+                  log, artifacts = art)
     run.events === nothing || event_item_finished(run, o)
     return nothing
 end
@@ -2072,6 +2122,10 @@ then 0, and `elapsed` is how long the attempt held its worker.
 directory of the run of the item's package, next to the run's record and logs. The
 files go where that directory goes: `RUNTESTS_ARTIFACT_DIR` copies them, and retention
 deletes them with the run. The run makes the directory only when it is given a function.
+
+On `kind = :finished`, `log` is the attempt's log file when the attempt wrote one (empty
+otherwise), and `artifacts` is the attempt's evidence directory when a failed attempt
+kept evidence (empty otherwise). Both are empty on `kind = :started`.
 """
 struct TestItemEvent
     kind::Symbol
@@ -2097,6 +2151,8 @@ struct TestItemEvent
     package::String
     root::String
     events_dir::String
+    log::String
+    artifacts::String
 end
 
 # Where the caller's `on_event` keeps files for package `k` of the run: beside its logs.
@@ -2107,7 +2163,8 @@ events_dir(run::Run, k::Integer) = joinpath(run.logdirs[k], "events")
 # is the caller's code, and a run goes on whatever its observer does.
 function tell_on_event(
         run::Run, i::ItemIdx, kind::Symbol, state::ItemState, attempt::Int8, slot::Integer, pid::Integer,
-        at::Float64, elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool
+        at::Float64, elapsed::Float64, stats::RuntestsWorkers.PerfStats, measured::Bool;
+        log::String = "", artifacts::String = ""
     )
     (@atomic run.on_event) === nothing && return nothing
     p = run.plan
@@ -2115,7 +2172,8 @@ function tell_on_event(
         kind, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i], attempt, slot, pid,
         at, Symbol(state_name(state)), measured, elapsed, stats.cpu_ns / 1.0e9, stats.compile_ns / 1.0e9,
         stats.recompile_ns / 1.0e9, stats.gc_ns / 1.0e9, stats.bytes, stats.allocs, stats.maxrss,
-        p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]], events_dir(run, p.items.package[i])
+        p.packages.name[p.items.package[i]], p.packages.root[p.items.package[i]], events_dir(run, p.items.package[i]),
+        log, artifacts
     )
     @lock run.on_event_lock begin
         # Read again: a call another task made while this one waited may have failed.

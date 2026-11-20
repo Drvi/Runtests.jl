@@ -141,7 +141,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         dir = make_pkg(
             "Served",
             "test/a_test.jl" => string(
-                item("passes"), item("fails", "x = 1\n    @test x == 2"), item("not asked for"),
+                item("passes"), item("fails", "x = 1; write(joinpath(Main.Runtests.artifacts_dir(), \"out.txt\"), \"kept\")\n    @test x == 2"), item("not asked for"),
                 item("flaky", "m = joinpath(ENV[\"SERVED_DIR\"], \"flaky\")\n    first = !isfile(m)\n" *
                               "    first && touch(m)\n    @test !first"; opts = "retries=1"),
             ),
@@ -172,9 +172,11 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                 finished = [e for e in seen if e["event"] == "item_finished"]
                 ends(name) = [e for e in finished if e["name"] == name]
                 @test only(ends("passes"))["state"] == "passed" && only(ends("passes"))["package"] == "Served"
+                @test only(ends("passes"))["artifacts"] === nothing
                 # A failure says where it is and what it was.
                 f = only(ends("fails"))
                 @test f["state"] == "failed" && f["attempts"] == 1
+                @test f["artifacts"] isa String && isfile(joinpath(f["artifacts"], "files", "out.txt"))
                 failure = only(f["failures"])
                 @test failure["kind"] == "fail"
                 @test failure["file"] == joinpath(dir, "test", "a_test.jl")

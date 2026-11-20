@@ -247,10 +247,12 @@ end
                 p = plan_of(replayed; replay = path)
                 @test sort(p.items.name) == ["main", "qa"]
                 @test pools_of(p)["qa"] == (:fast, joinpath(replayed, "test", "qa"), false)
-                # A recorded item the suite no longer has cannot run again, and is named.
+                # A recorded item the suite no longer has cannot run again, and is recorded in `p.replay`.
                 rm(joinpath(replayed, "test", "main_tests.jl"))
-                p = @test_logs (:warn, r"the run state recorded.*\"main\"") match_mode=:any plan_of(replayed; replay = path)
+                p = plan_of(replayed; replay = path)
                 @test p.items.name == ["qa"]
+                @test p.replay !== nothing && p.replay.gone == ["\"main\""]
+                @test occursin("missing items (1, skipped): \"main\"", sprint(Runtests.Private.print_plan, p))
             end
         end
     end

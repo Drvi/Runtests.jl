@@ -69,11 +69,13 @@ function event_item_finished(run, o)
     i = o.i
     failures = [failure_json(p, r) for r in collect_failures(o.testset)]
     log = item_log(run, i, max(o.attempt, 1))
+    art = is_non_pass(o.state) && o.artifacts != 0 ? attempt_artifacts(run, i, max(o.attempt, 1)) : nothing
     emit(run.events, "item_finished"; id = run.events.run_id, item_json(p, i)...,
          attempt = Int(o.attempt), attempts = attempts_for(p, i), worker = Int(o.slot),
          pid = Int(o.pid), state = state_name(o.state), verdict = state_name(o.verdict),
          elapsed = Float32(o.elapsed), compile = Float32(o.stats.compile_ns / 1.0e9),
-         note = o.note, log = isfile(log) && filesize(log) > 0 ? log : nothing, failures)
+         note = o.note, log = isfile(log) && filesize(log) > 0 ? log : nothing,
+         artifacts = art, failures)
     return nothing
 end
 

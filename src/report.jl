@@ -25,6 +25,7 @@ function plan_block(p::Plan, order)
     body = sprint() do io
         print_selection(io, p)
         print_packages(io, p)
+        p.replay === nothing || print_replay_diff(io, p.replay)
         print_startup(io, p.startup)
         isempty(p.setups) || println(io, "setups: ", join(("`$s`" for s in p.setups), ", "))
         println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
@@ -66,6 +67,49 @@ end
 # What selected the items of the run, a line of its own in the bracket of a header: a
 # group, with its tags and what asked for it, can be long.
 print_selection(io::IO, p::Plan) = isempty(p.selection) || println(io, "selection: ", p.selection)
+
+# Detailed diff between the replayed run state and this checkout, shown in `dry_run = true`.
+function print_replay_diff(io::IO, d::ReplayDiff)
+    if !has_replay_diff(d)
+        println(io, "replay: ", d.from, " · matches this checkout")
+        return nothing
+    end
+    println(io, "replay: ", d.from)
+    g = git_diff_text(d)
+    isempty(g) || println(io, "  revision: ", g)
+    isempty(d.gone) || println(io, "  missing items (", length(d.gone), ", skipped): ", listed(d.gone))
+    isempty(d.changed) || println(io, "  changed items (", length(d.changed), ", running as the checkout has ",
+                                  length(d.changed) == 1 ? "it" : "them", "): ", listed(d.changed))
+    if !isempty(d.env_moved)
+        println(io, "  moved environments (", length(d.env_moved), "):")
+        for m in first(d.env_moved, 20)
+            println(io, "    ", m)
+        end
+        length(d.env_moved) > 20 && println(io, "    … (", length(d.env_moved) - 20, " more)")
+    end
+    if !isempty(d.policies)
+        println(io, "  policies from recording (", length(d.policies), ", overriding this checkout):")
+        for pol in first(d.policies, 20)
+            println(io, "    ", pol.item, ": ", pol.changes)
+        end
+        length(d.policies) > 20 && println(io, "    … (", length(d.policies) - 20, " more)")
+    end
+    for e in d.envs
+        has_env_diff(e) || continue
+        parts = String[]
+        isempty(e.diffs) || push!(parts, string(plural(length(e.diffs), "package"), " differ", length(e.diffs) == 1 ? "s" : ""))
+        e.prefs_differ && push!(parts, "preferences differ")
+        e.partial && push!(parts, "test-only deps not resolved in dry run")
+        println(io, "  ", e.label, " (", join(parts, " · "), "):")
+        for line in first(e.diffs, 40)
+            println(io, "    ", line)
+        end
+        length(e.diffs) > 40 && println(io, "    … (", length(e.diffs) - 40, " more)")
+    end
+    by_path = sort!(unique!(reduce(vcat, (e.by_path for e in d.envs); init = String[])))
+    isempty(by_path) || println(io, "  tracked by path (not compared): ", join(by_path, ", "))
+    return nothing
+end
 
 # What a profile sets, each said briefly; `threads` is what a profile that sets none
 # runs with, which is not said. A preferences file is named from `root`. With `detail`,

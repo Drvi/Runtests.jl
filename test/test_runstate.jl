@@ -1691,6 +1691,85 @@ end
         end
     end
 
+    @testset "a replay applies recorded item policies and reports drift in one warning or dry_run" begin
+        with_runstate_dir() do dir
+            pkg = make_pkg("ReplayPolicy",
+                "test/p_test.jl" => """
+                @testitem "kept policy" timeout=120 retries=2 failfast=true begin
+                    @test true
+                end
+                @testitem "also here" begin
+                    @test true
+                end
+                """)
+            run_states(pkg; workers = 1, logs = :issues, monitor = false)
+            recorded = only(records_in(dir))
+            # Edit the checkout: change policy + body of "kept policy", delete "also here".
+            write(joinpath(pkg, "test", "p_test.jl"), """
+            @testitem "kept policy" timeout=30 retries=0 failfast=false begin
+                @test 1 + 1 == 2
+            end
+            """)
+            # Default replay applies the recorded policies and captures the full diff.
+            p, _ = prepare((pkg,); replay = recorded, announce = false, dry_run = true)
+            @test p.items.name == ["kept policy"]
+            @test p.items.timeout_s[1] == 120
+            @test p.items.retries[1] == 2
+            @test p.items.failfast[1] == 1
+            @test p.replay !== nothing
+            @test p.replay.gone == ["\"also here\""]
+            @test p.replay.changed == ["\"kept policy\""]
+            @test length(p.replay.policies) == 1
+            @test occursin("timeout 120s (checkout 30s)", p.replay.policies[1].changes)
+            @test occursin("retries 2 (checkout 0)", p.replay.policies[1].changes)
+            @test occursin("failfast true (checkout false)", p.replay.policies[1].changes)
+            # Explicit call kwargs still win over recorded policies (recorded timeout=120 is not applied).
+            p_override, _ = prepare((pkg,); replay = recorded, retries = 0, timeout = 45, announce = false)
+            @test p_override.cfg.retries == 0 && p_override.items.retries[1] == 0
+            @test p_override.cfg.timeout_s == 45 && p_override.items.timeout_s[1] == 30
+            # dry_run prints the detailed diff block.
+            _, dry_out = capture_run(() -> Runtests.runtests(pkg; replay = recorded, dry_run = true))
+            @test occursin("missing items (1, skipped): \"also here\"", dry_out)
+            @test occursin("changed items (1, running as the checkout has it): \"kept policy\"", dry_out)
+            @test occursin("policies from recording (1, overriding this checkout):", dry_out)
+            @test occursin("timeout 120s (checkout 30s)", dry_out)
+            # A real replay emits one single brief warning pointing to `dry_run = true`.
+            _, run_out = capture_run(() -> run_states(pkg; replay = recorded, logs = :issues, monitor = false))
+            @test count("this checkout differs from the replayed run", run_out) == 1
+            @test occursin("1 missing item skipped", run_out)
+            @test occursin("1 changed item", run_out)
+            @test occursin("1 item uses the recorded policy", run_out)
+            @test occursin("run with `dry_run = true` for details", run_out)
+        end
+    end
+
+    @testset "a replay compares profile worker environments and git revision/worktree" begin
+        with_runstate_dir() do dir
+            pkg = make_pkg("ReplayEnvGit",
+                ".gitignore" => "Manifest.toml\n",
+                "test/qa/Project.toml" => "[deps]\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n",
+                "test/qa/LocalPreferences.toml" => "[ReplayEnvGit]\nmode = \"a\"\n",
+                "test/qa/qa_tests.jl" => "@testitem \"qa\" begin\n    @test true\nend\n")
+            run(Cmd(`git init -q`; dir = pkg))
+            run(Cmd(`git config user.email test@example.com`; dir = pkg))
+            run(Cmd(`git config user.name Test`; dir = pkg))
+            run(Cmd(`git add -A`; dir = pkg))
+            run(Cmd(`git commit -q -m init`; dir = pkg))
+            run_states(pkg; workers = 1, logs = :issues, monitor = false)
+            recorded = only(records_in(dir))
+            # Dirty the tracked file AND change profile preferences.
+            write(joinpath(pkg, "test", "qa", "LocalPreferences.toml"), "[ReplayEnvGit]\nmode = \"b\"\n")
+            _, dry_out = capture_run(() -> Runtests.runtests(pkg; replay = recorded, dry_run = true))
+            @test occursin("this checkout has uncommitted changes", dry_out)
+            @test occursin("preferences differ", dry_out)
+            _, run_out = capture_run(() -> run_states(pkg; replay = recorded, logs = :issues, monitor = false))
+            @test count("this checkout differs from the replayed run", run_out) == 1
+            @test occursin("revision:", run_out)
+            @test occursin("preferences differ in profile `default` (test/qa)", run_out)
+            @test occursin("run with `dry_run = true` for details", run_out)
+        end
+    end
+
     @testset "a manifest is read as each package's code, and compared by it" begin
         m = Runtests.Private.manifest_versions("""
         manifest_format = "2.0"

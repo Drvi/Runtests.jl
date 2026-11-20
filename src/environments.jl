@@ -176,9 +176,248 @@ function running_from_runtests(target)
     return abspath(String(source)) == abspath(joinpath(target.testdir, "runtests.jl"))
 end
 
-# A replay runs against this machine's environment, which may not be the one the
-# run state was recorded in. Every package whose version differs is named: it is
-# the first thing to rule out when a replay does not fail the way the original did.
+# Parse a recorded `skip` policy string back into `Bool` or `Expr`, or `nothing` if
+# it cannot be parsed cleanly.
+function parse_recorded_skip(text::AbstractString)
+    text == "false" && return false
+    text == "true" && return true
+    ex = Meta.parse(text; raise = false)
+    ex isa Expr && (ex.head === :error || ex.head === :incomplete) && return nothing
+    return ex
+end
+
+# Apply recorded per-item policies from `records` onto `p` (unless overridden by explicit
+# call `kwargs`), collect per-profile worker environment snapshots, and return `p` with
+# its `ReplayDiff` attached. When `dry_run` is true, also populate on-disk environment diffs.
+function apply_recorded_replay!(p::Plan, given::RunStateRecord, records::Vector, kwargs;
+                                gone::Vector{String} = String[], changed::Vector{String} = String[],
+                                env_moved::Vector{String} = String[], dry_run::Bool = false,
+                                target_project::AbstractString = "")
+    rec_rev = get(given.meta, "revision", "")
+    rec_wt = get(given.meta, "worktree", "")
+    cur_rev = project_revision(p.root)
+    cur_wt = isempty(cur_rev) && isempty(rec_rev) ? "" : worktree_state(p.root)
+
+    override_timeout = haskey(kwargs, :timeout)
+    override_retries = haskey(kwargs, :retries)
+    override_failfast = haskey(kwargs, :item_failfast)
+
+    policies = ReplayPolicyDiff[]
+    snapshots = ReplayProfileSnapshot[]
+    seen_snaps = Set{Tuple{ProfileIdx, Int, Int}}()
+
+    for (k, rs) in enumerate(records)
+        rs === nothing && continue
+        rec_idx = Dict{String, Int}(it.name => idx for (idx, it) in enumerate(rs.items))
+        for i in 1:nitems(p)
+            p.items.package[i] == k || continue
+            ridx = get(rec_idx, p.items.name[i], 0)
+            ridx == 0 && continue
+            if ridx <= length(rs.policies)
+                pol = rs.policies[ridx]
+                cur_t = item_timeout(p, ItemIdx(i))
+                cur_r = attempts_for(p, i) - 1
+                cur_f = item_failfast(p, i)
+                cur_s = p.items.skip[i]
+                cur_s_text = cur_s isa Expr ? expr_text(cur_s) : string(cur_s)
+                parts = String[]
+                if !override_timeout && cur_t != Int(pol.timeout_s)
+                    p.items.timeout_s[i] = pol.timeout_s
+                    push!(parts, string("timeout ", pol.timeout_s, "s (checkout ", cur_t, "s)"))
+                end
+                if !override_retries && cur_r != Int(pol.retries)
+                    p.items.retries[i] = Int32(pol.retries)
+                    push!(parts, string("retries ", pol.retries, " (checkout ", cur_r, ")"))
+                end
+                if !override_failfast && cur_f != pol.failfast
+                    p.items.failfast[i] = Int8(pol.failfast ? 1 : 0)
+                    push!(parts, string("failfast ", pol.failfast, " (checkout ", cur_f, ")"))
+                end
+                if cur_s_text != pol.skip
+                    parsed = parse_recorded_skip(pol.skip)
+                    if parsed !== nothing
+                        p.items.skip[i] = parsed
+                        push!(parts, string("skip `", pol.skip, "` (checkout `", cur_s_text, "`)"))
+                    end
+                end
+                if !isempty(parts)
+                    label = is_combined(p) ? string(p.packages.name[k], " ", repr(p.items.name[i])) : repr(p.items.name[i])
+                    push!(policies, ReplayPolicyDiff(label, join(parts, ", ")))
+                end
+            end
+            rec_prof = Int(rs.items[ridx].profile)
+            if 1 <= rec_prof <= length(rs.profile_environments)
+                env_idx = rs.profile_environments[rec_prof]
+                if 1 <= env_idx <= length(rs.worker_environments)
+                    j_now = p.items.profile[i]
+                    key = (j_now, k, env_idx)
+                    if !(key in seen_snaps)
+                        push!(seen_snaps, key)
+                        we = rs.worker_environments[env_idx]
+                        same_as_run = we.manifest_zlib === rs.manifest_zlib && we.manifest_bytes == rs.manifest_bytes
+                        prof = p.profiles[j_now]
+                        env_rel = isempty(prof.environment) ? "" : relpath_or_path(prof.environment, p.packages.root[k])
+                        base = isempty(env_rel) ? string("profile `", prof.name, "`") : string("profile `", prof.name, "` (", env_rel, ")")
+                        plabel = is_combined(p) ? string(p.packages.name[k], " · ", base) : base
+                        push!(snapshots, ReplayProfileSnapshot(j_now, plabel, we.manifest_bytes, we.manifest_zlib,
+                                                               we.preferences, same_as_run))
+                    end
+                end
+            end
+        end
+    end
+
+    diff = ReplayDiff(
+        basename(run_location(given.path)), rec_rev, rec_wt, cur_rev, cur_wt,
+        gone, changed, env_moved, policies, ReplayEnvDiff[], snapshots
+    )
+    dry_run && populate_dry_run_env_diffs!(diff, p, target_project)
+    return with_replay(p, diff)
+end
+
+function compare_manifest_texts(here_text::AbstractString, there_text::AbstractString)
+    here = manifest_versions(here_text)
+    there = manifest_versions(there_text)
+    diffs, by_path = String[], String[]
+    for name in sort!(collect(union(keys(here), keys(there))))
+        h, t = get(here, name, nothing), get(there, name, nothing)
+        if h !== nothing && t !== nothing && (h.path || t.path)
+            push!(by_path, name)
+        elseif !same_code(h, t)
+            push!(diffs, string(name, ": ", code_text(t), " when recorded, ", code_text(h), " here"))
+        end
+    end
+    return diffs, by_path
+end
+
+function compare_project_env(label::AbstractString, proj_file::Union{Nothing, AbstractString},
+                             there_manifest::AbstractString, there_prefs::Union{Nothing, AbstractString};
+                             partial::Bool = false, require_manifest::Bool = false)
+    here_manifest = read_text(proj_file === nothing ? nothing : Base.project_file_manifest_path(proj_file))
+    diffs, by_path = (isempty(there_manifest) || (require_manifest && isempty(here_manifest))) ?
+        (String[], String[]) : compare_manifest_texts(here_manifest, there_manifest)
+    prefs_differ = false
+    if there_prefs !== nothing
+        here_prefs = proj_file === nothing ? "" : read_text(joinpath(dirname(proj_file), "LocalPreferences.toml"))
+        prefs_differ = strip(here_prefs) != strip(there_prefs)
+    end
+    return ReplayEnvDiff(String(label), diffs, by_path, prefs_differ, partial)
+end
+
+# Best-effort read-only project lookup for `dry_run = true`, avoiding `TestEnv.activate()`.
+function dry_run_test_project(p::Plan, target_project::AbstractString)
+    current = Base.active_project()
+    testproj = joinpath(p.root, "test", "Project.toml")
+    if current !== nothing && isfile(testproj) && abspath(current) == abspath(testproj)
+        return current, false
+    end
+    if !isempty(target_project)
+        proj = abspath(target_project)
+        cached = @lock TEST_ENVS_LOCK get(TEST_ENVS, proj, nothing)
+        if cached !== nothing && isfile(cached[1])
+            return cached[1], false
+        end
+        if isfile(testproj) && (in_package_workspace(testproj, proj) ||
+                                Base.project_file_manifest_path(testproj) !== nothing)
+            return testproj, false
+        end
+        return proj, isfile(testproj) || Base.project_file_manifest_path(proj) !== nothing
+    end
+    ws_proj = project_file(p.root)
+    return ws_proj, ws_proj !== nothing
+end
+
+function populate_dry_run_env_diffs!(diff::ReplayDiff, p::Plan, target_project::AbstractString)
+    empty!(diff.envs)
+    recorded = p.cfg.replayed_manifest
+    main_proj, partial = dry_run_test_project(p, target_project)
+    if !isempty(recorded)
+        push!(diff.envs, compare_project_env("test environment", main_proj, recorded, nothing;
+                                             partial, require_manifest = true))
+    end
+    for snap in diff.snapshots
+        prof = p.profiles[snap.profile_idx]
+        wfile = !isempty(prof.environment) ? project_file(prof.environment) : main_proj
+        if snap.same_as_run && isempty(prof.environment) && isempty(snap.preferences)
+            continue
+        end
+        there_manifest = snap.same_as_run ? recorded :
+            inflate_manifest(snap.manifest_zlib, snap.manifest_bytes, snap.label)
+        # For a profile with its own preferences file, compare the checkout's file if present.
+        here_prefs_proj = !isempty(prof.environment) ? wfile :
+            isempty(prof.preferences) ? wfile : prof.preferences
+        env_diff = compare_project_env(snap.label, wfile, there_manifest, nothing;
+                                       partial = isempty(prof.environment) && partial,
+                                       require_manifest = true)
+        if !isempty(snap.preferences) || (!isempty(prof.environment) && wfile !== nothing && isfile(joinpath(dirname(wfile), "LocalPreferences.toml")))
+            here_prefs = !isempty(prof.environment) ?
+                (wfile === nothing ? "" : read_text(joinpath(dirname(wfile), "LocalPreferences.toml"))) :
+                read_text(here_prefs_proj)
+            prefs_differ = strip(here_prefs) != strip(snap.preferences)
+            env_diff = ReplayEnvDiff(env_diff.label, env_diff.diffs, env_diff.by_path, prefs_differ, env_diff.partial)
+        end
+        push!(diff.envs, env_diff)
+    end
+    return diff
+end
+
+function git_diff_text(d::ReplayDiff)
+    rec_r, cur_r = d.recorded_rev, d.current_rev
+    rec_w, cur_w = d.recorded_worktree, d.current_worktree
+    short(r) = isempty(r) ? "none" : first(r, 10)
+    wt(w) = (w == "clean" || w == "dirty") ? " ($w)" : ""
+    if rec_r != cur_r
+        return string("rev ", short(rec_r), wt(rec_w), " when recorded, rev ", short(cur_r), wt(cur_w), " here")
+    end
+    isempty(rec_r) && rec_w != "dirty" && cur_w != "dirty" && return ""
+    if rec_w == "dirty" && cur_w == "dirty"
+        return string("recorded at rev ", short(rec_r), " with uncommitted changes, and this checkout is also dirty")
+    elseif rec_w == "dirty"
+        return string("recorded at rev ", short(rec_r), " with uncommitted changes (not in git)")
+    elseif cur_w == "dirty"
+        return string("rev ", short(rec_r), " matches, but this checkout has uncommitted changes")
+    end
+    return ""
+end
+
+has_env_diff(e::ReplayEnvDiff) = !isempty(e.diffs) || e.prefs_differ
+
+has_replay_diff(d::ReplayDiff) =
+    !isempty(git_diff_text(d)) || !isempty(d.gone) || !isempty(d.changed) ||
+    !isempty(d.env_moved) || !isempty(d.policies) || any(has_env_diff, d.envs)
+
+function format_replay_warning(d::ReplayDiff)
+    lines = String[]
+    g = git_diff_text(d)
+    isempty(g) || push!(lines, string("  revision: ", g))
+    item_parts = String[]
+    isempty(d.gone) || push!(item_parts, string(plural(length(d.gone), "missing item"), " skipped"))
+    isempty(d.changed) || push!(item_parts, string(plural(length(d.changed), "changed item"),
+        " (running as the checkout has ", length(d.changed) == 1 ? "it" : "them", ")"))
+    isempty(d.env_moved) || push!(item_parts, string(plural(length(d.env_moved), "item"), " moved environment"))
+    isempty(item_parts) || push!(lines, string("  items: ", join(item_parts, " · ")))
+    isempty(d.policies) || push!(lines, string("  policies: ", plural(length(d.policies), "item"),
+        " use", length(d.policies) == 1 ? "s" : "", " the recorded policy where this checkout differs"))
+    env_parts = String[]
+    for e in d.envs
+        ep = String[]
+        isempty(e.diffs) || push!(ep, string(plural(length(e.diffs), "package"), " differ", length(e.diffs) == 1 ? "s" : ""))
+        e.prefs_differ && push!(ep, "preferences differ")
+        isempty(ep) || push!(env_parts, string(join(ep, ", "), " in ", e.label))
+    end
+    isempty(env_parts) || push!(lines, string("  environments: ", join(env_parts, " · ")))
+    isempty(lines) && return ""
+    return string(
+        "Runtests: this checkout differs from the replayed run:\n",
+        join(lines, "\n"),
+        "\n  run with `dry_run = true` for details"
+    )
+end
+
+# A replay runs against this machine's environments, which may not be the ones the
+# run state was recorded in. Every package and preference difference is collected on
+# `run.plan.replay`, and any drift across revision, items, policies or environments is
+# reported in one brief warning pointing to `dry_run = true` for full details.
 function check_replayed_environment(run::Run)
     cfg = run.plan.cfg
     if !isempty(cfg.julia_flags)
@@ -190,31 +429,31 @@ function check_replayed_environment(run::Run)
             "$(join(cfg.julia_flags, " ")), and `workers = 0` runs the items in this process, which has " *
             "$(join(code_flags(), " ")); give it one worker or more to run them as they were run"
     end
+    diff = run.plan.replay
+    diff === nothing && return nothing
+    empty!(diff.envs)
     recorded = cfg.replayed_manifest
-    isempty(recorded) && return nothing
     env = Base.active_project()
-    here = manifest_versions(read_text(env === nothing ? nothing : Base.project_file_manifest_path(env)))
-    there = manifest_versions(recorded)
-    diffs, by_path = String[], String[]
-    for name in sort!(collect(union(keys(here), keys(there))))
-        h, t = get(here, name, nothing), get(there, name, nothing)
-        if h !== nothing && t !== nothing && (h.path || t.path)
-            push!(by_path, name)
-        elseif !same_code(h, t)
-            push!(diffs, string(name, ": ", code_text(t), " when recorded, ", code_text(h), " here"))
-        end
+    if !isempty(recorded)
+        push!(diff.envs, compare_project_env("test environment", env, recorded, nothing))
     end
+    for snap in diff.snapshots
+        wproj = worker_project(run, snap.profile_idx)
+        wfile = isempty(wproj) ? nothing : isdir(wproj) ? project_file(wproj) : String(wproj)
+        same_file = wfile !== nothing && env !== nothing && abspath(wfile) == abspath(env)
+        snap.same_as_run && same_file && isempty(snap.preferences) && continue
+        there_manifest = snap.same_as_run ? recorded :
+            inflate_manifest(snap.manifest_zlib, snap.manifest_bytes, snap.label)
+        push!(diff.envs, compare_project_env(snap.label, wfile, there_manifest, snap.preferences))
+    end
+    by_path = sort!(unique!(reduce(vcat, (e.by_path for e in diff.envs); init = String[])))
     # Its path is the recording machine's, and its source may differ under the same one.
     isempty(by_path) || say(run, "tracked by path, so not compared with the recorded run: ", join(by_path, ", "))
-    # The test environment's manifest is what the run state compares by. A profile with
-    # a project of its own, as one of an environment directory has, has a snapshot of
-    # its own in the run state, which this does not compare.
-    own = length(run.profile_projects)
-    own == 0 || say(run, "not compared with the recorded run: the environments of ", plural(own, "profile"),
-                    " with a project of their own")
-    isempty(diffs) && return say(run, "the test environment matches the one the run state was recorded in")
-    @warn "Runtests: the test environment differs from the one the run state was recorded in:\n" *
-        join(("  " * d for d in first(diffs, 40)), "\n") * (length(diffs) > 40 ? "\n  …" : "")
+    if !isempty(recorded) && !any(has_env_diff, diff.envs)
+        say(run, "the test environment matches the one the run state was recorded in")
+    end
+    msg = format_replay_warning(diff)
+    isempty(msg) || @warn msg
     return nothing
 end
 

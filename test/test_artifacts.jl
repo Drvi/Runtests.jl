@@ -86,29 +86,6 @@ end
     @test false
 end
 
-@testitem "asks too late" begin
-    Threads.@spawn begin
-        sleep(0.5)
-        msg = try
-            Main.Runtests.on_failure(identity)
-            "registered"
-        catch e
-            sprint(showerror, e)
-        end
-        write(joinpath(ENV["RUNTESTS_ART_MARKS"], "late"), msg)
-    end
-    @test true
-end
-
-@testitem "after the one that asks too late" begin
-    path = joinpath(ENV["RUNTESTS_ART_MARKS"], "late")
-    deadline = time() + 30
-    while !isfile(path) && time() < deadline
-        sleep(0.05)
-    end
-    @test occursin("after the test item's body returned", read(path, String))
-end
-
 @testitem "asks where it may not" skip=(try
         Main.Runtests.artifacts_dir()
         false
@@ -156,6 +133,43 @@ end
     @test false
 end
 
+"""
+
+# An item that spawns a task calling `on_failure` after its body returns, and a second
+# item on the same worker that keeps the worker alive and synchronizes with it.
+const LATE_ITEMS = raw"""
+@testitem "asks too late" begin
+    let marks = ENV["RUNTESTS_ART_MARKS"]
+        Threads.@spawn begin
+            ready = joinpath(marks, "next_started")
+            deadline = time() + 30
+            while !isfile(ready) && time() < deadline
+                sleep(0.01)
+            end
+            msg = try
+                Main.Runtests.on_failure(identity)
+                "registered"
+            catch e
+                sprint(showerror, e)
+            end
+            tmp = joinpath(marks, "late.tmp")
+            write(tmp, msg)
+            mv(tmp, joinpath(marks, "late"); force = true)
+        end
+    end
+    @test true
+end
+
+@testitem "after the one that asks too late" begin
+    marks = ENV["RUNTESTS_ART_MARKS"]
+    touch(joinpath(marks, "next_started"))
+    path = joinpath(marks, "late")
+    deadline = time() + 30
+    while !isfile(path) && time() < deadline
+        sleep(0.01)
+    end
+    @test occursin("after the test item's body returned", read(path, String))
+end
 """
 
 # An item whose producer holds an object, and one after it in the same process that
@@ -212,7 +226,7 @@ function check_art_run(states, run, p, out, marks)
 
     @testset "an attempt that passes leaves nothing, and its producers never run" begin
         for name in ("passes with files and a producer", "registers and passes", "is broken", "is skipped",
-                     "writes and passes", "asks too late")
+                     "writes and passes")
             @test states[name] in (PASSED, SKIPPED)
             @test !ispath(dir(name))
             @test !ispath(artifacts_log_path(dir(name)))
@@ -261,7 +275,6 @@ function check_art_run(states, run, p, out, marks)
     end
 
     @testset "registering is for the item's body alone" begin
-        @test occursin("after the test item's body returned", art_read(joinpath(marks, "late")))
         @test isfile(joinpath(marks, "skip refused"))
         @test isfile(joinpath(marks, "test_end refused"))
         @test occursin("in a producer", art_read(produced("asks where it may not", "during.txt")))
@@ -308,6 +321,21 @@ end
     @testset "in this process" begin
         marks = mktempdir()
         check_art_run(art_run(pkg, marks; workers = 0)..., marks)
+    end
+
+    @testset "registering after an item's body returned is refused" begin
+        # One worker (or in-process) with `[order]` pins the spawner first so both items
+        # run in order in the same process and the worker stays alive until the mark lands.
+        late_pkg = make_pkg("LateRegister",
+            "test/TestItems.toml" => "[order]\nfirst = [\"asks too late\"]\n",
+            "test/late_tests.jl" => LATE_ITEMS)
+        for workers in (1, 0)
+            marks = mktempdir()
+            states, _, _, _ = art_run(late_pkg, marks; workers)
+            @test states["asks too late"] === PASSED
+            @test states["after the one that asks too late"] === PASSED
+            @test occursin("after the test item's body returned", art_read(joinpath(marks, "late")))
+        end
     end
 
     @testset "what a passing attempt's producers hold is let go of before the next item" begin

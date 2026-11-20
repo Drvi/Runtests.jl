@@ -154,7 +154,7 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
     ))
     return exclusively() do
         # A dry run says what it found in its own block, with the plan.
-        p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
+        p, target = prepare(args; name, tags, announce = !dry_run, dry_run, kwargs...)
         if dry_run
             print_plan(stdout, p)
             return nothing
@@ -174,11 +174,12 @@ end
 # which says itself where they stand. `allow_unknown_names` runs the named items the
 # suite has and leaves the rest out, for an editor, whose tree can be behind the files.
 function prepare(args; name = nothing, tags = nothing, group = nothing, replay = nothing, announce::Bool = true,
-                 expansions::Bool = true, allow_unknown_names::Bool = false, worker_init = nothing, test_end = nothing,
-                 kwargs...)
+                 dry_run::Bool = false, expansions::Bool = true, allow_unknown_names::Bool = false,
+                 worker_init = nothing, test_end = nothing, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     named = name !== nothing   # by the caller, not by a replay
+    call_kwargs = kwargs
     # A seed the caller gives is every item's; otherwise a failure runs again with the
     # seed it failed with, and a replayed item with the one it was recorded with.
     seeded = haskey(kwargs, :seed)
@@ -252,14 +253,8 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
         hint = name_hint(filter.name, suite_names)
         isempty(hint) || throw(NoTestsError("not every name given is a test item" * hint))
     end
-    if recorded !== nothing
-        gone = sort!(collect(setdiff(recorded, suite_names)))
-        isempty(gone) || @warn "Runtests: the run state recorded $(plural(length(gone), "test item")) the suite " *
-            "no longer has, renamed or deleted since, which cannot run again: " * listed(repr.(gone))
-        changed = changed_since(rs, items)
-        isempty(changed) || @warn "Runtests: $(plural(length(changed), "test item")) changed since the replayed run, " *
-            "and run as the checkout has them now: " * listed(repr.(changed))
-    end
+    gone = recorded === nothing ? String[] : String[repr(n) for n in sort!(collect(setdiff(recorded, suite_names)))]
+    changed = rs === nothing ? String[] : String[repr(n) for n in changed_since(rs, items)]
     announce && println(
         stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
         plural(length(unique(i -> i.file, items)), "file"),
@@ -281,6 +276,10 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
         items, cfg; history = history(target.root; base = rs), root = target.root,
         selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
+    if rs !== nothing
+        p = apply_recorded_replay!(p, rs, Union{Nothing, RunStateRecord}[rs], call_kwargs;
+                                   gone, changed, dry_run, target_project = target.project)
+    end
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
     return p, target
@@ -429,7 +428,7 @@ function runtests_mono(args...; packages = nothing, name = nothing, tags = nothi
         "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got $(repr(on_event))"
     ))
     return exclusively() do
-        r = prepare_mono(args; packages, name, tags, announce = !dry_run, kwargs...)
+        r = prepare_mono(args; packages, name, tags, announce = !dry_run, dry_run, kwargs...)
         p = r.plan
         # One process holds one test environment.
         p.cfg.workers == 0 && length(p.packages) > 1 && throw(ArgumentError(

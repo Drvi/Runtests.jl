@@ -150,6 +150,9 @@ end
 
 const TH32CS_SNAPPROCESS = UInt32(0x2)
 const INVALID_HANDLE_VALUE = reinterpret(Ptr{Cvoid}, typemax(UInt))
+const EMPTY_PROCESS_ENTRY = ProcessEntry32W(
+    UInt32(sizeof(ProcessEntry32W)), 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0x0000, 260)
+)
 
 # MEMORYSTATUSEX (64 bytes): dwLength, dwMemoryLoad, and 7 UInt64 byte counters.
 struct MemoryStatusEx
@@ -207,7 +210,7 @@ end
         snap = ccall((:CreateToolhelp32Snapshot, "kernel32"), stdcall, Ptr{Cvoid}, (UInt32, UInt32), TH32CS_SNAPPROCESS, 0)
         snap == INVALID_HANDLE_VALUE && return out
         try
-            entry = Ref(ProcessEntry32W(sizeof(ProcessEntry32W), 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0x0000, 260)))
+            entry = Ref(EMPTY_PROCESS_ENTRY)
             ok = ccall((:Process32FirstW, "kernel32"), stdcall, Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
             while ok != 0
                 push!(out, Int32(entry[].pid) => Int32(entry[].parent_pid))

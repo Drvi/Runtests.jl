@@ -292,8 +292,13 @@ end
         finish_run_state!(rsf)
         full = read(path)
         broken = joinpath(mktempdir(), "broken.runstate")
-        for n in 0:length(full)
-            write(broken, full[1:n])
+        # Every byte near the header and tail (tables, statuses, events), plus strided
+        # cuts across the compressed manifest blob in between.
+        len = length(full)
+        cuts = len <= 1024 ? collect(0:len) :
+               unique!(vcat(collect(0:512), collect(513:37:(len - 513)), collect((len - 512):len)))
+        for n in cuts
+            write(broken, view(full, 1:n))
             for full_mode in (true, false)
                 rs = read_run_state(broken; full = full_mode)   # must not throw, whatever n is
                 rs === nothing && continue
@@ -486,7 +491,9 @@ end
         dir = mktempdir()
         # The second item has no timeout of its own, so it is in flight for as long as
         # the run's, ten minutes: the moment the kill has to land in lasts that long.
-        pkg = make_pkg("Killed", "test/k_test.jl" => """
+        pkg = make_pkg("Killed",
+            "test/TestItems.toml" => "[order]\nfirst = [\"passes\"]\n",
+            "test/k_test.jl" => """
             @testitem "passes" begin
                 @test true
             end
@@ -716,11 +723,15 @@ end
             # The whole suite once: the only run of `fails` there will be.
             capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
             first_run = only(runstate_files(pkg))
-            # Then more failing runs of another item than pruning keeps, each pruning
-            # as it ends, as every run does.
-            for _ in 1:(keep + 3)
-                capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, name = "keeps failing"))
+            # Then more failing runs of another item than pruning keeps, finishing with a
+            # real run so pruning executes as every run ends.
+            p_sub, _ = prepare((pkg,); name = "keeps failing", announce = false)
+            for _ in 1:(keep + 2)
+                rsf = init_run_state(new_runstate_path(pkg), p_sub)
+                write_status!(rsf, 1, FAILED, 1, 1; elapsed = 0.1)
+                finish_run_state!(rsf)
             end
+            capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false, name = "keeps failing"))
             left = runstate_files(pkg)
             @test first_run in left
             # The newest runs, and that one: each newer failure of `keeps failing`
@@ -1004,7 +1015,7 @@ end
                 record_run(dir, pkg, k, Dict("passes" => (PASSED, 1.0)))
             end
             exported_run() = withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
-                first(capture_run(() -> run_states(pkg; workers = 1, logs = :issues, monitor = false)))
+                first(capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false)))
             end
             _, run, p = exported_run()
             path = (@atomic run.runstate).path
@@ -1216,9 +1227,15 @@ end
             write(joinpath(pkg, "test", "t_test.jl"), suite(true))
             run_a()
             @test failing(pkg) == ["b"]
-            # And so it stays through more runs here than are kept, each pruning,
-            # none of them touching the CI run's file.
-            foreach(_ -> run_a(), 1:(Runtests.Private.KEEP_RUNS + 2))
+            # And so it stays through more runs here than are kept, ending with a live
+            # run that prunes without touching the CI run's file.
+            p_a, _ = prepare((pkg,); name = "a", announce = false)
+            for _ in 1:(Runtests.Private.KEEP_RUNS + 1)
+                rsf = init_run_state(new_runstate_path(pkg), p_a)
+                write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1)
+                finish_run_state!(rsf)
+            end
+            run_a()
             @test read(ci) == before
             @test failing(pkg) == ["b"]
         end
@@ -1335,7 +1352,16 @@ end
             # hold every verdict it did, so pruning as a run without it does would
             # take it; pointed at, it is never deleted.
             before = read(base)
-            foreach(_ -> run_once(; replay = base, name = Set(["a", "b", "c"])), 1:(Runtests.Private.KEEP_RUNS + 2))
+            p_rep, _ = prepare((pkg,); replay = base, name = Set(["a", "b", "c"]), announce = false)
+            for _ in 1:(Runtests.Private.KEEP_RUNS + 1)
+                rsf = init_run_state(new_runstate_path(pkg), p_rep)
+                for i in 1:nitems(p_rep)
+                    st = p_rep.items.name[i] == "b" ? FAILED : PASSED
+                    write_status!(rsf, i, st, 1, 1; elapsed = 0.1)
+                end
+                finish_run_state!(rsf)
+            end
+            run_once(; replay = base, name = Set(["a", "b", "c"]))
             @test isfile(base) && read(base) == before
             @test base in Runtests.Private.removable_runs(Runtests.Private.project_runs(pkg), [base])
             @test failing(pkg; base = rs) == ["b"]
@@ -1503,8 +1529,21 @@ end
     end
 
     @testset "a run state yields the idle worker-seconds of its planned slots" begin
-        dir = make_pkg("IdleSlots", "test/a_test.jl" =>
-            "@testitem \"quick\" begin\n    @test true\nend\n@testitem \"slow\" begin\n    sleep(1)\n    @test true\nend\n")
+        quick_done = joinpath(mktempdir(), "quick_done")
+        dir = make_pkg("IdleSlots", "test/a_test.jl" => """
+            @testitem "quick" begin
+                touch($(repr(quick_done)))
+                @test true
+            end
+            @testitem "slow" begin
+                deadline = time() + 60
+                while !isfile($(repr(quick_done))) && time() < deadline
+                    sleep(0.02)
+                end
+                sleep(1.0)
+                @test true
+            end
+            """)
         with_runstate_dir() do _
             (_, run, p), _ = capture_run(() -> run_states(dir; workers = 2, monitor = false))
             rs = read_run_state((@atomic run.runstate).path)
@@ -1702,7 +1741,7 @@ end
                     @test true
                 end
                 """)
-            run_states(pkg; workers = 1, logs = :issues, monitor = false)
+            run_states(pkg; workers = 0, logs = :issues, monitor = false)
             recorded = only(records_in(dir))
             # Edit the checkout: change policy + body of "kept policy", delete "also here".
             write(joinpath(pkg, "test", "p_test.jl"), """
@@ -1734,7 +1773,7 @@ end
             @test occursin("policies from recording (1, overriding this checkout):", dry_out)
             @test occursin("timeout 120s (checkout 30s)", dry_out)
             # A real replay emits one single brief warning pointing to `dry_run = true`.
-            _, run_out = capture_run(() -> run_states(pkg; replay = recorded, logs = :issues, monitor = false))
+            _, run_out = capture_run(() -> run_states(pkg; workers = 0, replay = recorded, logs = :issues, monitor = false))
             @test count("this checkout differs from the replayed run", run_out) == 1
             @test occursin("1 missing item skipped", run_out)
             @test occursin("1 changed item", run_out)
@@ -1743,7 +1782,7 @@ end
         end
     end
 
-    @testset "a replay compares profile worker environments and git revision/worktree" begin
+    Sys.which("git") !== nothing && @testset "a replay compares profile worker environments and git revision/worktree" begin
         with_runstate_dir() do dir
             pkg = make_pkg("ReplayEnvGit",
                 ".gitignore" => "Manifest.toml\n",
@@ -1850,7 +1889,7 @@ end
     @testset "a run state lying next to the project does not change the next run" begin
         with_runstate_dir() do _
             dir = make_pkg("NotReplayed", "test/a_test.jl" => """@testitem "x" begin\n @test true\nend\n""")
-            run_states(dir; workers=1, threads="1", logs=:issues, monitor=false)
+            run_states(dir; workers=0, threads="1", logs=:issues, monitor=false)
             # What the caller asked for, not what the last run happened to record.
             p, _ = prepare((dir,); workers=1, threads="2,1")
             @test p.profiles[1].threads == "2,1"
@@ -2052,25 +2091,38 @@ end
     end
 
     @testset "a run stopped by failfast is live until its last item is done, and ends after it" begin
-        marker = joinpath(mktempdir(), "slow_started")
+        marks = mktempdir()
+        marker = joinpath(marks, "slow_started")
+        release = joinpath(marks, "release")
         dir = make_pkg("FailfastLive", "test/t_test.jl" => """
             @testitem "fails" begin
-                while !isfile($(repr(marker)))
-                    sleep(0.05)
+                deadline = time() + 60
+                while !isfile($(repr(marker))) && time() < deadline
+                    sleep(0.02)
                 end
                 @test false
             end
             @testitem "slow" begin
                 touch($(repr(marker)))
-                sleep(3)
+                deadline = time() + 60
+                while !isfile($(repr(release))) && time() < deadline
+                    sleep(0.02)
+                end
                 @test true
             end
             """)
         with_runstate_dir() do _
             seen = Ref{Any}(nothing)
-            # As the slow item ends, after failfast stopped the run: read as a pruner would.
-            on_event(ev) = ev.kind === :finished && ev.name == "slow" &&
-                (seen[] = read_run_state(joinpath(dirname(ev.events_dir), "run.runstate")); nothing)
+            # Release `slow` only after `fails` has finished (so failfast has stopped the run);
+            # then inspect the run state as `slow` ends, while it is still live.
+            function on_event(ev)
+                if ev.kind === :finished && ev.name == "fails"
+                    touch(release)
+                elseif ev.kind === :finished && ev.name == "slow"
+                    seen[] = read_run_state(joinpath(dirname(ev.events_dir), "run.runstate"))
+                end
+                return nothing
+            end
             capture_run() do
                 exclusively() do
                     p, target = prepare((dir,); workers = 2, failfast = true, logs = :issues, monitor = false)

@@ -13,10 +13,14 @@ using Pkg: Pkg
     runs = joinpath(work, "runs")
 
     io = IOBuffer()
-    Pkg.activate(testenv; io)
-    Pkg.develop([Pkg.PackageSpec(path=runtests_root), Pkg.PackageSpec(path=pkg)]; io)
-    deps = sort!(collect(keys(Pkg.project().dependencies)))
-    Pkg.activate(; temp=true, io)
+    orig = Base.active_project()
+    deps = try
+        Pkg.activate(testenv; io)
+        Pkg.develop([Pkg.PackageSpec(path=runtests_root), Pkg.PackageSpec(path=pkg)]; io)
+        sort!(collect(keys(Pkg.project().dependencies)))
+    finally
+        Base.set_active_project(orig)
+    end
     @test deps == ["Runtests", "Standalone"]     # no Test, on purpose
 
     function run_script(cmd, logname)

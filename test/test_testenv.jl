@@ -61,8 +61,7 @@ using TOML: TOML
         target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
         before = test_env(target)
         @test test_env(target) == before
-        sleep(0.01)
-        touch(joinpath(pkg, "Project.toml"))         # e.g. a test dependency was added
+        bump_mtime!(joinpath(pkg, "Project.toml"))   # e.g. a test dependency was added
         after = test_env(target)
         @test after != before
     end
@@ -78,8 +77,7 @@ using TOML: TOML
         write(versioned, "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n")
         created = test_env(target)
         @test created != before
-        sleep(0.01)
-        touch(versioned)
+        bump_mtime!(versioned)
         @test test_env(target) != created
     end
 

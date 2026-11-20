@@ -1027,17 +1027,51 @@ function with_union_env(f, run)
     end
 end
 
+# Session stamp cache for instantiated workspaces (same pattern as `TEST_ENVS` and
+# `ENVIRONMENT_PROJECTS`): avoids re-running `Pkg.instantiate` on unchanged workspaces.
+const WORKSPACE_INSTANTIATED = Dict{String, Tuple{String, Float64, Vector{Tuple{String, Float64}}}}()
+const WORKSPACE_INSTANTIATED_LOCK = ReentrantLock()
+
+function workspace_stamp(root::AbstractString)
+    pf = project_file(root)
+    mf = pf === nothing ? nothing : Base.project_file_manifest_path(pf)
+    mf_str = something(mf, "")
+    mf_mtime = isempty(mf_str) ? 0.0 : mtime_or_zero(mf_str)
+    projs = Tuple{String, Float64}[]
+    if pf !== nothing && isfile(pf)
+        push!(projs, (pf, mtime_or_zero(pf)))
+        t = parse_project(pf)
+        ws = get(t, "workspace", nothing)
+        if ws isa AbstractDict
+            for rel in get(ws, "projects", Any[])
+                rel isa AbstractString || continue
+                mp = project_file(joinpath(root, rel))
+                mp === nothing || push!(projs, (mp, mtime_or_zero(mp)))
+            end
+        end
+    end
+    return (mf_str, mf_mtime, projs)
+end
+
 # Instantiate the workspace manifest shared by its packages and test projects.
 # Explicitly resolve when the manifest is missing; Pkg handles the manifest during
 # instantiate in either case.
 function instantiate_workspace(root::AbstractString)
-    with_pkg_isolated("could not instantiate the workspace at $root: ") do Pkg, _
-        Pkg.activate(root; io = devnull)
-        manifest = Base.project_file_manifest_path(project_file(root))
-        (manifest === nothing || !isfile(manifest)) && Pkg.resolve(; io = devnull)
-        Pkg.instantiate(; allow_autoprecomp = false, io = devnull)
+    key = abspath(root)
+    return @lock WORKSPACE_INSTANTIATED_LOCK begin
+        stamp = workspace_stamp(key)
+        if !isempty(stamp[1]) && isfile(stamp[1]) && get(WORKSPACE_INSTANTIATED, key, nothing) == stamp
+            return nothing
+        end
+        with_pkg_isolated("could not instantiate the workspace at $root: ") do Pkg, _
+            Pkg.activate(root; io = devnull)
+            manifest = Base.project_file_manifest_path(project_file(root))
+            (manifest === nothing || !isfile(manifest)) && Pkg.resolve(; io = devnull)
+            Pkg.instantiate(; allow_autoprecomp = false, io = devnull)
+        end
+        WORKSPACE_INSTANTIATED[key] = workspace_stamp(key)
+        return nothing
     end
-    return nothing
 end
 
 """

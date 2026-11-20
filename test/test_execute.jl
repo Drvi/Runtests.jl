@@ -141,28 +141,34 @@ end
         @test occursin("uses setup", out)
     end
 
+    # One worker run of the non-crashing Faulty items covers failure, error, skip, and
+    # scoped-value checks without booting four separate workers.
+    faulty_states, _, _ = run_states(FAULTY; workers=1, logs=:issues,
+        name=r"^(fails|errors|throws outside a test|skipped statically|skipped dynamically|knows it is in a test item)$")
+
     @testset "a failing item is recorded, not fatal" begin
-        states, _, _ = run_states(FAULTY; workers=1, tags=[:fail], logs=:issues)
-        @test states["fails"] === FAILED
+        @test faulty_states["fails"] === FAILED
     end
 
     @testset "an erroring item is recorded" begin
-        states, _, _ = run_states(FAULTY; workers=1, tags=[:error], logs=:issues)
-        @test states["errors"] === ERRORED
-        @test states["throws outside a test"] === ERRORED
+        @test faulty_states["errors"] === ERRORED
+        @test faulty_states["throws outside a test"] === ERRORED
     end
 
     @testset "a worker that dies is replaced and the run continues" begin
-        # The dying item and a passing item share one worker, so the second only
-        # runs if the slot recovered from the first one killing its process.
-        states, _, _ = run_states(FAULTY; workers=1, tags=nothing, name=r"^(kills its worker|passes)$",
-                                  logs=:issues)
+        # File order puts `kills its worker` before `its own log lines go through the
+        # coordinator` on one worker, so the second only runs on a replacement process.
+        after = "its own log lines go through the coordinator"
+        states, run, p = run_states(FAULTY; workers=1, tags=nothing,
+                                    name=Regex("^(kills its worker|$after)\$"), logs=:issues)
         @test states["kills its worker"] === ERRORED
-        @test states["passes"] === PASSED
+        @test states[after] === PASSED
+        @test run.statuses.pid[findfirst(==("kills its worker"), p.items.name)] !=
+              run.statuses.pid[findfirst(==(after), p.items.name)]
     end
 
     @testset "a hung item times out and its worker is killed" begin
-        t = @elapsed ((states, _, _) = run_states(FAULTY; workers=1, tags=[:hang], logs=:issues))
+        t = @elapsed ((states, _, _) = with_fast_inspect(() -> run_states(FAULTY; workers=1, tags=[:hang], logs=:issues)))
         @test states["hangs"] === TIMEDOUT
         @test t < 60          # the item sleeps for 600s; the timeout is 3s
     end
@@ -312,22 +318,24 @@ end
     end
 
     @testset "skip is honoured, statically and dynamically" begin
-        states, _, _ = run_states(FAULTY; workers=1, tags=[:skip], logs=:issues)
-        @test states["skipped statically"] === SKIPPED
-        @test states["skipped dynamically"] === SKIPPED
+        @test faulty_states["skipped statically"] === SKIPPED
+        @test faulty_states["skipped dynamically"] === SKIPPED
     end
 
     @testset "a result that cannot be serialized is an error, not a lost worker" begin
-        states, _, _ = run_states(FAULTY; workers=1, logs=:issues,
-                                  name=r"^(returns something unserializable|passes)$")
-        @test states["returns something unserializable"] === ERRORED
-        # the worker survived to run the next item
-        @test states["passes"] === PASSED
+        # File order puts `returns something unserializable` before `its own log lines
+        # go through the coordinator`, so the second item runs on the same worker process.
+        after = "its own log lines go through the coordinator"
+        states_f, run_f, p_f = run_states(FAULTY; workers=1, logs=:issues,
+                                          name=Regex("^(returns something unserializable|$after)\$"))
+        @test states_f["returns something unserializable"] === ERRORED
+        @test states_f[after] === PASSED
+        @test run_f.statuses.pid[findfirst(==("returns something unserializable"), p_f.items.name)] ==
+              run_f.statuses.pid[findfirst(==(after), p_f.items.name)]
     end
 
     @testset "the scoped value is set inside an item and inherited by its tasks" begin
-        states, _, _ = run_states(FAULTY; workers=1, tags=[:scope], logs=:issues)
-        @test states["knows it is in a test item"] === PASSED
+        @test faulty_states["knows it is in a test item"] === PASSED
     end
 
     @testset "failfast stops the run" begin
@@ -340,13 +348,25 @@ end
     end
 
     @testset "a retry another item's failfast stops leaves the failure it was" begin
+        marks = mktempdir()
+        slow_started = joinpath(marks, "slow_started")
+        quick_done = joinpath(marks, "quick_done")
         dir = make_pkg("FailfastRetry", "test/t_test.jl" => """
             @testitem "fails slowly, retries" retries=1 begin
-                sleep(3)
+                touch($(repr(slow_started)))
+                deadline = time() + 60
+                while !isfile($(repr(quick_done))) && time() < deadline
+                    sleep(0.02)
+                end
+                sleep(0.2)
                 @test false
             end
             @testitem "fails quickly" begin
-                sleep(1)
+                deadline = time() + 60
+                while !isfile($(repr(slow_started))) && time() < deadline
+                    sleep(0.02)
+                end
+                touch($(repr(quick_done)))
                 @test false
             end
             """)
@@ -463,33 +483,36 @@ end
     end
 
     @testset "a second run in the same process is refused, and the first goes on" begin
+        release = joinpath(mktempdir(), "release")
         dir = make_pkg("OneAtATime", "test/t_test.jl" => """
             @testitem "takes a while" begin
-                sleep(3)
-                @test true
-            end
-            """)
-        other = make_pkg("OneAtATimeOther", "test/t_test.jl" => """
-            @testitem "never runs" begin
+                deadline = time() + 60
+                while !isfile($(repr(release))) && time() < deadline
+                    sleep(0.02)
+                end
                 @test true
             end
             """)
         first_run = @async run_states(dir; workers=1, logs=:issues, monitor=false)
-        timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
-        target = RuntestsWorkers.INTERRUPT_TARGET.task
-        @test Runtests.Private.RUN_ACTIVE[] && target !== nothing
-        busy = "Runtests is already at work in this process"
-        @test_throws busy run_states(dir; workers=1, logs=:issues, monitor=false)
-        # Refused before it touches anything the run has set: not the root its paths
-        # print against, not where Ctrl-C goes.
-        @test_throws busy Runtests.runtests(other; workers=1, logs=:issues, monitor=false)
-        @test_throws busy Runtests.runtests(other; dry_run=true)
-        @test_throws busy Runtests.chores(other; dry_run=true)
-        @test_throws busy @eval @testitem "pasted" begin
-            @test true
+        try
+            timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
+            target = RuntestsWorkers.INTERRUPT_TARGET.task
+            @test Runtests.Private.RUN_ACTIVE[] && target !== nothing
+            busy = "Runtests is already at work in this process"
+            @test_throws busy run_states(dir; workers=1, logs=:issues, monitor=false)
+            # Refused before it touches anything the run has set: not the root its paths
+            # print against, not where Ctrl-C goes.
+            @test_throws busy Runtests.runtests(BASICPKG; workers=1, logs=:issues, monitor=false)
+            @test_throws busy Runtests.runtests(BASICPKG; dry_run=true)
+            @test_throws busy Runtests.chores(BASICPKG; dry_run=true)
+            @test_throws busy @eval @testitem "pasted" begin
+                @test true
+            end
+            @test Runtests.Private.PROJECT_ROOT[] == dir
+            @test RuntestsWorkers.INTERRUPT_TARGET.task === target
+        finally
+            touch(release)
         end
-        @test Runtests.Private.PROJECT_ROOT[] == dir
-        @test RuntestsWorkers.INTERRUPT_TARGET.task === target
         states, _, _ = fetch(first_run)
         @test states["takes a while"] === PASSED && !Runtests.Private.RUN_ACTIVE[]
     end
@@ -642,8 +665,7 @@ end
         @test any(l -> occursin(OTHER_BOUNDS.arg, l), lifecycle)
 
         # ...and the processes it started are gone again.
-        sleep(0.5)
-        @test live_worker_processes() <= before
+        @test timedwait(() -> live_worker_processes() <= before, 10) === :ok
 
         warnings = filter(r -> r.level == Logging.Warn, first(logs))
         @test length(warnings) == 1
@@ -741,30 +763,30 @@ end
         end
     end
 
-    @testset "no worker processes are left behind" begin
-        before = live_worker_processes()
-        run_states(BASICPKG; workers=2, logs=:issues)
-        sleep(0.5)
-        @test live_worker_processes() <= before
-    end
-
-    @testset "the worker count is a cap, not a suggestion" begin
-        # 6 units, 2 workers: this run must never have a third process alive.
-        # Counted against a snapshot taken first, because workers an earlier test
-        # is still reaping are not this run's doing.
+    @testset "no worker processes are left behind, and the worker count is a cap" begin
+        # 6 units, 2 workers: this run must never have a third process alive, and once
+        # it ends no worker it started is left behind. Counted against a snapshot taken
+        # first, because workers an earlier test is still reaping are not this run's doing.
         p, target = prepare((BASICPKG,); workers=2)
+        before_count = live_worker_processes()
         before = live_worker_pids()
         peak = Ref(0)
+        done = Threads.Atomic{Bool}(false)
         watcher = Threads.@spawn begin
-            for _ in 1:400
+            while !done[]
                 peak[] = max(peak[], length(setdiff(live_worker_pids(), before)))
                 sleep(0.01)
             end
         end
-        run = execute(p, target)
+        run = try
+            execute(p, target)
+        finally
+            done[] = true
+            wait(watcher)
+        end
         rm(run.scratch; force=true, recursive=true)
-        wait(watcher)
         @test peak[] <= 2
+        @test timedwait(() -> live_worker_processes() <= before_count, 10) === :ok
     end
 
     @testset "on_event" begin
@@ -810,11 +832,11 @@ end
 
         @testset "each event names the events directory of its run, made only for a run given a function" begin
             events = Runtests.TestItemEvent[]
-            heard(ev -> push!(events, ev), BASICPKG; workers = 1)
+            heard(ev -> push!(events, ev), BASICPKG; workers = 0)
             dir = only(unique(ev.events_dir for ev in events))
             newest = last(Runtests.Private.runstate_files(BASICPKG))
             @test dir == joinpath(dirname(newest), "events") && isdir(dir)
-            heard(nothing, BASICPKG; workers = 1)
+            heard(nothing, BASICPKG; workers = 0)
             newest = last(Runtests.Private.runstate_files(BASICPKG))
             @test !ispath(joinpath(dirname(newest), "events"))
         end
@@ -856,7 +878,7 @@ end
                     GC.gc()
                 end
                 @testitem "waits" begin
-                    sleep(0.5)
+                    sleep(1.0)
                     @test true
                 end
                 """)
@@ -868,7 +890,7 @@ end
                 @test works.cpu > 0.05 && works.compile > 0 && works.gc > 0
                 @test works.allocated >= 8 * 10^7 && works.allocations >= 10^5
                 # CPU time, not the time that passed.
-                @test waits.elapsed >= 0.5 && waits.cpu < waits.elapsed / 2
+                @test waits.elapsed >= 0.9 && waits.cpu < waits.elapsed / 2
                 workers == 0 && @test all(ev -> ev.pid == getpid(), events)
             end
         end
@@ -879,7 +901,7 @@ end
                 inside[] && (overlapped[] = true)
                 inside[] = true
                 calls[] += 1
-                sleep(0.1)   # yields: another slot's call would run meanwhile
+                sleep(0.02)  # yields: another slot's call would run meanwhile
                 inside[] = false
             end
             @test calls[] == 2 * 6
@@ -888,7 +910,7 @@ end
 
         @testset "a call that throws is reported, and the run goes on without it" begin
             calls = Ref(0)
-            _, out = heard(_ -> (calls[] += 1; error("the observer broke")), BASICPKG; workers = 1)
+            _, out = heard(_ -> (calls[] += 1; error("the observer broke")), BASICPKG; workers = 0)
             @test calls[] == 1
             @test count("`on_event` threw", out) == 1
             @test occursin("the observer broke", out)
@@ -971,7 +993,9 @@ end
     end
 
     @testset "failfast stops a run in this process before the items after the failure" begin
-        dir = make_pkg("FailfastHere", "test/t_test.jl" => failing("first fails") * passing("never starts"))
+        dir = make_pkg("FailfastHere",
+            "test/TestItems.toml" => "[order]\nfirst = [\"first fails\"]\n",
+            "test/t_test.jl" => failing("first fails") * passing("never starts"))
         with_runstate_dir() do _
             (states, _, _), _ = capture_run(() -> run_states(dir; workers = 0, failfast = true, logs = :issues,
                                                              monitor = false))
@@ -982,17 +1006,30 @@ end
 
     if combined
         @testset "a combined run holds the process as a run does, against either kind of call" begin
-            ws = e2e_workspace("A" => ["test/a_test.jl" => "@testitem \"waits\" begin\n    sleep(5)\n    @test true\nend\n"])
-            pkg = make_pkg("BusyOther", "test/b_test.jl" => passing("b"))
+            release = joinpath(mktempdir(), "release")
+            ws = e2e_workspace("A" => ["test/a_test.jl" => """
+                @testitem "waits" begin
+                    deadline = time() + 60
+                    while !isfile($(repr(release))) && time() < deadline
+                        sleep(0.02)
+                    end
+                    @test true
+                end
+                """])
             with_runstate_dir() do _
                 # The run's output is captured while it runs, this task's included: what
                 # this task finds is tested once the run is over.
                 running = Threads.@spawn capture_run(() -> outside(() -> Runtests.runtests_mono(ws; workers = 1,
                                                                                                  logs = :issues,
                                                                                                  monitor = false)))
-                started = timedwait(() -> Runtests.Private.RUN_ACTIVE[], 120.0)
-                errs = [outside(() -> Runtests.runtests(pkg; workers = 1)), outside(() -> Runtests.runtests_mono(ws)),
-                        outside(() -> Runtests.chores_mono(ws; dry_run = true))]
+                started, errs = try
+                    s = timedwait(() -> Runtests.Private.RUN_ACTIVE[], 120.0)
+                    e = [outside(() -> Runtests.runtests(BASICPKG; workers = 1)), outside(() -> Runtests.runtests_mono(ws)),
+                         outside(() -> Runtests.chores_mono(ws; dry_run = true))]
+                    s, e
+                finally
+                    touch(release)
+                end
                 ts, _ = fetch(running)
                 @test started === :ok
                 for err in errs

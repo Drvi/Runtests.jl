@@ -42,6 +42,7 @@ const STEPPED = make_pkg(
     end
 
     @testitem "throws" begin
+        sleep(0.05)
         error("thrown from the item")
     end
 
@@ -324,11 +325,14 @@ function typed_into_debugger(f, keys::AbstractString)
     write(input.in, keys)
     close(input.in)
     drawn = @async read(output.out, String)
+    had_repl = isdefined(Base, :active_repl)
+    old_repl = had_repl ? Base.active_repl : nothing
     Base.active_repl = REPL.LineEditREPL(FakeTerminal(input.out, output.in, output.in, false, false), false)
     value = try
         f()
     finally
         close(output.in)
+        had_repl && (Base.active_repl = old_repl)
     end
     return value, replace(fetch(drawn), r"\e\[[0-9;?]*[A-Za-z]" => "")
 end

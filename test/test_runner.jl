@@ -16,9 +16,9 @@
     end
 
     @testset "a file that hangs is stopped at its limit, with what it printed" begin
-        r = run_snippet("""@testset "hangs" begin\n    println("got as far as this"); flush(stdout)\n    sleep(600)\nend\n"""; limit=20)
+        r = run_snippet("""@testset "hangs" begin\n    println("got as far as this"); flush(stdout)\n    sleep(600)\nend\n"""; limit=45)
         @test !r.ok
-        @test occursin("still running after the 20s limit", r.status)
+        @test occursin("still running after the 45s limit", r.status)
         @test occursin("got as far as this", r.output)
         # Where it was stuck: every task's backtrace from the inspection hook, or
         # every thread's from SIGTERM. Windows has neither signal.

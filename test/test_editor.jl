@@ -141,7 +141,8 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         dir = make_pkg(
             "Served",
             "test/a_test.jl" => string(
-                item("passes"), item("fails", "x = 1; write(joinpath(Main.Runtests.artifacts_dir(), \"out.txt\"), \"kept\")\n    @test x == 2"), item("not asked for"),
+                item("passes", "hold = joinpath(ENV[\"SERVED_DIR\"], \"hold\"); deadline = time() + 60; while isfile(hold) && time() < deadline; sleep(0.02); end; @test true"),
+                item("fails", "x = 1; write(joinpath(Main.Runtests.artifacts_dir(), \"out.txt\"), \"kept\")\n    @test x == 2"), item("not asked for"),
                 item("flaky", "m = joinpath(ENV[\"SERVED_DIR\"], \"flaky\")\n    first = !isfile(m)\n" *
                               "    first && touch(m)\n    @test !first"; opts = "retries=1"),
             ),
@@ -214,10 +215,19 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
                     @test !occursin("Error:", e["message"])
                 end
 
-                # One run at a time.
-                send(s, (; id = 7, command = "run", names = ["passes"], options = (; workers = 1)))
-                send(s, (; id = 8, command = "run", names = ["passes"]))
-                seen = events_until(e -> e["event"] == "run_finished", s)
+                # One run at a time: hold `id=7` open until `id=8` has been refused.
+                hold = joinpath(marker, "hold")
+                touch(hold)
+                seen = try
+                    send(s, (; id = 7, command = "run", names = ["passes"], options = (; workers = 1)))
+                    started7 = events_until(e -> e["event"] == "run_started", s)
+                    send(s, (; id = 8, command = "run", names = ["passes"]))
+                    err8 = events_until(e -> e["event"] == "error", s)
+                    rm(hold; force = true)
+                    vcat(started7, err8, events_until(e -> e["event"] == "run_finished", s))
+                finally
+                    rm(hold; force = true)
+                end
                 busy = only(e for e in seen if e["event"] == "error")
                 @test busy["id"] == 8 && occursin("already in progress", busy["message"])
                 @test last(seen)["id"] == 7 && last(seen)["state"] == "passed"
@@ -259,21 +269,27 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
     end
 
     @testset "a run asked for while this process runs another is refused, and leaves that one be" begin
-        beside = make_pkg("ServedBeside", "test/t_test.jl" => item("takes a while", "sleep(3)\n    @test true"))
+        release = joinpath(mktempdir(), "release")
+        beside = make_pkg("ServedBeside", "test/t_test.jl" => item("takes a while",
+            "deadline = time() + 60\n    while !isfile($(repr(release))) && time() < deadline; sleep(0.02); end\n    @test true"))
         dir = make_pkg("ServedAfter", "test/a_test.jl" => item("passes"))
         with_runstate_dir() do _
             s = open_session(dir)
             @test next_event(s)["event"] == "hello"
             first_run = @async run_states(beside; workers=1, logs=:issues, monitor=false)
-            timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
-            target = RuntestsWorkers.INTERRUPT_TARGET.task
-            send(s, (; id = 1, command = "run", options = (; workers = 1)))
-            refused = next_event(s)
-            @test refused["event"] == "error" && refused["id"] == 1
-            @test occursin("already at work in this process", refused["message"])
-            # Ctrl-C still goes to the run that is going, and its paths print as they did.
-            @test RuntestsWorkers.INTERRUPT_TARGET.task === target
-            @test Runtests.Private.PROJECT_ROOT[] == beside
+            try
+                timedwait(() -> RuntestsWorkers.INTERRUPT_TARGET.task !== nothing, 120)
+                target = RuntestsWorkers.INTERRUPT_TARGET.task
+                send(s, (; id = 1, command = "run", options = (; workers = 1)))
+                refused = next_event(s)
+                @test refused["event"] == "error" && refused["id"] == 1
+                @test occursin("already at work in this process", refused["message"])
+                # Ctrl-C still goes to the run that is going, and its paths print as they did.
+                @test RuntestsWorkers.INTERRUPT_TARGET.task === target
+                @test Runtests.Private.PROJECT_ROOT[] == beside
+            finally
+                touch(release)
+            end
             states, _, _ = fetch(first_run)
             @test states["takes a while"] === Runtests.Private.PASSED
             send(s, (; id = 2, command = "run", options = (; workers = 1)))
@@ -327,14 +343,14 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             # Asked for no names: the whole suite, as `runtests` runs it, which
             # `run_started` says.
             names(e) = [k["name"] for k in e["items"]]
-            send(s, (; id = 1, command = "run"))
+            send(s, (; id = 1, command = "run", options = (; workers = 1)))
             @test sort(names(started(events_until(e -> e["event"] == "run_finished", s)))) == ["fast", "slow"]
-            send(s, (; id = 2, command = "run", options = (; group = "default")))
+            send(s, (; id = 2, command = "run", options = (; group = "default", workers = 1)))
             seen = events_until(e -> e["event"] == "run_finished", s)
             @test names(started(seen)) == ["fast"]
             recorded = last(seen)["runstate"]
             # The run state of the default group's run, run again: its items, not the whole suite.
-            send(s, (; id = 3, command = "run", options = (; replay = recorded)))
+            send(s, (; id = 3, command = "run", options = (; replay = recorded, workers = 1)))
             @test names(started(events_until(e -> e["event"] == "run_finished", s))) == ["fast"]
             close_session(s)
         end
@@ -352,13 +368,13 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             started(seen) = only(e for e in seen if e["event"] == "run_started")
             names(e) = sort([k["name"] for k in e["items"]])
             draws(name) = readlines(joinpath(marks, name))
-            send(s, (; id = 1, command = "run"))
+            send(s, (; id = 1, command = "run", options = (; workers = 1)))
             events_until(e -> e["event"] == "run_finished", s)
-            send(s, (; id = 2, command = "run", failing = true))
+            send(s, (; id = 2, command = "run", failing = true, options = (; workers = 1)))
             @test names(started(events_until(e -> e["event"] == "run_finished", s))) == ["a", "b"]
             @test draws("a")[2] == draws("a")[1] && draws("b")[2] == draws("b")[1]
             @test draws("a")[1] != draws("b")[1]
-            send(s, (; id = 3, command = "run", failing = true, options = (; seed = 7)))
+            send(s, (; id = 3, command = "run", failing = true, options = (; seed = 7, workers = 1)))
             events_until(e -> e["event"] == "run_finished", s)
             @test draws("a")[3] != draws("a")[1]
             # Among the items asked for, none is failing: said, not run.
@@ -399,9 +415,14 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
         dir = make_pkg("Streamed", "test/a_test.jl" => item("talks", "println(\"from the item\")\n    @info \"logged\"\n    @test true") *
                                                        item("fails", "@test false"))
         root = dirname(@__DIR__)
-        cmd = setenv(`$(Base.julia_cmd()) --project=$root --startup-file=no -e "using Runtests; Runtests.serve(ARGS[1])" $dir`,
-                     "JULIA_LOAD_PATH" => join([root, joinpath(root, "test"), ""], Sys.iswindows() ? ';' : ':'),
-                     "RUNTESTS_RUNSTATE_DIR" => mktempdir())
+        env = Pair{String, String}[
+            "JULIA_LOAD_PATH" => join([root, joinpath(root, "test"), ""], Sys.iswindows() ? ';' : ':'),
+            "RUNTESTS_RUNSTATE_DIR" => mktempdir(),
+        ]
+        for k in ("JULIA_DEPOT_PATH", "JULIA_PKG_OFFLINE")
+            haskey(ENV, k) && push!(env, k => ENV[k])
+        end
+        cmd = setenv(`$(Base.julia_cmd()) --project=$root --startup-file=no -e "using Runtests; Runtests.serve(ARGS[1])" $dir`, env...)
         err = Base.BufferStream()
         proc = open(pipeline(cmd; stderr = err), "r+")
         lines = String[]

@@ -6,67 +6,78 @@ function with_toml(f, contents::AbstractString)
     return f(dir)
 end
 
+function with_clean_runtests_env(f)
+    cleared = [k => nothing for k in keys(ENV) if startswith(k, "RUNTESTS_")]
+    return withenv(f, cleared...)
+end
+
 @testset "config" begin
     @testset "defaults without a TestItems.toml" begin
-        cfg = read_config(mktempdir())
-        @test cfg.workers >= 1
-        @test cfg.timeout_s == 30 * 60
-        @test cfg.retries == 0
-        @test cfg.memory_threshold == 0.9
-        @test !cfg.full_names   # a name too long for its column is shortened
-        @test cfg.testset_name == "Runtests"
-        @test haskey(cfg.profiles, DEFAULT_PROFILE)
-        @test isempty(cfg.order_first) && isempty(cfg.order_last)
+        with_clean_runtests_env() do
+            cfg = read_config(mktempdir())
+            @test cfg.workers >= 1
+            @test cfg.timeout_s == 30 * 60
+            @test cfg.retries == 0
+            @test cfg.memory_threshold == 0.9
+            @test !cfg.full_names   # a name too long for its column is shortened
+            @test cfg.testset_name == "Runtests"
+            @test haskey(cfg.profiles, DEFAULT_PROFILE)
+            @test isempty(cfg.order_first) && isempty(cfg.order_last)
+        end
     end
 
     @testset "TestItems.toml is read" begin
-        with_toml("""
-        [run]
-        workers = 3
-        timeout = 120
-        retries = 2
-        logs = "eager"
-        full_names = true
-        testset_name = "unit"
+        with_clean_runtests_env() do
+            with_toml("""
+            [run]
+            workers = 3
+            timeout = 120
+            retries = 2
+            logs = "eager"
+            full_names = true
+            testset_name = "unit"
 
-        [order]
-        first = ["a"]
-        last = ["z"]
+            [order]
+            first = ["a"]
+            last = ["z"]
 
-        [profiles.bounds]
-        julia_args = ["--check-bounds=yes", "--threads=4"]
-        env = { FOO = "1" }
-        precompile = ["Test"]
-        """) do dir
-            code = mkpath(joinpath(dir, "testconfigs", "bounds"))
-            write(joinpath(code, "worker_init.jl"), "using Test\n")
-            write(joinpath(code, "test_end.jl"), "GC.gc(true)\n")
-            cfg = read_config(dir)
-            @test cfg.workers == 3
-            @test cfg.timeout_s == 120
-            @test cfg.retries == 2
-            @test cfg.logs === :eager
-            @test cfg.full_names
-            @test cfg.testset_name == "unit"
-            @test cfg.order_first == ["a"] && cfg.order_last == ["z"]
-            p = cfg.profiles[:bounds]
-            @test p.julia_args == ["--check-bounds=yes"]
-            @test p.threads == "4"
-            @test p.env == ["FOO" => "1"]
-            @test p.init.head === :block && !isempty(p.init.args)
-            @test p.test_end.head === :block && !isempty(p.test_end.args)
-            # Parsed with the path of its file, so an error in it names the file and the line.
-            @test first(p.init.args) == LineNumberNode(1, Symbol(joinpath(code, "worker_init.jl")))
-            @test p.precompile == ["Test"]
-            # Without the key, the whole environment.
-            @test cfg.profiles[:default].precompile === nothing
+            [profiles.bounds]
+            julia_args = ["--check-bounds=yes", "--threads=4"]
+            env = { FOO = "1" }
+            precompile = ["Test"]
+            """) do dir
+                code = mkpath(joinpath(dir, "testconfigs", "bounds"))
+                write(joinpath(code, "worker_init.jl"), "using Test\n")
+                write(joinpath(code, "test_end.jl"), "GC.gc(true)\n")
+                cfg = read_config(dir)
+                @test cfg.workers == 3
+                @test cfg.timeout_s == 120
+                @test cfg.retries == 2
+                @test cfg.logs === :eager
+                @test cfg.full_names
+                @test cfg.testset_name == "unit"
+                @test cfg.order_first == ["a"] && cfg.order_last == ["z"]
+                p = cfg.profiles[:bounds]
+                @test p.julia_args == ["--check-bounds=yes"]
+                @test p.threads == "4"
+                @test p.env == ["FOO" => "1"]
+                @test p.init.head === :block && !isempty(p.init.args)
+                @test p.test_end.head === :block && !isempty(p.test_end.args)
+                # Parsed with the path of its file, so an error in it names the file and the line.
+                @test first(p.init.args) == LineNumberNode(1, Symbol(joinpath(code, "worker_init.jl")))
+                @test p.precompile == ["Test"]
+                # Without the key, the whole environment.
+                @test cfg.profiles[:default].precompile === nothing
+            end
         end
     end
 
     @testset "an explicit keyword beats the file" begin
-        with_toml("[run]\nworkers = 3\n") do dir
-            @test read_config(dir; workers=7).workers == 7
-            @test read_config(dir).workers == 3
+        with_clean_runtests_env() do
+            with_toml("[run]\nworkers = 3\n") do dir
+                @test read_config(dir; workers=7).workers == 7
+                @test read_config(dir).workers == 3
+            end
         end
     end
 

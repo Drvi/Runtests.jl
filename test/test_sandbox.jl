@@ -170,7 +170,12 @@ timed_item(name; opts="", before="") = journal_item(name; opts, body=before * ""
         three_started = """
             let dir = ENV["RUNTESTS_JOURNAL"], deadline = time() + 30
                 started() = count(readdir(dir; join=true)) do f
-                    r = split(strip(read(f, String)), '\\t')
+                    endswith(f, ".tmp") && return false
+                    r = try
+                        split(strip(read(f, String)), '\\t')
+                    catch
+                        return false
+                    end
                     length(r) == 3 && !endswith(r[1], " end")
                 end
                 while started() < 3
@@ -241,17 +246,18 @@ timed_item(name; opts="", before="") = journal_item(name; opts, body=before * ""
     end
 
     @testset "a slot whose profile's items are done goes on with another profile's" begin
-        # One quick item under a profile of its own, and two seconds of default
-        # items. The profile's slot is done at once, and a fresh default worker in
-        # it takes far less than the second each default slot would otherwise have
-        # left, so it restarts under the default profile and takes a share.
+        # One quick item under a profile of its own, and enough default items for
+        # `neediest_pool` to judge a second worker worth starting. `d1` holds its slot
+        # until any other default item has started elsewhere, so the profile's slot
+        # always finishes `tiny`, rebinds to the default profile, and takes a share
+        # regardless of how long worker startup takes on a busy machine.
+        others = ["d$i" for i in 2:20]
         dir = make_pkg(
             "Refilled",
-            "test/t_test.jl" => string(
-                journal_item("tiny"; opts = "profile=:tiny", body = "@test ENV[\"TINY\"] == \"1\""),
-                (journal_item("d$i"; body = "sleep(0.1)\n@test !haskey(ENV, \"TINY\")") for i in 1:20)...,
-            ),
-            "test/TestItems.toml" => "[profiles.tiny]\nenv = { TINY = \"1\" }\n",
+            "test/tiny_test.jl" => journal_item("tiny"; opts = "profile=:tiny", body = "@test ENV[\"TINY\"] == \"1\""),
+            "test/a_test.jl" => journal_item("d1"; body = started_elsewhere(others) * "@test !haskey(ENV, \"TINY\")"),
+            "test/b_test.jl" => string((journal_item(n; body = "@test !haskey(ENV, \"TINY\")") for n in others)...),
+            "test/TestItems.toml" => "[profiles.tiny]\nenv = { TINY = \"1\" }\n[order]\nfirst = [\"d1\"]\n",
         )
         rows = with_journal() do path
             states, run, p = run_states(dir; workers = 2, logs = :issues, monitor = false)

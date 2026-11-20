@@ -161,7 +161,7 @@ function run_file_in_subprocess(
         Int32(0)   # it has already exited
     end
     memory === nothing || pid == 0 || @lock memory.lock (memory.pids[pid] = file)
-    hung = timedwait(() -> process_exited(proc), limit; pollint = 1.0) === :timed_out
+    hung = timedwait(() -> process_exited(proc), limit; pollint = 0.05) === :timed_out
     hung && stop_hung(proc)
     wait(proc)
     memory === nothing || @lock memory.lock delete!(memory.pids, pid)

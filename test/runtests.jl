@@ -30,51 +30,48 @@ fixture(name) = joinpath(FIXTURES, name)
 include("helpers.jl")
 include("parallel.jl")
 
-# Slowest first. The files are independent and the run is only as short as its
-# longest file, so the long ones have to be in flight from the start; the order
-# is a packing hint and nothing depends on it.
+# Slowest first (ordered by measured wall-clock duration). The files are independent
+# and the run is only as short as its longest tail, so long files start first.
 const TEST_FILES = [
-    "test_timeouts.jl",
-    "test_sandbox.jl",
-    "test_crashes.jl",
-    "test_artifacts.jl",
-    "test_runner.jl",
     "test_execute.jl",
-    "test_setups.jl",
-    "test_environments.jl",
-    "test_static.jl",
-    "test_workers.jl",
-    "test_runstate.jl",
-    "test_matrix.jl",
-    "test_monitor.jl",
-    "test_pkgtest.jl",
-    "test_testenv.jl",
     "test_monorepo.jl",
-    "test_where_code_runs.jl",
-    "test_output.jl",
-    "test_shared_runstates.jl",
-    "test_templates.jl",
-    "test_editor.jl",
-    "test_filters.jl",
-    "test_groups.jl",
-    "test_scan.jl",
-    "test_plan.jl",
-    "test_gating.jl",
-    "test_fixtures.jl",
-    "test_config.jl",
     "test_precompile.jl",
+    "test_timeouts.jl",
+    "test_crashes.jl",
+    "test_runstate.jl",
+    "test_runner.jl",
+    "test_environments.jl",
+    "test_setups.jl",
+    "test_artifacts.jl",
+    "test_monitor.jl",
+    "test_static.jl",
+    "test_editor.jl",
+    "test_templates.jl",
+    "test_sandbox.jl",
+    "test_workers.jl",
+    "test_where_code_runs.jl",
     "test_debug.jl",
+    "test_testenv.jl",
     "test_interactive.jl",
-    "test_chores.jl",
-    "test_coverage.jl",
+    "test_matrix.jl",
     "test_port.jl",
+    "test_output.jl",
+    "test_pkgtest.jl",
+    "test_coverage.jl",
+    "test_shared_runstates.jl",
+    "test_config.jl",
+    "test_groups.jl",
+    "test_plan.jl",
+    "test_filters.jl",
+    "test_fixtures.jl",
+    "test_chores.jl",
+    "test_scan.jl",
+    "test_gating.jl",
 ]
 
-# Four is where this stops paying: the longest file takes about as long as a
-# quarter of the suite, so more processes only add memory. Each of these starts
-# worker processes of its own; the run ends with each file's peak memory, and the
-# suite's, to choose from.
-default_jobs() = something(tryparse(Int, get(ENV, "RUNTESTS_TEST_JOBS", "")), 4)
+# CI sets `RUNTESTS_TEST_JOBS` explicitly for its 2-4 core runners; locally scale gently
+# with CPU count (capped at 6 to bound peak RSS across worker-spawning test files).
+default_jobs() = something(tryparse(Int, get(ENV, "RUNTESTS_TEST_JOBS", "")), clamp(Sys.CPU_THREADS ÷ 3, 4, 6))
 
 """
     run_file(file)

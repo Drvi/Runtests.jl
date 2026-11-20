@@ -71,7 +71,7 @@ end
     # its cache is a flat `<name>*.ji` beside the package directories, not inside
     # one of them.
     cache_root = joinpath(Base.DEPOT_PATH[1], "compiled", "v$(VERSION.major).$(VERSION.minor)")
-    caches() = filter(f -> startswith(f, setup) && endswith(f, ".ji"), readdir(cache_root))
+    caches() = isdir(cache_root) ? filter(f -> startswith(f, setup) && endswith(f, ".ji"), readdir(cache_root)) : String[]
 
     @testset "a worker on the same flags reuses what the stage compiled" begin
         write(joinpath(dir, "test", "a_test.jl"), """
@@ -354,12 +354,19 @@ end
     @testset "a setup compiles once what it loads is compiled, not after the whole environment" begin
         foreach(f -> rm(joinpath(log, f)), readdir(log))
         slow, setup = "SlowEnv$tag", "QuickSetup$tag"
+        setup_started = repr(joinpath(log, "$setup.started"))
         files = Pair{String, String}[]
-        us = timed_pkg!(files, slow; body = "sleep(4)")
+        us = timed_pkg!(files, slow; body = """
+            let deadline = time() + 60
+                while !isfile($setup_started) && time() < deadline
+                    sleep(0.05)
+                end
+            end
+            """)
         dir = make_pkg("SetupEarly$tag", files..., "test/Project.toml" => dep(slow, us, ".."),
-                       "test/testsetups/$setup.jl" => "module $setup\n$(stamp(setup, "start"))\n$(stamp(setup, "end"))\nend\n",
+                       "test/testsetups/$setup.jl" => "module $setup\n$(stamp(setup, "start"))\ntouch($setup_started)\n$(stamp(setup, "end"))\nend\n",
                        "test/t_test.jl" => "@testitem \"t\" begin\n    using $setup\n    @test true\nend\n")
-        (states, _, _), out = run_once(dir)
+        (states, _, _), out = withenv(() -> run_once(dir), "JULIA_NUM_PRECOMPILE_TASKS" => "4")
         @test all(==(PASSED), values(states))
         s = spans()
         @test s[setup][1] < s[slow][2]
@@ -371,11 +378,20 @@ end
     @testset "a helper ends when its environment is done, not with the queue" begin
         foreach(f -> rm(joinpath(log, f)), readdir(log))
         slow, quick = "SlowHere$tag", "QuickQa$tag"
+        quick_done = repr(joinpath(log, "$quick.end"))
         files = Pair{String, String}[]
-        us, uq = timed_pkg!(files, slow; body = "sleep(4)"), timed_pkg!(files, quick; body = "")
+        us = timed_pkg!(files, slow; body = """
+            let deadline = time() + 60
+                while !isfile($quick_done) && time() < deadline
+                    sleep(0.05)
+                end
+            end
+            sleep(0.8)
+            """)
+        uq = timed_pkg!(files, quick; body = "")
         dir = make_pkg("EarlyExit$tag", files..., "test/Project.toml" => dep(slow, us, ".."), "test/t_test.jl" => item("t"),
                        "test/qa/Project.toml" => dep(quick, uq, "../.."), "test/qa/q_test.jl" => item("q"))
-        (states, _, _), out = run_once(dir)
+        (states, _, _), out = withenv(() -> run_once(dir), "JULIA_NUM_PRECOMPILE_TASKS" => "4")
         @test all(==(PASSED), values(states))
         lines = collect(eachsplit(out, '\n'))
         exit_at = findfirst(l -> occursin(r"⬛ w1 · \d\d:\d\d:\d\d · EXIT", l), lines)
@@ -389,7 +405,7 @@ end
         foreach(f -> rm(joinpath(log, f)), readdir(log))
         slow, setup = "SlowLoaded$tag", "LoadingSetup$tag"
         files = Pair{String, String}[]
-        us = timed_pkg!(files, slow)
+        us = timed_pkg!(files, slow; body = "sleep(0.5)")
         dir = make_pkg("SetupArgs$tag", files..., "test/Project.toml" => dep(slow, us, ".."),
                        "test/testsetups/$setup.jl" =>
                            "module $setup\n$(stamp(setup, "start"))\nusing $slow\n$(stamp(setup, "end"))\nend\n",
@@ -564,33 +580,12 @@ end
     stage = "precompiling the env test/qa for 1 profile: bounds"
 
     with_runstate_dir() do _
-        @testset "an empty list compiles Runtests only, and the workers what the items load" begin
-            dir, kept, left, cached = unloaded_pkg("NoPrecompile")
-            write(joinpath(dir, "test", "TestItems.toml"), profile("precompile = []\n"))
-            (states, _, _), out = run_once(dir)
-            @test all(==(PASSED), values(states))
-            @test !occursin(stage, out)
-            @test !cached(kept) && !cached(left)
-            # Without the key, the run compiles the whole environment for the flags.
-            write(joinpath(dir, "test", "TestItems.toml"), profile())
-            (states, _, _), out = run_once(dir)
-            @test all(==(PASSED), values(states))
-            @test occursin(stage, out)
-            @test cached(kept) && cached(left)
-        end
-
-        @testset "a list compiles the packages it names" begin
-            dir, kept, left, cached = unloaded_pkg("SomePrecompile")
-            write(joinpath(dir, "test", "TestItems.toml"), profile("precompile = [\"$kept\"]\n"))
-            (states, _, _), out = run_once(dir)
-            @test all(==(PASSED), values(states))
-            @test occursin(stage, out)
-            @test cached(kept)
-            @test !cached(left)
-        end
+        # One fresh package covers the full sequence — invalid name, empty list, partial
+        # list, and default (whole environment) — so `test/qa` and Runtests under the
+        # profile's flags are resolved and compiled once instead of three times.
+        dir, kept, left, cached = unloaded_pkg("PrecompileList")
 
         @testset "a name that the environment does not hold stops the run before the workers start" begin
-            dir, kept, _, _ = unloaded_pkg("MisnamedPrecompile")
             write(joinpath(dir, "test", "TestItems.toml"), profile("precompile = [\"$kept\", \"Nope\"]\n"))
             err = try
                 run_once(dir)
@@ -601,6 +596,32 @@ end
             @test err isa ConfigError
             @test occursin("`precompile` of profile `bounds` names `Nope`, which is not a package of the environment of its items",
                            sprint(showerror, err))
+            @test !cached(kept) && !cached(left)
+        end
+
+        @testset "an empty list compiles Runtests only, and the workers what the items load" begin
+            write(joinpath(dir, "test", "TestItems.toml"), profile("precompile = []\n"))
+            (states, _, _), out = run_once(dir)
+            @test all(==(PASSED), values(states))
+            @test !occursin(stage, out)
+            @test !cached(kept) && !cached(left)
+        end
+
+        @testset "a list compiles the packages it names" begin
+            write(joinpath(dir, "test", "TestItems.toml"), profile("precompile = [\"$kept\"]\n"))
+            (states, _, _), out = run_once(dir)
+            @test all(==(PASSED), values(states))
+            @test occursin(stage, out)
+            @test cached(kept)
+            @test !cached(left)
+        end
+
+        @testset "without the key, the run compiles the whole environment for the flags" begin
+            write(joinpath(dir, "test", "TestItems.toml"), profile())
+            (states, _, _), out = run_once(dir)
+            @test all(==(PASSED), values(states))
+            @test occursin(stage, out)
+            @test cached(kept) && cached(left)
         end
     end
 end
@@ -763,7 +784,7 @@ end
     dir = make_pkg(
         "SlowLog",
         "deps/SlowPkg/Project.toml" => "name = \"SlowPkg\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
-        "deps/SlowPkg/src/SlowPkg.jl" => "module SlowPkg\nsleep(2)\nend\n",
+        "deps/SlowPkg/src/SlowPkg.jl" => "module SlowPkg\nsleep(0.8)\nend\n",
         "test/Project.toml" => "[deps]\nSlowPkg = \"$u\"\n\n[sources]\nSlowPkg = {path = \"../deps/SlowPkg\"}\n",
         "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
     )

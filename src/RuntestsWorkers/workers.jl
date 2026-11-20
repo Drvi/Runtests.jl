@@ -556,6 +556,7 @@ const INSPECT_SIGNAL = Sys.iswindows() ? nothing : Sys.isbsd() ? 29 : 10
 # The runtime samples for `Profile.get_peek_duration()`, one second by default,
 # and the report follows from a task, so the output needs a moment to appear.
 const INSPECT_SECONDS = 2.5
+const INSPECT_SECONDS_OVERRIDE = ScopedValue{Union{Nothing, Float64}}(nothing)
 
 """
     inspect!(w::Worker)
@@ -567,13 +568,15 @@ which the coordinator relays like any other output. Does nothing on Windows.
 function inspect!(w::Worker)
     INSPECT_SIGNAL === nothing && return nothing
     process_running(w.process) || return nothing
+    seconds = something(INSPECT_SECONDS_OVERRIDE[], INSPECT_SECONDS)
+    seconds <= 0 && return nothing
     try
         kill(w.process, INSPECT_SIGNAL)   # the worker itself, not its process group
     catch e
         is_interrupt(e) && rethrow()
         return nothing
     end
-    wait_exit(w.process, INSPECT_SECONDS)   # a worker that exits meanwhile needs no more time
+    wait_exit(w.process, seconds)   # a worker that exits meanwhile needs no more time
     return nothing
 end
 

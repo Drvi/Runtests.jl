@@ -293,7 +293,7 @@ end
                          joinpath(dir, "test", "qa_prefs.toml"), joinpath(dir, "Project.toml"),
                          joinpath(dir, "lib", "EnvBuildCore", "Project.toml"))
                 n = builds[]
-                write(file, read(file))
+                bump_mtime!(file)
                 again = build()
                 @test builds[] == n + 1
                 @test again != first_
@@ -325,25 +325,23 @@ end
             write(joinpath(bad, "test", "qa", "qa_tests.jl"), "@testitem \"qa\" begin\nend\n")
             write(joinpath(bad, "test", "main_tests.jl"), "@testitem \"main\" begin\nend\n")
             with_runstate_dir() do _
+                artifacts = mktempdir()
                 # How many errors Julia prints: the run's alone, with Pkg's in its message.
+                # With somewhere for a job's artifacts, why it stopped is kept there too.
                 printed = 0
-                err = try
-                    capture_run(() -> run_states(bad; workers = 1, monitor = false))
-                    nothing
-                catch e
-                    printed = length(current_exceptions())
-                    e
+                err = withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
+                    try
+                        capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                        nothing
+                    catch e
+                        printed = length(current_exceptions())
+                        e
+                    end
                 end
                 @test err isa ConfigError && printed == 1
                 @test occursin("could not build the environment of $(joinpath("test", "qa"))", sprint(showerror, err))
                 @test isempty(runstate_files(bad))
                 @test live_worker_processes() == 0
-                # With somewhere for a job's artifacts, why it stopped is kept there, as no
-                # directory of the run is.
-                artifacts = mktempdir()
-                withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
-                    @test_throws ConfigError capture_run(() -> run_states(bad; workers = 1, monitor = false))
-                end
                 logs = filter(startswith("setup-"), readdir(artifacts))
                 @test length(logs) == 1
                 @test occursin("could not build the environment", read(joinpath(artifacts, only(logs)), String))
@@ -418,14 +416,14 @@ end
 
                 @testset "the variable sets it, the keyword wins, and the file refuses it" begin
                     withenv("RUNTESTS_SKIP_ENVIRONMENT" => " test/qa , test/qa") do
-                        (states, _, _), out = capture_run(() -> run_states(bad; workers = 1, monitor = false))
+                        (states, _, _), out = capture_run(() -> run_states(bad; workers = 0, monitor = false))
                         @test states == skipped
                         @test occursin("RUNTESTS_SKIP_ENVIRONMENT", out)
                         # `nothing` is no keyword, so the variable still decides.
-                        (states, _, _), _ = capture_run(() -> run_states(bad; workers = 1, monitor = false, skip_environment = nothing))
+                        (states, _, _), _ = capture_run(() -> run_states(bad; workers = 0, monitor = false, skip_environment = nothing))
                         @test states == skipped
                         # A keyword that skips none: the run builds the environment, which stops it.
-                        @test_throws ConfigError capture_run(() -> run_states(bad; workers = 1, monitor = false, skip_environment = String[]))
+                        @test_throws ConfigError capture_run(() -> run_states(bad; workers = 0, monitor = false, skip_environment = String[]))
                     end
                     config = joinpath(bad, "test", "TestItems.toml")
                     before = read(config, String)
@@ -492,13 +490,18 @@ end
     end
 
     @testset "running in an environment" begin
+        only_dep_uuid = next_uuid()
         dir = env_pkg(
             "EnvRun",
+            "lib/OnlyInTestEnv/Project.toml" => "name = \"OnlyInTestEnv\"\nuuid = \"$only_dep_uuid\"\nversion = \"0.1.0\"\n",
+            "lib/OnlyInTestEnv/src/OnlyInTestEnv.jl" => "module OnlyInTestEnv\nend\n",
+            "test/Project.toml" => "[deps]\nOnlyInTestEnv = \"$only_dep_uuid\"\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n\n[sources]\nOnlyInTestEnv = {path = \"../lib/OnlyInTestEnv\"}\n",
             "test/main_tests.jl" => """
             @testitem "main sees the package" begin
                 @test EnvRun.double(1) == 4
                 # The environment's packages are its directory's alone.
                 @test Base.find_package("EnvRunTools") === nothing
+                @test Base.find_package("OnlyInTestEnv") !== nothing
                 @test Main.Runtests.current_testitem().profile === :default
             end
             """,
@@ -507,6 +510,8 @@ end
             @testitem "qa nested" begin
                 using EnvRunTools
                 @test EnvRunTools.marker() === :tools
+                # A package declared only in `test/Project.toml` is not visible to `test/qa/`.
+                @test Base.find_package("OnlyInTestEnv") === nothing
                 @test Main.Runtests.current_testitem().profile === :default
             end
             """,
@@ -664,30 +669,6 @@ end
                 end
                 @test Base.active_project() == env
                 @test LOAD_PATH == before
-            end
-            # A package declared only in `test/Project.toml` is not visible to `test/qa/`.
-            iso = env_pkg("EnvStrictIso",
-                "test/qa/qa_tests.jl" => """
-                @testitem "cannot see test-only dep" begin
-                    @test Base.find_package("OnlyInTestEnv") === nothing
-                    @test Base.find_package("EnvStrictIsoTools") !== nothing
-                end
-                """)
-            only_dep = joinpath(iso, "lib", "OnlyInTestEnv")
-            mkpath(joinpath(only_dep, "src"))
-            write(joinpath(only_dep, "Project.toml"), "name = \"OnlyInTestEnv\"\nuuid = \"9a9b9c9d-1111-4111-8111-111111111111\"\nversion = \"0.1.0\"\n")
-            write(joinpath(only_dep, "src", "OnlyInTestEnv.jl"), "module OnlyInTestEnv\nend\n")
-            write(joinpath(iso, "test", "Project.toml"), """
-                [deps]
-                OnlyInTestEnv = "9a9b9c9d-1111-4111-8111-111111111111"
-                Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-
-                [sources]
-                OnlyInTestEnv = {path = "../lib/OnlyInTestEnv"}
-                """)
-            with_runstate_dir() do _
-                (states, _, _), _ = capture_run(() -> run_states(iso; workers = 1, monitor = false))
-                @test states["cannot see test-only dep"] === PASSED
             end
         end
 

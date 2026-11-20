@@ -345,8 +345,7 @@ const DEPS = fixture("TestDeps.jl")
                 end
             end
         end
-        sleep(0.5)
-        @test live_worker_processes() <= before
+        @test timedwait(() -> live_worker_processes() <= before, 10) === :ok
     end
 end
 

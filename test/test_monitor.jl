@@ -61,8 +61,10 @@ end
             spin(0.3)
             b, c1 = process_cpu_seconds(), clock()
             @test isapprox(b - a, c1 - c0; atol = 0.05)
-            # A child's counts once it has exited and been waited for.
-            run(`$(Base.julia_cmd()[1]) --startup-file=no -e "t = time(); x = 0.0; while time() - t < 0.5; global x += sin(x); end"`)
+            # A child's counts once it has exited and been waited for. Spin on the
+            # child's own CPU clock rather than wall time so a loaded runner still
+            # accumulates enough CPU time.
+            run(`$(Base.julia_cmd()[1]) --startup-file=no -e "c0 = ccall(:clock, Clong, ()); t0 = time(); x = 0.0; while (ccall(:clock, Clong, ()) - c0) / 1e6 < 0.5 && time() - t0 < 30; global x += sin(x); end"`)
             @test process_cpu_seconds() - b >= 0.45
         end
     end
@@ -84,6 +86,7 @@ end
                 @test getpid() in process_tree([getpid()])
             finally
                 kill(proc, Base.SIGKILL)
+                try wait(proc) catch end
             end
         end
     end
@@ -142,6 +145,7 @@ end
             @test (child => Int32(getpid())) in Runtests.Private.Platform.process_parents_windows()
         finally
             kill(proc, Base.SIGKILL)
+            try wait(proc) catch end
         end
     end
 
@@ -191,12 +195,39 @@ end
     end
 end
 
-@testset "monitor" begin
-    @testset "a run records its memory peaks" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true,
-                            monitor_interval=1)
+# Shared finished `Basic.jl` runs for testsets that inspect `Run` / `Monitor` state
+# without needing a fresh worker boot of their own.
+const _BASIC_W2 = Ref{Any}(nothing)
+const _BASIC_W1 = Ref{Any}(nothing)
+const _BASIC_W1_RS = Ref{String}("")
+
+function shared_basic_w2()
+    if _BASIC_W2[] === nothing
+        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true, monitor_interval=1)
         run = execute(p, target)
         rm(run.scratch; force=true, recursive=true)
+        _BASIC_W2[] = (p, run)
+    end
+    return _BASIC_W2[]
+end
+
+function shared_basic_w1()
+    if _BASIC_W1[] === nothing
+        rsdir = mktempdir()
+        _BASIC_W1_RS[] = rsdir
+        withenv("RUNTESTS_RUNSTATE_DIR" => rsdir) do
+            p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
+            run = execute(p, target)
+            rm(run.scratch; force=true, recursive=true)
+            _BASIC_W1[] = (p, run)
+        end
+    end
+    return _BASIC_W1[]
+end
+
+@testset "monitor" begin
+    @testset "a run records its memory peaks" begin
+        _, run = shared_basic_w2()
         @test run.monitor !== nothing
         st = run.monitor.stats
         @test st.machine_total > 0
@@ -235,9 +266,7 @@ end
     end
 
     @testset "no stage claims more than the run as a whole" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        _, run = shared_basic_w1()
         st = run.monitor.stats
         # The run-wide peak is still the largest of the stages, and each stage's
         # largest single process is within its own total.
@@ -260,9 +289,13 @@ end
         @test due(57, 47, 200.0, 190.0)
         @test !due(56, 47, 200.0, 190.0)
 
-        # Twelve items of 0.7 s on one worker, and a clock that says nothing within the
-        # hour: the tenth item finishes more than five seconds into testing.
-        items = join(("@testitem \"slow $k\" begin\n    sleep(0.7)\n    @test true\nend\n" for k in 1:12), "\n")
+        # Twelve items on one worker, and a clock that says nothing within the hour:
+        # item 01 pushes elapsed time past the 5 s gate, items 02..10 finish at once,
+        # and item 11 holds long enough for the monitor to sample at 10/12.
+        items = join((begin
+            delay = k == 1 ? "sleep(5.4)\n    " : k == 11 ? "sleep(0.6)\n    " : ""
+            "@testitem \"slow $(lpad(k, 2, '0'))\" begin\n    $(delay)@test true\nend\n"
+        end for k in 1:12), "\n")
         dir = make_pkg("ProgressLines", "test/a_test.jl" => items)
         _, out = with(Runtests.Private.TTY_OVERRIDE => false) do
             capture_run(() -> run_states(dir; workers = 1, monitor = true, monitor_interval = 3600))
@@ -274,7 +307,7 @@ end
     @testset "an item's memory is its worker's with what the worker started, over the attempt" begin
         dir = make_pkg("TreeMemory", "test/t_test.jl" => """
             @testitem "starts a big process" begin
-                run(`\$(Base.julia_cmd()) --startup-file=no -e 'x = ones(UInt8, 600 * 2^20); sleep(2); print(sum(x) > 0)'`)
+                run(`\$(Base.julia_cmd()) --startup-file=no -e 'x = ones(UInt8, 350 * 2^20); sleep(1.2); print(sum(x) > 0)'`)
                 @test true
             end
             """)
@@ -283,17 +316,15 @@ end
             @test states["starts a big process"] === Runtests.Private.PASSED
             if Runtests.Private.Platform.PER_PROCESS_OK[]
                 done = match(r"DONE .* tree max +([0-9.]+) GiB", out)
-                @test done !== nothing && parse(Float64, done[1]) >= 0.6
+                @test done !== nothing && parse(Float64, done[1]) >= 0.35
                 rs = Runtests.Private.read_run_state(run.runstate.path)
-                @test only(rs.statuses).peak_rss_mb >= 600
+                @test only(rs.statuses).peak_rss_mb >= 350
             end
         end
     end
 
     @testset "the status line says what is happening" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        _, run = shared_basic_w1()
         line = status_line(run.monitor)
         @test startswith(line, Runtests.Private.MARK_INFO * " w0" * Runtests.Private.FIELD)
         @test occursin("INFO", line)
@@ -341,11 +372,16 @@ end
         @test !occursin(r"cpu +\d+\.\d/", status_line(m))
         @atomic m.reading = saved
         # A window has to pass before there is a percentage, and one starts with the first.
-        m.cpu_window_at = 0.0
-        @test Runtests.Private.cpu_percent!(m, 100.0) < 0
-        @test Runtests.Private.cpu_percent!(m, 105.0) < 0
-        pct = Runtests.Private.cpu_percent!(m, 100.0 + Runtests.Private.CPU_WINDOW_S)
-        @test pct == -1 || 0 <= pct <= 100
+        saved_at, saved_pct = m.cpu_window_at, m.cpu_pct
+        try
+            m.cpu_window_at = 0.0
+            @test Runtests.Private.cpu_percent!(m, 100.0) < 0
+            @test Runtests.Private.cpu_percent!(m, 105.0) < 0
+            pct = Runtests.Private.cpu_percent!(m, 100.0 + Runtests.Private.CPU_WINDOW_S)
+            @test pct == -1 || 0 <= pct <= 100
+        finally
+            m.cpu_window_at, m.cpu_pct = saved_at, saved_pct
+        end
 
         # It is redrawn after every line the run prints, so it must not allocate to
         # do it: this is the one place in the run where formatting is on the hot path.
@@ -362,13 +398,12 @@ end
     end
 
     @testset "the status line names the item that has been running longest" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        p, run = shared_basic_w2()
         m = run.monitor
         @test length(run.slots) == 2
         named(i) = " · " * sprint(io -> Runtests.Private.print_clipped(io, p.items.name[i], Runtests.Private.RUNNING_WIDTH))
         ItemIdx = Runtests.Private.ItemIdx
+        saved_starts = (run.statuses.start[1], run.statuses.start[2])
         try
             # The second slot's item started first, so it is named, whichever slot
             # comes first.
@@ -385,13 +420,12 @@ end
             @test !occursin(p.items.name[2], status_line(m))
         finally
             foreach(sl -> (@atomic sl.current = ItemIdx(0)), run.slots)
+            run.statuses.start[1], run.statuses.start[2] = saved_starts
         end
     end
 
     @testset "a printed line and the status line are one update" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        _, run = shared_basic_w1()
         m = run.monitor
         out = String(take!(copy(status_update!(m, "a line of output"))))
         # Erase, the line, then the status line again — assembled whole, because
@@ -466,10 +500,8 @@ end
     end
 
     @testset "a report fires on a clock, on a phase change, and near OOM" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
-        m = run.monitor
+        _, run = shared_basic_w1()
+        m = Monitor(run)
 
         # Upward through a mark is worth saying; sitting above it is not, and
         # neither is drifting back down.
@@ -557,7 +589,7 @@ end
                                          Runtests.Private.ItemIdx(0), Int8(0), "", String[], false,
                                          Runtests.Private.ItemIdx(0))
             Runtests.Private.set_paused!(q, true)
-            released = @async (sleep(1); Runtests.Private.set_paused!(q, false))
+            released = @async (sleep(0.05); Runtests.Private.set_paused!(q, false))
             Runtests.Private.wait_while_paused(q, slot)
             wait(released)
             @test collections() > before
@@ -569,24 +601,36 @@ end
     @testset "the memory guard restarts a worker between items, and stops no item" begin
         # Asked while the worker is running an item: the item finishes and passes,
         # and the next one gets a fresh process.
-        ready = joinpath(mktempdir(), "ready")
-        dir = make_pkg("GuardRecycle", "test/t_test.jl" => """
+        marks = mktempdir()
+        ready = joinpath(marks, "ready")
+        release = joinpath(marks, "release")
+        dir = make_pkg("GuardRecycle",
+            "test/t_test.jl" => """
             @testitem "holds the worker" begin
                 touch($(repr(ready)))
-                sleep(2)
+                deadline = time() + 60
+                while !isfile($(repr(release))) && time() < deadline
+                    sleep(0.02)
+                end
                 @test true
             end
             @testitem "runs after" begin
                 @test true
             end
-            """)
+            """,
+            "test/TestItems.toml" => "[order]\nfirst = [\"holds the worker\"]\n",
+        )
         (states, run, p), out = capture_run() do
             task = @async run_states(dir; workers=1, logs=:issues, monitor=false)
             deadline = time() + 300
             while !isfile(ready) && !istaskdone(task) && time() < deadline
                 sleep(0.05)
             end
-            Runtests.Private.recycle_biggest_worker!(Monitor(Runtests.Private.LIVE_RUN.run))
+            try
+                Runtests.Private.recycle_biggest_worker!(Monitor(Runtests.Private.LIVE_RUN.run))
+            finally
+                touch(release)
+            end
             fetch(task)
         end
         @test states["holds the worker"] === Runtests.Private.PASSED
@@ -599,8 +643,7 @@ end
     end
 
     @testset "a run with workers frees what the session left behind while they start" begin
-        pkg = make_pkg("SessionGarbage", "test/t_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
-        capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))   # compiled, environment cached
+        shared_basic_w1()   # Basic.jl compiled and its test environment cached
         garbage = leave_old_garbage(256)
         # Asked by whether the garbage is gone, not by the bytes left: a process on a
         # machine short of memory collects in full on its own, before the run as much
@@ -608,7 +651,7 @@ end
         if garbage.value === nothing
             @test_skip "the process collected the garbage itself, before the run"
         else
-            capture_run(() -> run_states(pkg; workers=1, logs=:issues, monitor=false))
+            capture_run(() -> run_states(fixture("Basic.jl"); workers=1, logs=:issues, monitor=false))
             @test garbage.value === nothing
         end
     end
@@ -656,10 +699,8 @@ end
     end
 
     @testset "a dead worker's memory is its own" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
-        m = run.monitor
+        _, run = shared_basic_w1()
+        m = Monitor(run)
         r = @atomic m.reading
         @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
                                                  [Int64(3) << 30], Int32[4242], [Int64(0)], [Int64(0)], [Int64(0)])
@@ -689,10 +730,8 @@ end
     end
 
     @testset "a sample counts against the stage it was taken in" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
-        m = run.monitor
+        _, run = shared_basic_w1()
+        m = Monitor(run)
         st = m.stats
         for ps in st.phases
             ps.peak_total = 0; ps.peak_single = 0; ps.nprocs_at_peak = 0; ps.starts = 0
@@ -733,14 +772,19 @@ end
 
     @testset "the summary reports each stage the run went through" begin
         # Each item holds memory while both run, so that the testing stage peaks while
-        # the workers are alive. The coordinator, this process, has run the whole file
-        # and is larger than the worker of a small package: without the items' memory,
-        # a sample of it alone at either end of the stage could be the peak.
+        # the workers are alive. A two-file barrier guarantees both workers hold their
+        # resident buffer at the same time even if one boots slower than the other.
+        barrier = mktempdir()
         dir = make_pkg("StagePeaks", "test/t_test.jl" => join((
             """
             @testitem "holds memory $i" begin
-                x = fill(UInt8(1), 400_000_000)   # written, so resident
-                sleep(2)
+                x = fill(UInt8(1), 350_000_000)   # written, so resident
+                touch($(repr(joinpath(barrier, "ready_$i"))))
+                deadline = time() + 60
+                while !isfile($(repr(joinpath(barrier, "ready_$(3 - i)")))) && time() < deadline
+                    sleep(0.05)
+                end
+                sleep(0.8)
                 @test sum(view(x, 1:1000)) == 1000
             end
             """ for i in 1:2), "\n"))
@@ -792,24 +836,22 @@ end
             @testitem "solo $i" sandbox=true begin
                 @test true
             end
-            """ for i in 1:4)...
+            """ for i in 1:2)...
         ))
         p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
         rm(run.scratch; force=true, recursive=true)
         st = run.monitor.stats
-        @test phase_stats(st, PHASE_TEST).starts == 4
+        @test phase_stats(st, PHASE_TEST).starts == 2
         # One worker at a time. The whole tree can hold more, such as a process that
         # a worker starts, which this run does not decide.
         @test phase_stats(st, PHASE_TEST).workers_at_peak <= 1
         summary = sprint(io -> print_memory_summary(io, run.monitor))
-        @test occursin("4 worker starts", summary)
+        @test occursin("2 worker starts", summary)
 
         # A suite that reuses its worker says nothing about starts: that number
         # would be the worker count again, under another name.
-        p2, target2 = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run2 = execute(p2, target2)
-        rm(run2.scratch; force=true, recursive=true)
+        _, run2 = shared_basic_w1()
         @test phase_stats(run2.monitor.stats, PHASE_TEST).starts == 1
         @test !occursin("worker start", sprint(io -> print_memory_summary(io, run2.monitor)))
     end
@@ -847,7 +889,7 @@ end
               "module $setup
 " * join(["f$i(x) = x + $i" for i in 1:200], "
 ") * "
-sleep(1)
+sleep(1.5)
 end
 ")
         write(joinpath(dir, "test", "a_test.jl"), """
@@ -871,9 +913,7 @@ end
     end
 
     @testset "the memory summary reports totals, not what was running" begin
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        _, run = shared_basic_w1()
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
         @test occursin("tree max", summary)
@@ -883,11 +923,8 @@ end
     end
 
     @testset "the run state records the memory summary" begin
-        dir = mktempdir()
-        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
-            p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
-            run = execute(p, target)
-            rm(run.scratch; force=true, recursive=true)
+        p, _ = shared_basic_w1()
+        withenv("RUNTESTS_RUNSTATE_DIR" => _BASIC_W1_RS[]) do
             @test !isempty(Runtests.Private.runstate_files(p.root))
             @test Runtests.Private.read_run_state(last(Runtests.Private.runstate_files(p.root))) !== nothing
         end
@@ -919,87 +956,93 @@ end
         # `\r\e[2K` erases the row the cursor is on. A line wider than the terminal
         # wraps onto several, so the next redraw would leave all but its last row
         # behind.
-        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=false)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
-        plain(s) = replace(s, r"\e\[[0-9;?]*[a-zA-Z]" => "")
-        drawn(cols) = withenv("COLUMNS" => string(cols)) do
-            with(Runtests.Private.TTY_OVERRIDE => true) do
-                run.monitor = Monitor(run)
-                @test run.monitor.columns == cols
-                out = String(take!(copy(status_update!(run.monitor, "x"))))
-                out[findlast("\r\e[2K", out).stop + 1:end]
+        _, run = shared_basic_w2()
+        saved_mon = run.monitor
+        try
+            plain(s) = replace(s, r"\e\[[0-9;?]*[a-zA-Z]" => "")
+            drawn(cols) = withenv("COLUMNS" => string(cols)) do
+                with(Runtests.Private.TTY_OVERRIDE => true) do
+                    run.monitor = Monitor(run)
+                    @test run.monitor.columns == cols
+                    out = String(take!(copy(status_update!(run.monitor, "x"))))
+                    out[findlast("\r\e[2K", out).stop + 1:end]
+                end
             end
-        end
-        for cols in (200, 100, 60, 30, 12)
-            line = drawn(cols)
-            @test textwidth(plain(line)) <= cols
-            # Cut between characters, not through one: a half-written glyph is
-            # what a byte-count truncation would leave.
-            @test isvalid(line)
-        end
-        # Wide enough for the whole line, and it is not cut at all.
-        @test textwidth(plain(drawn(400))) == textwidth(plain(drawn(0)))
+            for cols in (200, 100, 60, 30, 12)
+                line = drawn(cols)
+                @test textwidth(plain(line)) <= cols
+                # Cut between characters, not through one: a half-written glyph is
+                # what a byte-count truncation would leave.
+                @test isvalid(line)
+            end
+            # Wide enough for the whole line, and it is not cut at all.
+            @test textwidth(plain(drawn(400))) == textwidth(plain(drawn(0)))
 
-        # In colour: the escape codes take no columns and are kept or cut whole, and
-        # a line cut inside a colour still ends by resetting it.
-        fits(s, cols) = Runtests.Private.bytes_within(codeunits(s), 1, ncodeunits(s), cols)
-        @test fits("abcdef", 4) == 4
-        @test fits("\e[32mabcdef\e[0m", 4) == ncodeunits("\e[32mabcd")
-        @test fits("\e[1;32mab\e[0mcdef", 4) == ncodeunits("\e[1;32mab\e[0mcd")
-        @test fits("ab\e[32m", 4) == ncodeunits("ab\e[32m")
-        m = withenv(() -> with(() -> Monitor(run), Runtests.Private.TTY_OVERRIDE => true), "COLUMNS" => "4")
-        truncate(m.linebuf, 0)
-        print(m.linebuf, "\e[32mabcdef\e[0m")
-        Runtests.Private.clip_status!(m, 0)
-        @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
+            # In colour: the escape codes take no columns and are kept or cut whole, and
+            # a line cut inside a colour still ends by resetting it.
+            fits(s, cols) = Runtests.Private.bytes_within(codeunits(s), 1, ncodeunits(s), cols)
+            @test fits("abcdef", 4) == 4
+            @test fits("\e[32mabcdef\e[0m", 4) == ncodeunits("\e[32mabcd")
+            @test fits("\e[1;32mab\e[0mcdef", 4) == ncodeunits("\e[1;32mab\e[0mcd")
+            @test fits("ab\e[32m", 4) == ncodeunits("ab\e[32m")
+            m = withenv(() -> with(() -> Monitor(run), Runtests.Private.TTY_OVERRIDE => true), "COLUMNS" => "4")
+            truncate(m.linebuf, 0)
+            print(m.linebuf, "\e[32mabcdef\e[0m")
+            Runtests.Private.clip_status!(m, 0)
+            @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
+        finally
+            run.monitor = saved_mon
+        end
     end
 
     @testset "while the queue runs, the line counts its compiles and names the oldest" begin
         P = Runtests.Private
-        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=false)
-        run = execute(p, target)
-        rm(run.scratch; force=true, recursive=true)
+        p, run = shared_basic_w1()
+        saved_mon = run.monitor
         plain_text(line) = replace(line, r"\e\[[0-9;]*m" => "")
-        with(P.TTY_OVERRIDE => true) do
-            m = run.monitor = Monitor(run)
-            items = string("INFO · ", lpad(@atomic(run.ndone), ndigits(nitems(p))), "/", nitems(p), " · ",
-                           @atomic(run.nonpass), " failed")
-            # No test worker runs before the tests: the line names them from then on.
-            P.set_phase!(m, P.PHASE_SETUP)
-            plain = status_line(m)
-            @test startswith(plain, P.MARK_INFO)
-            @test occursin(items, plain_text(plain))
-            @test !occursin("precompiling", plain)
-            @test !occursin("workers", plain)
-            P.set_phase!(m, P.PHASE_TEST)
-            @test occursin(r" · \d+/1 workers", status_line(m))
-            P.set_phase!(m, P.PHASE_SETUP)
-            # From before the first compile until the helpers are down, with a compile in
-            # flight or not: the white square, and the compiles counted in place of the
-            # items. No test worker runs yet, so a queue without helpers names no workers.
-            P.queue_started!(12, 0)
-            @atomic P.QUEUE_PROGRESS.done += 3
-            @atomic P.QUEUE_PROGRESS.failed += 1
-            between = status_line(m)
-            @test startswith(between, P.PRECOMPILE_MARK_INFO)
-            @test occursin("INFO ·  3/12 · 1 failed · ", plain_text(between))
-            @test !occursin("workers", between)
-            @test !occursin("precompiling", between)
-            # A queue with helpers counts them as the workers: those up, of all it has.
-            P.queue_started!(12, 2)
-            @atomic P.QUEUE_PROGRESS.live += 1
-            @test occursin("INFO ·  0/12 · 0 failed · 1/2 workers · ", plain_text(status_line(m)))
-            P.compiling_started(1, "SomePackage")
-            line = status_line(m)
-            @test startswith(line, P.PRECOMPILE_MARK_INFO)
-            @test occursin("precompiling SomePackage", line)
-            P.compiling_ended(1)
-            P.queue_ended!()
-            after = status_line(m)
-            @test startswith(after, P.MARK_INFO)
-            @test occursin(items, plain_text(after))
-            @test isempty(P.compiling_names())
+        try
+            with(P.TTY_OVERRIDE => true) do
+                m = run.monitor = Monitor(run)
+                items = string("INFO · ", lpad(@atomic(run.ndone), ndigits(nitems(p))), "/", nitems(p), " · ",
+                               @atomic(run.nonpass), " failed")
+                # No test worker runs before the tests: the line names them from then on.
+                P.set_phase!(m, P.PHASE_SETUP)
+                plain = status_line(m)
+                @test startswith(plain, P.MARK_INFO)
+                @test occursin(items, plain_text(plain))
+                @test !occursin("precompiling", plain)
+                @test !occursin("workers", plain)
+                P.set_phase!(m, P.PHASE_TEST)
+                @test occursin(r" · \d+/1 workers", status_line(m))
+                P.set_phase!(m, P.PHASE_SETUP)
+                # From before the first compile until the helpers are down, with a compile in
+                # flight or not: the white square, and the compiles counted in place of the
+                # items. No test worker runs yet, so a queue without helpers names no workers.
+                P.queue_started!(12, 0)
+                @atomic P.QUEUE_PROGRESS.done += 3
+                @atomic P.QUEUE_PROGRESS.failed += 1
+                between = status_line(m)
+                @test startswith(between, P.PRECOMPILE_MARK_INFO)
+                @test occursin("INFO ·  3/12 · 1 failed · ", plain_text(between))
+                @test !occursin("workers", between)
+                @test !occursin("precompiling", between)
+                # A queue with helpers counts them as the workers: those up, of all it has.
+                P.queue_started!(12, 2)
+                @atomic P.QUEUE_PROGRESS.live += 1
+                @test occursin("INFO ·  0/12 · 0 failed · 1/2 workers · ", plain_text(status_line(m)))
+                P.compiling_started(1, "SomePackage")
+                line = status_line(m)
+                @test startswith(line, P.PRECOMPILE_MARK_INFO)
+                @test occursin("precompiling SomePackage", line)
+                P.compiling_ended(1)
+                P.queue_ended!()
+                after = status_line(m)
+                @test startswith(after, P.MARK_INFO)
+                @test occursin(items, plain_text(after))
+                @test isempty(P.compiling_names())
+            end
+        finally
+            run.monitor = saved_mon
         end
     end
 

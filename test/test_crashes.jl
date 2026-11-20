@@ -160,18 +160,24 @@ end
     @testset "an attempt whose worker dies or is stopped keeps the memory the monitor saw of it" begin
         dir = make_pkg("HeldMemory", "test/t_test.jl" => """
         @testitem "dies holding memory" begin
-            x = ones(UInt8, 200 * 2^20)
-            sleep(1.5)
+            wait_s = parse(Float64, get(ENV, "RUNTESTS_HELD_WAIT", "1.0"))
+            wait_s > 0 && (x = ones(UInt8, 200 * 2^20); sleep(wait_s))
             ccall(:abort, Cvoid, ())
         end
-        @testitem "times out holding memory" timeout=3 begin
-            x = ones(UInt8, 200 * 2^20)
+        @testitem "times out holding memory" timeout=4 begin
+            wait_s = parse(Float64, get(ENV, "RUNTESTS_HELD_WAIT", "1.0"))
+            wait_s > 0 && (x = ones(UInt8, 200 * 2^20))
             sleep(60)
         end
         """)
         with_runstate_dir() do _
             for monitor in (true, false)
-                states, run, p = run_states(dir; workers=2, logs=:issues, monitor)
+                states, run, p = with_fast_inspect() do
+                    withenv("RUNTESTS_HELD_WAIT" => monitor ? "1.0" : "0.0") do
+                        run_states(dir; workers=2, logs=:issues, monitor,
+                                   timeout = monitor ? 4 : 1)
+                    end
+                end
                 @test states["dies holding memory"] === ERRORED && states["times out holding memory"] === TIMEDOUT
                 rs = read_run_state(run.runstate.path)
                 for name in ("dies holding memory", "times out holding memory")
@@ -189,9 +195,11 @@ end
         end
     end
 
-    @testset "failfast is recorded as a cancellation" begin
+    @testset "failfast is recorded as a cancellation, and everything it did not reach is retried" begin
         with_runstate_dir() do _
-            dir = make_pkg("FailFast", "test/t_test.jl" => """
+            dir = make_pkg("FailFast",
+                "test/TestItems.toml" => "[order]\nfirst = [\"a fails\"]\n",
+                "test/t_test.jl" => """
             @testitem "a fails" begin
                 @test 1 == 2
             end
@@ -212,6 +220,11 @@ end
             unrun = [it.name for (i, it) in enumerate(rs.items)
                      if rs.statuses[i].state === UNSEEN || rs.statuses[i].state === CANCELLED]
             @test length(unrun) == 2
+            h = history(dir; nruns=1)
+            # The failure and the items that never got a turn, all of them.
+            @test haskey(h.failed, "a fails")
+            @test haskey(h.failed, "b never runs")
+            @test haskey(h.failed, "c never runs")
         end
     end
 
@@ -246,28 +259,36 @@ end
             rm(blocker; force=true)
         end
     end
-
-    @testset "everything a cancelled run did not reach is retried" begin
-        with_runstate_dir() do _
-            dir = make_pkg("RetryAfterFailfast", "test/t_test.jl" => """
-            @testitem "a fails" begin
-                @test 1 == 2
-            end
-            @testitem "b never runs" begin
-                @test true
-            end
-            """)
-            run_states(dir; workers=1, logs=:issues, monitor=false, failfast=true)
-            h = history(dir; nruns=1)
-            # The failure and the item that never got a turn, both.
-            @test haskey(h.failed, "a fails")
-            @test haskey(h.failed, "b never runs")
-        end
-    end
 end
 
 # The checkout, for a child process that has to find the same one.
 const REPO_ROOT = dirname(@__DIR__)
+
+# Forward the temp test depot and offline flag so child coordinators neither pollute
+# `~/.julia/compiled/` nor talk to registries.
+function child_env(extra::Pair{String, String}...)
+    env = Pair{String, String}[extra...]
+    for k in ("JULIA_DEPOT_PATH", "JULIA_PKG_OFFLINE")
+        haskey(ENV, k) && push!(env, k => ENV[k])
+    end
+    return env
+end
+
+# One shared package for every `interrupted_run` subprocess so the package is compiled
+# once in the temp depot rather than rebuilt from scratch on every signal test.
+const INTERRUPTED_PKG = make_pkg("Interrupted", "test/t_test.jl" => join(
+    ["""
+    @testitem "slow $i" begin
+        touch(joinpath(ENV["RUNTESTS_READY_DIR"], "ready$i"))
+        if get(ENV, "RUNTESTS_CUT", "") == "1"
+            for fd in 3:1023
+                ccall(:shutdown, Cint, (Cint, Cint), fd, 2)
+            end
+        end
+        sleep(600)
+        @test true
+    end
+    """ for i in 1:4], "\n"))
 
 # Windows has no signal to send: `kill` there terminates the process outright, so
 # there is no teardown to watch.
@@ -289,6 +310,7 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     tmp = mktempdir()
     ready = joinpath(tmp, "ready")
     ignored = joinpath(tmp, "sigint_ignored")
+    selected = Set(["slow $i" for i in 1:items])
     script = """
     # Julia 1.11 and 1.12 on macOS can come up ignoring SIGINT: its signal thread sets
     # it to SIG_IGN, racing the handler the main thread installs, and when it lands
@@ -308,27 +330,18 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
     const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "testfixtures")
     fixture(name) = joinpath(FIXTURES, name)
-    dir = make_pkg("Interrupted", "test/t_test.jl" => join(
-        [\"\"\"
-        @testitem "slow \$i" begin
-            touch(joinpath($(repr(dirname(ready))), string("ready", \$i)))
-            $(cut ? "for fd in 3:1023; ccall(:shutdown, Cint, (Cint, Cint), fd, 2); end" : "")
-            sleep(600)
-            @test true
-        end
-        \"\"\" for i in 1:$items], "\\n"))
     sigint_ignored() && (touch($(repr(ignored))); exit())
     # From 1.14 Ctrl-C cancels this script's scope, where every later wait throws
     # again: what it says afterwards is said shielded.
     try
-        run_states(dir; workers=$items, logs=:issues, monitor=$monitor)
+        run_states($(repr(INTERRUPTED_PKG)); workers=$items, name=$(repr(selected)), logs=:issues, monitor=$monitor)
     catch e
         RuntestsWorkers.shielded(() -> println(stderr, "CAUGHT \$(typeof(e))"))
     end
     RuntestsWorkers.shielded() do
-        sleep(0.5)
-        alive = @lock RuntestsWorkers.LIVE_LOCK count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)
-        println(stderr, "ALIVE \$alive")
+        alive_count() = @lock RuntestsWorkers.LIVE_LOCK count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)
+        timedwait(() -> alive_count() == 0, 5.0)
+        println(stderr, "ALIVE \$(alive_count())")
     end
     """
     path, io = mktemp()
@@ -351,8 +364,12 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
         log = Base.BufferStream()
         proc = run(pipeline(
             setenv(`$(Base.julia_cmd()) $julia_args --project=$(REPO_ROOT) --startup-file=no $path`,
-                   "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":"),
-                   "RUNTESTS_RUNSTATE_DIR" => mktempdir()),
+                   child_env(
+                       "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":"),
+                       "RUNTESTS_RUNSTATE_DIR" => mktempdir(),
+                       "RUNTESTS_READY_DIR" => dirname(ready),
+                       "RUNTESTS_CUT" => cut ? "1" : "0",
+                   )...),
             stdout = log, stderr = err,
         ); wait = false)
         while time() < deadline && process_running(proc) && !running()
@@ -444,7 +461,7 @@ Sys.iswindows() ||
     for monitor in (true, false)
         # No interactive thread: Julia 1.11 has none unless asked, and refuses a count of
         # zero; from 1.12 there is one unless the count says zero.
-        r = interrupted_run(; items = 2, julia_args = [VERSION >= v"1.12" ? "--threads=1,0" : "--threads=1"], monitor, delay = 1.0)
+        r = interrupted_run(; items = 2, julia_args = [VERSION >= v"1.12" ? "--threads=1,0" : "--threads=1"], monitor, delay = 0.3)
         @test r.got_running
         @test r.elapsed < 30
         @test all_gone(r.started)
@@ -463,7 +480,7 @@ Sys.iswindows() ||
     # neither records it again nor reports its worker as lost after the run has
     # said how it ended.
     for repl in (true, false)
-        r = interrupted_run(; items = 1, delay = 1.0, repl, cut = true)
+        r = interrupted_run(; items = 1, delay = 0.5, repl, cut = true)
         @test r.got_running
         @test occursin("interrupted after 0 of 1 test item", r.printed)
         @test occursin("1 cancelled", r.printed)
@@ -477,7 +494,7 @@ Sys.iswindows() ||
     # A script, and `Pkg.test`, exit on SIGINT: the exit hooks close the run. The
     # run's own hook stops the workers before anything lets the slots run, so no
     # slot finds its worker gone and puts it down to the out-of-memory killer.
-    r = interrupted_run(; items = 2, delay = 1.0, repl = false)
+    r = interrupted_run(; items = 2, delay = 0.3, repl = false)
     @test r.got_running
     @test r.elapsed < 30
     @test all_gone(r.started)
@@ -486,6 +503,15 @@ Sys.iswindows() ||
     @test !occursin("out-of-memory", r.printed)
     @test !occursin("LOST", r.printed)
 end
+
+const EXIT_DURING_PKG = make_pkg("ExitDuring", "test/t_test.jl" => """
+    @testitem "first" begin
+        sleep(600)
+    end
+    @testitem "second" begin
+        sleep(600)
+    end
+    """)
 
 """
     exit_during(; on_event, stall_editor, deadline) -> NamedTuple
@@ -508,14 +534,6 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
     const P = Runtests.Private
     const WHEN = $(repr(when))
-    dir = make_pkg("ExitDuring", "test/t_test.jl" => \"\"\"
-        @testitem "first" begin
-            sleep(600)
-        end
-        @testitem "second" begin
-            sleep(600)
-        end
-        \"\"\")
     struct StallingIO <: IO end
     function Base.unsafe_write(::StallingIO, p::Ptr{UInt8}, n::UInt)
         line = unsafe_string(p, n)
@@ -536,7 +554,7 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     stream = $(stall_editor ? "P.EventStream(StallingIO())" : "nothing")
     P.with(P.EVENTS => stream) do
         P.exclusively() do
-            p, target = P.prepare((dir,); workers = 2, logs = :issues, monitor = false)
+            p, target = P.prepare(($(repr(EXIT_DURING_PKG)),); workers = 2, logs = :issues, monitor = false)
             P.execute(p, target; on_event = $on_event)
         end
     end
@@ -547,7 +565,7 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
     # The empty entry at the end stands for the default load path.
     load_path = join([REPO_ROOT, joinpath(REPO_ROOT, "test"), ""], Runtests.Private.PATHSEP)
     proc = run(pipeline(setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
-                               "JULIA_LOAD_PATH" => load_path, "RUNTESTS_RUNSTATE_DIR" => runs);
+                               child_env("JULIA_LOAD_PATH" => load_path, "RUNTESTS_RUNSTATE_DIR" => runs)...);
                         stdout = log, stderr = log); wait = false)
     timedwait(() -> isfile(called) || process_exited(proc), 600)
     t0 = time()

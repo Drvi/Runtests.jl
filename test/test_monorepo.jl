@@ -168,20 +168,21 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test ps.isolated == [false, true]
             # What an entry may not be, each said before anything is read.
             mkpath(joinpath(ws, "lib", "plain"))
-            symlink(joinpath(ws, "..") |> realpath, joinpath(ws, "lib", "away"))
-            for (entries, isolated, says) in (
-                    (["lib/X*"], String[], "matches no package of the workspace"),
-                    (["../elsewhere"], String[], "leaves the workspace"),
-                    (["lib/away"], String[], "leads outside the workspace"),
-                    (["lib/plain"], String[], "is not a package of the workspace"),
-                    (["lib/missing"], String[], "no such directory"),
-                    (["lib/NoSuite"], String[], "names NoSuite, which has no suite to run: its test/ has no test files"),
-                    ([""], String[], r"`packages` entry \"\" of \[monorepo\] in \S+ is empty"),
-                    (["lib/A", " "], String[], r"`packages` entry \" \" of \[monorepo\] in \S+ is empty"),
-                    (["lib/A"], [""], r"`isolated` entry \"\" of \[monorepo\] in \S+ is empty"),
-                    (["lib/A"], ["lib/Z*"], "`isolated` entry \"lib/Z*\" of [monorepo]"),
-                    (String[], String[], "leaves no package with a suite to run"),
-                )
+            Sys.iswindows() || symlink(joinpath(ws, "..") |> realpath, joinpath(ws, "lib", "away"))
+            cases = Any[
+                (["lib/X*"], String[], "matches no package of the workspace"),
+                (["../elsewhere"], String[], "leaves the workspace"),
+                (["lib/plain"], String[], "is not a package of the workspace"),
+                (["lib/missing"], String[], "no such directory"),
+                (["lib/NoSuite"], String[], "names NoSuite, which has no suite to run: its test/ has no test files"),
+                ([""], String[], r"`packages` entry \"\" of \[monorepo\] in \S+ is empty"),
+                (["lib/A", " "], String[], r"`packages` entry \" \" of \[monorepo\] in \S+ is empty"),
+                (["lib/A"], [""], r"`isolated` entry \"\" of \[monorepo\] in \S+ is empty"),
+                (["lib/A"], ["lib/Z*"], "`isolated` entry \"lib/Z*\" of [monorepo]"),
+                (String[], String[], "leaves no package with a suite to run"),
+            ]
+            Sys.iswindows() || push!(cases, (["lib/away"], String[], "leads outside the workspace"))
+            for (entries, isolated, says) in cases
                 listing(entries...; isolated)
                 err = try find_participants(ws); nothing catch e; e end
                 @test err isa ConfigError && occursin(says, slashed(err.msg))
@@ -790,14 +791,10 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # The packages' own runs read them as theirs.
                 @test sort!(collect(keys(history(joinpath(ws, "lib", "A")).seconds))) == ["db1", "db2", "same"]
                 @test sort!(collect(keys(history(joinpath(ws, "lib", "B")).seconds))) == ["db1", "same"]
+                # What `report` returns: a testset for each package.
+                ts, _ = capture_run(() -> Runtests.Private.without_enclosing_testset(() -> Runtests.Private.report(run)))
+                @test [r.description for r in ts.results] == ["A", "B"]
             end
-            # What the call returns: a testset for each package.
-            ts = with_runstate_dir() do _
-                Runtests.Private.without_enclosing_testset() do
-                    Runtests.runtests_mono(ws; workers = 1, logs = :issues, monitor = false)
-                end
-            end
-            @test [r.description for r in ts.results] == ["A", "B"]
         end
 
         @testset "a shared profile's workers serve every package that has it, its init run in the workspace root" begin
@@ -1118,7 +1115,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                     "data.txt" => "a",
                     "test/TestItems.toml" => """
                         [run]
-                        test_end_timeout = 2
+                        test_end_timeout = 1
                         [profiles.slow_end]
                         [order]
                         first = ["test_end too slow"]
@@ -1146,7 +1143,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         test_end_timeout = 30
                         [profiles.slow_end]
                         """,
-                    profile_files("slow_end"; test_end = "sleep(3); @assert read(\"data.txt\", String) == \"b\"")...,
+                    profile_files("slow_end"; test_end = "sleep(1.5); @assert read(\"data.txt\", String) == \"b\"")...,
                     "test/b_test.jl" => """
                         @testitem "reads its own root" skip=!isfile("data.txt") begin
                             @test read("data.txt", String) == "b"
@@ -1166,7 +1163,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 ],
             )
             with_runstate_dir() do _
-                states, run, p = run_mono(ws; workers = 1, logs = :issues, monitor = false)
+                states, run, p = with_fast_inspect(() -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
                 @test states[("A", "reads its own root")] === PASSED && states[("B", "reads its own root")] === PASSED
                 # A's `test_end` outlasts A's limit: its worker is ended, and the body's
                 # verdict stands.
@@ -1303,20 +1300,27 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
-        @testset "a combined run's export replays whole, with no history beside it" begin
+        @testset "a combined run's export replays whole, with no history beside it, and respects replay seed overrides" begin
             # As on another machine than the one that ran it: what `RUNTESTS_ARTIFACT_DIR`
-            # kept of each package, and no run state in the history.
+            # kept of each package, and no run state in the history. Also covers per-item
+            # seeds and an explicit `seed` overriding every recorded item seed.
             ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
             artifacts = mktempdir()
             withenv("RUNTESTS_ARTIFACT_DIR" => artifacts) do
-                with_runstate_dir(_ -> run_mono(ws; workers = 1, logs = :issues, monitor = false))
+                with_runstate_dir(_ -> run_mono(ws; workers = 1, item_keys = [("A", "a"), ("B", "b")],
+                                                item_seeds = Dict(("A", "a") => UInt64(5)), logs = :issues, monitor = false))
             end
             with_runstate_dir() do _
                 exported = only(filter(endswith(".rundata"), readdir(joinpath(artifacts, "A"); join = true)))
-                r = mono(ws; replay = joinpath(exported, "run.runstate"))
+                record = joinpath(exported, "run.runstate")
+                r = mono(ws; replay = record)
                 @test sort!([(r.plan.packages.name[r.plan.items.package[i]], r.plan.items.name[i]) for i in 1:nitems(r.plan)]) ==
                       [("A", "a"), ("B", "b")]
                 @test !any(startswith("partial replay"), r.plan.notes)
+                seed_of(p, name) = p.items.seed[findfirst(==(name), p.items.name)]
+                @test seed_of(r.plan, "a") == 5 && seed_of(r.plan, "b") == r.plan.cfg.seed != 5
+                r_seeded = mono(ws; replay = record, seed = 99)
+                @test r_seeded.plan.cfg.seed == 99 && seed_of(r_seeded.plan, "a") == 99 && seed_of(r_seeded.plan, "b") == 99
                 # As a killed job's recovery step copies them: each run directory side by side.
                 flat = mktempdir()
                 for name in ("A", "B"), d in filter(endswith(".rundata"), readdir(joinpath(artifacts, name); join = true))
@@ -1393,21 +1397,6 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             end
         end
 
-        @testset "a combined replay given a seed draws every item from it, a recorded seed of its own aside" begin
-            ws = e2e_workspace("A" => ["test/a_test.jl" => item_text("a")], "B" => ["test/b_test.jl" => item_text("b")])
-            with_runstate_dir() do _
-                # As an editor reruns a failure: `a` with the seed it failed with.
-                _, run, _ = run_mono(ws; workers = 1, item_keys = [("A", "a"), ("B", "b")],
-                                     item_seeds = Dict(("A", "a") => UInt64(5)), logs = :issues, monitor = false)
-                record = first(f.path for f in run.runstate.files)
-                seed_of(p, name) = p.items.seed[findfirst(==(name), p.items.name)]
-                r = mono(ws; replay = record)
-                @test seed_of(r.plan, "a") == 5 && seed_of(r.plan, "b") == r.plan.cfg.seed != 5
-                r = mono(ws; replay = record, seed = 99)
-                @test r.plan.cfg.seed == 99 && seed_of(r.plan, "a") == 99 && seed_of(r.plan, "b") == 99
-            end
-        end
-
         @testset "a worker that cannot start leaves every run state finished, and passes nothing it did not run" begin
             ws = e2e_workspace(
                 "A" => ["test/a_test.jl" => item_text("a"), profile_files(; init = "error(\"no\")")...],
@@ -1459,7 +1448,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # the union environment, with its package and setups, in its root.
                 body = quote
                     using ASetup
-                    @test pwd() == $(joinpath(ws, "lib", "A"))
+                    @test samefile(pwd(), $(joinpath(ws, "lib", "A")))
                     @test A isa Module
                     @test occursin("runtests_union_", Base.active_project())
                 end
@@ -1484,6 +1473,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             finally
                 Runtests.is_activated() && redirect_stdout(Runtests.deactivate, devnull)
                 Base.set_active_project(project)
+                copy!(LOAD_PATH, load_path)
             end
             # Two setups of one name stop it before anything changes.
             ws = make_workspace("A" => ["test/a_test.jl" => item_text("a"), "test/testsetups/Common.jl" => "module Common end\n"],

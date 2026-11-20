@@ -206,10 +206,32 @@ function capture_run(f)
         close(io)
     end
     output = read(path, String)
-    rm(path; force=true)
+    try
+        rm(path; force=true)
+    catch e
+        e isa Base.IOError || rethrow()
+    end
     echo_captured(output)
     return value, output
 end
+
+# Deterministically advance a file's mtime past any filesystem tick (Linux coarse clock,
+# Windows 15.6ms tick) without sleeping.
+function bump_mtime!(path::AbstractString; delta::Real = 5.0)
+    t = mtime(path) + Float64(delta)
+    f = Base.Filesystem.open(path, Base.Filesystem.JL_O_WRONLY)
+    try
+        Base.Filesystem.futime(f, t, t)
+    finally
+        close(f)
+    end
+    return t
+end
+
+# Run `f()` with `INSPECT_SECONDS_OVERRIDE` reduced for timeout tests that do not check
+# profile/backtrace output, saving ~2.3s per timeout without changing default behavior.
+with_fast_inspect(f; seconds::Float64 = 0.05) =
+    Base.ScopedValues.with(f, RuntestsWorkers.INSPECT_SECONDS_OVERRIDE => seconds)
 
 # The runner shows a child's output only when its file fails, so there each
 # captured output is echoed: an assertion about it fails next to what it read.
@@ -295,9 +317,12 @@ function journal_item(name::AbstractString; opts::AbstractString="", body::Abstr
     return """
     @testitem $(repr(name)) $opts begin
         let dir = ENV["RUNTESTS_JOURNAL"], now = time()
-            open(joinpath(dir, string(time_ns(), "-", getpid())), "w") do io
+            dest = joinpath(dir, string(time_ns(), "-", getpid()))
+            tmp = dest * ".tmp"
+            open(tmp, "w") do io
                 println(io, $(repr(name)), "\\t", getpid(), "\\t", now)
             end
+            mv(tmp, dest; force = true)
         end
         $body
     end
@@ -317,6 +342,7 @@ function journal(dir::AbstractString)
     isdir(dir) || return NamedTuple{(:name, :pid), Tuple{String, Int}}[]
     rows = NamedTuple{(:name, :pid, :t), Tuple{String, Int, Float64}}[]
     for file in readdir(dir; join=true)
+        endswith(file, ".tmp") && continue
         parts = split(strip(read(file, String)), '\t')
         length(parts) == 3 || continue
         push!(rows, (name=String(parts[1]), pid=parse(Int, parts[2]), t=parse(Float64, parts[3])))
@@ -351,7 +377,12 @@ started_elsewhere(names; seconds::Real=60) = """
     let dir = ENV["RUNTESTS_JOURNAL"], names = $(repr(collect(String, names))), deadline = time() + $seconds
         gave_up = joinpath(dir, "gave-up")
         moved() = any(readdir(dir; join=true)) do f
-            r = split(strip(read(f, String)), '\\t')
+            endswith(f, ".tmp") && return false
+            r = try
+                split(strip(read(f, String)), '\\t')
+            catch
+                return false
+            end
             length(r) == 3 && r[1] in names && parse(Int, r[2]) != getpid()
         end
         while !isfile(gave_up) && !moved()

@@ -29,20 +29,28 @@ end
 # adds `coverage`, and `coverage_path`, a path that can hold a space, or `nothing`).
 const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(repr(ntuple(i -> getfield(f, i), nfields(f))))"
 
+const CACHE_FLAGS_CACHE = Dict{Vector{String}, Base.CacheFlags}()
+const CACHE_FLAGS_LOCK = ReentrantLock()
+
 """
     cache_flags_for(julia_args) -> Base.CacheFlags
 
 The cache flags a worker started with `julia_args` will have, asked of a process
 started the same way: which arguments reach the cache key is Julia's business and
 changes between versions, and a wrong answer precompiles for the wrong key.
+Memoized for the process lifetime since the Julia binary and version do not change.
 """
 function cache_flags_for(julia_args::Cmd)
+    key = copy(julia_args.exec)
+    cached = @lock CACHE_FLAGS_LOCK get(CACHE_FLAGS_CACHE, key, nothing)
+    cached === nothing || return cached
     out = read(
         `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e $CACHE_FLAGS_CODE`,
         String
     )
     flags = PrecompileHelper.cache_flags_from(out)
     flags === nothing && error("Runtests: could not read the cache flags of `julia $julia_args`: $out")
+    @lock CACHE_FLAGS_LOCK (CACHE_FLAGS_CACHE[key] = flags)
     return flags
 end
 

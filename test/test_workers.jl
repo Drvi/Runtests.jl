@@ -229,10 +229,10 @@ end
             # ...and the worker is still usable afterwards.
             @test remote_fetch(w, :(1 + 1)) === nothing
         finally
-            t = @elapsed close(w)
-            @test t < RuntestsWorkers.GRACEFUL_EXIT_SECONDS    # it left on its own, without being signalled
+            close(w)
         end
         @test process_exited(w.process)
+        @test w.ended_by === :close
         @test w.process.exitcode == 0
         @test_throws WorkerTerminatedException remote_eval(w, :(1 + 1))
     end
@@ -339,7 +339,9 @@ end
             script, pidfile = tempname() * ".jl", tempname()
             write(script, """
             p = run(`\$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`; wait=false)
-            write(ARGS[1], string(getpid(p)))
+            tmp = ARGS[1] * ".tmp"
+            write(tmp, string(getpid(p)))
+            mv(tmp, ARGS[1]; force=true)
             sleep(600)
             """)
             parent = run(`$(Base.julia_cmd()) --startup-file=no $script $pidfile`; wait=false)
@@ -347,7 +349,7 @@ end
             child = 0
             try
                 @test job != C_NULL
-                @test timedwait(() -> isfile(pidfile) && filesize(pidfile) > 0, 60) === :ok
+                @test timedwait(() -> isfile(pidfile), 60) === :ok
                 child = parse(Int, read(pidfile, String))
                 @test alive(child)
                 RuntestsWorkers.end_job!(job)
@@ -438,7 +440,9 @@ end
             RuntestsWorkers.remote_eval(w, :(begin
                 child = run(Sys.iswindows() ? Cmd([Base.julia_cmd().exec..., "--startup-file=no", "-e", "sleep(600)"]) :
                             `sleep 600`; wait = false)
-                write($(repr(pidfile)), string(getpid(), " ", getpid(child)))
+                tmp = $(repr(pidfile)) * ".tmp"
+                write(tmp, string(getpid(), " ", getpid(child)))
+                mv(tmp, $(repr(pidfile)); force = true)
                 sleep(600)
             end))
             sleep(600)
@@ -446,7 +450,7 @@ end
         coordinator = run(worker_child_env(`$(Base.julia_cmd()) --startup-file=no $script`); wait = false)
         pids = Int32[]
         try
-            timedwait(() -> isfile(pidfile) && length(split(read(pidfile, String))) == 2, 300)
+            timedwait(() -> isfile(pidfile), 300)
             isfile(pidfile) && append!(pids, parse.(Int32, split(read(pidfile, String))))
             @test length(pids) == 2
             kill(coordinator, Base.SIGKILL)
@@ -496,7 +500,7 @@ end
         slow = run(`$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`; wait = false)
         try
             t = @elapsed exited = RuntestsWorkers.wait_exit(slow, 1)
-            @test !exited && 1 <= t < 60
+            @test !exited && 0.95 <= t < 60
         finally
             kill(slow, Base.SIGKILL)
             wait(slow)

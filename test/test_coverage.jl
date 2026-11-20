@@ -147,7 +147,16 @@ end
     end
 
     @testset "a covered run merges its workers' counts into lcov.info at the root" begin
-        dir = covered_package("CovRun")
+        # `sandbox=true` keeps the two items in separate worker processes even if one
+        # finishes before the second slot finishes booting.
+        dir = covered_package("CovRun"; items = """
+            @testitem "doubles" begin
+                @test CovRun.double(2) == 4
+            end
+            @testitem "halves" sandbox=true begin
+                @test CovRun.half(4) == 2
+            end
+            """)
         (states, run, p), out = capture_run(() -> run_states(dir; workers=2, logs=:issues, monitor=false, coverage=true))
         @test all(==(PASSED), values(states))
         @test length(unique(run.statuses.pid)) == 2                 # the two items, on two workers
@@ -174,12 +183,13 @@ end
 
     @testset "a worker that dies without exiting is said to have left no coverage" begin
         # `_exit` ends the process without Julia's exit hooks, which write the
-        # tracefile, as SIGKILL or a crash does.
+        # tracefile, as SIGKILL or a crash does. `sandbox=true` guarantees `dies`
+        # runs in its own process and never kills the worker that ran `doubles`.
         dir = covered_package("CovLost"; items = """
             @testitem "doubles" begin
                 @test CovLost.double(2) == 4
             end
-            @testitem "dies" begin
+            @testitem "dies" sandbox=true begin
                 CovLost.half(4)
                 ccall(:_exit, Cvoid, (Cint,), 3)
             end
@@ -196,12 +206,14 @@ end
         # Stopped with SIGTERM, on which Julia runs its exit hooks; on Windows with
         # TerminateProcess, which runs nothing.
         dir = covered_package("CovTimeout"; items = """
-            @testitem "hangs" timeout=3 begin
+            @testitem "hangs" timeout=2 begin
                 CovTimeout.half(4)
                 sleep(600)
             end
             """)
-        (states, run, p), out = capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false, coverage=true))
+        (states, run, p), out = with_fast_inspect() do
+            capture_run(() -> run_states(dir; workers=1, logs=:issues, monitor=false, coverage=true))
+        end
         @test states["hangs"] === TIMEDOUT
         if Sys.iswindows()
             @test occursin("coverage: none from 1 worker that ran items", closing(run, p))

@@ -622,9 +622,12 @@ end
         """)
         Pkg = Base.require(Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
         orig = Base.active_project()
-        Pkg.activate(dir; io=devnull)
-        Pkg.develop(path=pkgdir; io=devnull)
-        Pkg.activate(orig; io=devnull)
+        try
+            Pkg.activate(dir; io=devnull)
+            Pkg.develop(path=pkgdir; io=devnull)
+        finally
+            Base.set_active_project(orig)
+        end
 
         states, run, _ = run_states(dir; workers=2, logs=:issues, monitor=false)
         @test states["default sees no preference"] === PASSED
@@ -675,9 +678,12 @@ end
         """)
         Pkg = Base.require(Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
         orig = Base.active_project()
-        Pkg.activate(dir; io=devnull)
-        Pkg.develop(path=pkgdir; io=devnull)
-        Pkg.activate(orig; io=devnull)
+        try
+            Pkg.activate(dir; io=devnull)
+            Pkg.develop(path=pkgdir; io=devnull)
+        finally
+            Base.set_active_project(orig)
+        end
         states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["default"] === PASSED && states["tuned"] === PASSED
     end

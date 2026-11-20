@@ -339,14 +339,19 @@ end
     end
 
     @testset "what a passing attempt's producers hold is let go of before the next item" begin
-        # One worker, which runs the items in file order, the second in the first's process.
-        states, _, _, _ = art_run(make_pkg("Released", "test/r_tests.jl" => RELEASE_ITEMS), mktempdir(); workers = 1)
+        # One worker, with explicit order so the second item always runs in the first's process.
+        rel = make_pkg("Released",
+            "test/TestItems.toml" => "[order]\nfirst = [\"holds a reference and passes\"]\n",
+            "test/r_tests.jl" => RELEASE_ITEMS)
+        states, _, _, _ = art_run(rel, mktempdir(); workers = 1)
         @test states["holds a reference and passes"] === PASSED
         @test states["sees it let go of"] === PASSED
     end
 
     @testset "a producer that hangs or dies ends its worker, and nothing else" begin
-        bad = make_pkg("BadProducers", "test/bad_tests.jl" => raw"""
+        bad = make_pkg("BadProducers",
+            "test/TestItems.toml" => "[order]\nlast = [\"runs on whatever worker is left\"]\n",
+            "test/bad_tests.jl" => raw"""
             @testitem "hangs in a producer" begin
                 Main.Runtests.on_failure(function (d)
                     write(joinpath(d, "partial.txt"), "before the hang")
@@ -367,17 +372,19 @@ end
                 @test true
             end
             """)
-        states, run, p, out = art_run(bad, mktempdir(); workers = 1, artifacts_timeout = 3)
+        states, run, p, out = with_fast_inspect() do
+            art_run(bad, mktempdir(); workers = 1, artifacts_timeout = 4)
+        end
         @test states["hangs in a producer"] === FAILED
         @test states["dies in a producer"] === FAILED
         @test states["runs on whatever worker is left"] === PASSED
         for name in ("hangs in a producer", "dies in a producer")
             @test isfile(joinpath(art_dir(run, p, name), "producer_1", "partial.txt"))
         end
-        @test occursin("timed out after 3s (artifacts_timeout)", art_read(art_log(run, p, "hangs in a producer")))
+        @test occursin("timed out after 4s (artifacts_timeout)", art_read(art_log(run, p, "hangs in a producer")))
         @test occursin("the worker died while the producers ran", art_read(art_log(run, p, "dies in a producer")))
         # The time the item took is the item's, not its producers'.
-        @test run.statuses.elapsed[art_index(p, "hangs in a producer")] < 3
+        @test run.statuses.elapsed[art_index(p, "hangs in a producer")] < 4
         # One attempt, recorded once; and a new worker after each that was lost.
         rs = read_run_state(run.runstate.path)
         attempts = [e.item for e in rs.events if e.kind === :attempt]
@@ -397,7 +404,7 @@ end
             end
             """)
         path = with_runstate_dir() do _
-            err = with(STALL_LIMIT_OVERRIDE => 15.0) do
+            err = with(STALL_LIMIT_OVERRIDE => 10.0) do
                 try
                     capture_run(() -> Runtests.runtests(stalled; workers = 1, monitor = false))
                     nothing

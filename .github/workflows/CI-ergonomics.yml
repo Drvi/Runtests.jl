@@ -63,13 +63,11 @@ jobs:
           echo "::error::the fake suite's tests ended with '${{ steps.suite.outcome }}'; they fail on purpose, so this has to be 'failure'"
           exit 1
       - name: Save the run states for the next run, without their logs
-        if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload this run's run state, logs and evidence
-        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: fakeci
@@ -77,26 +75,34 @@ jobs:
           if-no-files-found: error
       # From here on, only what was saved: what the next job, or a person, gets.
       - name: Start over from what was saved
-        if: ${{ !cancelled() }}
         run: rm -rf "${{ runner.temp }}/runtests" "${{ runner.temp }}/runtests-artifact"
-      - name: Download what the run uploaded
-        if: ${{ !cancelled() }}
-        uses: actions/download-artifact@v4
-        with:
-          name: fakeci
-          path: ${{ runner.temp }}/downloaded
+      # Instantiate before restoring/downloading so GitHub's cache and artifact indexes
+      # have time to settle after the save/upload steps above.
+      - name: Instantiate the fake suite's test environment
+        run: julia --color=yes --project=${{ env.FAKECI }}/test -e "using Pkg; Pkg.instantiate()"
       - name: Restore the run states the run saved
-        if: ${{ !cancelled() }}
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/runtests/*.rundata/run.runstate
           key: fakeci-runstates-${{ github.run_id }}-${{ github.run_attempt }}
           fail-on-cache-miss: true
-      - name: Instantiate the fake suite's test environment
-        if: ${{ !cancelled() }}
-        run: julia --color=yes --project=${{ env.FAKECI }}/test -e "using Pkg; Pkg.instantiate()"
+      - name: Download what the run uploaded
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: fakeci
+          path: ${{ runner.temp }}/downloaded
+      - name: Retry artifact download if not yet visible
+        if: steps.download.outcome != 'success'
+        run: sleep 10
+      - name: Download what the run uploaded (retry)
+        if: steps.download.outcome != 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: fakeci
+          path: ${{ runner.temp }}/downloaded
       - name: Check what the run left
-        if: ${{ !cancelled() }}
         run: julia --color=yes --project=${{ env.FAKECI }}/test .github/scripts/verify_fake_run.jl
         env:
           FAKECI_ARTIFACT: ${{ runner.temp }}/downloaded

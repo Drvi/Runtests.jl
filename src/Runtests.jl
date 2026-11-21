@@ -868,12 +868,13 @@ end # module Private
 
 using Test
 using .Private: @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_dispatch, logs,
-    runtests_mono, runtestsd_mono, chores_mono, activate_mono, current_testitem,
+    runtests_mono, runtestsd_mono, runtests_dispatch_mono, chores_mono, activate_mono, current_testitem,
     serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 
-export @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_dispatch, chores, runtests_mono, runtestsd_mono, chores_mono
+export @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_dispatch, chores,
+    runtests_mono, runtestsd_mono, runtests_dispatch_mono, chores_mono
 
 # Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test

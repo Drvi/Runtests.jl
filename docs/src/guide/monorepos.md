@@ -101,6 +101,8 @@ The import check reads the code as it is written. It does not see an import that
 
 A combined run writes one run state for each package, in the run state directory of that package. Each run state holds only the items of its package. Thus `runtestsf()` in a package runs the failures of that package from the combined run, and the next run of the package plans with the durations of the combined run.
 
+To split a monorepo across CI jobs while statically verifying that every participating package and test item is covered, use [`runtests_dispatch_mono`](@ref) (see [Run on CI](@ref ci)).
+
 The closing block gives one line for each package: its items, those that did not pass, and the directory of its run. To replay a combined run, give the directory of the run of any of its packages:
 
 ```julia

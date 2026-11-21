@@ -1560,5 +1560,107 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             @test !occursin(joinpath("lib", "C", "test", "runtests.jl"), out)
             @test isfile(joinpath(ws, "lib", "A", "test", "testsetups", "ASetup.jl"))
         end
+
+        @testset "runtests_dispatch_mono validates workspace coverage, packages, overlaps, and rejects extra selection args" begin
+            ws = make_workspace(
+                "Core" => [
+                    "test/TestItems.toml" => "[groups]\njuliac = \"juliac || shared\"\nnon_juliac = \"!juliac && !manual\"\n",
+                    "test/core_test.jl" => """
+                        @testitem "core plain" begin
+                            @test true
+                        end
+                        @testitem "core shared" tags=[:shared] begin
+                            @test true
+                        end
+                        @testitem "core juliac" tags=[:juliac] begin
+                            @test true
+                        end
+                        @testitem "core manual" tags=[:manual] begin
+                            @test true
+                        end
+                        """,
+                ],
+                "Extra" => [
+                    "test/extra_test.jl" => """
+                        @testitem "extra plain" begin
+                            @test true
+                        end
+                        """,
+                    "test/qa/Project.toml" => "",
+                    "test/qa/qa_test.jl" => """
+                        @testitem "extra qa" begin
+                            @test true
+                        end
+                        """,
+                ],
+            )
+            # Slice by groups + packages + workspace-relative paths, with explicit `exclude`.
+            variants = Dict(
+                "juliac"     => (; group = "juliac"),
+                "non_juliac" => (; group = "non_juliac"),
+                "extra"      => (; packages = ["Extra"]),
+            )
+            _, out = capture_run() do
+                Runtests.runtests_dispatch_mono(ws, "juliac", variants;
+                                                exclude = (; name = "core manual"),
+                                                dry_run = true)
+            end
+            @test occursin("\"core juliac\"", out) && occursin("\"core shared\"", out)
+            @test !occursin("\"extra plain\"", out)
+
+            # `RUNTESTS_GROUP` does not hijack a variant that declared no `group`.
+            _, out = withenv("RUNTESTS_GROUP" => "juliac") do
+                capture_run() do
+                    Runtests.runtests_dispatch_mono(ws, "extra", variants;
+                                                    exclude = (; name = "core manual"),
+                                                    dry_run = true)
+                end
+            end
+            @test occursin("\"extra plain\"", out) && occursin("\"extra qa\"", out)
+            @test !occursin("\"core juliac\"", out)
+
+            # `allow_overlaps = false` rejects `core shared` matched by both `juliac` and `non_juliac`.
+            err = try Runtests.runtests_dispatch_mono(ws, "juliac", variants;
+                                                      exclude = (; name = "core manual"),
+                                                      allow_overlaps = false, dry_run = true); nothing catch e; e end
+            @test err isa ConfigError
+            @test occursin("Core \"core shared\"", sprint(showerror, err))
+
+            # Uncovered package (`Extra` left out of package-sliced variants) throws ConfigError naming `Extra`.
+            pkg_only = Dict("core" => (; packages = ["Core"]))
+            err = try Runtests.runtests_dispatch_mono(ws, "core", pkg_only; dry_run = true); nothing catch e; e end
+            @test err isa ConfigError
+            @test occursin("Extra \"extra plain\"", sprint(showerror, err))
+
+            # `skip_environment` in a variant does not count that environment's items as covered.
+            skip_variants = Dict(
+                "core"  => (; packages = ["Core"]),
+                "extra" => (; packages = ["Extra"], skip_environment = ["lib/Extra/test/qa"]),
+            )
+            err = try Runtests.runtests_dispatch_mono(ws, "extra", skip_variants; dry_run = true); nothing catch e; e end
+            @test err isa ConfigError
+            @test occursin("Extra \"extra qa\"", sprint(showerror, err))
+
+            # Covering the skipped env with a dedicated path variant succeeds cleanly (and disjointly).
+            disjoint_variants = Dict(
+                "core"  => (; packages = ["Core"]),
+                "extra" => (; packages = ["Extra"], skip_environment = ["lib/Extra/test/qa"]),
+                "qa"    => (; paths = ["lib/Extra/test/qa"]),
+            )
+            _, out = capture_run() do
+                Runtests.runtests_dispatch_mono(ws, "qa", disjoint_variants; allow_overlaps = false, dry_run = true)
+            end
+            @test occursin("\"extra qa\"", out) && !occursin("\"extra plain\"", out)
+
+            # Unknown variant and top-level selection keywords are rejected with ArgumentError.
+            err = try Runtests.runtests_dispatch_mono(ws, "nope", disjoint_variants; dry_run = true); nothing catch e; e end
+            @test err isa ArgumentError && occursin("unknown variant", sprint(showerror, err))
+            for kw in ((; packages = ["Core"]), (; group = "juliac"), (; tags = :juliac),
+                       (; name = "core plain"), (; paths = ["lib/Extra/test/qa"]),
+                       (; skip_environment = ["lib/Extra/test/qa"]))
+                err = try Runtests.runtests_dispatch_mono(ws, "core", disjoint_variants; dry_run = true, kw...); nothing catch e; e end
+                @test err isa ArgumentError && occursin("must be declared inside `variants`", sprint(showerror, err))
+            end
+        end
     end
 end

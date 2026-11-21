@@ -72,7 +72,7 @@ Before starting any worker, `runtests_dispatch` scans the whole suite and checks
 - every test item is covered by at least one variant (excluding items skipped by a variant's `skip_environment`) or by `exclude`,
 - when `allow_overlaps = false`, no item matches more than one variant (or both a variant and `exclude`).
 
-A variant that declares no `group` (such as `"qa"` above) runs with `group = "all"`, so `RUNTESTS_GROUP` cannot silently narrow it.
+A variant that declares no `group` (such as `"qa"` above) runs with `group = "all"`, so `RUNTESTS_GROUP` cannot silently narrow it. For monorepos, [`runtests_dispatch_mono`](@ref) provides the same coverage check across all participating workspace packages (supporting `packages` and workspace-relative `paths`, and catching newly added workspace packages that no variant selects).
 
 ## [Keep the history of runs](@id ci-history)
 

@@ -10,6 +10,8 @@
 #     END   (spec::ItemSpec, test_end::Expr) -> RESULT result::ItemResult | ERROR message::String
 #     FINISH (index::Int32, attempt::Int8, collect::Bool)
 #                                            -> RESULT (; producers, failed, seconds) | ERROR message::String
+#     ACTIVATE (project::String, load_path::Vector{String})
+#                                            -> RESULT nothing            | ERROR message::String
 #
 # RUN and END are separate because they are timed separately: a profile's
 # `test_end` is the suite's code, not the item's. FINISH follows only an attempt that
@@ -32,15 +34,16 @@
 # Closing the connection is the shutdown request: a worker exits when it reads EOF,
 # whether the coordinator closed the socket or died.
 
-export Worker, remote_eval, remote_fetch, remote_run, remote_end, remote_finish, inspect!, terminate!,
-       WorkerTerminatedException, RemoteException
+export Worker, remote_eval, remote_fetch, remote_run, remote_end, remote_finish, remote_activate,
+       inspect!, terminate!, WorkerTerminatedException, RemoteException
 
-const KIND_EVAL   = UInt8(1)
-const KIND_RUN    = UInt8(2)
-const KIND_RESULT = UInt8(3)
-const KIND_ERROR  = UInt8(4)
-const KIND_END    = UInt8(5)
-const KIND_FINISH = UInt8(6)
+const KIND_EVAL     = UInt8(1)
+const KIND_RUN      = UInt8(2)
+const KIND_RESULT   = UInt8(3)
+const KIND_ERROR    = UInt8(4)
+const KIND_END      = UInt8(5)
+const KIND_FINISH   = UInt8(6)
+const KIND_ACTIVATE = UInt8(7)
 
 # Same value as Distributed's: 10 bytes, so hitting it inside a payload by chance
 # is not a practical concern.
@@ -1001,6 +1004,16 @@ Run the producers attempt `attempt` at item `index` registered on the worker, wh
 remote_finish(w::Worker, index::Integer, attempt::Integer, collect::Bool) =
     send_request(w, KIND_FINISH, (Int32(index), Int8(attempt), collect))
 
+"""
+    remote_activate(w::Worker, project, load_path) -> Future
+
+Switch the worker's active project and `LOAD_PATH` (and the matching `JULIA_PROJECT` /
+`JULIA_LOAD_PATH` environment variables) before running `init` or test items. Used when a
+worker is pre-spawned during environment resolution and precompilation.
+"""
+remote_activate(w::Worker, project::AbstractString, load_path::Vector{String}) =
+    send_request(w, KIND_ACTIVATE, (String(project), load_path))
+
 function send_request(w::Worker, kind::UInt8, payload)
     id = @atomic w.next_id += 1
     fut = Future(id, Channel{Any}(1))
@@ -1204,6 +1217,19 @@ function serve_requests(io::IO)
     end
 end
 
+function activate_worker(project::String, load_path::Vector{String})
+    copy!(LOAD_PATH, load_path)
+    ENV["JULIA_LOAD_PATH"] = join(load_path, PATHSEP)
+    if isempty(project)
+        Base.set_active_project(nothing)
+        delete!(ENV, "JULIA_PROJECT")
+    else
+        Base.set_active_project(project)
+        ENV["JULIA_PROJECT"] = project
+    end
+    return nothing
+end
+
 function handle_request(frame::Frame)
     frame.error === nothing ||
         return KIND_ERROR, "the request could not be deserialized on the worker: " * format_error(frame.error)
@@ -1228,6 +1254,11 @@ function handle_request(frame::Frame)
             prefix = "the worker could not collect this attempt's artifacts: "
             index, attempt, collect = frame.payload
             return KIND_RESULT, finish_artifacts(index, attempt, collect)
+        elseif kind === KIND_ACTIVATE
+            prefix = "the worker could not activate its test environment: "
+            project, load_path = frame.payload
+            activate_worker(project, load_path)
+            return KIND_RESULT, nothing
         end
     catch e
         return KIND_ERROR, prefix * format_error(e, catch_backtrace())

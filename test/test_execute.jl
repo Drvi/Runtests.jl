@@ -1089,6 +1089,19 @@ end
         end
     end
 
+    @testset "pre-spawned workers are cleaned up when setup fails" begin
+        dir = make_pkg("BadEnvSetup",
+            "test/qa/Project.toml" => "[deps]\nNoSuchPkgForPreSpawn = \"11111111-1111-4111-8111-111111111111\"\n",
+            "test/qa/qa_test.jl" => """@testitem "qa" begin\n @test true\n end\n""",
+            "test/a_test.jl" => """@testitem "ok" begin\n @test true\n end\n""",
+        )
+        before = live_worker_processes()
+        @test_throws Runtests.Private.ConfigError capture_run() do
+            run_states(dir; workers = 2, logs = :issues, monitor = false)
+        end
+        @test live_worker_processes() == before
+    end
+
     @testset "an unwritable temporary directory warns once and falls back to logs = :eager" begin
         if !Sys.iswindows()
             locked = mktempdir()

@@ -97,15 +97,18 @@ Startup() = Startup(0.0, 0.0, 0.0)
     ColdCost
 
 What a fresh worker costs before it runs as fast as one that has been running: the
-seconds from starting its process to its being ready for an item, and the compile
-time its first unit takes beyond what a later unit takes. 0 where nothing was
-measured.
+seconds from starting its process to its being ready for an item (`start_s`), the
+compile time its first unit takes beyond what a later unit takes (`compile_s`), and the
+mean total compile time each worker process spent across recent runs (`worker_compile_s`).
+0 where nothing was measured.
 """
 struct ColdCost
     start_s::Float64
     compile_s::Float64
+    worker_compile_s::Float64
 end
-ColdCost() = ColdCost(0.0, 0.0)
+ColdCost() = ColdCost(0.0, 0.0, 0.0)
+ColdCost(start_s::Real, compile_s::Real) = ColdCost(Float64(start_s), Float64(compile_s), 0.0)
 
 """
     Packages
@@ -206,9 +209,10 @@ end
 
 with_replay(p::Plan, replay::Union{Nothing, ReplayDiff};
             replay_slots::Vector{Vector{ItemIdx}} = p.replay_slots,
-            slot_pool::Vector{Int32} = p.slot_pool) = Plan(
+            slot_pool::Vector{Int32} = p.slot_pool,
+            slot_items::Vector{UnitRange{ItemIdx}} = p.slot_items) = Plan(
     p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, slot_pool,
-    p.slot_items, p.pending, p.gate_limit, p.cold, p.setups, p.cfg, p.packages, p.root,
+    slot_items, p.pending, p.gate_limit, p.cold, p.setups, p.cfg, p.packages, p.root,
     p.startup, p.selection, p.suite_names, p.notes, replay, replay_slots
 )
 
@@ -252,10 +256,41 @@ struct History
     cancelled::Set{String}
     hashes::Dict{String, UInt32}   # each item's source hash in the newest run that ran it
     known::Set{String}             # every item a kept run state records
+    item_rss_mb::Dict{String, Float64}   # newest recorded worker peak RSS (MiB) per item
+    crash_peak_worker_mb::Float64        # peak worker tree RSS (MiB) from recent incomplete/crashed worker runs
+    compile_s::Dict{String, Float64}     # newest recorded compile time (s) per item
 end
 History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::ColdCost = ColdCost(),
-        cancelled = Set{String}(), hashes = Dict{String, UInt32}(), known = Set{String}()) =
-    History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known))
+        cancelled = Set{String}(), hashes = Dict{String, UInt32}(), known = Set{String}(),
+        item_rss_mb = Dict{String, Float64}(), crash_peak_worker_mb::Float64 = 0.0,
+        compile_s = Dict{String, Float64}()) =
+    History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known),
+            item_rss_mb, crash_peak_worker_mb, compile_s)
+
+# Estimate per-worker peak RSS (MiB) and observation coverage (`obs_frac` in [0, 1]) for
+# the selected `items` from `histories`. `auto_workers` regularizes low readings toward
+# `ASSUMED_WORKER_RSS` (4 GiB) whenever `obs_frac < 1`, while high readings or crash
+# peaks (`crash_peak_worker_mb`) are never shrunk downward.
+function estimate_worker_rss(items::Vector{RawItem}, histories::Vector{History})
+    n = length(items)
+    n == 0 && return 0.0, 0.0
+    observed = 0
+    peak_mb = 0.0
+    pkgs_seen = Set{Int32}()
+    for it in items
+        push!(pkgs_seen, it.package)
+        r = get(histories[it.package].item_rss_mb, it.name, 0.0)
+        if r > 0.0
+            observed += 1
+            r > peak_mb && (peak_mb = r)
+        end
+    end
+    for k in pkgs_seen
+        p = histories[k].crash_peak_worker_mb
+        p > peak_mb && (peak_mb = p)
+    end
+    return peak_mb, observed / n
+end
 
 """
     plan(raw, cfg; history, histories, root, packages, selection, suite_names) -> Plan
@@ -431,6 +466,7 @@ struct PlanDraft
     profile::Vector{ProfileIdx}
     gate::Vector{Int32}
     est_s::Vector{Float64}
+    compile_s::Vector{Float64}
     file_rank::Vector{Int32}   # sorted file path rank so `order_pool!` compares `Int32`
     key::Vector{Tuple{Int8, Int, Float64, Float64, Int32, Int32}}
     why::Vector{Why}
@@ -472,16 +508,18 @@ function build_draft(raw::Vector{RawItem}, profile_idx, histories::Vector{Histor
     u_profile = Vector{ProfileIdx}(undef, n)
     u_gate = zeros(Int32, n)
     u_est = Vector{Float64}(undef, n)
+    u_comp = Vector{Float64}(undef, n)
     u_rank = Vector{Int32}(undef, n)
     for i in 1:n
         it = raw[i]
         u_profile[i] = profile_idx[(it.package, it.profile, it.environment)]
         it.throttle === NO_THROTTLE || (u_gate[i] = gate[it.throttle])
         u_est[i] = get(histories[it.package].seconds, it.name, 0.0)
+        u_comp[i] = get(histories[it.package].compile_s, it.name, 0.0)
         u_rank[i] = rank_of[it.file]
     end
     draft = PlanDraft(
-        u_profile, u_gate, u_est, u_rank,
+        u_profile, u_gate, u_est, u_comp, u_rank,
         Vector{Tuple{Int8, Int, Float64, Float64, Int32, Int32}}(undef, n),
         fill(IN_FILE_ORDER, n), fill(Int32(-1), n), falses(n), falses(n), falses(n)
     )
@@ -559,11 +597,19 @@ function pool_key(prof::Profile, k::Integer, root::AbstractString, isolated::Boo
     return (start_configuration(prof), owner)
 end
 
+# Fraction of known per-worker compile time charged against each additional worker
+# started in a pool (reflecting duplicated compilation of shared definitions and
+# parallel-JIT overhead). Adding worker `n + 1` only pays off when its wall-time
+# reduction exceeds `cold.start_s + WORKER_COMPILE_OVERHEAD * per_worker_compile`.
+const WORKER_COMPILE_OVERHEAD = 0.20
+
 """
     pool_estimate(pools, draft, gate_limit, cold) -> completion(k, n)
 
 The estimated completion of pool `k` with `n` workers, in seconds: the time a worker
-takes to be ready for its first item, as earlier runs measured it, then the larger of
+takes to be ready for its first item, as earlier runs measured it, plus each additional
+worker's marginal start and duplicated-compilation cost (`cold.start_s` plus
+`WORKER_COMPILE_OVERHEAD` of the pool's per-worker compile time), plus the larger of
 the pool's work shared among its workers, its longest unit and each gate's work in it
 over the gate's limit, which no number of workers shortens. An item without a
 recorded duration counts as the typical item.
@@ -574,17 +620,20 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
     np = length(pools)
     work = Vector{Float64}(undef, np)
     longest = Vector{Float64}(undef, np)
+    extra = Vector{Float64}(undef, np)
     throttled = zeros(Float64, np)
     has_gates = !isempty(gate_limit)
     gate_work = has_gates ? Vector{Float64}(undef, length(gate_limit)) : Float64[]
     for k in 1:np
         pool = pools[k]
         w = 0.0
+        c = 0.0
         l = 0.0
         has_gates && fill!(gate_work, 0.0)
         for u in pool
             e = est(u)
             w += e
+            c += draft.compile_s[u]
             e > l && (l = e)
             if has_gates
                 g = draft.gate[u]
@@ -593,6 +642,10 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
         end
         work[k] = w
         longest[k] = l
+        # A fresh worker always pays at least the recorded cold-start compile excess;
+        # beyond that, cap full-suite per-worker compile at this pool's own compile work.
+        per_worker_comp = max(cold.compile_s, min(c, cold.worker_compile_s))
+        extra[k] = cold.start_s + WORKER_COMPILE_OVERHEAD * per_worker_comp
         if has_gates
             t = 0.0
             for g in eachindex(gate_limit)
@@ -603,14 +656,14 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
         end
     end
     ready = cold.start_s + cold.compile_s
-    return (k, n) -> ready + max(work[k] / n, longest[k], throttled[k])
+    return (k, n) -> ready + (n - 1) * extra[k] + max(work[k] / n, longest[k], throttled[k])
 end
 
 # What a fresh worker cost in the earlier runs of the packages: the mean of what each
 # package's runs measured, of those that measured it.
 function combined_cold(histories::Vector{History})
     mean_of(f) = (xs = [f(h.cold) for h in histories if f(h.cold) > 0]; isempty(xs) ? 0.0 : sum(xs) / length(xs))
-    return ColdCost(mean_of(c -> c.start_s), mean_of(c -> c.compile_s))
+    return ColdCost(mean_of(c -> c.start_s), mean_of(c -> c.compile_s), mean_of(c -> c.worker_compile_s))
 end
 
 # `workers` is a hard cap on live processes, because that cap is what bounds

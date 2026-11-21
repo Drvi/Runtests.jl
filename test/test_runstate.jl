@@ -2274,4 +2274,37 @@ end
             @test_throws ArgumentError Runtests.logs(rs_path; attempt = 0)
         end
     end
+
+    @testset "recorded peak worker memory feeds history and auto worker sizing" begin
+        dir = make_pkg("PeakWorkerMem", "test/a_test.jl" => """
+            @testitem "one" begin
+                @test true
+            end
+            @testitem "two" begin
+                @test true
+            end
+            """)
+        with_runstate_dir() do _
+            # In-process (`workers = 0`) RSS belongs to the coordinator and is ignored.
+            capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+            @test isempty(history(dir).item_rss_mb)
+            @test history(dir).crash_peak_worker_mb == 0.0
+
+            # Partial worker run records only the item it ran (`coverage == 0.5` for a 2-item suite).
+            capture_run(() -> run_states(dir; name = "one", workers = 1, logs = :issues, monitor = false))
+            h1 = history(dir)
+            @test haskey(h1.item_rss_mb, "one") && h1.item_rss_mb["one"] > 0.0
+            @test !haskey(h1.item_rss_mb, "two")
+
+            # Full worker run records both items and `read_run_state(; full = false)` decodes `memory`.
+            (_, run, _), _ = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = true))
+            rs_path = (@atomic run.runstate).path
+            rs_fast = read_run_state(rs_path; full = false)
+            rs_full = read_run_state(rs_path; full = true)
+            @test rs_fast !== nothing && rs_full !== nothing
+            @test rs_fast.memory == rs_full.memory
+            h2 = history(dir)
+            @test haskey(h2.item_rss_mb, "one") && haskey(h2.item_rss_mb, "two")
+        end
+    end
 end

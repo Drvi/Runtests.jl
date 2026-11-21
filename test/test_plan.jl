@@ -1026,4 +1026,29 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test [match(r"\"(.*?)\"", l).captures[1] for l in r] == [p.items.name[i] for i in 1:nitems(p)]
         @test !any(l -> occursin(r"· w\d+", l), r)
     end
+
+    @testset "slot allocation accounts for worker start and per-worker compile cost" begin
+        ColdCost = Runtests.Private.ColdCost
+        raw = read_items()
+        names = [it.name for it in raw]
+        # 6 items of 1.0s each (6s total, with a 2-item throttle gate of limit 1 -> floor 2.0s):
+        # without compile/start cost, budget 6 uses 3 slots (6/3 == 2.0s).
+        secs = Dict(n => 1.0 for n in names)
+        p_free = plan(raw, Runtests.Private.read_config(joinpath(fixture("Basic.jl"), "test"); workers = 6);
+                      history = History(secs, Dict{String, Int}()))
+        @test nslots(p_free) == 3
+
+        # With heavy cold-start compile (20s -> 20% = 4s per extra worker), adding a 2nd
+        # worker saves 3s < 4s, so the planner keeps a single worker.
+        p_cold = plan(raw, Runtests.Private.read_config(joinpath(fixture("Basic.jl"), "test"); workers = 6);
+                      history = History(secs, Dict{String, Int}(); cold = ColdCost(0.5, 20.0, 20.0)))
+        @test nslots(p_cold) == 1
+
+        # With moderate per-worker compile (10s across items -> 20% = 2s + 0.5s start = 2.5s),
+        # 1->2 saves 3.0s > 2.5s (worth it), 2->3 saves 1.0s < 2.5s (stops at 2 workers).
+        comps = Dict(n => 2.0 for n in names)
+        p_mod = plan(raw, Runtests.Private.read_config(joinpath(fixture("Basic.jl"), "test"); workers = 6);
+                     history = History(secs, Dict{String, Int}(); cold = ColdCost(0.5, 0.0, 10.0), compile_s = comps))
+        @test nslots(p_mod) == 2
+    end
 end

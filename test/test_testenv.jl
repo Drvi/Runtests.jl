@@ -1,4 +1,6 @@
-using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED, nitems
+using Runtests.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED, nitems,
+                        clear_disk_test_env!, load_disk_test_env, manifest_packages_present, sweep_runstate_dirs,
+                        ENV_CACHE_DIR, runstate_dir
 using TOML: TOML
 
 @testset "test environment" begin
@@ -24,7 +26,9 @@ using TOML: TOML
         # immediate, and at the REPL — where the cache is the point — a line about
         # it would be noise on every call.
         pkg = fixture("TestDeps.jl")
+        target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
         delete!(TEST_ENVS, abspath(joinpath(pkg, "Project.toml")))
+        clear_disk_test_env!(target)
         _, cold = capture_run() do
             p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
             run = execute(p, target)
@@ -37,6 +41,14 @@ using TOML: TOML
             rm(run.scratch; force=true, recursive=true)
         end
         @test !occursin("resolving the test environment", warm)
+        # Clearing the in-memory cache still hits the on-disk cache without resolving.
+        delete!(TEST_ENVS, abspath(joinpath(pkg, "Project.toml")))
+        _, disk_hit = capture_run() do
+            p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
+            run = execute(p, target)
+            rm(run.scratch; force=true, recursive=true)
+        end
+        @test !occursin("resolving the test environment", disk_hit)
     end
 
     @testset "the environment is cached across runs in a session" begin
@@ -61,7 +73,13 @@ using TOML: TOML
         target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
         before = test_env(target)
         @test test_env(target) == before
-        bump_mtime!(joinpath(pkg, "Project.toml"))   # e.g. a test dependency was added
+        # Bumping mtime without changing content (as a fresh CI checkout does) still
+        # hits the content-hashed disk cache.
+        bump_mtime!(joinpath(pkg, "Project.toml"))
+        @test test_env(target) == before
+        # Changing content invalidates both the session cache and the disk cache.
+        open(io -> write(io, "\n[extras]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n[targets]\ntest = [\"Random\"]\n"),
+             joinpath(pkg, "Project.toml"), "a")
         after = test_env(target)
         @test after != before
     end
@@ -77,8 +95,111 @@ using TOML: TOML
         write(versioned, "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n")
         created = test_env(target)
         @test created != before
-        bump_mtime!(versioned)
+        open(io -> write(io, "# edited\n"), versioned, "a")
         @test test_env(target) != created
+    end
+
+    @testset "the disk cache tracks path dependencies, depot presence, and sweep cleanup" begin
+        with_runstate_dir() do rsdir
+            work = mktempdir()
+            dep_uuid = next_uuid()
+            dep = joinpath(work, "LocalDep")
+            mkpath(joinpath(dep, "src"))
+            write(joinpath(dep, "Project.toml"),
+                  "name = \"LocalDep\"\nuuid = \"$dep_uuid\"\nversion = \"0.1.0\"\n")
+            write(joinpath(dep, "src", "LocalDep.jl"), "module LocalDep\nval() = 1\nend\n")
+
+            pkg_uuid = next_uuid()
+            pkg = joinpath(work, "UsesLocalDep")
+            mkpath(joinpath(pkg, "src")); mkpath(joinpath(pkg, "test"))
+            write(joinpath(pkg, "Project.toml"), """
+            name = "UsesLocalDep"
+            uuid = "$pkg_uuid"
+            version = "0.1.0"
+
+            [deps]
+            LocalDep = "$dep_uuid"
+
+            [sources]
+            LocalDep = {path = "../LocalDep"}
+            """)
+            write(joinpath(pkg, "src", "UsesLocalDep.jl"), "module UsesLocalDep\nusing LocalDep\nend\n")
+            write(joinpath(pkg, "test", "a_test.jl"), """@testitem "ok" begin\n @test true\n end\n""")
+            target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))
+
+            env1 = test_env(target)
+            @test startswith(env1, joinpath(rsdir, ENV_CACHE_DIR))
+            delete!(TEST_ENVS, abspath(target.project))
+            @test load_disk_test_env(target) == env1
+            @test test_env(target) == env1
+
+            # Editing the developed path dependency's Project.toml invalidates BOTH the
+            # in-memory session cache and the disk cache (even without clearing TEST_ENVS).
+            open(io -> write(io, "\n[deps]\nRandom = \"9a3f8284-a2c9-5f02-9a11-845980a1fd5c\"\n"),
+                 joinpath(dep, "Project.toml"), "a")
+            @test load_disk_test_env(target) === nothing
+            env2 = test_env(target)
+            @test env2 != env1
+
+            # Tampering with a cached Manifest.toml invalidates the disk entry via CRC check.
+            cached_mf = joinpath(dirname(env2), "Manifest.toml")
+            open(io -> write(io, "\n# corrupted\n"), cached_mf, "a")
+            delete!(TEST_ENVS, abspath(target.project))
+            @test load_disk_test_env(target) === nothing
+            env3 = test_env(target)
+            @test isfile(env3)
+
+            # Updating a registry metadata file or removing a depot artifact invalidates the cache.
+            fake_depot = mktempdir()
+            reg_dir = joinpath(fake_depot, "registries", "FakeReg")
+            mkpath(reg_dir)
+            mkpath(joinpath(fake_depot, "artifacts", "deadbeef"))
+            reg_file = joinpath(reg_dir, "Registry.toml")
+            write(reg_file, "name = \"FakeReg\"\nuuid = \"$(next_uuid())\"\nrepo = \"\"\n[packages]\n")
+            pushfirst!(DEPOT_PATH, fake_depot)
+            try
+                env_dep = test_env(target)
+                delete!(TEST_ENVS, abspath(target.project))
+                @test load_disk_test_env(target) == env_dep
+
+                # Registry update -> cache miss
+                open(io -> write(io, "# updated\n"), reg_file, "a")
+                @test load_disk_test_env(target) === nothing
+                env_dep2 = test_env(target)
+                @test env_dep2 != env_dep
+
+                # Artifact removal (e.g. Pkg.gc()) -> cache miss
+                rm(joinpath(fake_depot, "artifacts", "deadbeef"); force = true, recursive = true)
+                delete!(TEST_ENVS, abspath(target.project))
+                @test load_disk_test_env(target) === nothing
+            finally
+                popfirst!(DEPOT_PATH)
+                rm(fake_depot; force = true, recursive = true)
+            end
+
+            # A manifest entry whose package directory is absent from DEPOT_PATH misses.
+            fake_mf = joinpath(work, "FakeManifest.toml")
+            write(fake_mf, """
+            manifest_format = "2.0"
+            [[deps.MissingPkg]]
+            git-tree-sha1 = "0123456789abcdef0123456789abcdef01234567"
+            uuid = "11111111-2222-3333-4444-555555555555"
+            version = "1.0.0"
+            """)
+            @test !manifest_packages_present(fake_mf, TOML.parsefile(fake_mf))
+        end
+
+        # `sweep_runstate_dirs` treats `envcache` as disposable alongside `project`.
+        base = mktempdir()
+        temp_root = mktempdir()
+        gone_pkg = joinpath(temp_root, "GonePkg")
+        entry = joinpath(base, "GonePkg-12345678")
+        mkpath(joinpath(entry, ENV_CACHE_DIR))
+        write(joinpath(entry, "project"), gone_pkg)
+        write(joinpath(entry, ENV_CACHE_DIR, "stamp.toml"), "mode = \"testenv\"\n")
+        swept = sweep_runstate_dirs(base; temp = temp_root, fix = true)
+        @test length(swept) == 1 && swept[1].whole
+        @test !ispath(entry)
     end
 
     @testset "a JULIA_PROJECT in the caller's environment does not reach the items" begin

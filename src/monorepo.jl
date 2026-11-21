@@ -728,12 +728,14 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
                         plural(length(kept), "package"), " in ", fmt_seconds(files_seconds))
 
     t_plan = time()
+    histories = History[history(ps.root[k]) for k in kept]
+    peak_worker_mb, rss_coverage = estimate_worker_rss(items, histories)
     overrides = map(kept) do k
         rs = replayed === nothing ? nothing : replayed.records[k]
         rs === nothing ? Dict{Symbol, Any}() :
             Dict{Symbol, Any}(key => v for (key, v) in pairs(recorded_settings(rs)) if key in PACKAGE_KEYS)
     end
-    run_cfg, cfgs = mono_configs(ps, configs, kept, length(items), kwargs, overrides)
+    run_cfg, cfgs = mono_configs(ps, configs, kept, length(items), kwargs, overrides; peak_worker_mb, rss_coverage)
     # The call and the variable give one list to every package, and each name is one
     # package's environment.
     known_environments = unique!(reduce(vcat, environment_names[kept]; init = String[]))
@@ -761,7 +763,6 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     problems = import_problems(sub, items, Int[it.package for it in items],
                                [c.profiles for c in cfgs], setups[kept])
     isempty(problems) || throw(ScanFailure(problems))
-    histories = History[history(ps.root[k]) for k in kept]
     full = name === nothing && tags === nothing && all(g -> g === nothing, gsel) && isempty(chosen) && item_keys === nothing
     p = plan(items, run_cfg; histories, root = workspace,
              packages = Packages(ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], cfgs,
@@ -953,7 +954,8 @@ run-wide settings have no effect; the root package's file is the root's. A packa
 nothing sets is the run's `failfast`.
 """
 function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int, kwargs,
-                      overrides::Vector{Dict{Symbol, Any}} = [Dict{Symbol, Any}() for _ in kept])
+                      overrides::Vector{Dict{Symbol, Any}} = [Dict{Symbol, Any}() for _ in kept];
+                      peak_worker_mb::Real = 0.0, rss_coverage::Real = 1.0)
     root_path, root_toml = config_toml(joinpath(ps.workspace, "test"), nothing)
     shared = shared_profiles(root_path, root_toml, ps.workspace)
     run_section(toml) = (r = get(toml, "run", nothing); r isa AbstractDict ? r : Dict{String, Any}())
@@ -974,7 +976,10 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
             end
             most > per_worker && (per_worker = most)
         end
-        run_kwargs[:workers] = auto_workers(string(per_worker), nunits)
+        mt_raw = pick_run_setting(:memory_threshold, 0.9, kwargs, run_section(root_toml))
+        mt = (is_number(mt_raw) && 0 < mt_raw <= 1) ? Float64(mt_raw) : 0.9
+        run_kwargs[:workers] = auto_workers(string(per_worker), nunits; peak_worker_mb,
+                                            coverage = rss_coverage, memory_threshold = mt)
     end
     run = build_config(root_path, root_toml; nunits, shared, run_kwargs...)
     package_kwargs = Dict{Symbol, Any}(k => v for (k, v) in pairs(kwargs) if k in PACKAGE_KEYS)

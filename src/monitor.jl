@@ -90,6 +90,7 @@ Base.@kwdef mutable struct MemStats
     peak_total_at::Float64 = 0.0
     peak_single_bytes::Int64 = 0
     peak_single_pid::Int32 = 0
+    peak_worker_bytes::Int64 = 0
     nprocs_peak::Int = 0
     machine_peak_used::Int64 = 0
     machine_total::Int64 = 0
@@ -407,6 +408,7 @@ function sample!(m::Monitor)
     phase = @atomic m.phase
     used, total = machine_memory()
     total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0; nworkers = 0
+    worker_tree_max = Int64(0)
     if PER_PROCESS_OK[]
         roots = tree_roots!(m.scratch_roots, m)
         # One walk of the whole tree, each process with the worker it descends from, or
@@ -441,6 +443,7 @@ function sample!(m::Monitor)
             # is what running it took.
             tree = get(tree_of, pid, Int64(0))
             m.tree_rss[slot.id] = tree
+            tree > worker_tree_max && (worker_tree_max = tree)
             key = attempt_key(@atomic(slot.current), @atomic(slot.attempt))
             if key != m.attempt_key[slot.id]
                 m.attempt_key[slot.id] = key
@@ -453,7 +456,7 @@ function sample!(m::Monitor)
     cpu_pct = load1 >= 0 ? -1.0f0 : cpu_percent!(m, time())
     s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1, cpu_pct)
     m.last_sample = s
-    update_stats!(m, s)
+    update_stats!(m, s, worker_tree_max)
     st = m.stats
     @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes,
                                 (@atomic phase_stats(st, phase).entered), copy(m.worker_peak), copy(m.worker_pid),
@@ -461,7 +464,7 @@ function sample!(m::Monitor)
     return s
 end
 
-function update_stats!(m::Monitor, s::Sample)
+function update_stats!(m::Monitor, s::Sample, worker_tree_max::Int64 = Int64(0))
     st = m.stats
     st.machine_total = s.machine_total
     s.machine_used > st.machine_peak_used && (st.machine_peak_used = s.machine_used)
@@ -475,6 +478,10 @@ function update_stats!(m::Monitor, s::Sample)
     if s.largest_rss > st.peak_single_bytes
         st.peak_single_bytes = s.largest_rss
         st.peak_single_pid = s.largest_pid
+        changed = true
+    end
+    if s.phase === PHASE_TEST && worker_tree_max > st.peak_worker_bytes
+        st.peak_worker_bytes = worker_tree_max
         changed = true
     end
     changed && write_memory!((@atomic run_of(m).runstate), st)

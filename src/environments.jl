@@ -15,7 +15,9 @@ active afterwards. The environment is:
    package is in, which shares its manifest, as `Pkg.test` uses it;
 4. otherwise a test environment built by `TestEnv`.
 
-The last two are cached for the session.
+The last two are cached for the session and on disk across processes under
+`runstate_dir(target.root)/envcache` (keyed by file content hashes, path-dependency
+project/manifest hashes, Julia version, and depot package presence).
 
 Outside `test/runtests.jl`, the package's plain project is not reused because it
 lacks test-only dependencies. A call from that file assumes its active project
@@ -48,7 +50,7 @@ function test_env_for(target, announce = nothing)
     current = Base.active_project()
     if current !== nothing
         running_from_runtests(target) && return nothing
-        testproj = joinpath(target.testdir, "Project.toml")
+        testproj = test_project_file(target)
         isfile(testproj) && abspath(current) == abspath(testproj) && return nothing
     end
     env = test_env(target, announce)::String
@@ -87,27 +89,44 @@ function with_pkg_isolated(f, err_prefix::AbstractString)
     return result
 end
 
-# Test environments, kept for the session and keyed by project file: building one
-# costs a resolve, seconds at the REPL. It costs no compilation: caches are keyed by
-# package versions and flags, not by environment, so a new environment with the same
-# versions reuses them. The stamp is what it was generated from, so a test dependency
-# added mid-session rebuilds it.
-const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Tuple{String, Float64}}}}()
+# Test environments, kept for the session (in-memory) and across processes (on disk
+# under `runstate_dir(target.root)/envcache`): building one costs a resolve plus loading
+# `Pkg`/`TestEnv`, seconds on every cold CLI or CI run. It costs no compilation: caches
+# are keyed by package versions and flags, not by environment, so a reused or rebuilt
+# environment with the same versions reuses them.
+#
+# Both caches track every input that can change resolution: the package and test
+# `Project.toml`/`JuliaProject.toml`, their resolved manifests, `LocalPreferences.toml`,
+# workspace ancestor and member projects (Julia 1.12+), every developed path dependency's
+# project and manifest, installed registry metadata (`*.toml` / `*/Registry.toml`), and
+# depot package/artifact state. The in-memory table checks mtimes + depot state for fast
+# hits within a session; the disk cache checks file content hashes (surviving CI checkout
+# mtime resets), cached file integrity, and pure-Base manifest package presence.
+const SessionEnvStamp = Tuple{Vector{Tuple{String, Float64}}, UInt32}
+const TEST_ENVS = Dict{String, Tuple{String, SessionEnvStamp}}()
 const TEST_ENVS_LOCK = ReentrantLock()
+
+test_project_file(target) = something(project_file(target.testdir), joinpath(target.testdir, "Project.toml"))
 
 function test_env(target, announce = nothing)
     proj = abspath(target.project)
     return @lock TEST_ENVS_LOCK begin
         cached = get(TEST_ENVS, proj, nothing)
-        if cached !== nothing && isfile(cached[1]) && cached[2] == env_stamp(target)
+        if cached !== nothing && isfile(cached[1]) && cached[2] == session_env_stamp(target, cached[1])
             return cached[1]
         end
+        disk = load_disk_test_env(target)
+        if disk !== nothing
+            TEST_ENVS[proj] = (disk, session_env_stamp(target, disk))
+            return disk
+        end
         # Announced only when building: a cache hit is immediate, and at the REPL
-        # the hit is the point.
+        # or on a warm CI run the hit is the point.
         announce === nothing || announce()
+        testproj = test_project_file(target)
+        workspace = in_package_workspace(testproj, proj)
         env = with_pkg_isolated("could not build a test environment for $(relpath_or_path(proj)): ") do Pkg, TestEnv
-            testproj = joinpath(target.testdir, "Project.toml")
-            if in_package_workspace(testproj, proj)
+            if workspace
                 # It shares the package's manifest, so `Pkg.test` runs it as it
                 # is, without a sandbox.
                 Pkg.activate(testproj; io = devnull)
@@ -119,26 +138,403 @@ function test_env(target, announce = nothing)
             # What activating made active: a project, or it would have thrown.
             Base.active_project()::String
         end::String
-        # Stamped *after* generating it: resolving writes the package's manifest,
-        # so a stamp taken beforehand never matches again and every call would
-        # rebuild the environment it was supposed to cache.
-        TEST_ENVS[proj] = (env, env_stamp(target))
-        return env
+        # Persisted and stamped *after* generating it: resolving can write the
+        # package's manifest, so computing hashes beforehand would miss on the
+        # very next call.
+        saved = save_disk_test_env(target, env, workspace)
+        TEST_ENVS[proj] = (saved, session_env_stamp(target, saved))
+        return saved
     end
 end
 
-# The package's project and the test project, each with the manifest Julia reads for
-# it: `Manifest-v1.x.toml` before `Manifest.toml`, a workspace's shared one. Paths
-# as well as times, so a manifest that takes over from another changes the stamp.
-function env_stamp(target)
-    proj = abspath(target.project)
-    testproj = joinpath(target.testdir, "Project.toml")
-    stamped(path) = (path, mtime_or_zero(path))
-    manifest(project) = something(isfile(project) ? Base.project_file_manifest_path(project) : nothing, "")
-    return (stamped(proj), stamped(manifest(proj)), stamped(testproj), stamped(manifest(testproj)))
+mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
+
+function file_crc32c(path::AbstractString)
+    isfile(path) || return (false, UInt32(0))
+    try
+        return (true, open(crc32c, path))
+    catch e
+        is_interrupt(e) && rethrow()
+        return (false, UInt32(0))
+    end
 end
 
-mtime_or_zero(path::AbstractString) = isfile(path) ? mtime(path) : 0.0
+file_tag(path::AbstractString) =
+    isempty(path) ? "0:00000000" : ((ex, h) = file_crc32c(path); string(ex ? "1:" : "0:", string(h; base = 16, pad = 8)))
+
+test_env_cache_root(target) = joinpath(runstate_dir(target.root), ENV_CACHE_DIR)
+test_env_proj_prefix(proj::AbstractString) =
+    string(string(crc32c(abspath(proj)); base = 16, pad = 8), "-v", VERSION.major, ".", VERSION.minor, "-")
+
+# Collect every project, manifest, preferences, workspace ancestor/member, and registry
+# metadata file that can influence `TestEnv.activate()` or `Pkg.instantiate()`.
+function env_input_files(target)
+    proj = abspath(target.project)
+    proj_dir = dirname(proj)
+    test_dir = abspath(target.testdir)
+    manifest_of(p) = something(isfile(p) ? Base.project_file_manifest_path(p) : nothing, "")
+    seen = Set{String}()
+    files = String[]
+    add!(p::AbstractString) = (isempty(p) || p in seen) ? nothing : (push!(seen, String(p)); push!(files, String(p)); nothing)
+    add_project_dir!(d::AbstractString) = begin
+        for name in ("JuliaProject.toml", "Project.toml", "LocalPreferences.toml")
+            add!(joinpath(d, name))
+        end
+        pf = project_file(d)
+        pf === nothing || add!(manifest_of(pf))
+    end
+
+    add_project_dir!(proj_dir)
+    add_project_dir!(test_dir)
+    add!(proj)
+    add!(manifest_of(proj))
+    testproj = test_project_file(target)
+    add!(testproj)
+    add!(manifest_of(testproj))
+
+    # Julia 1.12+ workspaces: walk every ancestor up to the outermost workspace root and
+    # include every workspace member project listed there, since editing any member or
+    # root `[sources]`/`[compat]`/`[workspace]` can make the shared manifest stale.
+    @static if isdefined(Base, :base_project)
+        for seed in (proj, testproj)
+            isfile(seed) || continue
+            cur = abspath(seed)
+            while true
+                add_project_dir!(dirname(cur))
+                parent = Base.base_project(cur)
+                (parent === nothing || samefile(parent, cur)) && break
+                cur = abspath(parent)
+            end
+            ws_root = dirname(cur)
+            ws_pf = project_file(ws_root)
+            if ws_pf !== nothing && isfile(ws_pf)
+                ws_table = get(parse_project(ws_pf), "workspace", nothing)
+                if ws_table isa AbstractDict
+                    for rel in get(ws_table, "projects", Any[])
+                        rel isa AbstractString || continue
+                        add_project_dir!(abspath(joinpath(ws_root, rel)))
+                    end
+                end
+            end
+        end
+    end
+
+    # Installed registry metadata (`*.toml` for compressed tarballs, `*/Registry.toml`
+    # for unpacked directories): ~100 B files carrying each registry's `git-tree-sha1`,
+    # so `Pkg.Registry.update()` invalidates test-only dependency resolutions.
+    for depot in DEPOT_PATH
+        reg_dir = joinpath(depot, "registries")
+        isdir(reg_dir) || continue
+        entries = try
+            readdir(reg_dir)
+        catch
+            continue
+        end
+        for entry in entries
+            p = joinpath(reg_dir, entry)
+            if endswith(entry, ".toml") && isfile(p)
+                add!(p)
+            elseif isdir(p)
+                rt = joinpath(p, "Registry.toml")
+                isfile(rt) && add!(rt)
+            end
+        end
+    end
+    return sort!(files)
+end
+
+# Hash of the unique artifact directory names available across `DEPOT_PATH`: survives
+# CI cache mtime resets and empty overlay depots while invalidating immediately if
+# `Pkg.gc()` deletes an artifact or a depot switch drops available artifacts.
+function depot_artifacts_hash()
+    seen = Set{String}()
+    for depot in DEPOT_PATH
+        adir = joinpath(depot, "artifacts")
+        isdir(adir) || continue
+        names = try
+            readdir(adir)
+        catch
+            continue
+        end
+        for n in names
+            push!(seen, n)
+        end
+    end
+    io = IOBuffer()
+    for n in sort!(collect(seen))
+        print(io, n, '\0')
+    end
+    return crc32c(take!(io))
+end
+
+# Fast in-session stamp: mtimes of all input files + resolved path-dep project/manifest
+# files + available depot artifacts hash. Catches mid-session edits to path deps,
+# workspace members, registries, or `Pkg.gc()` without re-hashing every file on a hit.
+function session_env_stamp(target, env_proj::AbstractString)::SessionEnvStamp
+    files = env_input_files(target)
+    mf = isfile(env_proj) ? Base.project_file_manifest_path(env_proj) : nothing
+    if mf !== nothing && isfile(mf)
+        toml = try
+            TOML.parsefile(mf)
+        catch
+            nothing
+        end
+        if toml !== nothing
+            mf_dir = dirname(abspath(mf))
+            seen = Set(files)
+            for (_, entries) in manifest_entries(toml)
+                entries isa AbstractVector || continue
+                for entry in entries
+                    entry isa AbstractDict || continue
+                    p = get(entry, "path", nothing)
+                    p isa AbstractString || continue
+                    d = rstrip_path(normpath(joinpath(mf_dir, p)))
+                    for f in (joinpath(d, "JuliaProject.toml"), joinpath(d, "Project.toml"))
+                        f in seen || (push!(seen, f); push!(files, f))
+                    end
+                    pf = project_file(d)
+                    if pf !== nothing
+                        dmf = something(Base.project_file_manifest_path(pf), "")
+                        (!isempty(dmf) && !(dmf in seen)) && (push!(seen, dmf); push!(files, dmf))
+                    end
+                end
+            end
+            sort!(files)
+        end
+    end
+    stamps = Tuple{String, Float64}[(f, mtime_or_zero(f)) for f in files]
+    return (stamps, depot_artifacts_hash())
+end
+
+# Content hash of every input file that determines the test environment (plus Julia
+# version, workspace mode, depot paths, and depot artifacts). Content-hashed rather than
+# mtime-hashed so CI checkouts with freshly reset mtimes still hit a cached environment.
+function disk_env_input_key(target, workspace::Bool)
+    io = IOBuffer()
+    print(io, VERSION, '\0', workspace ? '1' : '0', '\0', string(depot_artifacts_hash(); base = 16, pad = 8))
+    for f in env_input_files(target)
+        exists, h = file_crc32c(f)
+        print(io, '\0', f, '\0', exists ? '1' : '0', '\0', string(h; base = 16, pad = 8))
+    end
+    return string(crc32c(take!(io)); base = 16, pad = 8)
+end
+
+# Sorted `[dep_dir, proj_path, proj_crc, manifest_path, manifest_crc]` rows for every
+# package tracked by `path` in `manifest_path`. Catches a developed dependency whose own
+# dependencies or manifest changed without touching the target package's files.
+function manifest_path_dep_stamps(manifest_path::AbstractString, toml::AbstractDict)
+    mf_dir = dirname(abspath(manifest_path))
+    dirs = Set{String}()
+    for (_, entries) in manifest_entries(toml)
+        entries isa AbstractVector || continue
+        for entry in entries
+            entry isa AbstractDict || continue
+            p = get(entry, "path", nothing)
+            p isa AbstractString || continue
+            push!(dirs, rstrip_path(normpath(joinpath(mf_dir, p))))
+        end
+    end
+    rows = Vector{String}[]
+    for d in sort!(collect(dirs))
+        pf = something(project_file(d), "")
+        mf = isempty(pf) ? "" : something(Base.project_file_manifest_path(pf), "")
+        push!(rows, String[d, pf, file_tag(pf), mf, file_tag(mf)])
+    end
+    return rows
+end
+
+function path_dep_stamps_match(rows)
+    rows isa AbstractVector || return false
+    for row in rows
+        (row isa AbstractVector && length(row) == 5 && all(x -> x isa AbstractString, row)) || return false
+        d, pf_rec, pf_tag, mf_rec, mf_tag = row
+        isdir(d) || return false
+        pf_now = something(project_file(d), "")
+        pf_now == pf_rec || return false
+        file_tag(pf_now) == pf_tag || return false
+        mf_now = isempty(pf_now) ? "" : something(Base.project_file_manifest_path(pf_now), "")
+        mf_now == mf_rec || return false
+        file_tag(mf_now) == mf_tag || return false
+    end
+    return true
+end
+
+# Verify without loading `Pkg` that every package named in `manifest_path` is currently
+# present on disk (path directory with project or entry file, `DEPOT_PATH` package slug,
+# or `Sys.STDLIB`).
+function manifest_packages_present(manifest_path::AbstractString, toml::AbstractDict)
+    mf_dir = dirname(abspath(manifest_path))
+    for (name, entries) in manifest_entries(toml)
+        entries isa AbstractVector || continue
+        for entry in entries
+            entry isa AbstractDict || continue
+            if haskey(entry, "path")
+                p = entry["path"]
+                p isa AbstractString || return false
+                dir = normpath(joinpath(mf_dir, p))
+                (isdir(dir) && (project_file(dir) !== nothing || isfile(joinpath(dir, "src", string(name, ".jl"))))) || return false
+            elseif haskey(entry, "git-tree-sha1")
+                uuid_s = get(entry, "uuid", nothing)
+                tree_s = get(entry, "git-tree-sha1", nothing)
+                (uuid_s isa AbstractString && tree_s isa AbstractString) || return false
+                uuid = tryparse(Base.UUID, uuid_s)
+                uuid === nothing && return false
+                sha = try
+                    Base.SHA1(tree_s)
+                catch
+                    return false
+                end
+                slug = Base.version_slug(uuid, sha)
+                any(d -> isdir(joinpath(d, "packages", name, slug)), DEPOT_PATH) || return false
+            else
+                isdir(joinpath(Sys.STDLIB, name)) || return false
+            end
+        end
+    end
+    return true
+end
+
+const ENV_CACHE_STAMP = "stamp.toml"
+
+function load_disk_test_env(target)
+    try
+        cache_root = test_env_cache_root(target)
+        isdir(cache_root) || return nothing
+        proj = abspath(target.project)
+        testproj = test_project_file(target)
+        workspace = in_package_workspace(testproj, proj)
+        input_key = disk_env_input_key(target, workspace)
+        want_prefix = string(test_env_proj_prefix(proj), input_key, "-")
+        want_mode = workspace ? "workspace" : "testenv"
+        ver = string(VERSION)
+        for name in readdir(cache_root)
+            startswith(name, want_prefix) || continue
+            entry_dir = joinpath(cache_root, name)
+            isdir(entry_dir) || continue
+            stamp_file = joinpath(entry_dir, ENV_CACHE_STAMP)
+            isfile(stamp_file) || continue
+            stamp = try
+                TOML.parsefile(stamp_file)
+            catch
+                continue
+            end
+            get(stamp, "mode", "") == want_mode || continue
+            get(stamp, "julia_version", "") == ver || continue
+            get(stamp, "input_key", "") == input_key || continue
+            env_proj = workspace ? String(get(stamp, "env_path", "")) : joinpath(entry_dir, "Project.toml")
+            (isempty(env_proj) || !isfile(env_proj)) && continue
+            workspace && !samefile(env_proj, testproj) && continue
+            mf = Base.project_file_manifest_path(env_proj)
+            (mf === nothing || !isfile(mf)) && continue
+            if !workspace
+                file_tag(env_proj) == get(stamp, "cached_proj_crc", "") || continue
+                file_tag(mf) == get(stamp, "cached_mf_crc", "") || continue
+            end
+            mf_toml = try
+                TOML.parsefile(mf)
+            catch
+                continue
+            end
+            path_dep_stamps_match(get(stamp, "path_deps", nothing)) || continue
+            manifest_packages_present(mf, mf_toml) || continue
+            return env_proj
+        end
+        return nothing
+    catch e
+        is_interrupt(e) && rethrow()
+        return nothing
+    end
+end
+
+function save_disk_test_env(target, env::AbstractString, workspace::Bool)
+    try
+        mf = Base.project_file_manifest_path(env)
+        (mf === nothing || !isfile(mf)) && return String(env)
+        mf_toml = TOML.parsefile(mf)
+        cache_root = test_env_cache_root(target)
+        mkpath(cache_root)
+        if isempty(get(ENV, "RUNTESTS_RUNSTATE_DIR", ""))
+            mark = joinpath(dirname(cache_root), PROJECT_MARK)
+            isfile(mark) || write_whole(mark, abspath(target.root))
+        end
+        proj = abspath(target.project)
+        proj_prefix = test_env_proj_prefix(proj)
+        input_key = disk_env_input_key(target, workspace)
+        dep_rows = manifest_path_dep_stamps(mf, mf_toml)
+        deps_io = IOBuffer()
+        for row in dep_rows
+            for col in row
+                print(deps_io, col, '\0')
+            end
+        end
+        deps_key = string(crc32c(take!(deps_io)); base = 16, pad = 8)
+        entry_name = string(proj_prefix, input_key, "-", deps_key)
+        entry_dir = joinpath(cache_root, entry_name)
+        if !isdir(entry_dir)
+            tmp = mktempdir(cache_root; prefix = ".tmp_")
+            try
+                cached_proj_crc = ""
+                cached_mf_crc = ""
+                if !workspace
+                    copy_env_files(tmp, env)
+                    prefs = joinpath(dirname(env), "LocalPreferences.toml")
+                    isfile(prefs) && cp(prefs, joinpath(tmp, "LocalPreferences.toml"); force = true)
+                    cached_proj_crc = file_tag(joinpath(tmp, "Project.toml"))
+                    cached_mf_crc = file_tag(joinpath(tmp, "Manifest.toml"))
+                end
+                stamp = Dict{String, Any}(
+                    "mode" => workspace ? "workspace" : "testenv",
+                    "julia_version" => string(VERSION),
+                    "input_key" => input_key,
+                    "env_path" => workspace ? abspath(env) : "",
+                    "cached_proj_crc" => cached_proj_crc,
+                    "cached_mf_crc" => cached_mf_crc,
+                    "path_deps" => dep_rows,
+                )
+                open(io -> TOML.print(io, stamp; sorted = true), joinpath(tmp, ENV_CACHE_STAMP), "w")
+                try
+                    mv(tmp, entry_dir)
+                catch e
+                    is_interrupt(e) && rethrow()
+                    # Another process may have raced to write the exact same immutable entry.
+                    isdir(entry_dir) || rethrow()
+                    rm(tmp; force = true, recursive = true)
+                end
+            catch
+                rm(tmp; force = true, recursive = true)
+                rethrow()
+            end
+        end
+        # Best-effort prune superseded cache entries for this project + Julia minor version.
+        for other in readdir(cache_root)
+            (startswith(other, proj_prefix) && other != entry_name) || continue
+            try
+                rm(joinpath(cache_root, other); force = true, recursive = true)
+            catch e
+                is_interrupt(e) && rethrow()
+            end
+        end
+        return workspace ? abspath(env) : joinpath(entry_dir, "Project.toml")
+    catch e
+        is_interrupt(e) && rethrow()
+        return String(env)
+    end
+end
+
+function clear_disk_test_env!(target)
+    try
+        cache_root = test_env_cache_root(target)
+        isdir(cache_root) || return nothing
+        prefix = test_env_proj_prefix(abspath(target.project))
+        for name in readdir(cache_root)
+            startswith(name, prefix) || continue
+            rm(joinpath(cache_root, name); force = true, recursive = true)
+        end
+    catch e
+        is_interrupt(e) && rethrow()
+    end
+    return nothing
+end
 
 # Whether `test/Project.toml` is a member of a workspace, and of the one the package
 # is in: the package's own, or one that lists both, as a monorepo's root does,
@@ -272,17 +668,17 @@ function apply_recorded_replay!(p::Plan, given::RunStateRecord, records::Vector,
         gone, changed, env_moved, policies, ReplayEnvDiff[], snapshots
     )
     dry_run && populate_dry_run_env_diffs!(diff, p, target_project)
-    replay_slots, slot_pool = recorded_replay_slots(p, records)
-    return with_replay(p, diff; replay_slots, slot_pool)
+    replay_slots, slot_pool, slot_items = recorded_replay_slots(p, records)
+    return with_replay(p, diff; replay_slots, slot_pool, slot_items)
 end
 
 # Reconstruct the exact per-slot item sequence recorded in `records`, restricted to the
 # items selected in `p`. Any selected item not seen in the recorded `:attempt` events
 # (e.g. UNSEEN in a crashed recording) is appended after the recorded work so nothing is
-# dropped. Returns `(replay_slots, slot_pool)`.
+# dropped. Preserves up to `max(p.cfg.workers, 1)` recorded slots even when `count_slots`
+# would otherwise allocate fewer slots for fast items. Returns `(replay_slots, slot_pool, slot_items)`.
 function recorded_replay_slots(p::Plan, records::Vector)
-    S = nslots(p)
-    (S == 0 || nitems(p) == 0) && return Vector{ItemIdx}[], p.slot_pool
+    (nslots(p) == 0 || nitems(p) == 0) && return Vector{ItemIdx}[], p.slot_pool, p.slot_items
     plan_item = Dict{Tuple{Int32, String}, ItemIdx}(
         (p.items.package[i], p.items.name[i]) => ItemIdx(i) for i in 1:nitems(p)
     )
@@ -304,9 +700,11 @@ function recorded_replay_slots(p::Plan, records::Vector)
             push!(get!(Vector{Tuple{Float32, Int, ItemIdx}}, by_slot, slot), (ev.t0, ord, idx))
         end
     end
-    isempty(by_slot) && return Vector{ItemIdx}[], p.slot_pool
+    isempty(by_slot) && return Vector{ItemIdx}[], p.slot_pool, p.slot_items
 
     rec_slots = sort!(collect(keys(by_slot)))
+    budget = max(p.cfg.workers, 1)
+    S = min(budget, max(nslots(p), maximum(rec_slots)))
     replay_slots = [ItemIdx[] for _ in 1:S]
     preserve_ids = maximum(rec_slots) <= S
     for (pos, r) in enumerate(rec_slots)
@@ -330,11 +728,12 @@ function recorded_replay_slots(p::Plan, records::Vector)
             end
         end
     end
-    slot_pool = copy(p.slot_pool)
+    slot_pool = Int32[s <= length(p.slot_pool) ? p.slot_pool[s] : Int32(1) for s in 1:S]
+    slot_items = UnitRange{ItemIdx}[s <= length(p.slot_items) ? p.slot_items[s] : (ItemIdx(1):ItemIdx(0)) for s in 1:S]
     for s in 1:S
         isempty(replay_slots[s]) || (slot_pool[s] = item_pool[replay_slots[s][1]])
     end
-    return replay_slots, slot_pool
+    return replay_slots, slot_pool, slot_items
 end
 
 function compare_manifest_texts(here_text::AbstractString, there_text::AbstractString)

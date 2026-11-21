@@ -197,7 +197,9 @@ struct ItemRecord
 end
 @assert sizeof(ItemRecord) == 32
 
-# Peak memory summary written in-place to the reserved `RS_MEMORY_BYTES` block.
+# Peak memory summary written in-place to the reserved `RS_MEMORY_BYTES` (64 B) block.
+# Appending `peak_worker_mb` at byte 28 stays within the zero-padded 64 B block, so
+# existing v1 files decode it cleanly as `0.0f0` without a format version bump.
 struct MemoryRecord
     peak_total_mb::Float32
     peak_total_at::Float32
@@ -206,17 +208,19 @@ struct MemoryRecord
     setup_peak_mb::Float32
     test_peak_mb::Float32
     nprocs_peak::Int32
+    peak_worker_mb::Float32   # largest single worker process tree during PHASE_TEST
 end
-@assert sizeof(MemoryRecord) == 28
+@assert sizeof(MemoryRecord) == 32 && sizeof(MemoryRecord) <= RS_MEMORY_BYTES
 
 const MemorySummary = @NamedTuple{
     peak_total_mb::Float32, peak_total_at::Float32, peak_single_mb::Float32,
-    peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32, nprocs_peak::Int32
+    peak_single_pid::Int32, setup_peak_mb::Float32, test_peak_mb::Float32,
+    nprocs_peak::Int32, peak_worker_mb::Float32
 }
-const ZERO_MEMORY = MemorySummary((0.0f0, 0.0f0, 0.0f0, Int32(0), 0.0f0, 0.0f0, Int32(0)))
+const ZERO_MEMORY = MemorySummary((0.0f0, 0.0f0, 0.0f0, Int32(0), 0.0f0, 0.0f0, Int32(0), 0.0f0))
 memory_summary(r::MemoryRecord) = MemorySummary((
     recorded(r.peak_total_mb), recorded(r.peak_total_at), recorded(r.peak_single_mb), r.peak_single_pid,
-    recorded(r.setup_peak_mb), recorded(r.test_peak_mb), r.nprocs_peak
+    recorded(r.setup_peak_mb), recorded(r.test_peak_mb), r.nprocs_peak, recorded(r.peak_worker_mb)
 ))
 
 # One item's status as it sits on disk. Every field lands on its natural alignment,
@@ -693,7 +697,8 @@ function write_memory!(rsf::Union{Nothing, RunStateFile}, m)
         rsf.memory_ref[] = MemoryRecord(
             Float32(m.peak_total_bytes / 2^20), Float32(m.peak_total_at), Float32(m.peak_single_bytes / 2^20),
             Int32(m.peak_single_pid), Float32(phase_peak(m, PHASE_SETUP) / 2^20),
-            Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak)
+            Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak),
+            Float32(m.peak_worker_bytes / 2^20)
         )
         write_record(io, rsf.memory_ref)
     end
@@ -1020,9 +1025,9 @@ it. A file that is truncated or from a crashed run gives as much as can be read,
 `nothing`; a file written by a different format version returns `nothing`. The reader
 suppresses ordinary read and parse errors so a broken old record does not stop a new
 run, and a record that another run deletes while it reads gives `nothing`. An interrupt
-during parsing is rethrown. With `full = false`, reads only the planning prefix and
-appended events, leaving `memory`, `profiles`, `preferences`, `manifest_zlib`,
-`worker_environments`, `profile_environments`, and `policies` empty/zeroed.
+during parsing is rethrown. With `full = false`, reads only the planning prefix (including
+`memory`) and appended events, leaving `profiles`, `preferences`, `manifest_zlib`,
+`worker_environments`, `profile_environments`, and `policies` empty.
 """
 function read_run_state(path::AbstractString; full::Bool = true)
     # Another run prunes records at any moment. On Windows a file that is being deleted
@@ -1105,13 +1110,11 @@ function read_run_state(path::AbstractString; full::Bool = true)
         end
 
         memory = ZERO_MEMORY
-        if full
-            if Int(h.off_memory) + sizeof(MemoryRecord) <= hot_total
-                seek(io, Int(h.off_memory))
-                memory = memory_summary(read_record(io, MemoryRecord))
-            else
-                truncated = true
-            end
+        if Int(h.off_memory) + sizeof(MemoryRecord) <= hot_total
+            seek(io, Int(h.off_memory))
+            memory = memory_summary(read_record(io, MemoryRecord))
+        elseif full
+            truncated = true
         end
 
         profiles = Dict{Symbol, Profile}()
@@ -1500,8 +1503,10 @@ end
 runstate_root() = joinpath(first(DEPOT_PATH), "runtests", "runs")
 
 # Beside a project's run states in the default location: the project's path, which
-# tells `sweep_runstate_dirs` whether the project is still there.
+# tells `sweep_runstate_dirs` whether the project is still there, and the cached test
+# environment directory (`environments.jl`).
 const PROJECT_MARK = "project"
+const ENV_CACHE_DIR = "envcache"
 
 # A run keeps what it records in a directory of its own, `<run>.rundata`: the record,
 # `RUNSTATE_FILE`, and beside it what its items left, every name of which starts with
@@ -1749,32 +1754,41 @@ struct ItemFacts
     hash::UInt32           # the source hash in the newest run that ran it; 0 for unknown
     selected_at::Float64   # when the newest run that is over and selected it started
     unreached::Bool        # whether that run stopped before the item ended
+    peak_rss_mb::Float64   # newest worker peak RSS (MiB) recorded for this item; 0 for none
+    compile_s::Float64     # newest recorded compile time (s) for this item; 0 for none
 end
-const NO_FACTS = ItemFacts(Int8(-1), UNSEEN, 0.0, 0.0f0, UInt64(0), 0.0, UInt32(0), 0.0, false)
+const NO_FACTS = ItemFacts(Int8(-1), UNSEEN, 0.0, 0.0f0, UInt64(0), 0.0, UInt32(0), 0.0, false, 0.0, 0.0)
 
 is_failing(f::ItemFacts) = f.verdict == 1
 
 """
     item_facts(runs; base = nothing) -> Dict{String, ItemFacts}
 
-Every item's facts from `runs`, oldest first as `project_runs` gives them. Durations
-and source hashes come from every run but dry runs and those that ended before their
-first item, a run another process is still in the middle of included: what it has
-finished is finished. Verdicts and stops come from the runs that are over, and with
-`base`, the run state a replay names, from it and the runs that started after it.
+Every item's facts from `runs`, oldest first as `project_runs` gives them. Durations,
+compile times, worker memory peaks, and source hashes come from every run but dry runs
+and those that ended before their first item, a run another process is still in the
+middle of included: what it has finished is finished. Verdicts and stops come from the
+runs that are over, and with `base`, the run state a replay names, from it and the runs
+that started after it.
 """
 function item_facts(runs::Vector{Pair{String, RunStateRecord}}; base::Union{Nothing, RunStateRecord} = nothing)
     facts = Dict{String, ItemFacts}()
     for (_, rs) in runs
         (rs.dry_run || rs.aborted) && continue
         counts = !is_live(rs) && (base === nothing || rs.start_unix >= base.start_unix)
+        on_worker = get(rs.meta, "workers", "") != "0"
         # Paired by index: a damaged file can hold fewer statuses than items.
         for i in 1:min(length(rs.items), length(rs.statuses))
             it, st = rs.items[i], rs.statuses[i]
             f = get(facts, it.name, NO_FACTS)
             v, state, at, ended, seed = f.verdict, f.state, f.verdict_at, f.verdict_end, f.seed
-            seconds, hash, selected_at, unreached = f.seconds, f.hash, f.selected_at, f.unreached
-            timed(st.state) && st.elapsed > 0 && (seconds = Float64(st.elapsed))
+            seconds, hash, selected_at, unreached, peak_rss, comp =
+                f.seconds, f.hash, f.selected_at, f.unreached, f.peak_rss_mb, f.compile_s
+            if timed(st.state) && st.elapsed > 0
+                seconds = Float64(st.elapsed)
+                comp = Float64(st.compile)
+            end
+            on_worker && timed(st.state) && st.peak_rss_mb > 0 && (peak_rss = Float64(st.peak_rss_mb))
             (st.state === UNSEEN || st.state === RUNNING || st.state === CANCELLED) || (hash = it.hash)
             if counts
                 found = verdict(rs, i)
@@ -1786,7 +1800,7 @@ function item_facts(runs::Vector{Pair{String, RunStateRecord}}; base::Union{Noth
                 # whichever way it ended: a coordinator that died stopped it too.
                 unreached = st.state === UNSEEN || st.state === CANCELLED || (st.state === RUNNING && found === nothing)
             end
-            facts[it.name] = ItemFacts(v, state, at, ended, seed, seconds, hash, selected_at, unreached)
+            facts[it.name] = ItemFacts(v, state, at, ended, seed, seconds, hash, selected_at, unreached, peak_rss, comp)
         end
     end
     return facts
@@ -2065,7 +2079,7 @@ function gone_checkout(dir::AbstractString, temp::AbstractString, parents::Paren
             rs !== nothing && recorded_here(rs) && !is_live(rs)
         end
         going = Set(basename(dirname(f)) for f in deleted)
-        whole = all(f -> f == PROJECT_MARK || is_folder_metadata(f) || f in going, entries)
+        whole = all(f -> f == PROJECT_MARK || f == ENV_CACHE_DIR || is_folder_metadata(f) || f in going, entries)
         return GoneCheckout(String(dir), project, deleted, whole)
     catch e
         is_interrupt(e) && rethrow()
@@ -2149,8 +2163,26 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
     end
     seconds = Dict(n => f.seconds for (n, f) in facts if f.seconds > 0)
     hashes = Dict(n => f.hash for (n, f) in facts if f.hash != 0)
+    item_rss = Dict(n => f.peak_rss_mb for (n, f) in facts if f.peak_rss_mb > 0)
+    compile_s = Dict(n => f.compile_s for (n, f) in facts if f.compile_s > 0)
     recent = over[max(1, end - nruns + 1):end]
-    return History(seconds, failed, recorded_cold_cost(recent), cancelled, hashes, Set(keys(facts)))
+    return History(seconds, failed, recorded_cold_cost(recent), cancelled, hashes, Set(keys(facts)),
+                   item_rss, recorded_crash_peak_worker_mb(recent), compile_s)
+end
+
+# Largest worker-tree peak RSS (MiB) recorded by the monitor across recent worker runs
+# where at least one item crashed, timed out, or was left running without recording a
+# status RSS (e.g. OOM before the item could finish). Skips `workers = 0` runs.
+function recorded_crash_peak_worker_mb(runs::Vector{RunStateRecord})
+    peak = 0.0
+    for rs in runs
+        get(rs.meta, "workers", "") == "0" && continue
+        p = Float64(rs.memory.peak_worker_mb)
+        p > 0 || continue
+        had_crash = any(st -> st.state in (ERRORED, TIMEDOUT, RUNNING) && st.peak_rss_mb == 0, rs.statuses)
+        had_crash && p > peak && (peak = p)
+    end
+    return peak
 end
 
 # When a checkout has no run states of its own, borrow durations and worker cold cost
@@ -2196,9 +2228,11 @@ function borrowed_history(root::AbstractString, nruns::Int = HISTORY_RUNS)
     now_t = time()
     over = RunStateRecord[rs for (_, rs) in runs if !rs.dry_run && !rs.aborted && !is_live(rs; now = now_t)]
     seconds = Dict(n => f.seconds for (n, f) in facts if f.seconds > 0)
+    item_rss = Dict(n => f.peak_rss_mb for (n, f) in facts if f.peak_rss_mb > 0)
+    compile_s = Dict(n => f.compile_s for (n, f) in facts if f.compile_s > 0)
     recent = over[max(1, end - nruns + 1):end]
     return History(seconds, Dict{String, Int}(), recorded_cold_cost(recent), Set{String}(),
-                   Dict{String, UInt32}(), Set{String}())
+                   Dict{String, UInt32}(), Set{String}(), item_rss, recorded_crash_peak_worker_mb(recent), compile_s)
 end
 
 """
@@ -2211,24 +2245,35 @@ chain whose worker died before it ran).
 """
 timed(state::ItemState) = !(state === UNSEEN || state === CANCELLED || state === BROKEN_CHAIN)
 
-# What a fresh worker cost across `runs`: how long its process took to come up, and
-# how much longer a process's first item spent compiling than its later ones did.
-# 0 for what the runs did not record.
+# What a fresh worker cost across `runs`: how long its process took to come up, how much
+# longer a process's first item spent compiling than its later ones did, and the mean total
+# compile time each active worker process spent across worker runs. 0 for what the runs
+# did not record.
 function recorded_cold_cost(runs::Vector{RunStateRecord})
     starts, start_s = 0, 0.0
     cold, cold_s, warm, warm_s = 0, 0.0, 0, 0.0
+    worker_count, worker_comp_s = 0, 0.0
     for rs in runs
+        on_worker = get(rs.meta, "workers", "") != "0"
+        pids = Set{Int32}()
         # Direct integer index per status row replaces a `Dict{Tuple{Int32, Int8}, Int16}`.
         seq = zeros(Int16, length(rs.statuses))
         for e in rs.events
-            if e.kind === :attempt && e.seq > 0 && checkbounds(Bool, rs.statuses, e.item) &&
-                    rs.statuses[e.item].attempt == e.attempt
-                seq[e.item] = e.seq
+            if e.kind === :attempt
+                if on_worker && e.pid > 0
+                    push!(pids, e.pid)
+                    worker_comp_s += Float64(e.compile)
+                end
+                if e.seq > 0 && checkbounds(Bool, rs.statuses, e.item) &&
+                        rs.statuses[e.item].attempt == e.attempt
+                    seq[e.item] = e.seq
+                end
             elseif e.kind === :worker_up && e.t1 > e.t0
                 starts += 1
                 start_s += e.t1 - e.t0
             end
         end
+        worker_count += length(pids)
         for (i, st) in enumerate(rs.statuses)
             n = seq[i]
             if n == 1
@@ -2240,7 +2285,8 @@ function recorded_cold_cost(runs::Vector{RunStateRecord})
     end
     return ColdCost(
         starts > 0 ? start_s / starts : 0.0,
-        cold > 0 && warm > 0 ? max(0.0, cold_s / cold - warm_s / warm) : 0.0
+        cold > 0 && warm > 0 ? max(0.0, cold_s / cold - warm_s / warm) : 0.0,
+        worker_count > 0 ? worker_comp_s / worker_count : 0.0
     )
 end
 

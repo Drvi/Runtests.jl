@@ -36,7 +36,7 @@ Runtests deletes an empty log file at the end of the run. When Runtests deletes 
 
 ## The run state directory
 
-By default, the run state directory is `runtests/runs/<project>-<hash>/` in the first Julia depot, for example `~/.julia/runtests/runs/MyPackage-8db4f545/`. `<project>` is the name of the project, and `<hash>` is a hash of the path of the project. Thus each checkout has its own directory. `RUNTESTS_RUNSTATE_DIR` names another directory, which several projects can share. Several processes can use one run state directory at the same time. Each run makes a new directory for itself, and no two runs get the same directory. [Run states and history](@ref history) explains which run states Runtests keeps.
+By default, the run state directory is `runtests/runs/<project>-<hash>/` in the first Julia depot, for example `~/.julia/runtests/runs/MyPackage-8db4f545/`. `<project>` is the name of the project, and `<hash>` is a hash of the path of the project. Thus each checkout has its own directory. `RUNTESTS_RUNSTATE_DIR` names another directory, which several projects can share. Several processes can use one run state directory at the same time. Each run makes a new directory for itself, and no two runs get the same directory. Beside the `<run>.rundata` directories, Runtests keeps an `envcache/` directory caching the resolved test environment across processes (keyed by file content hashes of project/test/workspace files, path-dependency hashes, installed registry metadata, Julia version, depot artifact state, cached file CRCs, and manifest package presence, and removed automatically when `chores` sweeps a gone checkout). [Run states and history](@ref history) explains which run states Runtests keeps.
 
 ## The artifact directory
 

@@ -271,7 +271,9 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     )
     files_seconds = time() - t_files
     t_plan = time()
-    cfg = read_config(target.testdir; nunits = length(items), kwargs...)
+    hist = history(target.root; base = rs)
+    peak_worker_mb, rss_coverage = estimate_worker_rss(items, History[hist])
+    cfg = read_config(target.testdir, peak_worker_mb, rss_coverage; nunits = length(items), kwargs...)
     naming = naming_root(target.root)
     check_skip_environment(cfg.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming,
                            get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
@@ -280,7 +282,7 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     call_code!(cfg.profiles, worker_init, test_end)
     merge!(cfg.item_seeds, item_seeds)
     p = plan(
-        items, cfg; history = history(target.root; base = rs), root = target.root,
+        items, cfg; history = hist, root = target.root,
         selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
     if rs !== nothing

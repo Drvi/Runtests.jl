@@ -483,6 +483,27 @@ end
         @test auto_workers("2", 100) <= 8
         # A worker with a thread per CPU fills the machine on its own.
         @test auto_workers("auto", 100) == 1 && auto_workers("auto,1", 100) == 1
+
+        # Recorded peak worker RSS scales down heavy suites and lets light suites use
+        # more workers than the unmeasured 4 GiB guess on memory-constrained machines.
+        mem_16g = Int64(16) * 2^30
+        @test auto_workers("1", 100; peak_worker_mb = 4096.0, coverage = 1.0, memory_threshold = 0.9, total_memory = mem_16g) <= 2
+        if Runtests.Private.effective_cpu_threads() >= 8
+            @test auto_workers("1", 100; peak_worker_mb = 350.0, coverage = 1.0, memory_threshold = 0.9, total_memory = mem_16g) >= 8
+        end
+        # Incomplete coverage regularizes low RSS readings back toward the 4 GiB prior
+        # (so a tiny partial run cannot oversubscribe a full run), while never shrinking
+        # high readings (> 4 GiB) downward.
+        @test auto_workers("1", 100; peak_worker_mb = 350.0, coverage = 0.05, memory_threshold = 0.9, total_memory = mem_16g) <= 4
+        @test auto_workers("1", 100; peak_worker_mb = 5120.0, coverage = 0.05, memory_threshold = 0.9, total_memory = mem_16g) <= 2
+        # Low coverage keeps the unmeasured cap of 8 even on large-memory machines.
+        mem_128g = Int64(128) * 2^30
+        @test auto_workers("1", 100; peak_worker_mb = 350.0, coverage = 0.5, memory_threshold = 0.9, total_memory = mem_128g) <= 8
+        # Non-finite or non-positive readings fall back to the unmeasured default.
+        @test auto_workers("2", 100; peak_worker_mb = NaN, total_memory = mem_16g) ==
+              auto_workers("2", 100; total_memory = mem_16g)
+        @test auto_workers("2", 100; peak_worker_mb = -50.0, total_memory = mem_16g) ==
+              auto_workers("2", 100; total_memory = mem_16g)
     end
 end
 

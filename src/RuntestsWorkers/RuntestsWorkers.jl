@@ -97,9 +97,12 @@ const PRECOMPILE_SIGNATURES = (
     (send_request, (Worker, UInt8, ItemSpec)),
     (send_request, (Worker, UInt8, Tuple{EndSpec, Expr})),
     (send_request, (Worker, UInt8, Tuple{Int32, Int8, Bool})),
+    (send_request, (Worker, UInt8, Tuple{String, Vector{String}})),
     (remote_run, (Worker, ItemSpec)),
     (remote_end, (Worker, ItemSpec, Expr)),
     (remote_finish, (Worker, Int32, Int8, Bool)),
+    (remote_activate, (Worker, String, Vector{String})),
+    (activate_worker, (String, Vector{String})),
     (finish_artifacts, (Int32, Int8, Bool)),
     (process_responses, (Worker,)),
     (read_message, (IOBuffer,)),
@@ -130,8 +133,10 @@ const PRECOMPILE_SIGNATURES = (
         write(io, encode_message(UInt64(1), KIND_RUN, spec))
         # A result's way back, which a worker's first item makes within its timeout.
         write(io, encode_message(UInt64(2), KIND_RESULT, result))
+        write(io, encode_message(UInt64(3), KIND_ACTIVATE, ("", String["@"])))
         seekstart(io)
         try
+            read_message(io)
             read_message(io)
             read_message(io)
         catch

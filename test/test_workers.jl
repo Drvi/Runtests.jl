@@ -522,6 +522,23 @@ end
         end
     end
 
+    @testset "remote_activate switches active project and LOAD_PATH in place" begin
+        alt = mktempdir()
+        alt_proj = joinpath(alt, "Project.toml")
+        write(alt_proj, "[deps]\n")
+        extra_dir = mktempdir()
+        with_worker(; threads="1", redirect_io=IOBuffer()) do w
+            new_lp = String["@", extra_dir, "@stdlib"]
+            @test fetch(RuntestsWorkers.remote_activate(w, alt_proj, new_lp)) === nothing
+            res = fetch(remote_run(w, probe_spec(:(begin
+                @test abspath(Base.active_project()) == abspath($alt_proj)
+                @test abspath(ENV["JULIA_PROJECT"]) == abspath($alt_proj)
+                @test LOAD_PATH == $new_lp
+            end); name = "activated")))
+            @test res.state === PASSED
+        end
+    end
+
     @testset "these tests leave no worker running" begin
         @test @lock(RuntestsWorkers.LIVE_LOCK, count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)) == 0
     end

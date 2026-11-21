@@ -289,10 +289,11 @@ directory; named, it has to exist, where `test/TestItems.toml` may be absent. Fo
 workspace member, profiles marked `monorepo_default = true` in the workspace root's
 file are also available; unrelated root profiles and run settings do not apply.
 """
-function read_config(testdir::AbstractString; config::Union{Nothing, AbstractString} = nothing, kwargs...)
+function read_config(testdir::AbstractString, peak_worker_mb::Real = 0.0, rss_coverage::Real = 1.0;
+                     config::Union{Nothing, AbstractString} = nothing, kwargs...)
     path, toml = config_toml(testdir, config)
     # The code of the profiles is the suite's, wherever the file that `config` names is.
-    return build_config(path, toml; config_file = config === nothing ? "" : path, testdir,
+    return build_config(path, toml, peak_worker_mb, rss_coverage; config_file = config === nothing ? "" : path, testdir,
                         shared = package_shared_profiles(dirname(abspath(testdir))), kwargs...)
 end
 
@@ -399,7 +400,8 @@ function pick_run_setting(key::Symbol, default, kwargs, run::AbstractDict,
     return get(run, string(key), default)
 end
 
-function build_config(path, toml; nunits = 0, config_file::AbstractString = "", testdir::AbstractString = dirname(path),
+function build_config(path, toml, peak_worker_mb::Real = 0.0, rss_coverage::Real = 1.0; nunits = 0,
+                      config_file::AbstractString = "", testdir::AbstractString = dirname(path),
                       shared::Union{Nothing, SharedProfiles} = nothing,
                       profiles::Union{Nothing, Dict{Symbol, Profile}} = nothing, kwargs...)
     for k in keys(kwargs)
@@ -438,20 +440,21 @@ function build_config(path, toml; nunits = 0, config_file::AbstractString = "", 
         throw(bad("`$key` must be true or false, got $(repr(v))", key)))
 
     threads = threads_spec("threads", pick(:threads, DEFAULT_THREADS), msg -> bad(msg, :threads))
+    mt = pick(:memory_threshold, 0.9)
+    (is_number(mt) && 0 < mt <= 1) || throw(bad("`memory_threshold` must be in (0, 1], got $(repr(mt))", :memory_threshold))
     w = pick(:workers, "auto")
     # A worker is a slot, and slots are numbered in a `SlotIdx`.
     ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(bad(
         "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))", :workers
     ))
-    workers = w isa Integer ? Int(w) : auto_workers(threads, nunits)
+    workers = w isa Integer ? Int(w) :
+        auto_workers(threads, nunits; peak_worker_mb, coverage = rss_coverage, memory_threshold = Float64(mt))
     logs = Symbol(pick(:logs, default_logs(workers)))::Symbol
     logs in LOG_MODES || throw(bad("`logs` must be one of $(LOG_MODES), got $(repr(logs))", :logs))
     timeout = seconds(:timeout, pick(:timeout, DEFAULT_TIMEOUT_S))
     retries = pick(:retries, 0)
     (is_whole_number(retries) && 0 <= retries <= MAX_RETRIES) ||
         throw(bad("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))", :retries))
-    mt = pick(:memory_threshold, 0.9)
-    (is_number(mt) && 0 < mt <= 1) || throw(bad("`memory_threshold` must be in (0, 1], got $(repr(mt))", :memory_threshold))
     failfast = flag(:failfast, false)
     # Absent, a random one: 0 is a seed like any other.
     seed = pick(:seed, nothing)
@@ -1030,9 +1033,15 @@ const DEFAULT_CODE_FLAGS = ("--check-bounds=auto", "-O2", "-g1", "--inline=yes",
 run_code_flags(cfg::RunConfig) = isempty(cfg.julia_flags) ? code_flags() : cfg.julia_flags
 nondefault_flags(flags) = String[f for f in flags if !(f in DEFAULT_CODE_FLAGS)]
 
-# A guess, not a measurement: too many workers is an OOM kill, and each extra one
-# compiles the same code again. An `Int64`: 4 GiB is 0 in a 32-bit `Int`.
+# Unmeasured fallback when no recorded worker RSS exists yet: too many workers risks
+# an OOM kill, and each extra one duplicates compilation. `Int64` avoids 32-bit overflow.
 const ASSUMED_WORKER_RSS = Int64(4) * 2^30
+const MIN_RECORDED_WORKER_RSS = Int64(256) * 2^20   # floor against noisy tiny samples
+const COORDINATOR_MEMORY_RESERVE = Int64(512) * 2^20
+const WORKER_MEMORY_MARGIN = 1.25                   # 25% headroom over recorded peak worker RSS
+const AUTO_WORKERS_UNMEASURED_CAP = 8
+const AUTO_WORKERS_MEASURED_CAP = 16
+const AUTO_WORKERS_HIGH_COVERAGE = 0.8              # minimum observed item fraction before lifting cap above 8
 
 # The CPUs this process may use: fewer than the machine's under a container
 # quota, and oversubscribing them turns timeouts flaky. 1.12 has only the
@@ -1043,11 +1052,32 @@ effective_cpu_threads() = @static isdefined(Sys, :EFFECTIVE_CPU_THREADS) ? Sys.E
 default_thread_count(threads::AbstractString, cpus::Int = effective_cpu_threads()) =
     (t = first(split(threads, ','))) == "auto" ? cpus : something(tryparse(Int, t), 2)
 
-function auto_workers(threads::String, nunits::Int)
+function auto_workers(threads::String, nunits::Int;
+                      peak_worker_mb::Real = 0.0,
+                      coverage::Real = 1.0,
+                      memory_threshold::Real = 0.9,
+                      total_memory::Integer = Sys.total_memory())
     cpus = effective_cpu_threads()
     per_worker = default_thread_count(threads, cpus)
     by_cpu = max(1, cpus ÷ max(1, per_worker))
-    by_mem = max(1, Int(Sys.total_memory() ÷ ASSUMED_WORKER_RSS))
-    n = clamp(min(by_cpu, by_mem), 1, 8)
+    recorded_mb = (isfinite(peak_worker_mb) && peak_worker_mb > 0) ? Float64(peak_worker_mb) : 0.0
+    if recorded_mb > 0
+        cov = isfinite(coverage) ? clamp(Float64(coverage), 0.0, 1.0) : 0.0
+        mt = (isfinite(memory_threshold) && 0 < memory_threshold <= 1) ? Float64(memory_threshold) : 0.9
+        usable = Int64(floor(Float64(total_memory) * mt))
+        reserve = min(COORDINATOR_MEMORY_RESERVE, usable ÷ 4)
+        budget = max(Int64(1), usable - reserve)
+        obs_bytes = max(MIN_RECORDED_WORKER_RSS, Int64(ceil(recorded_mb * 2^20 * WORKER_MEMORY_MARGIN)))
+        # Asymmetric regularization toward the 4 GiB prior when only part of the selection
+        # has recorded worker RSS: low readings pull smoothly upward toward 4 GiB so a tiny
+        # partial run cannot oversubscribe a full run, while readings above 4 GiB count in full.
+        per_worker_bytes = max(obs_bytes, round(Int64, cov * obs_bytes + (1.0 - cov) * ASSUMED_WORKER_RSS))
+        by_mem = max(1, Int(budget ÷ per_worker_bytes))
+        cap = cov >= AUTO_WORKERS_HIGH_COVERAGE ? AUTO_WORKERS_MEASURED_CAP : AUTO_WORKERS_UNMEASURED_CAP
+        n = clamp(min(by_cpu, by_mem), 1, cap)
+    else
+        by_mem = max(1, Int(Int64(total_memory) ÷ ASSUMED_WORKER_RSS))
+        n = clamp(min(by_cpu, by_mem), 1, AUTO_WORKERS_UNMEASURED_CAP)
+    end
     return nunits > 0 ? min(n, nunits) : n
 end

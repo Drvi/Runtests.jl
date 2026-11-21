@@ -784,13 +784,14 @@ end
     dir = make_pkg(
         "SlowLog",
         "deps/SlowPkg/Project.toml" => "name = \"SlowPkg\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n",
-        "deps/SlowPkg/src/SlowPkg.jl" => "module SlowPkg\nsleep(0.8)\nend\n",
+        "deps/SlowPkg/src/SlowPkg.jl" => "module SlowPkg\nsleep(1.2)\nend\n",
         "test/Project.toml" => "[deps]\nSlowPkg = \"$u\"\n\n[sources]\nSlowPkg = {path = \"../deps/SlowPkg\"}\n",
         "test/t_test.jl" => "@testitem \"t\" begin\n    @test true\nend\n",
     )
     (states, _, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false, monitor_interval = 0))
     @test all(==(PASSED), values(states))
-    @test occursin("still precompiling SlowPkg", out)
+    # `SlowLog` compiles alongside `SlowPkg` and may still be in flight at the reminder tick.
+    @test occursin(r"still precompiling [^\n]*SlowPkg", out)
     @test occursin(Regex("COMP · +\\d+/\\d+ · direct +· \"SlowPkg\" +· v0\\.1\\.0 +· PASS"), out)
 end
 

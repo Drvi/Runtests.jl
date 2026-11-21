@@ -15,13 +15,22 @@ An item that did not pass gets a block with its results right after its `DONE` l
 └ @ test/faults_test.jl:5 on worker 1
 ```
 
-The block holds the failed tests, the captured output of the item, and the path of the files that the item kept. Under `logs = :issues`, the default, only items that did not pass print their output. Under `logs = :quiet`, no item prints its output. Then read the output in the log of the item. Under `logs = :eager`, the output streams as the item runs and is not repeated in the block.
+The block holds the failed tests, the captured output of the item, and the path of the files that the item kept. On a timeout, both the `KILL` line and the block also report whether the worker was idle (`likely blocked or deadlocked`, `< 5%` CPU) or active (`<N>% CPU; slow or looping`). Under `logs = :issues`, the default, only items that did not pass print their output. Under `logs = :quiet`, no item prints its output during the run; read it afterwards with [`Runtests.logs()`](@ref logs). Under `logs = :eager`, the output streams as the item runs and is not repeated in the block.
 
 ## Read the logs
 
-Except under `logs = :eager`, each run keeps what each item printed in the directory of the run, `<run>.rundata`, next to its run state. The closing block names the directory on its `run state` line. The directory also holds the failure report of each attempt that did not pass. [The files reference](@ref run-state-files) shows the names of the files.
+Each run keeps nonempty item output in the directory of the run, `<run>.rundata`, next to its run state (on workers, even `logs = :eager` lazily saves nonempty item output there; only `workers = 0` or an unwritable temporary directory omits per-item log files). The closing block names the directory on its `run state` line. The directory also holds the failure report of each attempt that did not pass. [The files reference](@ref run-state-files) shows the names of the files.
 
-With `logs = :eager`, use the terminal or CI job log to read the item's output; Runtests does not retain an item log of that output. Failure reports and [artifact evidence](@ref evidence) are still kept. Producers' output is captured in their `.artifacts.log` even in this mode. [The configuration reference](@ref run-keys) lists all logging modes.
+Use [`Runtests.logs`](@ref logs) to print captured logs from the latest run or from a specific `.rundata` / `.runstate` path (especially useful after `logs = :quiet`):
+
+```julia
+Runtests.logs()                                           # all nonempty logs of the latest run
+Runtests.logs(failed = true)                              # only non-passing items
+Runtests.logs("path/to/the.rundata"; name = r"solver")    # filter by name / Regex
+Runtests.logs("path/to/the.rundata"; name = "flaky", attempt = 1)
+```
+
+Failure reports and [artifact evidence](@ref evidence) are kept alongside the logs, and producers' output is captured in their `.artifacts.log`. [The configuration reference](@ref run-keys) lists all logging modes.
 
 ## Run the failures again
 
@@ -29,7 +38,7 @@ With `logs = :eager`, use the terminal or CI job log to read the item's output; 
 
 ## Replay a recorded run
 
-A run state records a run: its items, configuration, profiles, `[order]` and seeds. To run the same items again, give the directory of the run as `replay`. The `run.runstate` file in it also works.
+A run state records a run: its items, configuration, profiles, `[order]`, `[throttle]` limits, per-item policies (`timeout`, `retries`, `item_failfast`, `skip`), per-worker item sequences, and seeds. To run the same items again, give the directory of the run as `replay`. The `run.runstate` file in it also works.
 
 ```julia
 Runtests.read_run_state("path/to/the.rundata")     # read the record
@@ -39,10 +48,10 @@ Runtests.runtestsf(replay = "path/to/the.rundata") # run its failures again
 
 A replay does these things:
 
-- It uses the items, the configuration, the profiles, the `[order]` and the seeds of the record. A keyword that you give replaces the recorded value.
+- It uses the items, configuration, profiles, `[throttle]` limits, per-item policies (`timeout`, `retries`, `item_failfast`, `skip`), and seeds of the record. A keyword that you give replaces the recorded value.
+- It reproduces the exact per-worker item sequence recorded in the run state, with no work-stealing and no reordering (switching pools as recorded and waiting in place on full throttle gates), so neighbor-dependent failures recur.
 - It gives the workers the Julia flags of the recorded run, when these differ from the flags of this process.
-- It names each package whose version differs from the recorded environment. It does not install the recorded versions.
-- It names each recorded item that the suite no longer has. A renamed or deleted item cannot run again.
+- It warns on git revision/worktree differences, changed or missing items, moved environments, overridden policies, and package/preference differences against the recorded environment (it does not install the recorded package versions). Running with `dry_run = true` prints the full replay diff and the exact per-worker plan.
 
 `runtestsf(replay = ...)` selects the failures from the verdicts of that run and of the runs that started after it. Earlier runs give only durations.
 
@@ -110,7 +119,7 @@ end
 
 ### When an attempt fails
 
-An attempt fails when a test fails or the item throws, in its body or in the `test_end` of its profile. Producers can run only if the worker survives to return the result. A skipped item, a test marked as broken and an attempt that passes do not run producers. An attempt that passes deletes what it wrote.
+An attempt fails when a test fails or the item throws in its body (a failure in a profile's `test_end` does not fail the attempt or trigger producers). Producers run whenever the worker process survives the failed attempt — including when a result fails to deserialize on a still-live worker — unless the body or `test_end` timed out or killed the worker. A skipped item, a test marked as broken and an attempt that passes do not run producers. An attempt that passes deletes what it wrote.
 
 Producers run after the body and its profile's `test_end` finish and the run records the verdict. They see their values as they are when they run, not as they were at registration. A file that a `mktempdir() do` block deletes is gone by then. Write such a file to `artifacts_dir()` instead.
 
@@ -131,7 +140,7 @@ The evidence is deleted with the run state. `RUNTESTS_ARTIFACT_DIR` copies it wi
 
 Both functions work only in the body of an item, and in the tasks that the body starts and waits for. They throw an `ArgumentError` in `init`, in `skip`, in `test_end`, in a producer and outside an item. They also throw in a task that the item did not wait for, if the task calls them after the body returned.
 
-A registered producer keeps what it refers to, and the globals of the item, until collection ends or the producers are discarded after a pass. A `test_end` such as `GC.gc(true)` does not release that memory. A passed attempt releases it before its worker runs the next item. The producer's serialization or other expensive work happens only after a failure; registration still retains the references and writes a small note that producers are waiting.
+On a passing attempt, Runtests releases producer closures and the item's module globals immediately when the body finishes (before `test_end` runs, so `GC.gc(true)` in `test_end` can reclaim them). On a failing attempt, registered producers keep what they refer to — and the globals of the item — through `test_end` until artifact collection ends. The producer's serialization or other expensive work happens only after a failure; registration still retains the references while the body runs and writes a small note that producers are waiting.
 
 ## Step into an item with a debugger
 

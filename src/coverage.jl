@@ -25,7 +25,7 @@ coverage_flags(root::AbstractString, dir::AbstractString) =
     ["--code-coverage=@" * realpath(root), "--code-coverage=" * joinpath(dir, "%p.info")]
 
 """
-    merge_coverage(tracedir, roots, out) -> (files, lines, hit)
+    merge_coverage(tracedir, roots, out; base = nothing) -> (files, lines, hit)
 
 Sum the LCOV tracefiles in `tracedir` over the `src/` and `ext/` of each package in
 `roots`, and write them to `out` as one. Output paths are relative to each package's

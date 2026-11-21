@@ -16,6 +16,8 @@ test/
     MySetups.jl                    # a test setup, loaded with `using MySetups`
   testtemplates/
     periods_tests_template.jl      # a test template: @testtemplate declarations
+  testconfigs/
+    worker_init.jl                 # optional profile init / test_end code
   qa/
     Project.toml                   # the environment of the test files in qa/
     aqua_tests.jl
@@ -110,7 +112,7 @@ Julia measures a plain call such as `@allocated f(x, y)` from inside `f`, when t
 end
 ```
 
-When the item ends, the run releases what its nonconstant globals refer to. An item that registers [failure-artifact producers](@ref evidence) retains the values they need through `test_end` and artifact collection. A `const` keeps its value for as long as the worker runs.
+When the item ends, the run releases what its nonconstant globals refer to. On a failing attempt that registered [failure-artifact producers](@ref evidence), those values stay live through `test_end` and artifact collection; on a passing attempt, they are released immediately when the body finishes. A `const` keeps its value for as long as the worker runs.
 
 ## [Items on one worker](@id items-on-one-worker)
 

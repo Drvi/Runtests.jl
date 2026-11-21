@@ -12,12 +12,13 @@ Runtests reads the files under `test/`. Each Julia file there must match one of 
 | `test/**/*_test.jl`, `test/**/*_tests.jl` | A test file. It holds `@testitem` declarations only. |
 | `test/testsetups/Name.jl`, `test/testsetups/Name/src/Name.jl` | A test setup: the module `Name`. |
 | `test/testtemplates/*_test_template.jl`, `test/testtemplates/*_tests_template.jl` | A test template. It holds `@testtemplate` declarations only. |
+| `test/testconfigs/**` | Profile `worker_init.jl` and `test_end.jl` files. |
 | `test/testfixtures/**` | Input for the tests. Runtests never reads it as part of the suite. |
 | `test/**/` with a `Project.toml` or `JuliaProject.toml` | An environment directory. Its test files run in that environment. |
 
 A hidden file or directory, whose name starts with `.`, is not part of the suite. A Julia file that matches no rule stops the run.
 
-Every nested `Project.toml` or `JuliaProject.toml` that discovery encounters makes its directory an [environment directory](@ref environments). The innermost one that holds a test file is the environment of its items. The root `test/` project is the test environment. Setup packages under `test/testsetups/`, projects under `test/testtemplates/` and fixture projects under `test/testfixtures/` are not environment directories. Only the suite-root `test/testfixtures/` is reserved: a deeper directory with that name is an ordinary directory.
+Every nested `Project.toml` or `JuliaProject.toml` that discovery encounters makes its directory an [environment directory](@ref environments). The innermost one that holds a test file is the environment of its items. The root `test/` project is the test environment. Setup packages under `test/testsetups/`, projects under `test/testtemplates/`, `test/testconfigs/`, and fixture projects under `test/testfixtures/` are not environment directories. Only the suite-root `test/testfixtures/` is reserved: a deeper directory with that name is an ordinary directory.
 
 The expansion of `test/testtemplates/x_tests_template.jl` is `test/x_tests.jl`.
 
@@ -69,7 +70,7 @@ A template makes one test item for each iteration of the loop. With several loop
 | Name | `"case $n"` | The value of the iteration goes into the literal name. |
 | Body or keywords | `$n` | The value of the loop variable goes in as Julia code. |
 | Keywords | `$(expression)` | The expansion evaluates the expression once for each iteration, in the scope of the loop, and writes its value. |
-| Body | `$` before anything else than a loop variable | The expansion leaves it as it is, for a macro of the body. |
+| Body | `$` not mentioning a loop variable | The expansion leaves it as it is, for a macro of the body. A `$(...)` in the body that mentions a loop variable is an error (write `f($x)` instead). |
 | Quoted expressions | any `$` | The expansion leaves it as it is. |
 
 An inserted value is written with `repr`, as the module of the item sees it with the imports of the body. It must evaluate back to an equal value there. A loop variable without `$` in the body is an error, unless the body binds it, as `x = $x` does. Inside a string in the body, write `"$($x)"` to insert the value.
@@ -109,10 +110,10 @@ The process that calls `runtests` or `chores` parses test files and templates, a
 | `skip` of an item | The process of the item | Before the body | A new module | `Test` and the package |
 | Body of an item | The process of the item | After `skip` | A new module, with the soft scope of the REPL | `Test`, the package and the imports of the body |
 | `test_end` of a profile | The process of the item | After each attempt that was not skipped | A new module | `Test` and the package |
-| Producer of `Runtests.on_failure` | The process of the item | After the verdict of an attempt that failed | The module of the item | The names of the item, with their values at that time |
+| Producer of `Runtests.on_failure` | The process of the item | After a failed/errored attempt and its profile's `test_end` finish (passing attempts release producers immediately after the body) | Invoked as a closure with its own directory `dir` | Captured bindings and live globals of the item's module |
 | Loop of a template, and each `$(...)` in its keywords | A process that `chores` starts, with the test environment | Once for each iteration | A module named `Template` | `Test`, the package and the packages that the body imports, by module name only |
 
-Each piece of code can import any package of the environment of its process. On a worker, that is the test environment, or the environment directory of the item over the test environment. Thus `init` and `test_end` can import every test dependency. An `init` that imports a package of one environment directory fails on the workers of the other environments of its profile.
+Each piece of code can import any package of the environment of its process. For ordinary items, that is the test environment; for items in an environment directory, it is that directory stacked over a minimal base environment containing only `Runtests` and `Test` (not the test environment, so undeclared test dependencies do not leak in). Thus `init` and `test_end` running on an environment directory's workers can only import packages declared in that directory (plus the package under test, setups, `Test`, `Runtests`, and stdlibs).
 
 Names do not pass from one piece of code to another, but the process stays the same. A package that one piece loads stays loaded for the next, and a method that one piece adds to a function stays added. [Items on one worker](@ref items-on-one-worker) describes this.
 

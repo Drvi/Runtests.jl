@@ -21,8 +21,8 @@ const ensure_checked! = OncePerProcess{Bool}() do
     platform_selfcheck!()
 end
 
-# Cached OS page size (avoids per-tick `getpagesize` syscall on macOS and fixes
-# 64 KiB-page Linux hosts before `platform_selfcheck!` runs).
+# Cached OS page size (avoids per-tick `getpagesize` syscalls on macOS and handles
+# 64 KiB-page Linux hosts).
 const PAGE_SIZE = OncePerProcess{Int64}() do
     @static if Sys.isapple()
         Int64(ccall(:getpagesize, Cint, ()))
@@ -334,8 +334,8 @@ end
 """
     tree_cpu_time(pid) -> Float64
 
-Total user and system CPU seconds consumed by `pid` and any live child processes it
-started, or `-1.0` if `pid`'s own CPU time cannot be read.
+Total user and system CPU seconds consumed by `pid` and any live descendant processes
+it started, or `-1.0` if `pid`'s own CPU time cannot be read.
 """
 function tree_cpu_time(pid::Integer)
     root = process_cpu_time(pid)

@@ -13,7 +13,7 @@ With `runtests`, each value comes from the first source that sets it, in this or
 
 An unknown key, an unknown keyword or an incorrect value is an error before any item runs. A mistake in the call is an `ArgumentError`. A mistake in a file or in an environment variable is a `Runtests.ConfigError`.
 
-For `runtests_mono`, the call and environment variables still take precedence. Run-wide keys then come from `[run]` at the workspace root; each package's own `[run]` supplies its other keys. A run-wide key in the `[run]` of another package has no effect. [What the packages share](@ref combined-settings) lists the run-wide keys. Run-wide keys in another package's file have no effect. [Run the suites of a monorepo](@ref monorepos) lists the run-wide keys.
+For `runtests_mono`, the call and environment variables still take precedence. Run-wide keys then come from `[run]` at the workspace root; each package's own `[run]` supplies its other keys. A run-wide key in the `[run]` of another package has no effect. [What the packages share](@ref combined-settings) lists the run-wide keys.
 
 ## [Run keys](@id run-keys)
 
@@ -21,7 +21,7 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 
 | Key | Default | Value |
 |:----|:--------|:------|
-| `workers` | `"auto"` | The number of workers, or `"auto"`. Auto uses the number of CPUs, the threads of each worker and an assumed 4 GiB for each worker, at most 8. `0` runs ordinary items in the calling process; sandboxed items and items of a named profile still use workers. See [Run tests](@ref running). |
+| `workers` | `"auto"` | The number of workers, or `"auto"`. Auto uses the number of CPUs, the threads of each worker and an assumed 4 GiB for each worker, at most 8. `0` runs ordinary items in the calling process; sandboxed items, items of a named profile, and items in an environment directory still use workers. See [Run tests](@ref running). |
 | `threads` | `"2,1"` | The `--threads` value of each worker, for example `"4"`, `"4,1"` or `"auto"`. |
 | `timeout` | `1800` | Seconds for each attempt at an item. |
 | `init_timeout` | `timeout` | Seconds for each `init` expression of a profile. |
@@ -49,10 +49,10 @@ A timeout must be positive and at most 2,147,483,647 seconds. A fraction rounds 
 |:------|:-------|
 | `:issues` | Print the output of each item that did not pass, after its `DONE` line. |
 | `:batched` | Print the output of every item when it ends. |
-| `:eager` | Print the output of every item while it runs, without saving it to per-item log files. |
-| `:quiet` | Print no item output. The output stays in the log files of the run. |
+| `:eager` | Print the output of every item while it runs. On workers, non-empty item output is also lazily saved to per-item log files (omitted under `workers = 0` or when a temporary log directory cannot be created). |
+| `:quiet` | Print no item output. Non-empty output stays in the log files of the run and can be read afterwards with [`Runtests.logs`](@ref logs). |
 
-An interactive session with one worker or less uses `:eager` by default. All other runs use `:issues` by default.
+An interactive session with one worker or less uses `:eager` by default. All other runs use `:issues` by default. If Runtests cannot create a temporary directory for logs, it warns once, falls back to `logs = :eager` (without temporary log files), and disables `coverage`.
 
 ## Call keywords
 
@@ -64,7 +64,7 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 | `tags` | A symbol, a vector of symbols that an item must carry all of, or a [tag expression](@ref tag-expressions). |
 | `group` | The name of a group of `[groups]`, `"all"` or `"default"`. `RUNTESTS_GROUP` also selects a group when the call selects nothing else; see [Groups](@ref groups). |
 | `dry_run` | `true` prints the plan and runs nothing. |
-| `replay` | The path of a run state to run again. |
+| `replay` | The path of a run state to run again. Reproduces the recorded items, settings, profiles, `[throttle]` limits, seeds, per-item policies (`timeout`, `retries`, `item_failfast`, `skip`, unless overridden), and exact per-worker slot order (no work-stealing or reordering). Combined with `dry_run = true`, prints a full diff against the current checkout. |
 | `config` | The path of a file to read in place of `test/TestItems.toml`, relative to the current directory. The file must exist. |
 | `skip_environment` | An [environment directory](@ref environments) that the run does not build, or a vector of them. Each name is the path of the directory from the root of the repository, for example `"test/qa"`, or `"lib/A/test/qa"` in a monorepo. The run records the selected items of the directory as skipped. A run that does not include the package of a named directory accepts the name without an error. A name that is no environment directory is an error. `RUNTESTS_SKIP_ENVIRONMENT` gives the names when the call gives none. See [Skip an environment](@ref skip-environment). |
 | `on_event` | A function that the run calls with a [`Runtests.TestItemEvent`](@ref) when each attempt starts and ends. |
@@ -88,7 +88,7 @@ The `[run]` table takes the [run keys](@ref run-keys) above. Write each key as t
 | `first` | A vector of exact item names. These items start first. |
 | `last` | A vector of exact item names. These items start last. |
 
-On a run of the whole suite, each name must be an item of the suite. A run of a part of the suite accepts names of items outside the selection.
+Every name in `[order]` must exist in the suite (even on a filtered run, which accepts existing items outside the current selection). Replays ignore recorded `[order]` names that have since been renamed or deleted.
 
 ### [groups]
 
@@ -144,7 +144,7 @@ These environment variables configure Runtests:
 | `RUNTESTS_SKIP_ENVIRONMENT` | The environment directories that the run does not build when the call gives no `skip_environment`, with commas between the names. An empty value counts as unset. |
 | `RUNTESTS_RUNSTATE_DIR` | The directory of the run states, which holds a directory `<run>.rundata` for each run. The default is `runtests/runs/` in the Julia depot, with a directory for each project. |
 | `RUNTESTS_HOST` | The name of this machine in the run states. The default is the macOS machine name, or the hostname on other systems. |
-| `RUNTESTS_ARTIFACT_DIR` | A directory into which a run copies its `<run>.rundata` directory, with its run state and logs, when it ends. A combined run puts each package's directory under a subdirectory named for the package. |
+| `RUNTESTS_ARTIFACT_DIR` | A directory into which a run copies its `<run>.rundata` directory, with its run state and logs, when it ends. A combined run puts each package's directory under a subdirectory named for the package. If a run fails before opening its run state, it writes `setup-<runid>.log` there instead. |
 
 Runtests sets these variables in each worker. Do not set them yourself:
 

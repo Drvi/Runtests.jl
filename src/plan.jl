@@ -42,7 +42,7 @@ struct Items
     profile::Vector{ProfileIdx}
     exclusive::Vector{Bool}
     throttle::Vector{Symbol}    # the throttle the item names, NO_THROTTLE for none
-    gate::Vector{Int32}         # a throttle with a limit above 1, 0 for none
+    gate::Vector{Int32}         # the throttle's gate index, 0 for none
     why::Vector{Why}            # where `order_pool!` put it, and so why
     failed_ago::Vector{Int32}   # runs since it last did not pass, -1 for none recorded
     cancelled::Vector{Bool}     # whether that was a cancel rather than a verdict
@@ -235,11 +235,12 @@ itemlocation(p::Plan, i::Integer) = string(itemfile(p, i), ":", p.items.line[i])
 """
     History
 
-What earlier runs measured, keyed by item name: how long each item took and how
-many runs ago it last did not pass (0 for the newest run); when the newest run
-started (0 without one); what a fresh worker cost; and which of those not passing
-a cancel decided, not a verdict. Empty on a first run: nothing has an estimate,
-and the body is cut by count.
+What earlier runs measured, keyed by item name: how long each item took (`seconds`),
+how many runs ago it last did not pass (`failed`, 0 for the newest run), what a fresh
+worker cost (`cold`), which of `failed` a cancel decided rather than a verdict
+(`cancelled`), each item's source hash in the newest run that ran it (`hashes`), and
+every item name seen in kept run states (`known`). Empty on a first run: nothing has
+an estimate, and the body is cut by count.
 """
 struct History
     seconds::Dict{String, Float64}
@@ -793,7 +794,7 @@ function stretches(body::UnitRange{ItemIdx}, est::Vector{Float64}, file::Vector{
         file[body[j]] != file[body[j + 1]] && push!(between_files, j)
     end
     has_files = !isempty(between_files)
-    # `cum` is strictly increasing, so binary search finds the nearest cut in O(log |at|).
+    # `cum` is strictly increasing, so binary search finds the nearest cut in O(log |between_files|).
     out = Vector{UnitRange{ItemIdx}}(undef, n)
     prev = 0
     total = m == 0 ? 0.0 : cum[m]

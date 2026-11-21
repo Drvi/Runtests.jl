@@ -2,7 +2,8 @@
 # walks its own stretch of the pool's body, steals half of the largest stretch left when
 # its own is done, then the pool's tail. When its own pool has nothing left it may
 # rebind to another pool, estimating completion with and without that worker including
-# its start and compilation cost.
+# its start and compilation cost. Under exact replay (`replay_slots`), stealing and
+# reordering are bypassed and each slot runs its recorded sequence in order.
 
 """
     PoolStats
@@ -35,12 +36,15 @@ stretch of its pool's body; and what the run has measured of each pool, which th
 slots write and a slot whose pool ran dry reads. Each claim takes the lock so the
 cursors and pool statistics remain consistent.
 
-A unit of a gate (`Units`) whose gate runs as many units as its limit allows is set
+An item of a gate (`Items`) whose gate runs as many items as its limit allows is set
 aside when a cursor passes it, in its pool's `set_aside`, and handed out from there,
-before anything else of the pool, once a unit of the gate ends. A slot whose pool
-holds only units set aside moves to a pool with a unit it can start now, if there is
+before anything else of the pool, once an item of the gate ends. A slot whose pool
+holds only items set aside moves to a pool with an item it can start now, if there is
 one, and otherwise waits on `room`. A pool that its last slot leaves so is `parked`
-until a slot takes it up again, which one does before any slot is done.
+until a slot takes it up again, which one does before any slot is done. When
+`replay_slots` is non-empty (exact replay), `claim_replay_now!` hands out each slot's
+fixed sequence in order with no stealing, rebinding pools as needed and waiting in
+place when a gate is full.
 """
 mutable struct Queues
     const lock::ReentrantLock

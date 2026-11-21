@@ -38,7 +38,7 @@ For a workspace folder, the extension tries the root `test` project, the root pr
 
 Other run settings come from the configuration file and environment variables, as for `Runtests.runtests()`. For example, set `artifacts_timeout` in `[run]` or `RUNTESTS_ARTIFACTS_TIMEOUT`; the editor's `options` field does not accept it.
 
-The extension has three commands: Runtests: Run Failed Tests, Runtests: Restart Server and Runtests: Show Log. Edits to the root project refresh the tree; a change of server mode or `runtests.environment` restarts the server. Restart it manually after changing the Julia executable, Julia arguments or `runtests.config`, or after updating Runtests in the server's environment. The extension requires editor protocol version 3 and stops with an error if that Julia environment loads a server of another protocol version.
+The extension has three commands: Runtests: Run Failed Tests, Runtests: Restart Server and Runtests: Show Log. Edits to the root project refresh the tree; a change of server mode or `runtests.environment` restarts the server. Restart it manually after changing the Julia executable, Julia arguments or `runtests.config`, or after updating Runtests in the server's environment. The extension requires editor protocol version 5 and stops with an error if that Julia environment loads a server of another protocol version.
 
 ### What the extension does not do
 
@@ -62,4 +62,4 @@ From a workspace root whose `lib/A/test/Project.toml` declares Runtests:
 julia --project=lib/A/test -e 'using Runtests; Runtests.serve_mono(pwd())'
 ```
 
-[The editor protocol](@ref editor-protocol) describes each command and event. Check the version in its first `hello` event before sending commands; version 3 identifies items by package and name.
+[The editor protocol](@ref editor-protocol) describes each command and event. Check the version in its first `hello` event before sending commands; current servers speak version 5.

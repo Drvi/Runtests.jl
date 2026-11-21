@@ -91,6 +91,7 @@ These problems stop a combined run before a worker starts:
 4. Two packages that declare one dependency name with two different UUIDs.
 5. Two packages whose `test/LocalPreferences.toml` set one preference to two different values.
 6. Two participating packages with the same package name. An editor and a combined run identify an item by its package name and item name.
+7. Two participating packages that assign different `[throttle]` limits to the same throttle name (including one setting a limit above 1 while another omits `[throttle]`, which defaults to 1).
 
 To fix 4 or 5 for a package that cannot change, put the package in `isolated`.
 
@@ -106,11 +107,11 @@ The closing block gives one line for each package: its items, those that did not
 Runtests.runtests_mono(; replay = "/path/to/the.rundata")
 ```
 
-The replay finds the run states of the other packages of the run. It runs their items again with their configuration and seeds. When the run state of a package is gone, the replay runs the other packages and says that it is a partial replay.
+The replay finds the run states of the other packages of the run. It runs their items again with their configuration, seeds, recorded per-item policies (`timeout`, `retries`, `item_failfast`, `skip`, unless overridden), and exact recorded per-worker slot order (no work-stealing or reordering); with `dry_run = true`, it prints a detailed diff against the current checkout. When the run state of a package is gone, the replay runs the other packages and says that it is a partial replay.
 
 ## Maintain the suites and work at the REPL
 
-`Runtests.chores_mono()` does the [chores](@ref chores) of every package that takes part. Before the chores of any package change a file, it stops for the problems that no chore fixes: two setups of one name, a dependency name with two UUIDs, and preferences that disagree. It writes one report for all packages, with paths from the workspace root. After the chores, the report shows the [groups of workers](@ref shared-profiles) and checks the imports of every package that shares workers, as a combined run does. It also names each `test/runtests.jl` that does more than call `Runtests.runtests()` or `Runtests.runtestsd()`, because a combined run does not run that file. Move what that file sets to `test/TestItems.toml` of its package. Run settings go to `[run]`, and variables go to `env` of a profile. The group that the file runs goes to `default` of `[groups]`, which `runtestsd` and `runtestsd_mono` run. A variable whose value the file computes goes to the `init` of the profile, in `test/testconfigs/`.
+`Runtests.chores_mono()` does the [chores](@ref chores) of every package that takes part. Before the chores of any package change a file, it stops for the problems that no chore fixes: duplicate participating package names, two setups of one name, a setup shadowed by a shared dependency, a dependency name with two UUIDs, and preferences that disagree. It writes one report for all packages, with paths from the workspace root. After the chores, the report shows the [groups of workers](@ref shared-profiles) and checks the imports of every package that shares workers, as a combined run does. It also names each `test/runtests.jl` that does more than call `Runtests.runtests()` or `Runtests.runtestsd()`, because a combined run does not run that file. Move what that file sets to `test/TestItems.toml` of its package. Run settings go to `[run]`, and variables go to `env` of a profile. The group that the file runs goes to `default` of `[groups]`, which `runtestsd` and `runtestsd_mono` run. A variable whose value the file computes goes to the `init` of the profile, in `test/testconfigs/`.
 
 `Runtests.activate_mono()` makes the REPL look like a shared worker. It activates the environment of the shared workers and puts the setups of every package that shares workers on `LOAD_PATH`. An included test item runs as an item of the package that holds its file, with that package loaded and its root as the working directory. A test item pasted at the REPL uses the package that holds the REPL's current directory, so `cd` into a package first. `Runtests.deactivate()` restores the environment and `LOAD_PATH`; it does not undo `cd`. To work with an isolated package, use `Runtests.activate` with that package. [Work at the REPL](@ref repl) has an example.
 

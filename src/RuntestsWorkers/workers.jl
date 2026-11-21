@@ -732,7 +732,7 @@ worker_startup_code(connect_timeout::Real) = string(
     "Runtests.", nameof(@__MODULE__), ".startworker(", connect_timeout, ")")
 
 """
-    Worker(; julia_args, threads, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit)
+    Worker(; julia_args, threads, env, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit, on_output_done)
 
 Start a worker process and connect to it.
 """

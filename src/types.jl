@@ -94,8 +94,8 @@ end
     NoTestsError
 
 Thrown when there is nothing to run: no test files or no item that a selection
-matched. `runtestsf()` with no failing items and no selection says so and
-returns `nothing`. `msg` describes the empty selection.
+matched. `runtestsf()` with no failing items on record says so and returns
+`nothing` (even if a selection is given). `msg` describes the empty selection.
 """
 struct NoTestsError <: Exception
     msg::String

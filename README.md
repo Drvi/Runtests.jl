@@ -42,6 +42,7 @@ Runtests.runtests(name = r"numbers$")        # the items whose names match
 Runtests.runtests(tags = "fast && !slow")    # the items that a tag expression selects
 Runtests.runtests(dry_run = true)            # the plan of a run, and nothing runs
 Runtests.runtestsf()                         # the items whose latest verdict was not a pass
+Runtests.logs()                              # captured output from the latest run (including logs = :quiet)
 Runtests.chores()                            # maintenance of the suite
 Runtests.runtests_mono()                     # the packages of a Julia workspace, in one run
 ```
@@ -54,9 +55,9 @@ The guides describe each of these features:
 - [Test setups](https://drvi.github.io/Runtests.jl/dev/guide/setups/): modules that items load with `using`, precompiled before the workers start.
 - [Test templates](https://drvi.github.io/Runtests.jl/dev/guide/templates/): loops that `chores` expands into ordinary test items.
 - [Profiles and environments](https://drvi.github.io/Runtests.jl/dev/guide/profiles/): the flags, threads, variables, `init` and `test_end` of the workers, and directories whose items run in a project of their own.
-- [Run history](https://drvi.github.io/Runtests.jl/dev/explanation/history/): the record of each run, the failures with their seeds, replay, and retention that keeps what later runs need.
-- [Evidence of failures](https://drvi.github.io/Runtests.jl/dev/guide/failures/): the logs of each item, and files that a failed attempt keeps.
-- [CI](https://drvi.github.io/Runtests.jl/dev/guide/ci/): groups that split a suite over jobs, and a cache that keeps the history between jobs.
+- [Run history](https://drvi.github.io/Runtests.jl/dev/explanation/history/): the record of each run, the failures with their seeds, exact per-worker replay, and retention that keeps what later runs need.
+- [Evidence of failures](https://drvi.github.io/Runtests.jl/dev/guide/failures/): per-item logs (readable afterwards with `Runtests.logs()`), and files that a failed attempt keeps.
+- [CI](https://drvi.github.io/Runtests.jl/dev/guide/ci/): groups and coverage-checked `runtests_dispatch` slices across jobs, plus a cache that keeps history between jobs.
 - [Coverage](https://drvi.github.io/Runtests.jl/dev/guide/coverage/), merged into one `lcov.info` file.
 - [Monorepos](https://drvi.github.io/Runtests.jl/dev/guide/monorepos/): the suites of the packages of a Julia workspace in one run, with shared workers.
 - [The REPL](https://drvi.github.io/Runtests.jl/dev/guide/repl/): a session that looks like a worker, pasted test items, and a debugger.

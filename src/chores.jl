@@ -22,13 +22,12 @@ Look after a package's suite: do what needs no person, then say what does.
   edit; a dry run checks expansion stamps and runs no templates. An expansion
   edited by hand, or a test file in a template's way that `chores` did not write,
   is left to a person.
-- run states: this machine's are pruned as a run prunes them, the same ones and no
-  others (see `prunable_runstates`), with their logs. One recorded elsewhere, a CI
-  artifact say, and one that cannot be read are never deleted.
+- run states: this machine's are pruned as a run prunes them, with their logs. One
+  recorded elsewhere, a CI artifact say, and one that cannot be read are never deleted.
 - checkouts that are gone: when the project keeps its run states in the default
-  location, the run states there of every checkout that no longer exists, as
-  `sweep_runstate_dirs` finds them, the directories that held them with them.
-  Nothing else deletes them: a run reads its own directory and no other.
+  location, the run states there of every checkout that no longer exists, together with
+  the directories that held them. Nothing else deletes them: a run reads its own
+  directory and no other.
 
 Returns whether nothing is left to do. Having done the rest, it throws a
 [`ChoresError`](@ref) when something is left that a person has to fix, and otherwise

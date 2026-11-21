@@ -106,24 +106,35 @@ function dispatch_predicate(label::AbstractString, spec::DispatchSpec, target::T
 end
 
 """
-    runtests_dispatch([root], selected, variants; exclude = nothing, allow_overlaps = true, kwargs...)
+    runtests_dispatch([root], selected, variants::AbstractDict;
+                      exclude = nothing, allow_overlaps = true, kwargs...)
 
 Dispatch one named variant from `variants` to [`runtests`](@ref), statically verifying
 before running that:
 
-1. `selected` is a declared key of `variants` (and no selection keyword such as `tags`,
-   `group`, `name`, `paths`, `skip_environment`, or `replay` was passed outside `variants`).
+1. `selected` is a declared key of `variants` (and no selection keyword — `name`, `tags`,
+   `group`, `paths`, `skip_environment`, or `replay` — is passed outside `variants`;
+   `replay` is also forbidden inside `variants` and `exclude`).
 2. Every test item in the package's suite is covered by at least one variant in `variants`
-   or by `exclude`.
+   (items in an environment directory skipped by a variant's `skip_environment` are not
+   counted as covered by that variant) or by `exclude`.
 3. When `allow_overlaps = false`, no test item is covered by more than one variant (or by
    both a variant and `exclude`).
 
-`variants` maps each variant key to a `NamedTuple` of `runtests` keywords (with an
-optional `paths` entry for positional path arguments, resolved relative to the package
-root), a `paths => (; kwargs...)` pair, or path(s). `exclude` takes one such selection
-spec or a collection of them. Shared runtime keywords (such as `workers`, `logs`, or
-`dry_run`) may be passed in `kwargs...` and are overridden by any keyword set on the
-selected variant.
+`root`, when given, is a package directory or `Module` (defaulting to the active
+package). `variants` is a non-empty `AbstractDict` mapping each variant key to a
+`NamedTuple` of `runtests` keywords (with an optional `paths` entry for positional path
+arguments, resolved relative to the package root), a `paths => (; kwargs...)` pair, or
+path(s). `exclude` takes one such selection spec or a collection of them. Shared runtime
+keywords (such as `workers`, `logs`, or `dry_run`) may be passed in `kwargs...` and are
+overridden by any keyword set on the selected variant. If the chosen variant declares no
+`group`, `group = "all"` is passed so `RUNTESTS_GROUP` in the environment cannot silently
+narrow it.
+
+Returns what [`runtests`](@ref) returns (a [`RunTestSet`](@ref), or `nothing` for
+`dry_run = true`). Throws `ArgumentError` for empty/invalid specs, an unknown `selected`
+key, or disallowed top-level selection keywords; throws [`ConfigError`](@ref) for
+uncovered items or disallowed overlaps.
 """
 function runtests_dispatch(selected, variants::AbstractDict;
                            exclude = nothing, allow_overlaps::Bool = true, kwargs...)

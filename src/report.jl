@@ -1,4 +1,5 @@
-# Human-facing output for a plan. `--dry-run` prints this and stops.
+# Human-facing output for plans (`dry_run = true`) and live runs (`RunTestSet`, headers,
+# item lines, failure blocks, and closing summaries).
 
 function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
     order = run_order(p)
@@ -182,7 +183,8 @@ The order the run is expected to start the items in, and where: its own dispatch
 unit nothing is recorded for counting as a typical one. A worker that moves to
 another profile's items first pays what the recorded runs say a fresh worker costs.
 `items` holds `(start, worker, item)` in that order; `work` is each worker's
-estimated busy seconds, without what it waits for a gate. A run without workers takes the units in plan order.
+estimated busy seconds, without what it waits for a gate. A run without workers takes
+the items in plan order (or `p.replay_slots[1]` under exact replay).
 """
 function run_order(p::Plan)
     typical = typical_estimate(p.items.est_s)
@@ -618,8 +620,8 @@ const SLOT_LABEL_WIDTH = Ref(2)
 slot_label_width(nslots::Integer) = 1 + ndigits(max(nslots, 1))
 
 # The start every line shares: glyph, the worker it is about (none in a run
-# without workers), and the time. The clock is passed in because the status line,
-# redrawn after everything the run prints, has a cheaper way to get it.
+# without workers), and the time. The clock is passed in so the status line
+# (`clock_text(m)`) can piggyback its once-per-second terminal width refresh.
 function print_line_head(io::IO, mark::AbstractString, slot_id, clock::AbstractString)
     print(io, mark, " ")
     if slot_id !== nothing
@@ -690,7 +692,7 @@ print_helper_line(run, id, state::AbstractString, text::AbstractString) =
     lifecycle_line(run, PRECOMPILE_MARK_WORKER, id, state, text)
 
 """
-    item_line(slot_id, i, total, shown, width, attempt, attempts, how) -> String
+    item_line(slot_id, i, total, shown, width, attempt, attempts, how; package = "", package_width = 0) -> String
 
 An item's RUN line when `how` is where it is, and its DONE line when `how` is how
 it went: `(; state, elapsed_ns, compile_ns, maxrss)`. `shown` is its name as the

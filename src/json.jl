@@ -10,7 +10,7 @@
 `x` as JSON: strings (invalid UTF-8 replaced by U+FFFD, which JSON cannot carry
 otherwise), symbols as strings, integers, finite floats (a non-finite one as
 `null`, which is what JSON has for it), booleans, `nothing` as `null`, vectors and
-tuples as arrays, and dictionaries, named tuples and pairs as objects.
+tuples as arrays, and dictionaries, named tuples and `Base.Pairs` as objects.
 """
 function write_json(io::IO, s::AbstractString)
     write(io, '"')
@@ -70,8 +70,8 @@ json(x) = sprint(write_json, x)
     read_json(text) -> Any
 
 One JSON value: objects as `Dict{String, Any}`, arrays as `Vector{Any}`, strings,
-numbers as `Int64` when written without a fraction or exponent and `Float64`
-otherwise, booleans, and `null` as `nothing`. Anything else, including text after
+numbers as `Int64` when written without a fraction or exponent and in `Int64` range,
+and `Float64` otherwise, booleans, and `null` as `nothing`. Anything else, including text after
 the value, throws an `ArgumentError` saying what was expected and at which byte.
 """
 function read_json(text::AbstractString)

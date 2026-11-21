@@ -54,7 +54,7 @@ A test item runs in a different way from a testset. These differences can change
 | Threads | The process had the threads that `julia` started with; record the count. | Workers use `--threads=2,1` by default. Set `threads` under `[run]`, or give a profile `--threads` in its `julia_args`. |
 | Setup code | Helper code at the top of a file ran when the file was included. | Top-level setup code runs when its precompile cache is built or rebuilt. Per-process initialization belongs in `__init__`. All items on a worker share the globals of the setup. See [test setups](setups.md). |
 | Paths | `@__DIR__` named the helper's directory. | Moving a helper into a setup changes its directory. Check its paths against the [setup path rules](@ref setup-paths). In an item, `@__DIR__` and `include` are relative to the test file. |
-| Parallel runs | Plain include-based Test.jl testsets ran one at a time. | Items can overlap. Give independent items separate temporary paths; preserve intentional shared paths with explicit ordering. |
+| Parallel runs | Plain include-based Test.jl testsets ran one at a time. | Items can overlap. Give independent items separate temporary paths; serialize access to intentional shared paths with `throttle = :sym` (limit 1 by default). |
 | Crashes | An `exit()` or a crash ended the suite. | It ends only that worker. The item counts as an error, and the run continues. |
 
 ## Rules for a port

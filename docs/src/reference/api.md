@@ -4,7 +4,7 @@
 CurrentModule = Runtests
 ```
 
-This page holds the docstrings of the public API of Runtests. `using Runtests` brings the exported names into scope: `@testitem`, `@testtemplate`, `runtests`, `runtestsd`, `runtestsf`, `chores`, `runtests_mono`, `runtestsd_mono` and `chores_mono`. It also exports `Test` and the macros of `Test`, for example `@test` and `@testset`. Reach the other public names with the `Runtests.` prefix, for example `Runtests.on_failure`.
+This page holds the docstrings of the public API of Runtests. `using Runtests` brings the exported names into scope: `@testitem`, `@testtemplate`, `runtests`, `runtestsd`, `runtestsf`, `runtests_dispatch`, `chores`, `runtests_mono`, `runtestsd_mono` and `chores_mono`. It also exports `Test` and the macros of `Test`, for example `@test` and `@testset`. Reach the other public names with the `Runtests.` prefix, for example `Runtests.on_failure` or `Runtests.logs`.
 
 The heading of each docstring names the module that defines the name, for example `Runtests.Private.runtests`. `Runtests.Private` and `Runtests.RuntestsWorkers` are internal modules. Always use the public name, for example `Runtests.runtests`.
 
@@ -18,6 +18,7 @@ Runtests
 runtests
 runtestsd
 runtestsf
+runtests_dispatch
 runtests_mono
 runtestsd_mono
 RunTestSet
@@ -60,10 +61,11 @@ is_activated
 debug
 ```
 
-## Run states
+## Run states and logs
 
 ```@docs
 read_run_state
+logs
 ```
 
 ## Editors

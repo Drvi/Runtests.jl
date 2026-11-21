@@ -119,7 +119,7 @@ The workers run in a copy of the environment, in the temporary files of the syst
 - The package under test is added by its path. This also brings the packages that its `[sources]` names, for example its siblings in a monorepo.
 - The `LocalPreferences.toml` of the directory is used, with the `preferences` of the profile over it.
 
-Runtests writes nothing into the directory. The copy is stacked over the test environment, as `Pkg.test` stacks its sandbox over the active project. Thus an item loads the packages of the environment first, and can still load the packages of the test environment.
+Runtests writes nothing into the directory. The copy is stacked over a minimal base environment containing only `Runtests` and `Test` (with the package's test environment removed from `LOAD_PATH`), so undeclared dependencies from `test/Project.toml` do not leak into the environment directory. Declare every package the directory's tests need in that directory's `Project.toml` (the package under test and its `[sources]` are added automatically).
 
 Runtests resolves the copy once in each session, and again when a file that it was built from changes. A copy that does not resolve stops the run before any item runs.
 

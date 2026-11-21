@@ -46,7 +46,7 @@ A `$` in a template puts a value of the loop into the item. The meaning depends 
 | Name: `"case $n"` | The value of the iteration goes into the literal name of the item. |
 | Body or keywords: `$n` | The value of the loop variable goes in as Julia code. |
 | Keywords: `$(expression)` | The expansion evaluates the expression once for each iteration, in the scope of the loop. |
-| Body: other `$` expressions | The expansion leaves them for the macros of the body, for example `@btime`. |
+| Body: other `$` expressions | `$` expressions that do not mention a loop variable are left for macros of the body, for example `@btime`. A `$(...)` in the body that mentions a loop variable is an error (write `f($x)` instead). |
 | Quoted expressions | The expansion leaves every `$` as it is. |
 
 Runtests writes an inserted value with `repr`, as the module of the item sees it with the imports of the body. The text must evaluate back to an equal value there. A value that cannot do this, for example a closure, is an error. Runtests adds parentheses where they are necessary to keep the meaning of the code around the value.

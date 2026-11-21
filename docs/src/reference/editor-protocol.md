@@ -78,7 +78,7 @@ Each item in `items` has these fields:
 | `skip` | `true`, `false`, or the text of the expression that the worker evaluates. |
 | `timeout`, `retries`, `failfast` | The value of the item, or `null` for the value of the run. |
 
-`errors` holds every problem that a run refuses to start on. Examples are a file that does not parse, a name that two items use, and a value that `TestItems.toml` does not accept. For `serve_mono`, it also holds what stops a combined run: two setups of one name, and an import that the test environment of its own package cannot load. Each error has a `file`, a `line` (0 when there is none) and a `message`. The items still come from every file that parses.
+`errors` holds every problem that a run refuses to start on. Examples are a file that does not parse, a name that two items use, and a value that `TestItems.toml` does not accept. For `serve_mono`, it also holds what stops a combined run: two setups of one name, conflicting `[throttle]` limits across packages, and an import that the test environment of its own package cannot load. Each error has a `file`, a `line` (0 when there is none) and a `message`. The items still come from every file that parses.
 
 ### run_started
 
@@ -109,7 +109,8 @@ It has the fields of `item_started`, and these:
 | `verdict` | The state of the item after this attempt. It is `state`, except after an attempt that is `skipped` or `cancelled` when an earlier attempt decided the item. Then it is the state of that earlier attempt. |
 | `elapsed`, `compile` | Seconds, as the item measured them. For an outcome that the run decided, the time that the item held its worker. |
 | `note` | What the run says about the attempt, for example that a retry follows. Often empty. |
-| `log` | The file with captured item output, or `null` when no nonempty log exists. With `logs = "eager"`, output goes to stderr without a per-item log. |
+| `log` | The file with captured item output, or `null` when no nonempty log exists. On workers, even `logs = "eager"` lazily saves nonempty item output to a per-item log (only `workers = 0` or an unwritable temporary directory leaves it `null`). |
+| `artifacts` | The path to the attempt's artifact directory when a failed attempt kept files or registered producers, or `null`. |
 | `failures` | Each failed or erroring test: `kind` (`fail` or `error`), `message` as `Test` shows it, `file` and `line`. |
 
 An item that is retried has an `item_started` and an `item_finished` for each attempt. The `verdict` of the latest is its current state, and the `verdict` of the last one before `run_finished` is its outcome. The other fields describe the attempt.
@@ -152,7 +153,7 @@ The last line. The server writes it when stdin ends or after a `shutdown` comman
 → {"id":2,"command":"run","items":[{"package":"Pkg1","name":"adds"}],"options":{"workers":1}}
 ← {"event":"run_started","id":2,"items":[{"package":"Pkg1","name":"adds"}],"workers":1,"seed":"0x0223a77cb668dc62","unknown":[]}
 ← {"event":"item_started","id":2,"package":"Pkg1","name":"adds","file":"/pkg/test/a_test.jl","line":1,"attempt":1,"attempts":1,"worker":1,"pid":4242}
-← {"event":"item_finished","id":2,"package":"Pkg1","name":"adds",…,"state":"passed","elapsed":0.03,"compile":0.02,"note":"","log":null,"failures":[]}
+← {"event":"item_finished","id":2,"package":"Pkg1","name":"adds",…,"state":"passed","verdict":"passed","elapsed":0.03,"compile":0.02,"note":"","log":null,"artifacts":null,"failures":[]}
 ← {"event":"run_finished","id":2,"state":"passed","counts":{"passed":1,…},"not_run":[],"elapsed":2.1,"runstate":"…","runstates":[…],"logdir":"…"}
 → {"command":"shutdown"}
 ← {"event":"bye"}

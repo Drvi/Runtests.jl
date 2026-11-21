@@ -243,8 +243,8 @@ end
 # The run's environment for the length of one item. After `activate` the session is
 # already in it, and `with_test_env` leaves it alone. `combined`: after `activate_mono`,
 # the union environment with the shared setups, which is what a shared worker has. For
-# a profile in an environment directory, `prof`, that environment over it, as its
-# workers have it.
+# a profile in an environment directory, `prof`, that environment isolated from the test
+# environment (`isolated_load_path`), as its workers have it.
 function with_interactive_env(f, target, prof::Union{Nothing, Profile} = nothing; combined::Bool = false)
     target === nothing && return f()
     combined && return in_profile_environment(f, target, prof)

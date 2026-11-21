@@ -10,9 +10,10 @@ the item that line is inside, or a test file or directory that holds that item a
 no other. What picks no item, or several, is an error that says what it found.
 Without `item` it is the most recent failure among the items that are failing (see
 [`runtestsf`](@ref)): of those that failed, errored or timed out, the one whose
-failure was recorded last, with the seed it failed with, so it draws the random
-numbers it failed with. When no run of the project is recorded, or no item is
-failing, there is nothing to step into, and it says so.
+failure was recorded last. Any failing item — picked automatically or named by `item` —
+reuses the seed it failed with unless `seed` is given, so it draws the random numbers
+it failed with. When no run of the project is recorded, or no item is failing, `debug()`
+throws [`NoTestsError`](@ref).
 
 The item runs here, in this process, as a run would run it: its module and imports,
 the test environment, or the environment of the directory its file is in, and the setups, and
@@ -20,9 +21,9 @@ its profile's `env`, `init` and `test_end`. Its body is a function the debugger 
 What cannot be part of a function, `using` and `struct` among it, has run by then.
 
 What this process cannot give the item is listed before it starts: a profile's
-`julia_args`, `threads` and `preferences`, a process of its own, and the keywords
-only a scheduler honours. `seed` is a run's, as `runtests` takes and prints it, so
-the item draws the random numbers it drew in that run.
+`julia_args`, thread count, and (outside environment directories) `preferences`, a
+process of its own, and the keywords only a scheduler honours. `seed` is a run's, as
+`runtests` takes and prints it, so the item draws the random numbers it drew in that run.
 
 Returns the item's testset. Leaving the debugger before the item has finished
 records an error, since the rest of it did not run.
@@ -177,8 +178,8 @@ function near_names(name::String, items::Vector{RawItem})
 end
 
 # Said before the debugger takes the terminal: which item and why, whose seed, the
-# failures there are to step into instead, and what the item gets here that it
-# would not get in a run.
+# failures there are to step into instead, and what is ignored here that the item
+# would get in a run.
 function print_debug_header(item::RawItem, prof::Profile, seed::UInt64, failure, runs_seed::Bool)
     head = string(
         "debugging ", repr(item.name), " in this process",

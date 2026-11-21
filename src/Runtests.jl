@@ -67,10 +67,11 @@ include("chores.jl")
 
 """
     runtests([paths...]; kwargs...)
+    runtests(mod::Module; kwargs...)
 
 Run the test items under a package's `test/`. With no paths, use the package of
 the active project, or the package whose `test/runtests.jl` is running under
-`Pkg.test`.
+`Pkg.test`. A `Module` runs its package's whole suite.
 
 `paths` narrow what runs, while the whole suite is still parsed for errors: a
 directory, a test file, or `file.jl:42` to select the item that line is inside,
@@ -116,22 +117,28 @@ Execution: `workers` (a count, or `0` to run in this process), `threads`,
 expressions are timed separately from the items, and default to `timeout`),
 `artifacts_timeout` (what all the producers of one failed attempt may take together,
 see [`on_failure`](@ref); `timeout` by default),
-`retries`, `failfast`, `memory_threshold`, `full_stacktraces` (keep the
-framework's own frames in a failing item's stacktrace; trimmed by default), `seed`
-(every item draws its random numbers from this and its own name; random unless
+`retries`, `failfast` (stop the run on the first failing item), `item_failfast`
+(stop an item at its first failing `@test`), `memory_threshold`, `full_stacktraces`
+(keep the framework's own frames in a failing item's stacktrace; trimmed by default),
+`seed` (every item draws its random numbers from this and its own name; random unless
 given, and printed at the start of the run).
 
 Output: `logs` (`:issues`, `:batched`, `:eager`, or `:quiet`, which keeps every
-item's output in the run's logs and prints none of it), `verbose`,
-`monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
+item's non-empty output in the run's logs — readable afterwards with [`logs`](@ref) —
+and prints none of it; worker runs in `:eager` mode also save non-empty item output to
+per-item logs), `verbose`, `full_names` (do not shorten long item names in the output
+column), `monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
 `src/` and `ext/` the workers run, merged into `lcov.info` at the package's root;
 also `RUNTESTS_COVERAGE`, which a keyword overrides and which overrides the file).
 
 State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
-downloaded from CI, say) and runs it again: the same items, settings, profiles,
-`[order]` and seeds, on workers given the Julia flags it recorded, with any keyword
-given here winning, and a warning naming each package whose version differs from
-the one recorded and each recorded item the suite no longer has.
+downloaded from CI, say) and runs it again: the same items in the exact per-worker
+slot order recorded (without work-stealing or reordering), with the recorded settings,
+profiles, `[order]`, `[throttle]` limits, per-item policies (`timeout`, `retries`,
+`item_failfast`, `skip`), and seeds, on workers given the Julia flags it recorded,
+with any keyword given here winning. Warns on git revision/worktree changes, missing
+or changed items, moved environments, overridden policies, and package/preference
+differences against the recording (`dry_run = true` prints the full diff).
 
 Each item: `on_event`, a function this process calls with a [`TestItemEvent`](@ref) as
 each attempt at an item starts, and again as it ends with what the attempt cost: its
@@ -353,15 +360,15 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
         profiles[name] = with_profile(prof; preferences = path, environment = "",
                                       dir = get(dirs, name, ""), precompile = get(cfg.profiles, name, prof).precompile)
     end
-    # The code its workers compiled, which this process's flags need not match: the
-    # recorded flags go first, before each profile's own, as the recorded workers had
-    # them from their coordinator.
     # The order the recording handed its items out in, whatever this checkout's says.
     order_first = String.(split(get(rs.meta, "order_first", ""), '\n'; keepempty = false))
     order_last = String.(split(get(rs.meta, "order_last", ""), '\n'; keepempty = false))
-    # Its throttle limits, which decide what shares a process and retries together. A
+    # Its throttle limits, which bound how many items of each throttle run at once. A
     # record from before throttles has none, and keeps this checkout's.
     throttle = haskey(rs.meta, "throttle") ? recorded_throttle(rs.meta["throttle"]) : cfg.throttle
+    # The code its workers compiled, which this process's flags need not match: the
+    # recorded flags go first, before each profile's own, as the recorded workers had
+    # them from their coordinator.
     recorded = split(get(rs.meta, "julia_flags", ""), ' '; keepempty = false)
     julia_flags = isempty(recorded) || recorded == code_flags() ? String[] : String.(recorded)
     if !isempty(julia_flags)
@@ -411,7 +418,8 @@ variable gives every package its value. `name`, `tags` and `group` select within
 package; a group or tag only some packages have is no error. `config` is an error.
 `worker_init` and `test_end` are the code of the default profile of every package, and
 the `init` runs in the workspace root, as the `init` of a profile that the workspace
-shares does.
+shares does. Also accepts `skip_environment`, `replay`, and `on_event`, as
+[`runtests`](@ref) does.
 
 Before any worker starts, a `using` or `import` written in an item, a setup or a
 profile's `init` or `test_end` that the package's own test environment could not

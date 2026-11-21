@@ -46,6 +46,8 @@ A group is a named tag expression that `test/TestItems.toml` declares under `[gr
 
 `group = "all"` removes the group restriction. Other selections still narrow the run. A path, a line, `name`, `tags` or `group` in the call replaces `RUNTESTS_GROUP`. Thus an item that you ask for by name runs, whatever its group.
 
+To split a suite across named CI jobs while guaranteeing that no test item is accidentally left uncovered, use [`runtests_dispatch`](@ref) (see [Split the suite over jobs](@ref ci)).
+
 ### Selections that are errors
 
 A selection that cannot mean what you intended is an error. The run does not select everything or nothing in its place. These selections are errors:
@@ -62,7 +64,7 @@ The selection narrows what runs, but not what Runtests reads. Each run parses th
 
 ## Run the failing items
 
-`Runtests.runtestsf()` runs the items whose latest verdict was not a pass. Failures include failed tests, errors, timeouts, and an item left running when its coordinator died. Runtests keeps the latest verdict of each item across runs. Thus a run of one failure does not forget the other failures. [Run states and history](@ref history) explains which records count.
+`Runtests.runtestsf()` runs the items whose latest verdict was not a pass. Failures include failed tests, errors, timeouts, and an item left running when its coordinator died or when the run stopped as hung. Runtests keeps the latest verdict of each item across runs; any later passing verdict (a passing retry or a pass in a subsequent run) resolves a recorded failure. Thus a run of one failure does not forget the other failures. [Run states and history](@ref history) explains which records count.
 
 These rules apply to `runtestsf`:
 
@@ -107,7 +109,7 @@ Some problems stop the run before any item runs. These problems throw an excepti
 |:----------|:------|
 | `Runtests.ScanFailure` | A test file that does not parse, a name that two items use, a Julia file under `test/` that is not a test file, or a template expansion that is missing or not current. |
 | `Runtests.NoTestsError` | No test files, no item that the selection matches, or existing failing items of which none matches the selection. With no failing items, `runtestsf()` returns `nothing`. |
-| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, in another configuration file or in an environment variable. Examples are an incorrect value, an unknown profile, an undeclared group in `RUNTESTS_GROUP`, or a profile environment that does not resolve. A package or a setup that the run needs and that does not precompile also throws it, as [Precompilation](@ref precompilation) describes. |
+| `Runtests.ConfigError` | A mistake in `test/TestItems.toml`, in another configuration file or in an environment variable. Examples are an incorrect value, an unknown profile, an undeclared group in `RUNTESTS_GROUP`, an environment directory that does not resolve, or uncovered/disallowed overlapping items in `runtests_dispatch`. A package or a setup that the run needs and that does not precompile also throws it, as [Precompilation](@ref precompilation) describes. |
 | `ArgumentError` | A mistake in the call. Examples are a misspelled keyword, a value out of range, an empty selection, a malformed tag expression, a path outside `test/` or in another package, and a line that the file does not have. |
 
 A `ScanFailure` lists every problem that Runtests found, so you can correct them all before the next run.

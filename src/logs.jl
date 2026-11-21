@@ -28,18 +28,19 @@ function latest_run_record(root::AbstractString)
 end
 
 """
-    Runtests.logs([run]; name = nothing, failed = false, attempt = nothing, io = stdout) -> Nothing
+    logs([run]; name = nothing, failed = false, attempt = nothing, io = stdout) -> Nothing
 
-Print captured item logs from a recorded run (including `logs = :quiet` runs, which
-keep every non-empty item log beside the run state).
+Print captured item logs from any recorded run (including `logs = :quiet` runs, which
+keep every non-empty item log beside the run state without printing it during the run).
 
 `run` may be omitted (the newest run of the active package), a package directory or
 `Module` (its newest run), a `.runstate` file or `.rundata` directory path, or a
-`RunStateRecord`.
+`RunStateRecord` returned by [`read_run_state`](@ref).
 
 Keywords:
 - `name`: filter items by exact name (`String`), `Regex`, or collection of names.
-- `failed::Bool`: when `true`, show only items that did not pass.
+- `failed::Bool`: when `true`, show only non-passing items (failed, errored, timed out,
+  or cancelled; excludes passed and skipped items).
 - `attempt::Union{Nothing, Integer}`: show only that attempt number (default: every
   attempt of each matching item that wrote output).
 - `io::IO`: output stream (default: `stdout`).

@@ -62,8 +62,9 @@ artifacts_log_path(dir::AbstractString) = string(dir, ".log")
 # Set for the length of an item's body, and seen by the tasks it starts.
 const CURRENT_ARTIFACTS = ScopedValue{Union{Nothing, AttemptArtifacts}}(nothing)
 
-# The attempt whose producers wait for the coordinator's verdict, or `nothing`. Read
-# and written by the task that serves requests, one at a time.
+# The non-passing attempt whose producers wait for `finish_artifacts`, or `nothing`.
+# Passing attempts release their producers immediately inside `_run_item`. Read and
+# written by the task that serves requests, one at a time.
 const PENDING_ARTIFACTS = Ref{Union{Nothing, AttemptArtifacts}}(nothing)
 
 # The attempt a call from test code belongs to, or an error saying why there is none.
@@ -174,8 +175,8 @@ end
 """
     discard_artifacts!()
 
-Let go of producers still waiting for a verdict that did not want them: the attempt
-passed. Called before the process runs another item.
+Clear any uncollected pending producers left over from an earlier non-passing attempt
+whose `finish_artifacts` was not called. Called before the process runs another item.
 """
 function discard_artifacts!()
     a = PENDING_ARTIFACTS[]

@@ -1459,16 +1459,16 @@ end
 queue_ended!() = (@atomic QUEUE_PROGRESS.total = 0; nothing)
 
 """
-    report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth, pwidth, kwidth)
+    report_job(run, q, i, helper, status, seconds, rss, text, n, total, width, vwidth, pwidth, kwidth, version, kind)
 
 The line of job `i` of `q`, compiled by helper process `helper` (`0` for this
 process), the `n`th of `total` stale caches to end, in the shape of a test item's
 DONE line: its outcome, its time, the largest a compile of the helper has run (`rss`,
 `0` for none known), and what it compiled for where that is not the default. A compile
 that did not build follows it with its output, in the bracket a test item's failure
-has; `width` is the name column's, `vwidth` the version column's, `pwidth` that of the
-tested packages, `0` outside a run of several, and `kwidth` that of what it compiles
-(`kind_text`).
+has; `width` is the name column's, `vwidth` the `version` column's, `pwidth` that of the
+tested packages (`0` outside a run of several), and `kwidth` that of `kind`
+(`stale_metadata`).
 """
 function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, status::Symbol, seconds::Float64,
                     rss::Float64, text::AbstractString,

@@ -130,7 +130,7 @@ Expand the templates `request`, a TOML file, names, and write what each declares
 `response`: per template, the text it evaluated, and either an error with its line
 or, for each `@testtemplate` in order, its line and the items it declares: each one's
 name, the code each interpolated loop variable's value is written as, and the code of
-each other `\$(...)` its keywords computed, by [`interpolation_key`](@ref).
+each other `\$(...)` its keywords computed, by `interpolation_key`.
 """
 function main(request::AbstractString, response::AbstractString)
     req = TOML.parsefile(request)

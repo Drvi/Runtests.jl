@@ -169,15 +169,6 @@ byte_range(node) = JuliaSyntax.first_byte(node):JuliaSyntax.last_byte(node)
 
 declaration_nodes(tree) = [c for c in children_of(tree) if Expander.is_testtemplate(Expr(c))]
 
-"""
-    render_expansion(template, text, items) -> String
-
-The test file `template` expands to, from the `text` the expanding process ran and
-what it answered for each of its `@testtemplate`s: a `@testitem` per instance, its
-name a literal, each `\$x` replaced by the code of `x`'s value and each other `\$(...)`
-of its keywords by the code of what it computed, the rest as written. The stamp on
-its third line is what a run checks it by.
-"""
 # Invariant structure of one `@testtemplate` node, extracted once for all its instances.
 struct TemplateSlots
     name_range::UnitRange{Int}
@@ -217,6 +208,15 @@ function collect_interpolation_sites!(out, text::String, node, in_header::Bool)
     return out
 end
 
+"""
+    render_expansion(template, text, items) -> String
+
+The test file `template` expands to, from the `text` the expanding process ran and
+what it answered for each of its `@testtemplate`s: a `@testitem` per instance, its
+name a literal, each `\$x` replaced by the code of `x`'s value and each other `\$(...)`
+of its keywords by the code of what it computed, the rest as written. The stamp on
+its third line is what a run checks it by.
+"""
 function render_expansion(template::AbstractString, text::String, items::Vector)
     nodes = declaration_nodes(JuliaSyntax.parseall(JuliaSyntax.SyntaxNode, text; filename = String(template)))
     length(nodes) == length(items) ||

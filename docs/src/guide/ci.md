@@ -13,7 +13,7 @@ On CI, run the tests with `Pkg.test`, as for any package. `julia-actions/julia-r
 - uses: julia-actions/julia-runtest@v1
 ```
 
-Outside a terminal, the run prints a progress line every `monitor_interval` seconds, 30 by default. It also prints one after every 10 finished items, but no sooner than 5 seconds after the last one.
+Outside a terminal, the run prints a progress line every `monitor_interval` seconds (30 by default, skipped if another progress line printed within `min(5, monitor_interval)` seconds) and after every 10 finished items (at most once per 5 seconds). Stage changes (`setup`, `testing`, `reporting`) and upward crossings of high-memory marks (`90%–99%`) or `100%` machine CPU saturation fire immediately regardless of the 5-second gap (each threshold mark has a 30-second cooldown).
 
 ## Configure a job with environment variables
 
@@ -43,6 +43,36 @@ steps:
 ```
 
 `RUNTESTS_GROUP` applies only when the call in `test/runtests.jl` selects nothing else. An empty `RUNTESTS_GROUP` counts as unset. Thus a job whose `matrix.group` is empty runs the whole suite, or the group `default` when `test/runtests.jl` calls `runtestsd()`.
+
+### Guarantee every item is covered (`runtests_dispatch`)
+
+When a suite is split across CI jobs, a new item whose tags match no slice can silently go untested. Use [`runtests_dispatch`](@ref) in `test/runtests.jl` to declare all supported slices in one place:
+
+```julia
+# test/runtests.jl
+using Runtests
+
+variants = Dict(
+    "core" => (; group = "default"),
+    "gpu"  => (; group = "gpu"),
+    "qa"   => (; paths = ["test/qa"]),
+)
+
+runtests_dispatch(
+    get(ENV, "TEST_GROUP", "core"),
+    variants;
+    exclude = (; tags = [:manual]),
+    allow_overlaps = true,   # set to false to forbid items matching multiple slices
+)
+```
+
+Before starting any worker, `runtests_dispatch` scans the whole suite and checks that:
+
+- the requested key exists in `variants` (and no selection keyword such as `tags`, `group`, `name`, `paths`, `skip_environment`, or `replay` was passed outside `variants`),
+- every test item is covered by at least one variant (excluding items skipped by a variant's `skip_environment`) or by `exclude`,
+- when `allow_overlaps = false`, no item matches more than one variant (or both a variant and `exclude`).
+
+A variant that declares no `group` (such as `"qa"` above) runs with `group = "all"`, so `RUNTESTS_GROUP` cannot silently narrow it.
 
 ## [Keep the history of runs](@id ci-history)
 
@@ -141,9 +171,10 @@ A stable `RUNTESTS_HOST` makes the restored run states part of the normal [reten
 
 ### [The artifact](@id ci-artifact)
 
-The artifact holds the directory of this job's run: its run state, its logs and its [failure evidence](@ref evidence). It holds none of the history. On your machine, run the failures of a downloaded run again:
+The artifact holds the directory of this job's run: its run state, its logs and its [failure evidence](@ref evidence). It holds none of the history. On your machine, inspect captured item logs or run the failures of a downloaded run again:
 
 ```julia
+Runtests.logs("path/to/the.rundata"; failed = true)
 Runtests.runtestsf(replay = "path/to/the.rundata")
 ```
 

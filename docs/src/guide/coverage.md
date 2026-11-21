@@ -26,7 +26,7 @@ Every line of a function that never ran counts as not covered. This also applies
 
 Coverage needs workers, so `workers = 0` with `coverage = true` is an error. A worker writes its counts when it exits, also after a timeout. A worker that stops without an exit loses its counts. Examples are a worker that the system killed and a worker that crashed. The closing block says how many workers lost their counts. On Windows, a worker that timed out is also stopped without an exit.
 
-If the run cannot write the report, the closing block says so. The result of the run does not change.
+If the run cannot write the report, the closing block says so. The result of the run does not change. If the system temporary directory is not writable, Runtests warns once, disables `coverage`, and falls back to `logs = :eager`.
 
 ## Use Pkg.test(coverage = true)
 

@@ -893,9 +893,10 @@ function maybe_print(m::Monitor)
         return nothing
     end
     # Not a terminal: poll often and report on a clock, every `PROGRESS_ITEMS` items,
-    # and immediately on phase change or memory/CPU threshold crossings. Both the clock
-    # and item-progress reports respect `PROGRESS_GAP_S` so two routine lines do not
-    # land seconds apart; threshold crossings fire immediately (with their own cooldown).
+    # and immediately on phase change or memory/CPU threshold crossings. Clock reports
+    # respect `min(PROGRESS_GAP_S, m.print_interval)` and item-progress reports respect
+    # `PROGRESS_GAP_S` so two routine lines do not land seconds apart; threshold
+    # crossings fire immediately (with their own 30s cooldown).
     phase_changed = s.phase !== m.last_phase_printed
     pressure = s.machine_total > 0 ? 100 * s.machine_used / s.machine_total : 0.0
     near_oom = crossed_memory_mark!(m, pressure, now) != 0

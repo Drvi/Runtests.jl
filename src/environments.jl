@@ -831,8 +831,8 @@ function isolated_load_path(load_path::Vector{String}, test_env::Union{Nothing, 
     return stacked_load_path(out, base)
 end
 
-# The projects of profiles that name an environment, kept for the session as the
-# test environment is, and keyed by the environment, the package and the
+# The projects of profiles running in an environment directory, kept for the session as
+# the test environment is, and keyed by the environment, the package and the
 # preferences: building one is a resolve.
 const ENVIRONMENT_PROJECTS = Dict{NTuple{3, String}, Tuple{String, Vector{Float64}}}()
 const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
@@ -840,11 +840,11 @@ const ENVIRONMENT_PROJECTS_LOCK = ReentrantLock()
 """
     environment_project(prof, root, announce = nothing) -> String
 
-Create the project in which workers run a profile that names an environment
-directory. Copy the environment into a temporary directory, add the package at
-`root` by path, apply the profile's preferences over the environment's
-`LocalPreferences.toml`, and resolve it. Developing the package by path lets
-resolution use its `[sources]` entries. The source environment is not modified.
+Create the project in which workers run a profile whose `environment` is set (from its
+items' directory). Copy the environment into a temporary directory, add the package at
+`root` by path in `[sources]`, apply the profile's preferences over the environment's
+`LocalPreferences.toml`, and resolve it. Adding the package by path in `[sources]` lets
+resolution use its own `[sources]` entries. The source environment is not modified.
 
 Keep the result for this session and rebuild it when an input file changes: the
 environment's files, the package's project, the preferences, or the project of a
@@ -870,8 +870,8 @@ function environment_project(prof::Profile, root, announce = nothing)
     end
 end
 
-# The environment `prof` names, written into `dir` with its paths made absolute, the
-# package at `root` added by path, and the preferences laid over its own.
+# The environment directory `prof.environment`, written into `dir` with its paths made
+# absolute, the package at `root` added by path, and the preferences laid over its own.
 function write_environment(dir::AbstractString, prof::Profile, root::AbstractString)
     src = prof.environment
     projfile = something(project_file(src), joinpath(src, "Project.toml"))

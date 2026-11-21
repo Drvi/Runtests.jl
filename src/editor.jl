@@ -81,8 +81,8 @@ end
 
 state_name(s::ItemState) = lowercase(string(s))
 
-# A failure where `Test` recorded it: in the item's own file when the source is
-# relative or missing.
+# A failure where `Test` recorded it: relative paths resolved against `p.root`,
+# and `""` when missing.
 function failure_json(p::Plan, r)
     src = r.source
     file = src.file === nothing ? "" : string(src.file)
@@ -92,20 +92,8 @@ end
 
 ### Listing #################################################################
 
-"""
-    list_items(root; config = nothing) -> NamedTuple
-
-Every test item of the package at `root`, as the scanner reads it, together with
-scanner and configuration problems found without running items, and the items
-whose last verdict was a failure, which [`runtestsf`](@ref) would run. The errors
-include files that do not parse, duplicate item names and settings that
-`test/TestItems.toml` (or `config` in its place) does not accept. Items come from
-files that parse even when others do not, so an editor shows what it can beside
-what is broken. An item's `end_line` is the line before the next item in its file,
-or the file's last: the lines where `runtests("file.jl:line")` picks that item.
-"""
 # Single-pass scan + config validation for one package, returning both the JSON
-# listing and the scanned data (`raw_items`, `setups`, `cfg`, `clean_scan`) so
+# listing and the scanned data (`raw_items`, `setups`, `cfg`) so
 # `list_items_mono` performs cross-package checks without re-scanning any file.
 function scan_package_listing(root::AbstractString; config::Union{Nothing, AbstractString} = nothing,
                               shared::Union{Nothing, SharedProfiles} = nothing)
@@ -114,7 +102,7 @@ function scan_package_listing(root::AbstractString; config::Union{Nothing, Abstr
     files, strays, templates, environments = walk_test_dir(target.testdir)
     setups = setup_modules(target.testdir)
     items, errors, _ = scan_files(files, Filter(), setups; strays, templates, environments)
-    # Whether the test files themselves parsed cleanly (ignoring strays/templates), matching `written_import_problems`.
+    # Whether any parse, duplicate-name, or template-expansion error occurred (ignoring strays only).
     scan_only_errors = length(errors) > length(strays)
     cfg = nothing
     try
@@ -150,6 +138,18 @@ function scan_package_listing(root::AbstractString; config::Union{Nothing, Abstr
     return (; listing, raw_items = scan_only_errors ? RawItem[] : items, setups, cfg)
 end
 
+"""
+    list_items(root; config = nothing) -> NamedTuple
+
+Every test item of the package at `root`, as the scanner reads it, together with
+scanner and configuration problems found without running items, and the items
+whose last verdict was a failure, which [`runtestsf`](@ref) would run. The errors
+include files that do not parse, duplicate item names and settings that
+`test/TestItems.toml` (or `config` in its place) does not accept. Items come from
+files that parse even when others do not, so an editor shows what it can beside
+what is broken. An item's `end_line` is the line before the next item in its file,
+or the file's last: the lines where `runtests("file.jl:line")` picks that item.
+"""
 function list_items(root::AbstractString; config::Union{Nothing, AbstractString} = nothing)
     return scan_package_listing(root; config).listing
 end
@@ -229,10 +229,11 @@ Drive the test suite of the package at `path` from an editor: read commands from
 `input` and write events to `output`, one JSON object per line, until `input` ends
 or a `shutdown` command arrives; a run still going is cancelled first. The commands
 are `list`, `run`, `cancel` and `shutdown`: each an object naming its `command`, with
-an `id` that the events answering it carry, and for `run` the `items` to run, each a
-`package` and a `name`, or their `names`, and the `options` to run them with
-(`RUN_OPTIONS`). `config` names a file every listing and run of the session reads in
-place of `test/TestItems.toml`, relative to the current directory.
+an `id` that the events answering it carry, and for `run` the `items` to run (each a
+`package` and a `name`), their `names`, or `failing = true` (the items `runtestsf` would
+run), together with run `options` (see the editor protocol reference). `config` names a
+file every listing and run of the session reads in place of `test/TestItems.toml`,
+relative to the current directory.
 
 Serving over this process's own `stdout` takes it over for the rest of the process:
 everything else written there, by the run, by `Pkg` or by C libraries, goes to

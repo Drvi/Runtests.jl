@@ -662,14 +662,6 @@ function no_such_tags(missing_::Vector{Symbol}, tags::Set{Symbol})
     )
 end
 
-"""
-    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, environments) -> (items, errors, rejected, tags)
-
-What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
-by (file, line), every problem found sorted the same way, the name and place of each
-item the filter left out, and every tag an item of the suite carries. For a caller
-that shows what it can read beside what is broken.
-"""
 function flatten_chunks(::Type{T}, chunks, idx::Int) where {T}
     total = 0
     for c in chunks
@@ -682,6 +674,14 @@ function flatten_chunks(::Type{T}, chunks, idx::Int) where {T}
     return out
 end
 
+"""
+    scan_files(files, filter, known_setups; ntasks, strays, templates, expansions, environments) -> (items, errors, rejected, tags)
+
+What [`scan`](@ref) reads, without its verdict: the items that pass `filter` sorted
+by (file, line), every problem found sorted the same way, the name and place of each
+item the filter left out, and every tag an item of the suite carries. For a caller
+that shows what it can read beside what is broken.
+"""
 function scan_files(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(), strays::Vector{ScanError} = ScanError[],

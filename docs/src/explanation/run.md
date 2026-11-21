@@ -18,7 +18,7 @@ Under `Pkg.test`, Runtests uses the environment that Pkg already built. It also 
 
 When a package and its `test/Project.toml` belong to the same outermost Julia workspace, Runtests activates the test project and instantiates it, as `Pkg.test` does. The workspace can list both projects directly, or the package can list its own `test` project. They share the workspace manifest, so TestEnv does not build a separate environment.
 
-Runtests keeps resolved environments for the session and rebuilds them when their input files, such as `Project.toml` or a manifest, change. Reusing an environment does not guarantee that all compilation is reusable: changed source or worker flags can require new compiled code. The items in an [environment directory](@ref environments) run in that environment, stacked over the test environment.
+Runtests keeps resolved environments for the session and rebuilds them when their input files, such as `Project.toml` or a manifest, change. Reusing an environment does not guarantee that all compilation is reusable: changed source or worker flags can require new compiled code. The items in an [environment directory](@ref environments) run in that environment stacked over a minimal base environment containing only `Runtests` and `Test` (not the test environment, so undeclared test dependencies do not leak in).
 
 ## [Precompilation](@id precompilation)
 
@@ -58,7 +58,7 @@ Each start configuration that the items use has a pool of workers. A start confi
 
 When a pool has no items left, a worker of that pool can restart for another pool. The restart must make that pool finish sooner. To find out, the run plays out the items that are left in the pool, in the order that the workers take them. Each item goes to the worker that is free first. The workers of the pool are free at once, and the new worker is free only after its cost: its start, and the compilation of what the other workers already compiled. Thus a new worker that is ready after the other workers took the last items makes the pool finish no sooner. Nor does a new worker that can only wait for a throttle. Of the pools that a restart makes finish sooner, the worker restarts for the pool that finishes last. During the run, an item that no run timed counts as the average item of its pool so far.
 
-The dry run shows the plan. It plays out the dispatch of the run with the recorded durations, so it is as good as those durations are. The `why here` column says which rule placed an item, when the rule was not file order.
+The dry run shows the plan. It plays out the dispatch of the run with the recorded durations, so it is as good as those durations are. The `why here` column says which rule placed an item, when the rule was not file order. Under `replay`, normal planning and work-stealing are bypassed: each worker slot runs the exact sequence of items recorded for it in the run state, in order, switching pools as recorded and waiting in place on full throttle gates.
 
 ### Short names
 
@@ -70,7 +70,7 @@ A worker starts with the flags, threads, environment variables and preferences o
 
 Each item runs in a new module. A worker can reuse compiled code from earlier items, though new method specializations or invalidations can still require compilation. Items on one worker also share the state of the process. [Write test items](@ref writing) explains what this means for a test.
 
-A worker that goes past the timeout of its item is stopped. The item is recorded as timed out, and the run starts a new worker in its place.
+A worker that goes past the timeout of its item is stopped. Before signalling it for stack traces and killing it, Runtests samples the worker process tree's CPU usage briefly (~0.15 s) and reports whether the worker was idle (`likely blocked or deadlocked`, `< 5%` CPU) or active (`<N>% CPU; slow or looping`). The item is recorded as timed out, and the run starts a new worker in its place.
 
 ## [Memory](@id memory)
 
@@ -88,7 +88,7 @@ A run can go a long time without a finished item. The watchdog allows the larger
 
 ## The output
 
-The coordinator writes all the output. A worker writes the output of its items to a log file, except under `logs = :eager`. When an item ends, the coordinator prints its block as one piece. Thus the output of another worker never lands inside it. [The output reference](@ref output) describes each line.
+The coordinator writes all the output. A worker writes the output of its items to a log file; under `logs = :eager` on workers, output streams through the coordinator, which prints it live and lazily saves nonempty item lines to `item_<i>_<a>.log` as well. If the system temporary directory is not writable, Runtests warns once, falls back to `logs = :eager` (without temporary log files), and disables `coverage`. When an item ends, the coordinator prints its block as one piece. Thus the output of another worker never lands inside it. [The output reference](@ref output) describes each line.
 
 ## The record
 

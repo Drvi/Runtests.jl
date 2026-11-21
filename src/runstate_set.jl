@@ -4,8 +4,8 @@
 """
     package_plan(p, k) -> Plan
 
-Package `k`'s part of a combined plan, as a plan of its own: its items,
-units and profiles in the order of `p`, renumbered, with paths relative to the
+Package `k`'s part of a combined plan, as a plan of its own: its items
+and profiles in the order of `p`, renumbered, with paths relative to the
 package's root, and its own configuration under the run's own settings. What its run
 state holds. It has no pools or slots: the run's slots served every package.
 """

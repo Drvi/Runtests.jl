@@ -89,9 +89,10 @@ the body binds it itself, as `x = \$x` does.
 In the keywords, a `\$(...)` is computed as the template expands, once per iteration
 among the same names, and its value written the same way: `skip = \$(x in MySetup.KNOWN_BAD)`
 is `skip = true` or `skip = false` in each item. Outside a `\$(...)` a keyword is the
-item's, evaluated as it runs. In the body, a `\$` before anything but a loop variable
-is left as it is, for a macro of the body's own, and so is every `\$` inside a quoted
-expression.
+item's, evaluated as it runs. In the body, a `\$` on an expression that does not mention any loop variable is left
+as it is, for a macro of the body's own, and so is every `\$` inside a quoted
+expression; a `\$(...)` in the body that mentions a loop variable is refused (write
+`f(\$x)` instead).
 
 Evaluated anywhere but in a template expanded by `chores`, it throws.
 """

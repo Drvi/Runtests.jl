@@ -51,7 +51,7 @@ using Zlib_jll: libz
 
 const RS_MAGIC = 0x544e5552   # "RUNT" on disk
 const RS_VERSION = UInt32(1)
-# 40 bytes of counts and times, then nine section offsets; the rest is room to
+# 40 bytes of counts and times, then eleven section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
 const RS_STATUS_BYTES = 32
@@ -567,8 +567,8 @@ function write_workers!(io::IO, strings::StringTable, p::Plan, worker_projects::
 end
 
 # Each item's policy as the run resolved it: its timeout in seconds, its retries, whether
-# a failure of it stops the run, and its skip expression, each distinct one once; then
-# each item's, by index from 1.
+# a failure stops the item at its first failing test (`item_failfast`), and its skip
+# expression, each distinct one once; then each item's, by index from 1.
 function write_policies!(io::IO, strings::StringTable, p::Plan)
     table = Dict{PolicyRecord, UInt32}()
     order = PolicyRecord[]
@@ -1016,13 +1016,13 @@ end
     read_run_state(path; full = true) -> Union{Nothing,RunStateRecord}
 
 Read a run state: a run's directory, `<run>.rundata`, or the `run.runstate` file in
-it. A file that is truncated, from a crashed run, or written by a different
-version gives as much as can be read, or `nothing`. The reader suppresses ordinary
-read and parse errors so a broken old record does not stop a new run, and a record
-that another run deletes while it reads gives `nothing`. An interrupt during parsing
-is rethrown. With `full = false`, reads only the hot planning prefix and appended
-events, skipping `cold_strings`, `profiles`, `environment`, `workers` and `policies`
-on disk.
+it. A file that is truncated or from a crashed run gives as much as can be read, or
+`nothing`; a file written by a different format version returns `nothing`. The reader
+suppresses ordinary read and parse errors so a broken old record does not stop a new
+run, and a record that another run deletes while it reads gives `nothing`. An interrupt
+during parsing is rethrown. With `full = false`, reads only the planning prefix and
+appended events, leaving `memory`, `profiles`, `preferences`, `manifest_zlib`,
+`worker_environments`, `profile_environments`, and `policies` empty/zeroed.
 """
 function read_run_state(path::AbstractString; full::Bool = true)
     # Another run prunes records at any moment. On Windows a file that is being deleted
@@ -1792,19 +1792,6 @@ function item_facts(runs::Vector{Pair{String, RunStateRecord}}; base::Union{Noth
     return facts
 end
 
-"""
-    removable_runs(runs, candidates; names = nothing) -> Vector{String}
-
-Of `candidates`, files among `runs` (every run state of the project, oldest first),
-those whose deletion changes no item's facts (see [`item_facts`](@ref)): its latest
-verdict and when it was recorded, the seed of a failure, its newest duration and
-source hash, and whether the newest run to select it stopped before it. With
-`names`, the suite's items, only theirs count: an item the suite no longer has holds
-back no run state beyond the newest ones pruning keeps anyway. Taken oldest first, so
-a run state is judged by what is left once the older ones have gone. Each item's
-newest verdict stays, which is also what a replay's base is read against: the
-verdicts after the base, newest first.
-"""
 # Recompute the kept-facts tuple for one item from its sorted `(run_idx, item_idx)`
 # occurrences, scanning newest-to-oldest over `alive` runs and stopping once all four
 # last-writer-wins channels are filled. Returns `(facts_tuple, min_run_visited)` where
@@ -1857,6 +1844,19 @@ end
 in_names(::Nothing, ::String) = true
 in_names(names, name::String) = name in names
 
+"""
+    removable_runs(runs, candidates; names = nothing) -> Vector{String}
+
+Of `candidates`, files among `runs` (every run state of the project, oldest first),
+those whose deletion changes no item's facts (see [`item_facts`](@ref)): its latest
+verdict and when it was recorded, the seed of a failure, its newest duration and
+source hash, and whether the newest run to select it stopped before it. With
+`names`, the suite's items, only theirs count: an item the suite no longer has holds
+back no run state beyond the newest ones pruning keeps anyway. Taken oldest first, so
+a run state is judged by what is left once the older ones have gone. Each item's
+newest verdict stays, which is also what a replay's base is read against: the
+verdicts after the base, newest first.
+"""
 function removable_runs(runs::Vector{Pair{String, RunStateRecord}}, candidates; names = nothing)
     # Nothing to weigh: the facts of every item need not be built to keep every run.
     isempty(candidates) && return String[]
@@ -1997,12 +1997,11 @@ end
 Clear the default location of checkouts that are gone, as `chores` does: in each
 directory whose recorded project path has not existed for `SWEEP_GRACE_S`, by the
 newest of its run states, or at once for a project that was in `temp`, the system's
-temporary files, delete this machine's run states and their logs, and those of a
-format older than any this version reads, and then the directory once nothing else
-is left in it. With `fix = false` it deletes nothing and says what it would. A run
-state recorded elsewhere, one that cannot be read otherwise, and a directory without
-a recorded project stay: nothing shows they are this machine's to delete. So does a
-project that is out of reach rather than gone: one whose parent directory is missing
+temporary files, delete this machine's run states and their logs, and then the
+directory once nothing else is left in it. With `fix = false` it deletes nothing and
+says what it would. A run state recorded elsewhere, one of another format version or
+that cannot be read otherwise, and a directory without a recorded project stay: nothing
+shows they are this machine's to delete. So does a project that is out of reach rather than gone: one whose parent directory is missing
 or empty, as a drive that is not mounted leaves it.
 
 The directories are read by `ntasks` tasks: a test suite that makes packages in the

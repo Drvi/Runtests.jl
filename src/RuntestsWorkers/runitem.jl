@@ -106,7 +106,10 @@ ItemResult(index, state, testset, stats) = ItemResult(index, state, testset, sta
 """
     TestItemInfo
 
-What `Runtests.current_testitem()` returns inside a running test item.
+Metadata for the currently running test item, returned by [`current_testitem`](@ref)
+inside the item's body, its profile's `test_end`, and [`on_failure`](@ref) producers.
+
+Fields: `name::String`, `file::String`, `line::Int32`, `attempt::Int8`, `profile::Symbol`.
 """
 struct TestItemInfo
     name    :: String
@@ -221,9 +224,10 @@ softscope_all!(@nospecialize ex) = (map!(softscope, ex.args, ex.args); ex)
     run_item(spec; printing=false, enter=nothing) -> ItemResult
 
 Evaluate one test item in a fresh module and return its results. Never throws for
-a failing test: a failure is a result, not an error. Producers the item registers
-wait for [`finish_artifacts`](@ref), or are let go of when the process runs its next
-item.
+a failing test: a failure is a result, not an error. For a non-passing item, producers
+the item registers wait for [`finish_artifacts`](@ref) (or are cleared when the process
+runs its next item); for a passing item, producers and item module globals are released
+immediately before `run_item` returns.
 
 With `enter`, the item's body becomes a function of no arguments that is handed to
 `enter(body)` to call, which is how a debugger steps into it (see
@@ -604,10 +608,9 @@ end
 
 is_failfast_error(err) = isdefined(Test, :FailFastError) && err isa Test.FailFastError
 
-# What an item's code starts with, the body and `skip` alike: the `Test` this package
+# What an item's code starts with, the body and `skip` alike: the `Test` this module
 # already has, bound in the module rather than found by name, so that `@test` works
-# whether or not the test environment declares `Test`, and a worker does not load
-# Runtests, the whole coordinator, to reach it; and the package under test.
+# whether or not the test/directory environment declares `Test`; and the package under test.
 function item_prelude(spec::AnyItemSpec)
     prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
     isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))

@@ -15,9 +15,9 @@ This page defines the terms of this manual, in alphabetical order.
 | plan | The order in which a run gives out its items, and the worker slot expected to run each item. |
 | producer | A function that an item registers with `on_failure`. It writes evidence after a failed attempt. |
 | profile | A named worker configuration in `[profiles]`: flags, threads, variables, expressions and preferences. An item chooses it with `profile = :name`. |
-| replay | A run of the items of a recorded run state, with its configuration and seeds. |
+| replay | A run of the items of a recorded run state, with its configuration, seeds, per-item policies (`timeout`, `retries`, `item_failfast`, `skip`), and exact per-worker item order (no work-stealing or reordering). |
 | retention | The rules that decide which run states Runtests keeps. |
-| run | One call to `runtests`, `runtestsf` or `runtests_mono`. |
+| run | One call to `runtests`, `runtestsd`, `runtestsf`, `runtests_dispatch`, `runtests_mono`, or `runtestsd_mono`. |
 | run state | A binary file that records a suite's part of a run: its items, results, configuration and seeds. |
 | sandbox | An item with `sandbox = true` runs alone in a new process, under its profile. |
 | seed | The number from which a run derives the random numbers of each item. |

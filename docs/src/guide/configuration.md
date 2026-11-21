@@ -63,7 +63,7 @@ To read another file in place of `test/TestItems.toml`, give the `config` keywor
 
 ## Workers and threads
 
-`workers = "auto"` is the default. It chooses the number of workers from the number of CPUs, the threads of each worker and an assumed 4 GiB for each worker. The maximum is 8. Give an integer to set the number yourself. `workers = 0` runs ordinary items in the process that calls `runtests`; sandboxed items and items of a named profile still use workers. [Run tests](@ref running) explains this mode.
+`workers = "auto"` is the default. It chooses the number of workers from the number of CPUs, the threads of each worker and an assumed 4 GiB for each worker. The maximum is 8. Give an integer to set the number yourself. `workers = 0` runs ordinary items in the process that calls `runtests`; sandboxed items, items of a named profile, and items in an environment directory still use workers. [Run tests](@ref running) explains this mode.
 
 `threads` is the `--threads` value of each worker. The default is `"2,1"`: two threads in the default pool and one interactive thread. A worker with `threads = "auto"` takes every CPU. A profile gives its workers other threads with `--threads` in its `julia_args`.
 
@@ -85,16 +85,16 @@ A timeout must be positive and at most 2,147,483,647 seconds. Runtests rounds a 
 |:------|:--------------------|
 | `:issues` | The output of each item that did not pass, after its `DONE` line. This is the default. |
 | `:batched` | The output of every item, when the item ends. |
-| `:eager` | The output of every item, while it runs. This mode does not save the output to per-item log files. |
-| `:quiet` | No output of any item. The output stays in the log files of the run. |
+| `:eager` | The output of every item, while it runs. On workers, nonempty output is also lazily saved to per-item log files (omitted under `workers = 0` or when a temporary log directory cannot be created). |
+| `:quiet` | No output of any item. Nonempty output stays in the log files of the run and can be read afterwards with [`Runtests.logs()`](@ref logs). |
 
-An interactive session with one worker or less uses `:eager` by default. When many workers print at the same time, their output mixes. Thus other runs use `:issues` by default.
+An interactive session with one worker or less uses `:eager` by default. When many workers print at the same time, their output mixes. Thus other runs use `:issues` by default. If Runtests cannot create its temporary scratch directory, it warns once, falls back to `logs = :eager` (without temporary log files), and disables `coverage`.
 
 These keys also control the output:
 
 - `verbose = true` includes passing testsets in the result summary. Use `logs = :batched` to print passing-item output too.
 - `monitor = false` switches off the memory monitor and the progress line.
-- `monitor_interval` is the number of seconds between progress lines when the output is not a terminal. The default is 30.
+- `monitor_interval` is the number of seconds between progress lines when the output is not a terminal (default 30; routine clock lines respect a 5-second minimum gap after another progress line, while stage changes and memory `>= 90%` or CPU `>= 100%` crossings print immediately).
 - `full_stacktraces = true` keeps the frames of Runtests in the stack traces of failures.
 - `full_names = true` prints long item names in full, in place of [a unique prefix](@ref plan).
 - `testset_name` is the name of the testset that the run returns. The default is `"Runtests"`.
@@ -169,4 +169,4 @@ A declared group, including a declared `default`, makes the run a selection of t
 
 ## Values that only a keyword sets
 
-Some keywords of `runtests` are not configuration keys, so they cannot go in `[run]` or in an environment variable. These keywords are `name`, `tags`, `group`, `dry_run`, `replay`, `config` and `on_event`. `RUNTESTS_GROUP` is the exception: it selects a group when the call selects nothing else.
+Some keywords of `runtests` are not configuration keys, so they cannot go in `[run]`. These keywords are `name`, `tags`, `group`, `skip_environment`, `dry_run`, `replay`, `config`, `on_event`, `worker_init`, and `test_end`. `group` and `skip_environment` are the only ones with environment-variable equivalents (`RUNTESTS_GROUP` and `RUNTESTS_SKIP_ENVIRONMENT`).

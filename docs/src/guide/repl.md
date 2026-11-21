@@ -46,7 +46,7 @@ The keywords behave as follows at the REPL:
 - `timeout`, `retries` and `throttle` need a run around the item. Runtests ignores them with a warning. An item with a worker of its own is the exception: it keeps its `timeout` and `retries`.
 - `tags` have no effect.
 
-An item running in this process, and its artifact producers, have no enforceable timeout. A sandboxed item keeps its explicitly declared `timeout` and `retries`; it does not inherit those two limits from `[run]`. Its profile hooks and artifact producers use their configured limits. [Investigate failures](@ref evidence) explains where a pasted item's evidence is kept.
+An item running in this process, and its artifact producers, have no enforceable timeout. An item that runs on a worker keeps its explicitly declared `timeout` and `retries`; it does not inherit those two limits from `[run]`. Its profile hooks and artifact producers use their configured limits. [Investigate failures](@ref evidence) explains where a pasted item's evidence is kept.
 
 ## [Step into an item with a debugger](@id debug)
 

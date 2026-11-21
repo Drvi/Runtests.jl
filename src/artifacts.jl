@@ -12,6 +12,8 @@ beside its log, with `prefix` the part of the path a log's shares.
 artifacts_path(prefix::String, index::Integer, attempt::Integer) =
     string(prefix, index, "_", attempt, ".artifacts")
 
+# Where attempt `attempt` at item `i` keeps its evidence, or `""` when no directory
+# could be created (after a scratch-dir fallback with no run state).
 function attempt_artifacts(run::Run, i::Integer, attempt::Integer)
     prefix = run.artifacts_prefixes[run.plan.items.package[i]]
     return isempty(prefix) ? "" : artifacts_path(prefix, run.local_item[i], attempt)
@@ -62,7 +64,7 @@ function evidence_after_loss!(run::Run, i::ItemIdx, attempt::Int8, why::Abstract
     return flags
 end
 
-# Run registered producers for `(index, attempt)` locally or on `w` within `limit` seconds.
+# Run registered producers for `(index, attempt)` locally or on `w` (within `limit` seconds on a worker).
 function run_artifact_producers(w::Union{Nothing, RuntestsWorkers.Worker}, index::Integer, attempt::Integer,
                                 name::AbstractString, limit::Integer)
     w === nothing && return RuntestsWorkers.finish_artifacts(index, attempt, true)

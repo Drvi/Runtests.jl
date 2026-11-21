@@ -57,13 +57,15 @@ While the step runs, the progress line has a white square. It counts the stale c
 └ startup: scan 0.0s · plan 0.1s · setup 1.2s
 ```
 
-The first line gives the versions of Runtests and Julia, and the number of selected items and files. It also gives the seed, the number of workers and their threads. It names these values too, when they apply:
+The first line gives the versions of Runtests and Julia, the number of selected items and files, the git revision (in a checkout), the seed (plus per-item seed counts when replaying failures), the number of workers and their threads, and any non-default Julia flags (for example `--check-bounds=yes -O1`).
 
-- the Julia flags of the workers that a plain `julia` does not have, for example `--check-bounds=yes -O1`,
-- the environment variables that set configuration values,
-- the source of the `coverage` value.
+Inside the block, conditional lines report what applies to the run:
 
-When the call or the environment selects items, a `selection` line comes first. It names what selected them, for example `tags = [:fast]`, or a group with its tags and what asked for it. The `env` line is the path of the test environment. The `machine` line gives the CPU threads and the memory of the machine, and the memory that is available when the run starts. In a container, the memory is what the container can use. The `startup` line gives the time to find and parse the test files (`scan`), to make the plan and to set up the environment.
+- `selection` (for example `tags = [:fast]`, or a group with its tags and what asked for it),
+- `packages` (in a combined run), `profile` details, and `env dir(s)`,
+- `set by the environment` (environment variables overriding defaults or `TestItems.toml`),
+- `coverage` (and its source),
+- `env` (path of the test environment), `machine` (CPU threads and available/total memory, respecting container limits), and `startup` (`scan`, `plan`, and `setup` timings).
 
 ## The lines of the run
 
@@ -90,25 +92,26 @@ Each line starts with a mark, the worker and the time. The worker is `w1`, `w2` 
 
 An `UP` line gives the process ID and the threads of the worker. It also says `sandbox` for the process of a sandboxed item, and gives the Julia flags of its profile. When an item of the run uses a profile other than `default`, the line names the profile of every worker. In a combined run, the line names the profile with its package, for example `profile default of B`. There, only the default profile of the first package has no name on the line. That package is the workspace root when the root has tests. When the run uses an environment directory, the line names the environment of the worker.
 
-A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and memory. `tree max` is the most memory that the worker and the processes it started held together while the item ran. The run samples it five times a second, so a shorter item gets the memory at the last sample. `maxrss` is given in its place with `monitor = false`, or for an item that runs in the process of the run: it is the most memory that the process held since it started. The outcome is the result of the body of the item. A `HOOK` line after it names the `test_end` of a profile that failed, errored or timed out, with the item, the attempt and the cause. The details go in the log of the attempt. The outcome of the item does not change.
+A `RUN` line gives the position of the item in the plan, its name and its location. A `DONE` line gives the outcome, the time, the fraction of the time that was compilation, and memory. `tree max` is the most memory that the worker and the processes it started held together while the item ran. The run samples it five times a second, so a shorter item gets the memory at the last sample. `maxrss` is given in its place with `monitor = false`, or for an item that runs in the process of the run: it is the most memory that the process held since it started. On a timeout, Runtests probes the worker process tree's CPU usage briefly (~0.15 s) before signalling it and appends either `worker was idle (likely blocked or deadlocked)` (`< 5%` CPU) or `worker was active (<N>% CPU; slow or looping)` (`>= 5%` CPU) to both the `KILL` line and the failed-item block. The outcome is the result of the body of the item. A `HOOK` line after it names the `test_end` of a profile that failed, errored or timed out, with the item, the attempt and the cause. The details go in the log of the attempt. The outcome of the item does not change.
 
 ### The progress line
 
 On a terminal, the progress line stays at the bottom, and the run draws it again as it goes. In other output, the run prints it at these times:
 
-- every `monitor_interval` seconds,
+- every `monitor_interval` seconds (skipped if another progress line printed within `min(5, monitor_interval)` seconds, so routine lines do not land seconds apart),
 - after every 10 finished items, but no sooner than 5 seconds after the last progress line,
-- when the run goes from setup to testing,
-- when memory use crosses one of the high-memory marks, starting at 90%.
+- on any stage transition (`setup`, `testing`, `reporting`),
+- immediately (bypassing the 5-second gap) on upward crossings of high-memory marks (`90%`, `95%`, `96%`, `97%`, `98%`, `99%`, each with a 30-second cooldown) or upward crossings of `100%` machine CPU saturation (30-second cooldown).
 
 The progress line gives these values:
 
 - the finished items and the selected items,
 - the number of failed items,
-- the busy workers and all workers,
+- the live workers and total worker slots,
 - the memory of the processes of the run, and of the largest of them,
 - the memory and CPU use of the machine. The CPU use is the one-minute load average over the number of CPU threads, for example `cpu  5.5/18`. A load above the number of threads means that threads wait for a CPU. Windows has no load average. There, the CPU use is the percentage of the CPU time of the machine that was busy in the last 10 seconds, for example `cpu  73%`.
-- the stage of the run and its time.
+- the stage of the run and its time,
+- the active work suffix (when applicable): the oldest running item, `collecting artifacts of …`, or `precompiling …`.
 
 While the precompile step runs, the first two values count the stale caches in place of the items, and the workers are the helper processes of the step. Before the tests start, the line names no test workers.
 
@@ -125,7 +128,7 @@ An item that did not pass gets a block with its results, right after its `DONE` 
 └ @ test/faults_test.jl:5 on worker 1
 ```
 
-The block holds the failed tests, the output of the item under `Captured logs`, and the path of the files that the item kept. The last line gives the location of the item and the worker. The run prints the block as one piece, so the output of another worker never lands inside it. Under `logs = :quiet`, the block has no output of the item.
+The block holds the failed tests, the output of the item under `Captured logs`, and the path of the files that the item kept. The last line gives the location of the item and the worker. The run prints the block as one piece, so the output of another worker never lands inside it. Under `logs = :quiet`, the block omits item output; read the saved logs afterwards with [`Runtests.logs`](@ref logs).
 
 ## The closing block
 
@@ -177,12 +180,13 @@ After the block, `Test` prints its usual summary.
   6 ·     w1 · "mul works"  · test/a_test.jl:6     · 0.0s · fast, math
 ```
 
-The table lists the items in the expected order of the run. Each row also gives the worker that is expected to run the item. The `estimated work` line gives the time that each worker is expected to be busy, from the recorded durations. Without recorded durations, the plan treats all items as equal, and the block has no `estimated work` line and no `est` column. The columns have these meanings:
+The table lists the items in the expected order of the run (or the exact recorded per-worker order under `replay`, where the header block also prints a `replay:` diff against the current checkout). Each row also gives the worker that is expected to run the item. The `estimated work` line gives the time that each worker is expected to be busy, from the recorded durations. Without recorded durations, the plan treats all items as equal, and the block has no `estimated work` line and no `est` column. The columns have these meanings:
 
 | Column | Meaning |
 |:-------|:--------|
 | `#` | The position in the plan. |
 | `worker` | The worker that is expected to run the item. |
+| `package` | The package name (shown in combined `runtests_mono` dry runs). |
 | `test item` | The name, or [a unique prefix](@ref plan) of a long name. |
 | `at` | The file and the line of the item. |
 | `est` | The newest recorded duration, in seconds with one decimal. The column shows when earlier runs recorded durations. |

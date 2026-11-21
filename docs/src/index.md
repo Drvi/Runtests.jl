@@ -18,7 +18,7 @@ Each call to `Runtests.runtests()` does these steps:
 4. It plans the order from earlier runs. Recent failures and long items start first. Other items run in file order, so that a worker can use code that it already compiled.
 5. It records the run in a run state file. A run state file holds the items, the results, the configuration and the random seeds of one run.
 
-With the run state, you can run the failures again with `Runtests.runtestsf()`, or [replay a recorded run](guide/failures.md) with the same seeds. A recorded run can come from your machine or from CI.
+With the run state, you can run the failures again with `Runtests.runtestsf()`, inspect captured item output with `Runtests.logs()`, or [replay a recorded run](guide/failures.md) with the same seeds, policies, and exact per-worker item order. A recorded run can come from your machine or from CI.
 
 ## Install
 

@@ -163,9 +163,11 @@ mutable struct Run
     const runid::String
     # The run's own temporary directory: coverage counts, which the run merges into
     # `lcov.info`, and the items' logs when there is no run state to keep them by.
+    # Empty if `mktempdir` failed (forcing `logs = :eager` and disabling coverage).
     const scratch::String
     # Where the items' logs go: in the run's directory, beside its record, which they
-    # share a lifetime with (see `rundata_dir`), once it is open; `scratch` until then.
+    # share a lifetime with (see `rundata_dir`), once it is open; `scratch` until then
+    # (or empty if no temporary directory could be created).
     logdir::String
     # Where `RUNTESTS_ARTIFACT_DIR` had the run copy its run state and logs, once it
     # has; empty otherwise.
@@ -174,8 +176,9 @@ mutable struct Run
     # and where the attempts' evidence goes (see `artifacts_path`), absolute: the log
     # prefix once the run state is open; until then, and without one, a directory of the
     # run's own in the system's temporary files, made only if an attempt asks, which
-    # outlives the run. `logdir` is the first package's, the one of a standalone run. A
-    # log is named by the item's index in its package's run state.
+    # outlives the run (all empty if `mktempdir` failed and no run state opened).
+    # `logdir` is the first package's, the one of a standalone run. A log is named by
+    # the item's index in its package's run state.
     const logdirs::Vector{String}
     const logprefixes::Vector{String}
     const artifacts_prefixes::Vector{String}
@@ -258,7 +261,7 @@ end
 Run the plan to completion and return the run, whose `statuses` hold what
 happened to every item. Printing and the pass/fail verdict are `report`'s job,
 so a caller that wants to inspect the outcome does not have to catch anything.
-The caller holds the process (`exclusively`). `on_event` is called with an
+The caller holds the process (`exclusively`). `on_event` is called with a
 [`TestItemEvent`](@ref) as each attempt starts and ends.
 """
 function execute(p::Plan, target; on_event = nothing)
@@ -710,9 +713,9 @@ function tidy_logs(run::Run)
 end
 
 """
-    needs_worker(p, u) -> Bool
+    needs_worker(p, i) -> Bool
 
-Whether this unit needs a process of its own however the run is configured:
+Whether item `i` needs a process of its own however the run is configured:
 `--check-bounds=yes` cannot be applied to a running process, one process cannot
 give an item a process to itself, and it loads the packages of one environment.
 Such an item gets a worker even under `workers=0`; passing it here would pass a test
@@ -1024,8 +1027,9 @@ function run_slot(run::Run, slot::Slot)
         elseif claim.kind === :wait
             continue
         elseif claim.kind === :rebind
-            # This slot's own pool is empty and another profile still has work, so
-            # the process is replaced instead of the worker cap being exceeded.
+            # Either this slot's own pool is empty and another profile still has work,
+            # or exact replay's next recorded item belongs to another pool; replace the
+            # process rather than exceeding the worker cap.
             slot.profile = run.plan.pools[claim.pool].profile
             stop_worker!(run, slot)
             continue
@@ -1304,10 +1308,10 @@ function worker_dir(p::Plan, j::Integer)
     return p.packages.isolated[k] ? p.packages.root[k] : p.root
 end
 
-# The load path of an item in an environment directory: that environment,
-# `@`, over the test environment `test_env`, as `Pkg.test` stacks its sandbox over the
-# active project. The worker loads RuntestsWorkers through the test environment's
-# manifest, and the environment's own packages come first.
+# Insert a base environment (normally the minimal `Runtests`-only base for isolated
+# environment directories, or `test_env` as a fallback) directly after `"@"` in
+# `load_path`, so the active project's own packages come first while `RuntestsWorkers`
+# remains loadable.
 function stacked_load_path(load_path::Vector{String}, test_env::Union{Nothing, String})
     out = copy(load_path)
     (test_env === nothing || test_env in out || dirname(test_env) in out) && return out
@@ -1379,8 +1383,6 @@ function died_how(run::Run, slot::Slot, w::RuntestsWorkers.Worker)
     return string(how, memory_note(run.monitor, slot.id, w.pid))
 end
 
-# Shared worker teardown after a failed remote RPC (item dispatch, `test_end`, or
-# artifact collection). Returns `:timeout`, `:died`, or `:alive` (worker still usable).
 # Distinguish a blocked/deadlocked worker from one actively computing at the moment of
 # a timeout. Samples CPU time over a short window before `inspect!` signals the worker;
 # returns "" if the OS does not expose per-process CPU time.
@@ -1400,6 +1402,8 @@ function worker_activity_note(pid::Integer; probe_s::Float64 = TIMEOUT_CPU_PROBE
         string("worker was active (", round(Int, 100 * ratio), "% CPU; slow or looping)")
 end
 
+# Shared worker teardown after a failed remote RPC (item dispatch, `test_end`, or
+# artifact collection). Returns `:timeout`, `:died`, or `:alive` (worker still usable).
 function resolve_worker_failure!(run::Run, slot::Slot, w::Union{Nothing, RuntestsWorkers.Worker}, e,
                                  dying_log::String; is_worker::Bool = w !== nothing,
                                  activity_out::Union{Nothing, Base.RefValue{String}} = nothing)
@@ -1941,10 +1945,10 @@ function handle_dispatch_failure!(
         )
         return false
     elseif outcome === :alive
-        # The request failed but the process is fine: a result that would not
-        # serialize, a `skip` expression that threw. The worker keeps everything
-        # it has compiled, and the item is an ordinary error. If the attempt
-        # registered `on_failure` producers before its reply was lost, run them now.
+        # The request failed but the process is fine (e.g. a result that would not
+        # serialize). The worker keeps everything it has compiled, and the item is an
+        # ordinary error. If the attempt registered `on_failure` producers before its
+        # reply was lost, run them now.
         dir = attempt_artifacts(run, i, attempt)
         flags = isempty(dir) ? 0x00 :
             ((isdir(dir) ? ARTIFACT_FILES : 0x00) | (isfile(artifacts_log_path(dir)) ? ARTIFACT_PRODUCERS : 0x00))
@@ -2011,8 +2015,8 @@ item_root(p::Plan, i::Integer) = p.packages.root[p.items.package[i]]
 item_seed(seed::UInt64, package::AbstractString, name::AbstractString) =
     seed ⊻ (UInt64(crc32c(name, crc32c("\0", crc32c(package)))) * 0x9e3779b97f4a7c15)
 
-# Whether a failure of item `i` stops the run: its own `failfast`, or else its package's
-# `item_failfast`.
+    # Whether a failure of item `i` stops the item at its first failing test: its own
+    # `failfast`, or else its package's `item_failfast`.
 item_failfast(p::Plan, i::Integer) = p.items.failfast[i] == -1 ? item_cfg(p, i).item_failfast : p.items.failfast[i] == 1
 
 item_timeout(p::Plan, i::ItemIdx) =
@@ -2184,7 +2188,8 @@ deletes them with the run. The run makes the directory only when it is given a f
 
 On `kind = :finished`, `log` is the attempt's log file when the attempt wrote one (empty
 otherwise), and `artifacts` is the attempt's evidence directory when a failed attempt
-kept evidence (empty otherwise). Both are empty on `kind = :started`.
+kept files or registered producers (empty otherwise; `on_failure` producers run right
+after `on_event` returns). Both are empty on `kind = :started`.
 """
 struct TestItemEvent
     kind::Symbol
@@ -2335,8 +2340,10 @@ function run_in_process(run::Run)
     @lock run.lock push!(run.tasks, current_task())
     slot = run.slots[1]
     # Every item, not just the one slot's queue: a pool that would have had a
-    # worker of its own has none here, and its items still have to run.
-    for i in ItemIdx(1):ItemIdx(nitems(p))
+    # worker of its own has none here, and its items still have to run. Under exact
+    # replay, follow the recorded slot sequence (`p.replay_slots[1]`).
+    order = isempty(p.replay_slots) ? (ItemIdx(1):ItemIdx(nitems(p))) : p.replay_slots[1]
+    for i in order
         is_cancelled(run.queues) && break
         # An item that asked for a process gets one here too — `run_item_once!`
         # decides which do — started and stopped around it.

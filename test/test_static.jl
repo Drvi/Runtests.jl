@@ -145,4 +145,54 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
         )
         @test !occursin("Core.Box", string(only(code_lowered(f, types))))
     end
+
+    # Guard against cross-platform and flakiness footguns in our own test suite that
+    # pass locally on a fast macOS machine and break on Windows or loaded CI runners.
+    @testset "test suite hygiene" begin
+        test_files = sort!(filter(f -> endswith(f, ".jl") && f != "test_static.jl", readdir(@__DIR__)))
+        @test !isempty(test_files)
+        bad_setenv = String[]
+        bad_symlink = String[]
+        bad_mtime_sleep = String[]
+        bad_tight_timeout = String[]
+        for fname in test_files
+            lines = readlines(joinpath(@__DIR__, fname))
+            full = join(lines, '\n')
+            for (i, line) in enumerate(lines)
+                stripped = lstrip(line)
+                startswith(stripped, '#') && continue
+                # `setenv` wipes `JULIA_DEPOT_PATH`, leaking throwaway fixture caches into
+                # `~/.julia/compiled/` unless the file forwards it.
+                if occursin(r"\bsetenv\(", line) && !occursin("JULIA_DEPOT_PATH", full)
+                    push!(bad_setenv, "$fname:$i")
+                end
+                # Unprivileged Windows runners cannot create symlinks.
+                if occursin(r"\bsymlink\(", line)
+                    ctx = join(lines[max(1, i - 5):i], '\n')
+                    occursin("Sys.iswindows()", ctx) || push!(bad_symlink, "$fname:$i")
+                end
+                # Waiting on filesystem mtime ticks is slow and flaky; use `bump_mtime!`.
+                if occursin(r"\bsleep\([^)]+\)\s*;\s*touch\(", line) ||
+                   (occursin(r"^\s*sleep\(", line) && i < length(lines) && occursin(r"^\s*touch\(", lines[i + 1]))
+                    push!(bad_mtime_sleep, "$fname:$i")
+                end
+                # Hook/artifact timeouts of 1s race fresh-worker compilation on slow CI runners,
+                # and a 1s item timeout is only safe on an intentional hang (`sleep(`).
+                if occursin(r"\b(test_end_timeout|init_timeout|artifacts_timeout)\s*=\s*1(?![.\deE])", line) &&
+                   !occursin("read_config(", line) && !occursin("allow-short-timeout", line)
+                    push!(bad_tight_timeout, "$fname:$i")
+                elseif occursin(r"\btimeout\s*=\s*1(?![.\deE])", line) &&
+                       !occursin("read_config(", line) &&
+                       !occursin(r"timeout\s*=\s*1\s+timeout\s*=", line) &&
+                       !occursin("allow-short-timeout", line)
+                    ctx = join(lines[i:min(length(lines), i + 5)], '\n')
+                    (occursin("@testitem", line) && occursin("sleep(", ctx)) || push!(bad_tight_timeout, "$fname:$i")
+                end
+            end
+        end
+        @test isempty(bad_setenv)
+        @test isempty(bad_symlink)
+        @test isempty(bad_mtime_sleep)
+        @test isempty(bad_tight_timeout)
+    end
 end

@@ -1115,7 +1115,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                     "data.txt" => "a",
                     "test/TestItems.toml" => """
                         [run]
-                        test_end_timeout = 1
+                        test_end_timeout = 2
                         [profiles.slow_end]
                         [order]
                         first = ["test_end too slow"]
@@ -1143,7 +1143,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                         test_end_timeout = 30
                         [profiles.slow_end]
                         """,
-                    profile_files("slow_end"; test_end = "sleep(1.5); @assert read(\"data.txt\", String) == \"b\"")...,
+                    profile_files("slow_end"; test_end = "sleep(2.5); @assert read(\"data.txt\", String) == \"b\"")...,
                     "test/b_test.jl" => """
                         @testitem "reads its own root" skip=!isfile("data.txt") begin
                             @test read("data.txt", String) == "b"

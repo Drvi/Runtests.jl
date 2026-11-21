@@ -105,7 +105,7 @@ using Runtests.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failu
         items = join(("@testitem \"$body, $h\" profile=:$h retries=1 begin\n    @test $(body == "passes")\nend\n"
                       for (h, _) in hooks for body in ("passes", "fails")))
         dir = make_pkg("HookMatrix",
-            "test/TestItems.toml" => "[run]\ntest_end_timeout = 1\n" * join(("\n[profiles.$h]\n" for (h, _) in hooks)),
+            "test/TestItems.toml" => "[run]\ntest_end_timeout = 3\n" * join(("\n[profiles.$h]\n" for (h, _) in hooks)),
             "test/t_test.jl" => items,
             (f for (h, code) in hooks for f in profile_files(h; test_end = code))...)
         with_runstate_dir() do _

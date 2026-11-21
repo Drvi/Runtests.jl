@@ -374,7 +374,7 @@ end
         with_marker_dir() do work
             marker = joinpath(work, "count")
             withenv("RUNTESTS_CRASH_MARKER" => marker) do
-                ex = :(@testitem "paste retries" timeout=3 retries=1 sandbox=true begin
+                ex = :(@testitem "paste retries" timeout=5 retries=1 sandbox=true begin
                     k = let p = ENV["RUNTESTS_CRASH_MARKER"]
                         n = isfile(p) ? parse(Int, read(p, String)) : 0
                         write(p, string(n + 1))
@@ -383,7 +383,7 @@ end
                     k < 1 && sleep(30)
                     @test k == 1
                 end)
-                ts = Core.eval(Main, ex)
+                ts = with_fast_inspect(() -> Core.eval(Main, ex))
                 # The first attempt was stopped at the timeout; the second passed.
                 @test parse(Int, read(marker, String)) == 2
                 @test isempty(collect_failures(ts))
@@ -448,7 +448,9 @@ end
                 sleep(30)
                 @test true
             end)
-            @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
+            with_fast_inspect() do
+                @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex)
+            end
         end
     end
 
@@ -470,15 +472,17 @@ end
             ex(profile) = :(@testitem $("pasted $profile") profile=$(QuoteNode(profile)) begin
                 @test true
             end)
-            took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex(:slow_init))
-            @test took < 40
-            # A `test_end` past its limit is ended and said; the body's result stands.
-            took = @elapsed begin
-                ts, out = capture_run(() -> Core.eval(Main, ex(:slow_end)))
+            with_fast_inspect() do
+                took = @elapsed @test_throws Runtests.Private.TimeoutException Core.eval(Main, ex(:slow_init))
+                @test took < 40
+                # A `test_end` past its limit is ended and said; the body's result stands.
+                took = @elapsed begin
+                    ts, out = capture_run(() -> Core.eval(Main, ex(:slow_end)))
+                end
+                @test took < 40
+                @test state_of(ts) === PASSED
+                @test occursin("test_end of profile `slow_end`: the `test_end` expression of profile `slow_end`", out)
             end
-            @test took < 40
-            @test state_of(ts) === PASSED
-            @test occursin("test_end of profile `slow_end`: the `test_end` expression of profile `slow_end`", out)
         end
     end
 end

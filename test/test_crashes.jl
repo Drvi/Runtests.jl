@@ -164,7 +164,7 @@ end
             wait_s > 0 && (x = ones(UInt8, 200 * 2^20); sleep(wait_s))
             ccall(:abort, Cvoid, ())
         end
-        @testitem "times out holding memory" timeout=4 begin
+        @testitem "times out holding memory" timeout=3 begin
             wait_s = parse(Float64, get(ENV, "RUNTESTS_HELD_WAIT", "1.0"))
             wait_s > 0 && (x = ones(UInt8, 200 * 2^20))
             sleep(60)
@@ -174,8 +174,7 @@ end
             for monitor in (true, false)
                 states, run, p = with_fast_inspect() do
                     withenv("RUNTESTS_HELD_WAIT" => monitor ? "1.0" : "0.0") do
-                        run_states(dir; workers=2, logs=:issues, monitor,
-                                   timeout = monitor ? 4 : 1)
+                        run_states(dir; workers=2, logs=:issues, monitor)
                     end
                 end
                 @test states["dies holding memory"] === ERRORED && states["times out holding memory"] === TIMEDOUT

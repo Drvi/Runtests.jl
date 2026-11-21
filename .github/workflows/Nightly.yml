@@ -1,0 +1,49 @@
+name: Nightly (Julia pre)
+
+on:
+  schedule:
+    # Run every night at 03:17 UTC to catch Julia prerelease / RC internal changes early.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: julia pre - ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            jobs: 3
+          - os: windows-latest
+            arch: x64
+            jobs: 3
+          - os: macos-latest
+            arch: aarch64
+            jobs: 2
+    steps:
+      - uses: actions/checkout@v5
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: 'pre'
+          arch: ${{ matrix.arch }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+          check_bounds: auto
+        env:
+          RUNTESTS_TEST_JOBS: ${{ matrix.jobs }}
+          JULIA_NUM_THREADS: 2

@@ -775,8 +775,8 @@ end
         # An environment directory's copy is stale once that manifest changes.
         prof = Runtests.Private.Profile(:qa; environment = env)
         before = Runtests.Private.environment_stamp(dir, prof, base)
-        sleep(1.1)   # past the resolution of a file's modification time
         write(versioned, entry("../Dep") * "\n")
+        bump_mtime!(versioned)
         @test Runtests.Private.environment_stamp(dir, prof, base) != before
         # A member of a workspace reads the root's manifest, with the root's paths.
         if VERSION >= v"1.12"

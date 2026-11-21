@@ -409,14 +409,15 @@ end
 
 function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
     return with_logger(RunLogger(current_logger(), run)) do
-        # Asked of git while the environments are made ready (`worktree_state`), on any
-        # thread: the task shares nothing with the run.
-        worktree = Threads.@spawn worktree_state(p.root)
         # Overlap worker process startup with test environment resolution and precompilation
         # when Runtests itself is already precompiled in this depot. Inside `try` so an
         # interrupt mid-spawn still reaps every already-launched process in `finally`.
         try
             prespawn_workers!(run, p)
+            # Asked of git while the environments are made ready (`worktree_state`), on any
+            # thread: started after `prespawn_workers!` so git's `uv_spawn` does not race
+            # worker process spawn on Windows.
+            worktree = Threads.@spawn worktree_state(p.root)
             with_run_env(target, run) do
                 # Before the run state: an environment directory that does not resolve
                 # stops the run before anything has run to record.
@@ -788,6 +789,10 @@ end
 ### Workers ################################################################
 
 function run_on_workers(run::Run)
+    # When workers were pre-spawned, they are already booting/booted, so collect
+    # before launching slot tasks rather than concurrently with `connect_worker`.
+    has_prespawned = @lock run.lock any(!isnothing, run.prespawned)
+    has_prespawned && GC.gc(true)
     # On the run's own thread, as the watchdog is. Interrupting a slot, which an
     # interrupt and a stall both do, schedules its task, and scheduling a task that
     # is running on another thread corrupts the scheduler; a task on this thread
@@ -826,7 +831,7 @@ function run_on_workers(run::Run)
         # that garbage stays resident for the whole run beside the workers, and
         # nothing collects it: a run allocates too little here to trigger it.
         yield()
-        GC.gc(true)
+        has_prespawned || GC.gc(true)
         foreach(wait, tasks)
     catch e
         # Ctrl-C lands in whichever task was running, this one included. Stop
@@ -1083,6 +1088,10 @@ const PRESPAWN_CONNECT_TIMEOUT = 600
 # `remote_activate`.
 function prespawn_workers!(run::Run, p::Plan)
     (single_process(p) || isempty(run.slots)) && return nothing
+    # Julia 1.12 on Windows intermittently aborts with 0xC0000005 when pre-spawned
+    # worker processes sit open across environment setup/precompilation (observed on
+    # 1.12.7 only; 1.11, 1.13, and 1.14 are unaffected). Start workers on demand there.
+    (Sys.iswindows() && v"1.12" <= VERSION < v"1.13") && return nothing
     # If `Runtests` has no fresh cache in the current depot (e.g. a fresh temp depot),
     # let `precompile_phase` compile it once instead of N workers racing to compile it.
     precompiled = try

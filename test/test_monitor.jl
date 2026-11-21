@@ -804,10 +804,12 @@ end
         @test occursin("tree max", summary)
         @test occursin("child max", summary)
         @test occursin("% compile", summary)
-        # Testing starts the workers, so it is the expensive stage.
+        # Both items hold memory during testing, so it is the expensive stage; pre-spawned
+        # workers may already be booting alongside precompilation during setup, so setup can
+        # briefly hold more processes, while testing still counts coordinator + 2 workers.
         @test phase_peak(st, PHASE_TEST) >= phase_peak(st, PHASE_SETUP)
-        @test phase_stats(st, PHASE_TEST).nprocs_at_peak >=
-            phase_stats(st, PHASE_SETUP).nprocs_at_peak
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak >= 3
+        @test phase_stats(st, PHASE_TEST).workers_at_peak == 2
         # The workers are counted as workers, in the stage that ran them.
         testing = only(filter(l -> occursin("testing", l), collect(eachsplit(summary, '\n'))))
         @test occursin("coordinator + 2 workers", testing)

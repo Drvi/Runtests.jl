@@ -734,6 +734,160 @@ worker_startup_code(connect_timeout::Real) = string(
     "const Runtests = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"", PKGID.name, "\")); ",
     "Runtests.", nameof(@__MODULE__), ".startworker(", connect_timeout, ")")
 
+struct WorkerProcess
+    pid::Int32
+    proc::Base.Process
+    job::Ptr{Cvoid}
+    cookie::String
+    began::Float64
+end
+
+"""
+    spawn_worker_process(; julia_args, threads, env, extra_env, dir, project, connect_timeout, color) -> WorkerProcess
+
+Launch the OS process for a worker and write its handshake cookie to stdin without
+waiting for it to finish booting or connecting over TCP. Splitting process spawn from
+[`connect_worker`](@ref) lets the coordinator start worker processes synchronously before
+environment resolution and precompilation (avoiding concurrent `uv_spawn` / `ENV` races)
+and connect once setup finishes.
+"""
+function spawn_worker_process(;
+        julia_args::Vector{String}=String[],
+        threads::String="2,1",
+        env::AbstractDict=ENV,
+        extra_env=Pair{String,String}[],
+        dir::String=pwd(),
+        project::Union{Nothing,String}=Base.ACTIVE_PROJECT[],
+        connect_timeout::Int=60,
+        color::Bool=false,
+    )
+    began = time()
+    env = Dict{String,String}(env)
+    for (k, v) in extra_env
+        env[k] = v
+    end
+    haskey(env, "JULIA_LOAD_PATH") || (env["JULIA_LOAD_PATH"] = join(LOAD_PATH, PATHSEP))
+    haskey(env, "JULIA_DEPOT_PATH") || (env["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, PATHSEP))
+    project === nothing || haskey(env, "JULIA_PROJECT") || (env["JULIA_PROJECT"] = project)
+    # Every worker would otherwise start a BLAS thread pool sized for the whole machine.
+    haskey(env, "OPENBLAS_NUM_THREADS") || (env["OPENBLAS_NUM_THREADS"] = "1")
+    color_arg = color ? "yes" : "no"
+    # A worker runs the suite's code and nothing else: no startup file, because a
+    # developer's own is not part of the tests, and no history file, because a
+    # worker has no REPL to record.
+    cmd = `$(Base.julia_cmd()) --threads=$threads --startup-file=no --history-file=no
+           --color=$color_arg $julia_args -e $(worker_startup_code(connect_timeout))`
+    proc = track!(open(detach(setenv(addenv(cmd, env), dir=dir)), "r+"))
+    # A process that fails at startup can be gone already, and a process that has
+    # exited has no pid to give; `read_port` below then says how it ended.
+    pid = try
+        Int32(getpid(proc))
+    catch e
+        # Interrupted here, the process would be left waiting for a cookie.
+        is_interrupt(e) && (shielded(() -> (kill(proc, Base.SIGKILL); wait_exit(proc, KILL_WAIT_SECONDS); untrack!(proc))); rethrow())
+        Int32(0)
+    end
+    job = worker_job(pid)
+    cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
+    try
+        # The cookie is the only thing the worker ever reads from its stdin. The pipe
+        # stays open while the worker runs: its end-of-file is how the worker learns
+        # that this process is gone (see `watch_coordinator`).
+        try
+            println(proc, cookie)
+        catch e
+            e isa Base.IOError || rethrow()   # the process is already gone; `read_port` reports that
+        end
+    catch
+        abort_worker_process!(WorkerProcess(pid, proc, job, cookie, began))
+        rethrow()
+    end
+    return WorkerProcess(pid, proc, job, cookie, began)
+end
+
+# Kill and reap a worker process that was never connected into a `Worker`.
+function abort_worker_process!(wp::WorkerProcess)
+    shielded() do
+        try
+            signal!(wp.pid, wp.proc, Base.SIGKILL)
+        catch
+        end
+        try
+            wait_exit(wp.proc, KILL_WAIT_SECONDS)
+        catch
+        end
+        untrack!(wp.proc)
+        end_job!(wp.job)
+        close_input(wp.proc)
+    end
+    return nothing
+end
+
+# Connect to an already-spawned `WorkerProcess`, returning `(worker, ready_timestamp)`.
+function connect_worker(
+        wp::WorkerProcess;
+        connect_timeout::Int=60,
+        redirect_io::IO=stdout,
+        redirect_fn=(io, pid, line) -> println(io, "      worker ", pid, " | ", line),
+        on_exit=nothing,
+        on_output_done=nothing,
+    )
+    pid, proc, job, cookie = wp.pid, wp.proc, wp.job, wp.cookie
+    sock::Union{Nothing, Sockets.TCPSocket} = nothing
+    w::Union{Nothing, Worker} = nothing
+    try
+        s, ready_ts = with_timeout(connect_timeout) do
+            port, ts = read_port(proc, redirect_io, pid, redirect_fn)
+            conn = Sockets.connect(Sockets.localhost, port)
+            Sockets.nagle(conn, false)
+            Sockets.quickack(conn, true)
+            write(conn, cookie)
+            (conn, ts)
+        end
+        sock = s
+        worker = Worker(ReentrantLock(), ReentrantLock(), IOBuffer(; sizehint = 1024), Int(pid), proc, s,
+                        Base.Event(), Task(nothing), Task(nothing), Task(nothing),
+                        Dict{UInt64,Future}(), UInt64(0), false, false, :none, job, on_exit)
+        w = worker
+        # Shielded: these watch the worker until it has gone, which on Ctrl-C is
+        # what the caller's teardown waits for.
+        shielded() do
+            worker.process_watch = Threads.@spawn watch_and_terminate!(worker)
+            worker.output = Threads.@spawn redirect_worker_output(redirect_io, worker, redirect_fn, proc, on_output_done)
+            worker.messages = Threads.@spawn process_responses(worker)
+        end
+        now_t = time()
+        ready = (isfinite(ready_ts) && ready_ts > 0.0) ? clamp(ready_ts, wp.began, now_t) : now_t
+        return worker, ready
+    catch
+        sock_c = sock
+        w_c = w
+        shielded() do
+            try
+                signal!(pid, proc, Base.SIGKILL)
+            catch
+            end
+            sock_c !== nothing && close(sock_c)
+            # The job and the worker's stdin are the worker's to end once it exists; until
+            # then, they are here. Reap `proc` so an interrupted connect leaves no live pid.
+            if w_c !== nothing
+                terminate!(w_c, :start_failed)
+                end_group!(w_c)
+                wait(w_c)
+            else
+                try
+                    wait_exit(proc, KILL_WAIT_SECONDS)
+                catch
+                end
+                untrack!(proc)
+                end_job!(job)
+                close_input(proc)
+            end
+        end
+        rethrow()
+    end
+end
+
 """
     Worker(; julia_args, threads, env, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit, on_output_done)
 
@@ -752,74 +906,12 @@ function Worker(;
         on_exit=nothing,
         on_output_done=nothing,
     )
-    env = Dict{String,String}(env)
-    for (k, v) in extra_env
-        env[k] = v
-    end
-    haskey(env, "JULIA_LOAD_PATH") || (env["JULIA_LOAD_PATH"] = join(LOAD_PATH, PATHSEP))
-    haskey(env, "JULIA_DEPOT_PATH") || (env["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, PATHSEP))
-    project === nothing || haskey(env, "JULIA_PROJECT") || (env["JULIA_PROJECT"] = project)
-    # Every worker would otherwise start a BLAS thread pool sized for the whole machine.
-    haskey(env, "OPENBLAS_NUM_THREADS") || (env["OPENBLAS_NUM_THREADS"] = "1")
-    color = get(redirect_io, :color, false) ? "yes" : "no"
-    # A worker runs the suite's code and nothing else: no startup file, because a
-    # developer's own is not part of the tests, and no history file, because a
-    # worker has no REPL to record.
-    cmd = `$(Base.julia_cmd()) --threads=$threads --startup-file=no --history-file=no
-           --color=$color $julia_args -e $(worker_startup_code(connect_timeout))`
-    proc = track!(open(detach(setenv(addenv(cmd, env), dir=dir)), "r+"))
-    # A process that fails at startup can be gone already, and a process that has
-    # exited has no pid to give; `read_port` below then says how it ended.
-    pid = try
-        getpid(proc)
-    catch e
-        # Interrupted here, the process would be left waiting for a cookie.
-        is_interrupt(e) && (kill(proc, Base.SIGKILL); untrack!(proc); rethrow())
-        Int32(0)
-    end
-    job = worker_job(pid)
-    cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
-    local sock, w
-    try
-        # The cookie is the only thing the worker ever reads from its stdin. The pipe
-        # stays open while the worker runs: its end-of-file is how the worker learns
-        # that this process is gone (see `watch_coordinator`).
-        try
-            println(proc, cookie)
-        catch e
-            e isa Base.IOError || rethrow()   # the process is already gone; `read_port` reports that
-        end
-        sock = with_timeout(connect_timeout) do
-            port = read_port(proc, redirect_io, pid, redirect_fn)
-            s = Sockets.connect(Sockets.localhost, port)
-            Sockets.nagle(s, false)
-            Sockets.quickack(s, true)
-            write(s, cookie)
-            s
-        end
-        w = Worker(ReentrantLock(), ReentrantLock(), IOBuffer(; sizehint = 1024), pid, proc, sock,
-                   Base.Event(), Task(nothing), Task(nothing), Task(nothing),
-                   Dict{UInt64,Future}(), UInt64(0), false, false, :none, job, on_exit)
-        # Shielded: these watch the worker until it has gone, which on Ctrl-C is
-        # what the caller's teardown waits for.
-        shielded() do
-            w.process_watch = Threads.@spawn watch_and_terminate!(w)
-            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, on_output_done)
-            w.messages = Threads.@spawn process_responses(w)
-        end
-        return w
-    catch
-        try
-            signal!(pid, proc, Base.SIGKILL)
-        catch
-        end
-        untrack!(proc)
-        @isdefined(sock) && close(sock)
-        # The job and the worker's stdin are the worker's to end once it exists; until
-        # then, they are here.
-        @isdefined(w) ? (terminate!(w, :start_failed); end_group!(w)) : (end_job!(job); close_input(proc))
-        rethrow()
-    end
+    wp = spawn_worker_process(;
+        julia_args, threads, env, extra_env, dir, project, connect_timeout,
+        color = get(redirect_io, :color, false),
+    )
+    w, _ = connect_worker(wp; connect_timeout, redirect_io, redirect_fn, on_exit, on_output_done)
+    return w
 end
 
 # The worker's stdin, closed once the worker has ended. A watch still in its group
@@ -833,14 +925,19 @@ function close_input(proc::Base.Process)
     return nothing
 end
 
-# The worker announces the port it listens on; anything it prints before that is
-# relayed like any other output. `eof` blocks until there is a line or the pipe is
-# closed, so a worker that dies before it is ready is reported at once.
+# The worker announces the port it listens on (and optionally the Unix timestamp when it
+# became ready); anything it prints before that is relayed like any other output. `eof`
+# blocks until there is a line or the pipe is closed, so a worker that dies before it is
+# ready is reported at once.
 function read_port(proc::Base.Process, io::IO, pid::Integer, fn)
     while !eof(proc)
         line = readline(proc)
-        m = match(r"runtestsworker:(\d+)", line)
-        m === nothing || return parse(Int, m.captures[1])
+        m = match(r"runtestsworker:(\d+)(?:\s+([0-9.eE+-]+))?", line)
+        if m !== nothing
+            port = parse(Int, m.captures[1])
+            ts = m.captures[2] === nothing ? 0.0 : something(tryparse(Float64, m.captures[2]), 0.0)
+            return port, ts
+        end
         isempty(line) || (fn(io, pid, line); flush(io))
     end
     wait(proc)
@@ -1088,7 +1185,7 @@ function startworker(connect_timeout::Real)
     install_inspection_hook()
     quiet_temp_cleanup_at_exit()
     port, server = listenany(Sockets.localhost, UInt16(rand(10000:50000)))
-    println(stdout, "runtestsworker:", port)
+    println(stdout, "runtestsworker:", port, " ", time())
     flush(stdout)
     # A coordinator that dies between spawning this process and connecting to it
     # would otherwise leave it waiting forever.

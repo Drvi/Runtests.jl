@@ -154,14 +154,6 @@ struct AttemptOutcome
     n::Int
 end
 
-# A worker process started in the background during environment setup/precompilation,
-# ready to be claimed by its slot and switched to the resolved test environment via
-# `remote_activate` before `init` or any item runs.
-struct PreSpawn
-    task::Task
-    began::Float64
-end
-
 mutable struct Run
     const plan::Plan
     const queues::Queues
@@ -224,8 +216,8 @@ mutable struct Run
     const tasks::Vector{Task}
     # Workers `kill_workers!` took from their slots, for `shutdown!` to wait for.
     const killed::Vector{RuntestsWorkers.Worker}
-    # Per-slot pre-spawned worker tasks started before `with_run_env` (claimed once).
-    const prespawned::Vector{Union{Nothing, PreSpawn}}
+    # Per-slot pre-spawned worker processes started before `with_run_env` (claimed once).
+    const prespawned::Vector{Union{Nothing, RuntestsWorkers.WorkerProcess}}
     # Guards `tasks`, `killed`, `prespawned`, `item_pids` and `evidence`, which other tasks use as well.
     const lock::ReentrantLock
     # Every process an attempt ran in: under coverage, each should leave a tracefile.
@@ -377,7 +369,7 @@ function execute_here(p::Plan, target, on_event)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, logprefixes,
         artifacts_prefixes, local_item, String[], skipped_profiles, package_width, column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
-        RuntestsWorkers.Worker[], Vector{Union{Nothing, PreSpawn}}(nothing, nslots(p)), ReentrantLock(),
+        RuntestsWorkers.Worker[], Vector{Union{Nothing, RuntestsWorkers.WorkerProcess}}(nothing, nslots(p)), ReentrantLock(),
         Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event, ReentrantLock(), Threads.threadid()
     )
     run.events === nothing || (run.events.run = run)
@@ -421,9 +413,10 @@ function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
         # thread: the task shares nothing with the run.
         worktree = Threads.@spawn worktree_state(p.root)
         # Overlap worker process startup with test environment resolution and precompilation
-        # when Runtests itself is already precompiled in this depot.
-        prespawn_workers!(run, p)
+        # when Runtests itself is already precompiled in this depot. Inside `try` so an
+        # interrupt mid-spawn still reaps every already-launched process in `finally`.
         try
+            prespawn_workers!(run, p)
             with_run_env(target, run) do
                 # Before the run state: an environment directory that does not resolve
                 # stops the run before anything has run to record.
@@ -1077,11 +1070,17 @@ function ensure_worker!(run::Run, slot::Slot, exclusive::Bool)
 end
 
 const WORKER_START_RETRIES = 2
+# Generous connect timeout for pre-spawned workers so long cold precompilation phases
+# do not expire them before `run_on_workers` claims them (`watch_coordinator` / Windows
+# JobObject still terminate them immediately if the coordinator exits).
+const PRESPAWN_CONNECT_TIMEOUT = 600
 
-# Spawn eligible slots' worker processes before `with_run_env` and `precompile_phase`
-# so Julia boot + `Runtests` load overlaps with environment setup. Workers start in the
-# coordinator's own active project/load path (which already has a fresh `Runtests` cache)
-# and are switched to their resolved test environment via `remote_activate` once claimed.
+# Spawn eligible slots' OS worker processes synchronously on the coordinator thread
+# *before* `with_run_env` and `precompile_phase` so Julia boot + `Runtests` load happens
+# in the kernel during environment setup — with zero background tasks racing against
+# `withenv` / `Base.require(Pkg)`. Once setup finishes, `start_worker` connects to the
+# already-ready pipe/socket and switches the worker to its resolved test environment via
+# `remote_activate`.
 function prespawn_workers!(run::Run, p::Plan)
     (single_process(p) || isempty(run.slots)) && return nothing
     # If `Runtests` has no fresh cache in the current depot (e.g. a fresh temp depot),
@@ -1097,6 +1096,7 @@ function prespawn_workers!(run::Run, p::Plan)
     # Strip any caller `JULIA_PROJECT`/`JULIA_LOAD_PATH` so the worker boots with the
     # coordinator's actual project and load path, not a stale environment variable.
     boot_env = Dict{String, String}(k => v for (k, v) in ENV if k != "JULIA_PROJECT" && k != "JULIA_LOAD_PATH")
+    color = get(stdout, :color, false)
     for slot in run.slots
         run.skipped_profiles[slot.profile] && continue
         !isempty(p.replay_slots) && isempty(p.replay_slots[slot.id]) && continue
@@ -1104,72 +1104,55 @@ function prespawn_workers!(run::Run, p::Plan)
         # Workers with custom julia flags or coverage may need `precompile_phase` to
         # build a matching cache of `Runtests` first; start them after precompilation.
         isempty(worker_julia_args(run, prof)) || continue
-        began = time()
         extra = Pair{String, String}[
             "RUNTESTS_RUN_ID" => run.runid,
             "RUNTESTS_WORKER" => string(slot.id),
             "JULIA_LOAD_PATH" => boot_load_path,
         ]
         append!(extra, prof.env)
-        dir = worker_dir(p, slot.profile)
-        relay_state = RelayState()
-        s = slot
-        t = shielded() do
-            Threads.@spawn begin
-                w = RuntestsWorkers.Worker(;
-                    julia_args = String[],
-                    threads = prof.threads,
-                    env = boot_env,
-                    extra_env = extra,
-                    dir = dir,
-                    project = boot_project,
-                    redirect_io = stdout,
-                    redirect_fn = (io, pid, line) -> relay!(run, s, relay_state, line),
-                    on_exit = w -> worker_ended!(run, s.id, w),
-                    on_output_done = () -> close_relay_log!(relay_state),
-                )
-                (w, time())
-            end
+        wp = try
+            RuntestsWorkers.spawn_worker_process(;
+                julia_args = String[],
+                threads = prof.threads,
+                env = boot_env,
+                extra_env = extra,
+                dir = worker_dir(p, slot.profile),
+                project = boot_project,
+                connect_timeout = PRESPAWN_CONNECT_TIMEOUT,
+                color,
+            )
+        catch e
+            is_interrupt(e) && rethrow()
+            nothing
         end
-        @lock run.lock (run.prespawned[slot.id] = PreSpawn(t, began))
+        wp === nothing || @lock run.lock (run.prespawned[slot.id] = wp)
     end
     return nothing
 end
 
 function claim_prespawned!(run::Run, slot_id::SlotIdx)
     return @lock run.lock begin
-        ps = run.prespawned[slot_id]
+        wp = run.prespawned[slot_id]
         run.prespawned[slot_id] = nothing
-        ps
+        wp
     end
 end
 
 function close_prespawned!(run::Run)
     pending = @lock run.lock begin
-        out = PreSpawn[]
+        out = RuntestsWorkers.WorkerProcess[]
         for i in eachindex(run.prespawned)
-            ps = run.prespawned[i]
-            if ps !== nothing
+            wp = run.prespawned[i]
+            if wp !== nothing
                 run.prespawned[i] = nothing
-                push!(out, ps)
+                push!(out, wp)
             end
         end
         out
     end
     isempty(pending) && return nothing
-    for ps in pending
-        w = try
-            first(fetch(ps.task))
-        catch
-            nothing
-        end
-        if w isa RuntestsWorkers.Worker
-            try
-                RuntestsWorkers.kill!(w)
-                wait(w)
-            catch
-            end
-        end
+    for wp in pending
+        RuntestsWorkers.abort_worker_process!(wp)
     end
     return nothing
 end
@@ -1182,26 +1165,30 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
         ready = began
         w = nothing
         from_prespawn = false
+        relay_state = RelayState()
         if attempt == 1
-            ps = claim_prespawned!(run, slot.id)
-            if ps !== nothing
+            wp = claim_prespawned!(run, slot.id)
+            if wp !== nothing
                 try
-                    pw, pready = fetch(ps.task)
-                    if !pw.terminated
-                        w = pw
-                        began = ps.began
-                        ready = pready
-                        from_prespawn = true
-                    end
+                    w, ready = RuntestsWorkers.connect_worker(
+                        wp;
+                        redirect_io = stdout,
+                        redirect_fn = (io, pid, line) -> relay!(run, slot, relay_state, line),
+                        on_exit = w -> worker_ended!(run, slot.id, w),
+                        on_output_done = () -> close_relay_log!(relay_state),
+                    )
+                    began = wp.began
+                    from_prespawn = true
                 catch e
                     is_interrupt(e) && rethrow()
-                    # Pre-spawn failed; fall through to a normal start attempt below.
+                    # Pre-spawn failed or exited during a very long setup; fall through
+                    # to a normal start attempt below.
+                    relay_state = RelayState()
                 end
             end
         end
         if w === nothing
             began = time()
-            relay_state = RelayState()
             w = try
                 RuntestsWorkers.Worker(;
                     julia_args = worker_julia_args(run, prof),
@@ -1255,9 +1242,15 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
             return w
         catch e
             # The process is up; it is activation or the `init` expression that failed or hung.
+            if is_interrupt(e)
+                shielded() do
+                    RuntestsWorkers.kill!(w)
+                    wait(w)
+                end
+                rethrow()
+            end
             RuntestsWorkers.terminate!(w, :init_failed)
             wait(w)
-            is_interrupt(e) && rethrow()
             if e isa RuntestsWorkers.RemoteException || e isa TimeoutException
                 # The expression itself is at fault: another process would only
                 # fail the same way. A timeout already names the expression it
@@ -1675,6 +1668,7 @@ across a pool, a long time to hold a terminal someone has asked for back. Nothin
 is reported for what they were running. `shutdown!` waits for them to be gone.
 """
 function kill_workers!(run::Run, why::AbstractString = "interrupted")
+    close_prespawned!(run)
     live = 0
     for slot in run.slots
         w = slot.worker

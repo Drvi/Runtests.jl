@@ -184,7 +184,7 @@ function run_states(pkg; kwargs...)
             states = Dict(p.items.name[i] => run.statuses.state[i] for i in 1:nitems(p))
             return states, run, p
         finally
-            rm(run.scratch; force=true, recursive=true)
+            isempty(run.scratch) || rm(run.scratch; force=true, recursive=true)
         end
     end
 end

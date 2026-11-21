@@ -472,13 +472,44 @@ end
             @test read(joinpath(dir, "producer_1", "b.txt"), String) == "b"
             @test PENDING_ARTIFACTS[] === nothing
             @test_throws ErrorException finish_artifacts(1, 1, true)
-            # Producers left waiting go when the process runs its next item.
+            # A passing item releases its producers immediately rather than keeping them in worker state.
             run_item(spec(quote
                 $(Runtests).on_failure(d -> touch(joinpath(d, "never")))
+            end))
+            @test PENDING_ARTIFACTS[] === nothing
+            # Producers of an uncollected failing item go when the process runs its next item.
+            run_item(spec(quote
+                $(Runtests).on_failure(d -> touch(joinpath(d, "never")))
+                @test false
             end))
             @test PENDING_ARTIFACTS[] !== nothing
             run_item(spec(quote @test true end))
             @test PENDING_ARTIFACTS[] === nothing
+        end
+
+        @testset "a failed reply that cannot be deserialized still collects on_failure producers" begin
+            unser = make_pkg("UnserializableArtifacts", "test/u_tests.jl" => raw"""
+                @testitem "unserializable failure with producer" begin
+                    Main.Runtests.on_failure(d -> write(joinpath(d, "recovered.txt"), "from_live_worker"))
+                    struct LocalUnserializableError <: Exception
+                        x::Int
+                    end
+                    throw(LocalUnserializableError(42))
+                end
+                @testitem "follows on same worker" begin
+                    @test true
+                end
+                """)
+            (states, run, p), _ = capture_run(() -> run_states(unser; workers = 1, logs = :issues, monitor = false))
+            @test states["unserializable failure with producer"] === ERRORED
+            @test states["follows on same worker"] === PASSED
+            idx1 = findfirst(==("unserializable failure with producer"), p.items.name)
+            idx2 = findfirst(==("follows on same worker"), p.items.name)
+            # Worker stayed alive and ran the next item in the same process.
+            @test run.statuses.pid[idx1] == run.statuses.pid[idx2]
+            artdir = Runtests.Private.attempt_artifacts(run, idx1, 1)
+            @test isfile(joinpath(artdir, "producer_1", "recovered.txt"))
+            @test read(joinpath(artdir, "producer_1", "recovered.txt"), String) == "from_live_worker"
         end
 
         @testset "a directory that cannot be made fails the call that asks for it" begin

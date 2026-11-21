@@ -3,7 +3,6 @@ AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
-LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
@@ -18,9 +17,4 @@ AllocCheck = "0.2"
 Aqua = "0.8"
 Debugger = "0.7, 0.9"
 JET = "0.9, 0.12, 0.13"
-# A dependency only through AllocCheck, held below 10.5: LLVM 10.5.0 calls
-# `LLVMExtraTypeIsScalable`, which LLVMExtra_jll 0.0.56, the version it requires, does
-# not have for the LLVM of Julia 1.12 and 1.13. GPUCompiler, and so AllocCheck, do not
-# precompile there.
-LLVM = "10.0 - 10.4"
 TOML = "1"

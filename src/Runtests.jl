@@ -163,7 +163,7 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
         try
             return RunTestSet(report(run))
         finally
-            rm(run.scratch; force = true, recursive = true)
+            isempty(run.scratch) || rm(run.scratch; force = true, recursive = true)
         end
     end
 end
@@ -444,7 +444,7 @@ function runtests_mono(args...; packages = nothing, name = nothing, tags = nothi
         try
             return RunTestSet(report(run))
         finally
-            rm(run.scratch; force = true, recursive = true)
+            isempty(run.scratch) || rm(run.scratch; force = true, recursive = true)
         end
     end
 end
@@ -744,6 +744,9 @@ function describe(f::Filter, t::Target)
     return isempty(parts) ? "the filter" : join(parts, " and ")
 end
 
+include("dispatch.jl")
+include("logs.jl")
+
 using PrecompileTools: @setup_workload, @compile_workload
 
 # The paths a run takes that the workload below cannot take for it: starting a
@@ -856,12 +859,13 @@ end
 end # module Private
 
 using Test
-using .Private: @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_mono, runtestsd_mono, chores_mono, activate_mono, current_testitem,
+using .Private: @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_dispatch, logs,
+    runtests_mono, runtestsd_mono, chores_mono, activate_mono, current_testitem,
     serve_mono,
     on_failure, artifacts_dir, activate, deactivate, is_activated, debug, setups_to_packages, chores, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 
-export @testitem, @testtemplate, runtests, runtestsd, runtestsf, chores, runtests_mono, runtestsd_mono, chores_mono
+export @testitem, @testtemplate, runtests, runtestsd, runtestsf, runtests_dispatch, chores, runtests_mono, runtestsd_mono, chores_mono
 
 # Re-exported, so `using Runtests` alone gives a script or the REPL `@test`, `@testset`
 # and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test
@@ -871,7 +875,7 @@ for name in names(Test)
     startswith(string(name), "@") && @eval export $name
 end
 
-public activate_mono, serve_mono, current_testitem, on_failure, artifacts_dir,
+public activate_mono, serve_mono, current_testitem, on_failure, artifacts_dir, logs,
     activate, deactivate, is_activated, debug, setups_to_packages, serve,
     ConfigError, ChoresError, NoTestsError, ScanFailure, RunTestSet, read_run_state, TestItemEvent
 

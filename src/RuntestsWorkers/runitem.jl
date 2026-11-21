@@ -342,7 +342,15 @@ function _run_item(spec::ItemSpec, enter=nothing)
     end
     state = finalize_testset!(ts, !spec.full_stacktraces)
     flags = artifact_flags(artifacts)
-    flags & ARTIFACT_PRODUCERS == 0 || (PENDING_ARTIFACTS[] = artifacts)
+    if flags & ARTIFACT_PRODUCERS != 0
+        if state === PASSED
+            # The verdict is final (`test_end` never changes it): release producer
+            # closures and item globals immediately rather than holding them in worker state.
+            release_artifacts!(artifacts)
+        else
+            PENDING_ARTIFACTS[] = artifacts
+        end
+    end
     return ItemResult(spec.index, state, ts, stats, flags)
 end
 

@@ -1166,4 +1166,68 @@ end
         @test occursin(Runtests.Private.MARK_INFO, after_outside)
         @test !occursin(Runtests.Private.MARK_INFO, after_inside)
     end
+
+    @testset "off-TTY cadence skips clock lines within 5s but fires immediately on memory or CPU thresholds" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.scratch; force=true, recursive=true)
+        Sample = Runtests.Private.Sample
+        PHASE_TEST = Runtests.Private.PHASE_TEST
+        maybe_print = Runtests.Private.maybe_print
+        nthreads = Float32(Runtests.Private.Platform.cpu_count())
+
+        _, out = capture_run() do
+            with(Runtests.Private.TTY_OVERRIDE => false) do
+                m = Monitor(run; print_interval = 30.0)
+                now = time()
+                m.last_phase_printed = PHASE_TEST
+                m.last_sample = Sample(1.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(50), Int64(100), 0.1f0, -1.0f0)
+                # Simulate a progress status line 2 seconds ago and a 30s clock tick due right now:
+                # clock tick should be skipped, while `next_print` still advances by 30s.
+                m.last_print = now - 2.0
+                m.next_print = now - 0.1
+                m.done_reported = 0
+                maybe_print(m)
+                @test m.next_print >= now + 29.0
+                @test m.last_print ≈ now - 2.0
+
+                # Crossing a memory pressure threshold (90%) fires immediately even 2s after last_print.
+                m.last_sample = Sample(2.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(92), Int64(100), 0.1f0, -1.0f0)
+                maybe_print(m)
+                @test m.last_print >= now
+                t_mem = m.last_print
+
+                # Hovering / dancing across 90% within the 30s cooldown stays quiet.
+                m.last_sample = Sample(3.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(89), Int64(100), 0.1f0, -1.0f0)
+                maybe_print(m)
+                m.last_sample = Sample(4.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(91), Int64(100), 0.1f0, -1.0f0)
+                maybe_print(m)
+                @test m.last_print == t_mem
+
+                # Crossing CPU >= 100% fires immediately even within 5s of last_print.
+                m.last_print = time() - 1.0
+                t_before_cpu = m.last_print
+                m.last_sample = Sample(5.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(91), Int64(100), nthreads * 1.1f0, -1.0f0)
+                maybe_print(m)
+                @test m.last_print > t_before_cpu
+                t_cpu = m.last_print
+
+                # Dancing across CPU 100% within the 30s cooldown stays quiet.
+                m.last_sample = Sample(6.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(91), Int64(100), nthreads * 0.5f0, -1.0f0)
+                maybe_print(m)
+                m.last_sample = Sample(7.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(91), Int64(100), nthreads * 1.2f0, -1.0f0)
+                maybe_print(m)
+                @test m.last_print == t_cpu
+            end
+        end
+        info_lines = filter(l -> startswith(l, Runtests.Private.MARK_INFO * " "), collect(eachsplit(out, '\n')))
+        @test length(info_lines) == 2
+    end
 end

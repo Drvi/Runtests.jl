@@ -324,13 +324,25 @@ function execute_here(p::Plan, target, on_event)
     warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
-    scratch = mktempdir(; prefix = "runtests_")
-    names, column = item_names(p, run_name_width(p))
-    # A package's logs go in a directory of their own until its run state is open.
     npkg = length(p.packages)
-    logdirs = npkg == 1 ? [scratch] : [mkpath(joinpath(scratch, string(k))) for k in 1:npkg]
-    evidence = joinpath(tempdir(), string("runtests_artifacts_", runid))
-    artifacts_prefixes = npkg == 1 ? [joinpath(evidence, "item_")] : [joinpath(evidence, string(k), "item_") for k in 1:npkg]
+    scratch, logdirs, logprefixes, artifacts_prefixes = try
+        dir = mktempdir(; prefix = "runtests_")
+        dirs = npkg == 1 ? [dir] : [mkpath(joinpath(dir, string(k))) for k in 1:npkg]
+        prefixes = [joinpath(d, "item_") for d in dirs]
+        evidence = joinpath(tempdir(), string("runtests_artifacts_", runid))
+        art = npkg == 1 ? [joinpath(evidence, "item_")] : [joinpath(evidence, string(k), "item_") for k in 1:npkg]
+        dir, dirs, prefixes, art
+    catch e
+        is_interrupt(e) && rethrow()
+        @warn string(
+            "Runtests: could not create temporary directory for logs; falling back to `logs = :eager`",
+            cfg.coverage ? " and disabling coverage" : ""
+        ) exception = e
+        cfg = with_config(cfg; logs = :eager, coverage = false)
+        p = with_plan_cfg(p, cfg)
+        "", fill("", npkg), fill("", npkg), fill("", npkg)
+    end
+    names, column = item_names(p, run_name_width(p))
     local_item = zeros(ItemIdx, nitems(p))
     seen = zeros(Int, npkg)
     for i in 1:nitems(p)
@@ -349,7 +361,7 @@ function execute_here(p::Plan, target, on_event)
     # As its first `@async` would: the run's tasks share this thread from here.
     current_task().sticky = true
     run = Run(
-        p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, [joinpath(d, "item_") for d in logdirs],
+        p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, logprefixes,
         artifacts_prefixes, local_item, String[], skipped_profiles, package_width, column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], ReentrantLock(), Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event,
@@ -583,6 +595,7 @@ function keep_logs_by_runstate!(run::Run)
     # Only for a caller that gave `on_event`: a run without one leaves no empty directory.
     if (@atomic run.on_event) !== nothing
         for k in eachindex(run.logdirs)
+            isempty(run.logdirs[k]) && continue
             try
                 mkpath(events_dir(run, k))
             catch e
@@ -597,6 +610,7 @@ end
 # `text` as `name` in each package's log directory; never a reason to fail the run.
 function write_run_log(run::Run, name::AbstractString, text::AbstractString)
     for dir in run.logdirs
+        isempty(dir) && continue
         try
             write(joinpath(dir, name), text)
         catch e
@@ -607,17 +621,24 @@ function write_run_log(run::Run, name::AbstractString, text::AbstractString)
 end
 
 # Where attempt `attempt` at item `i` writes what it prints, and its failure report:
-# with its package's logs, by its index in its package's run state.
-item_log(run::Run, i::Integer, attempt::Integer) =
-    item_log_path(run.logprefixes[run.plan.items.package[i]], run.local_item[i], attempt)
-failure_log(run::Run, i::Integer, attempt::Integer) =
-    failure_path(run.logprefixes[run.plan.items.package[i]], run.local_item[i], attempt)
+# with its package's logs, by its index in its package's run state. Empty when no log
+# directory could be made.
+function item_log(run::Run, i::Integer, attempt::Integer)
+    prefix = run.logprefixes[run.plan.items.package[i]]
+    return isempty(prefix) ? "" : item_log_path(prefix, run.local_item[i], attempt)
+end
+function failure_log(run::Run, i::Integer, attempt::Integer)
+    prefix = run.logprefixes[run.plan.items.package[i]]
+    return isempty(prefix) ? "" : failure_path(prefix, run.local_item[i], attempt)
+end
 
 # Whether a plan is a run of several packages, each with a run state of its own:
 # packages other than the one at its root.
 is_combined(p::Plan) = length(p.packages) > 1 || p.packages.root[1] != p.root
 
 function write_failure_report(run::Run, i::ItemIdx, attempt::Integer, testset)
+    path = failure_log(run, i, attempt)
+    isempty(path) && return nothing
     failures = collect_failures(testset)
     isempty(failures) && return nothing
     text = sprint() do io
@@ -627,7 +648,7 @@ function write_failure_report(run::Run, i::ItemIdx, attempt::Integer, testset)
         end
     end
     try
-        write(failure_log(run, i, attempt), strip_root(text, run.plan.root))
+        write(path, strip_root(text, run.plan.root))
     catch e
         is_interrupt(e) && rethrow()
     end
@@ -671,8 +692,11 @@ end
 function tidy_logs(run::Run)
     for k in eachindex(run.logdirs)
         logdir, prefix, evidence = run.logdirs[k], run.logprefixes[k], run.artifacts_prefixes[k]
-        evidence == abspath(prefix) || remove_if_empty(dirname(evidence))
-        startswith(logdir, run.scratch) && continue
+        if !isempty(evidence)
+            (isempty(prefix) || evidence != abspath(prefix)) && remove_if_empty(dirname(evidence))
+        end
+        isempty(logdir) && continue
+        !isempty(run.scratch) && startswith(logdir, run.scratch) && continue
         try
             for f in readdir(logdir; join = true)
                 isfile(f) && filesize(f) == 0 && rm(f; force = true)
@@ -1357,11 +1381,34 @@ end
 
 # Shared worker teardown after a failed remote RPC (item dispatch, `test_end`, or
 # artifact collection). Returns `:timeout`, `:died`, or `:alive` (worker still usable).
+# Distinguish a blocked/deadlocked worker from one actively computing at the moment of
+# a timeout. Samples CPU time over a short window before `inspect!` signals the worker;
+# returns "" if the OS does not expose per-process CPU time.
+const TIMEOUT_CPU_PROBE_S = 0.15
+
+function worker_activity_note(pid::Integer; probe_s::Float64 = TIMEOUT_CPU_PROBE_S)
+    c0 = Platform.tree_cpu_time(pid)
+    c0 < 0 && return ""
+    t0 = time()
+    sleep(probe_s)
+    t1 = time()
+    c1 = Platform.tree_cpu_time(pid)
+    (c1 < 0 || t1 <= t0) && return ""
+    ratio = max(0.0, c1 - c0) / (t1 - t0)
+    return ratio < 0.05 ?
+        "worker was idle (likely blocked or deadlocked)" :
+        string("worker was active (", round(Int, 100 * ratio), "% CPU; slow or looping)")
+end
+
 function resolve_worker_failure!(run::Run, slot::Slot, w::Union{Nothing, RuntestsWorkers.Worker}, e,
-                                 dying_log::String; is_worker::Bool = w !== nothing)
+                                 dying_log::String; is_worker::Bool = w !== nothing,
+                                 activity_out::Union{Nothing, Base.RefValue{String}} = nothing)
     if e isa TimeoutException
         if w !== nothing
-            print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
+            activity = worker_activity_note(w.pid)
+            activity_out === nothing || (activity_out[] = activity)
+            note = isempty(activity) ? "" : string(" · ", activity)
+            print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e), note))
             RuntestsWorkers.inspect!(w)
             @atomic slot.dying_log = dying_log
             RuntestsWorkers.terminate!(w, :timeout)
@@ -1822,19 +1869,21 @@ end
 function say_test_end(run::Run, slot_id, i::ItemIdx, attempt::Int8, cause::AbstractString, detail::AbstractString)
     prof = item_profile(run.plan, i)
     log = item_log(run, i, attempt)
-    try
-        mkpath(dirname(log))
-        open(log, "a") do io
-            println(io, "test_end of profile `", prof.name, "`: ", cause)
-            isempty(detail) || println(io, detail)
+    if !isempty(log)
+        try
+            mkpath(dirname(log))
+            open(log, "a") do io
+                println(io, "test_end of profile `", prof.name, "`: ", cause)
+                isempty(detail) || println(io, detail)
+            end
+        catch e
+            is_interrupt(e) && rethrow()
+            @warn "Runtests: could not write what the `test_end` of profile `$(prof.name)` said to $(log)" exception = e
         end
-    catch e
-        is_interrupt(e) && rethrow()
-        @warn "Runtests: could not write what the `test_end` of profile `$(prof.name)` said to $(log)" exception = e
     end
     print_worker_line(run, slot_id, "HOOK", string(
         "test_end of profile `", prof.name, "` after ", repr(run.plan.items.name[i]),
-        attempt > 1 ? string(" (attempt ", attempt, ")") : "", " · ", cause, isempty(detail) ? "" : " · in its log"))
+        attempt > 1 ? string(" (attempt ", attempt, ")") : "", " · ", cause, isempty(detail) || isempty(log) ? "" : " · in its log"))
     return nothing
 end
 
@@ -1879,23 +1928,30 @@ function handle_dispatch_failure!(
     tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, i, attempt, w.pid)
     peak_rss = tree > 0 ? tree : nothing
     ended = time()   # the item held its worker until here; inspecting/reaping is ours
-    outcome = resolve_worker_failure!(run, slot, w, e, item_log(run, i, attempt); is_worker = true)
+    activity = Ref("")
+    outcome = resolve_worker_failure!(run, slot, w, e, item_log(run, i, attempt); is_worker = true, activity_out = activity)
     if outcome === :timeout
         stopped_meanwhile(slot) && return false
         artifacts = evidence_after_loss!(run, i, attempt, sprint(showerror, e))
+        act_note = isempty(activity[]) ? "" : string(" · ", activity[])
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
-            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker")),
+            string(sprint(showerror, e), act_note, " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues), "on a new worker")),
             start_off, pid, seq; ended, artifacts, peak_rss
         )
         return false
     elseif outcome === :alive
         # The request failed but the process is fine: a result that would not
         # serialize, a `skip` expression that threw. The worker keeps everything
-        # it has compiled, and the item is an ordinary error.
-        artifacts = evidence_after_loss!(run, i, attempt, "its result could not be read")
-        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e), start_off, pid, seq; artifacts, peak_rss)
-        return true
+        # it has compiled, and the item is an ordinary error. If the attempt
+        # registered `on_failure` producers before its reply was lost, run them now.
+        dir = attempt_artifacts(run, i, attempt)
+        flags = isempty(dir) ? 0x00 :
+            ((isdir(dir) ? ARTIFACT_FILES : 0x00) | (isfile(artifacts_log_path(dir)) ? ARTIFACT_PRODUCERS : 0x00))
+        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e), start_off, pid, seq; artifacts = flags, peak_rss)
+        release_item!(slot)
+        flags == 0 && return true
+        return collect_failed_evidence!(run, slot, i, attempt, flags, w)
     end
     # Whatever took the worker recorded the item already (`record_stopped_item!`).
     stopped_meanwhile(slot) && return false
@@ -1984,11 +2040,13 @@ end
 # Why attempt `attempt` at item `i` was skipped, in its log: the run's `note`, as for an
 # environment the run skips, or else the item's own `skip`.
 function note_skip(run::Run, i::ItemIdx, attempt::Int8, note::AbstractString)
+    log = item_log(run, i, attempt)
+    isempty(log) && return nothing
     skip = run.plan.items.skip[i]
     why = !isempty(note) ? note : skip === true ? "`skip = true`" :
         string("its `skip` expression, `", skip isa Expr ? expr_text(skip) : string(skip), "`, was true")
     try
-        open(io -> println(io, "skipped: ", why), item_log(run, i, attempt), "a")
+        open(io -> println(io, "skipped: ", why), log, "a")
     catch e
         is_interrupt(e) && rethrow()
     end

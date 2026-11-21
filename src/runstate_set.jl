@@ -37,7 +37,7 @@ function package_plan(p::Plan, k::Integer)
     return Plan(
         items, abs_files, relfiles,
         p.profiles[js], ones(Int32, length(js)), Pool[], Int32[], UnitRange{ItemIdx}[], Int32[], p.gate_limit, p.cold,
-        sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[], nothing
+        sort!(unique!(copy(setups))), cfg, packages, root, p.startup, p.selection, p.packages.suite_names[k], String[], nothing, Vector{ItemIdx}[]
     )
 end
 

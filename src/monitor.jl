@@ -200,6 +200,8 @@ mutable struct Monitor
     done_reported::Int       # the items finished at the last report
     last_mem_pct::Float64    # the machine's memory at the previous check
     const mark_said::Vector{Float64}   # when each of MEMORY_MARKS last reported
+    last_cpu_pct::Float64    # the machine's CPU use (%) at the previous check
+    cpu_mark_said::Float64   # when CPU >= 100% last triggered a status line
     last_phase_printed::RunPhase
     over_since::Float64      # when machine pressure first crossed the threshold
     last_gc::Float64
@@ -258,7 +260,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
         zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n),
         Int32[], Dict{Int32, Int64}(), Dict{Int32, Int64}(),
         linebuf, IOContext(linebuf, :color => color), color, 0, 0.0, 0.0, 0, 0.0,
-        zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
+        zeros(Float64, length(MEMORY_MARKS)), 0.0, 0.0, PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
     )
 end
 
@@ -858,6 +860,26 @@ end
 const PROGRESS_ITEMS = 10
 const PROGRESS_GAP_S = 5.0
 
+# Machine CPU saturation (>= 100% of machine threads): triggers an immediate status
+# line regardless of `PROGRESS_GAP_S`, with a cooldown so dancing on the boundary
+# does not spam.
+const CPU_MARK = 100.0
+const CPU_MARK_QUIET = 30.0
+
+cpu_load_pct(s::Sample) =
+    s.cpu_pct >= 0 ? Float64(s.cpu_pct) :
+    (s.load1 >= 0 ? 100.0 * Float64(s.load1) / max(cpu_count(), 1) : -1.0)
+
+function crossed_cpu_mark!(m::Monitor, pct::Float64, now::Float64)
+    pct < 0 && return false
+    prev = m.last_cpu_pct
+    m.last_cpu_pct = pct
+    prev < CPU_MARK <= pct || return false
+    now - m.cpu_mark_said < CPU_MARK_QUIET && return false
+    m.cpu_mark_said = now
+    return true
+end
+
 progress_due(done::Integer, reported::Integer, now::Float64, last_print::Float64) =
     done - reported >= PROGRESS_ITEMS && now - last_print >= PROGRESS_GAP_S
 
@@ -870,16 +892,20 @@ function maybe_print(m::Monitor)
         @lock run_of(m).printer redraw_status(m)
         return nothing
     end
-    # Not a terminal: poll often and report on a clock, and also when the stage
-    # changes, memory nears the edge or enough items have finished. The clock is a
-    # cadence, so an unscheduled report does not push the next scheduled one back.
+    # Not a terminal: poll often and report on a clock, every `PROGRESS_ITEMS` items,
+    # and immediately on phase change or memory/CPU threshold crossings. Both the clock
+    # and item-progress reports respect `PROGRESS_GAP_S` so two routine lines do not
+    # land seconds apart; threshold crossings fire immediately (with their own cooldown).
     phase_changed = s.phase !== m.last_phase_printed
     pressure = s.machine_total > 0 ? 100 * s.machine_used / s.machine_total : 0.0
     near_oom = crossed_memory_mark!(m, pressure, now) != 0
+    high_cpu = crossed_cpu_mark!(m, cpu_load_pct(s), now)
     due = now >= m.next_print
-    done = @atomic run_of(m).ndone
-    (due || phase_changed || near_oom || progress_due(done, m.done_reported, now, m.last_print)) || return nothing
     due && (m.next_print = max(now, m.next_print) + m.print_interval)
+    clock_due = due && (now - m.last_print >= min(PROGRESS_GAP_S, m.print_interval))
+    done = @atomic run_of(m).ndone
+    prog_due = progress_due(done, m.done_reported, now, m.last_print)
+    (clock_due || prog_due || phase_changed || near_oom || high_cpu) || return nothing
     m.last_print = now
     m.done_reported = done
     m.last_phase_printed = s.phase

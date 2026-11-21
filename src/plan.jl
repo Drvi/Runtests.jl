@@ -200,12 +200,22 @@ struct Plan
     notes::Vector{String}
     # Differences between the replayed run state and this checkout; `nothing` outside replay.
     replay::Union{Nothing, ReplayDiff}
+    # Per-slot fixed item sequences for exact replay (empty outside replay).
+    replay_slots::Vector{Vector{ItemIdx}}
 end
 
-with_replay(p::Plan, replay::Union{Nothing, ReplayDiff}) = Plan(
-    p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, p.slot_pool,
+with_replay(p::Plan, replay::Union{Nothing, ReplayDiff};
+            replay_slots::Vector{Vector{ItemIdx}} = p.replay_slots,
+            slot_pool::Vector{Int32} = p.slot_pool) = Plan(
+    p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, slot_pool,
     p.slot_items, p.pending, p.gate_limit, p.cold, p.setups, p.cfg, p.packages, p.root,
-    p.startup, p.selection, p.suite_names, p.notes, replay
+    p.startup, p.selection, p.suite_names, p.notes, replay, replay_slots
+)
+
+with_plan_cfg(p::Plan, cfg::RunConfig) = Plan(
+    p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, p.slot_pool,
+    p.slot_items, p.pending, p.gate_limit, p.cold, p.setups, cfg, p.packages, p.root,
+    p.startup, p.selection, p.suite_names, p.notes, p.replay, p.replay_slots
 )
 
 nslots(p::Plan) = length(p.slot_pool)
@@ -906,7 +916,7 @@ function materialize(
     return Plan(
         items, files, relfiles,
         profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, cold,
-        sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[], nothing
+        sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[], nothing, Vector{ItemIdx}[]
     )
 end
 

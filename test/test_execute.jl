@@ -1088,4 +1088,34 @@ end
             end
         end
     end
+
+    @testset "an unwritable temporary directory warns once and falls back to logs = :eager" begin
+        if !Sys.iswindows()
+            locked = mktempdir()
+            chmod(locked, 0o555)
+            try
+                dir = make_pkg("UnwritableTmp", "test/t_test.jl" => """
+                    @testitem "prints eagerly" begin
+                        println("hello from unwritable tmp")
+                        @test true
+                    end
+                    """)
+                # Warm the package's test environment first so `with_run_env` hits its
+                # session cache and only `execute_here`'s `mktempdir` sees `TMPDIR=locked`.
+                capture_run(() -> run_states(dir; workers = 0, logs = :issues, monitor = false))
+                (states, run, _), out = @test_logs (:warn, r"falling back to `logs = :eager`") match_mode = :any capture_run() do
+                    withenv("TMPDIR" => locked) do
+                        run_states(dir; workers = 0, logs = :issues, monitor = false)
+                    end
+                end
+                @test states["prints eagerly"] === PASSED
+                @test run.plan.cfg.logs === :eager
+                @test isempty(run.scratch)
+                @test occursin("hello from unwritable tmp", out)
+            finally
+                chmod(locked, 0o755)
+                rm(locked; force = true, recursive = true)
+            end
+        end
+    end
 end

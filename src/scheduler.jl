@@ -67,8 +67,24 @@ mutable struct Queues
     # a gate's item ending lets one go, so until `gate_ends` moves on they still are.
     const aside_blocked_at::Vector{Int}
     gate_ends::Int                   # items of gates that have ended
+    const replay_slots::Vector{Vector{ItemIdx}}  # non-empty for exact replay: fixed per-slot sequence
+    const replay_pos::Vector{Int}                # per slot: next index in `replay_slots[s]`
+    const item_pool::Vector{Int32}               # per item: pool index (populated for exact replay)
     @atomic cancelled::Bool
     @atomic paused::Bool             # the memory guard is holding new work back
+end
+
+function pool_of_items(p::Plan)
+    isempty(p.replay_slots) && return Int32[]
+    out = zeros(Int32, nitems(p))
+    for (k, pool) in enumerate(p.pools)
+        for range in (pool.head, pool.body, pool.tail)
+            for i in range
+                out[i] = Int32(k)
+            end
+        end
+    end
+    return out
 end
 
 function Queues(p::Plan)
@@ -83,7 +99,9 @@ Queues(lock::ReentrantLock, room::Threads.Condition, p::Plan) = Queues(
     [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
     p.items.est_s, typical_estimate(p.items.est_s),
     [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, zeros(Int32, length(p.gate_limit)),
-    [ItemIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0, false, false
+    [ItemIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0,
+    p.replay_slots, ones(Int, length(p.replay_slots)), pool_of_items(p),
+    false, false
 )
 
 struct Claim
@@ -152,6 +170,7 @@ wake_waiting!(q::Queues) = @lock q.lock (notify(q.room); nothing)
 
 function claim_now!(q::Queues, s::Integer)
     (@atomic q.cancelled) && return Claim(:done)
+    isempty(q.replay_slots) || return claim_replay_now!(q, s)
     k = q.pool[s]
     u = next_unit!(q, s, k)
     u == 0 || return hand_out!(q, u)
@@ -172,6 +191,31 @@ function claim_now!(q::Queues, s::Integer)
         return Claim(:done)
     end
     return rebind!(q, s, k, j)
+end
+
+# Exact replay hand-out: each slot runs its recorded sequence in order, with no stealing
+# and no reordering. Switches pool when the next item belongs to another pool, and waits
+# in place if a throttle gate is currently full.
+function claim_replay_now!(q::Queues, s::Integer)
+    seq = q.replay_slots[s]
+    pos = q.replay_pos[s]
+    if pos > length(seq)
+        k = q.pool[s]
+        q.serving[k] > 0 && (q.serving[k] -= 1)
+        return Claim(:done)
+    end
+    u = seq[pos]
+    j = q.item_pool[u]
+    if j != q.pool[s]
+        k = q.pool[s]
+        q.serving[k] > 0 && (q.serving[k] -= 1)
+        q.serving[j] += 1
+        q.pool[s] = j
+        return Claim(:rebind, ItemIdx(0), j)
+    end
+    gate_full(q, u) && return Claim(:wait)
+    q.replay_pos[s] = pos + 1
+    return hand_out!(q, u)
 end
 
 # The next unit slot `s` of pool `k` can start, or 0: one set aside whose gate has

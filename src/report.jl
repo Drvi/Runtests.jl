@@ -190,7 +190,8 @@ function run_order(p::Plan)
     items = Tuple{Float64, Int, ItemIdx}[]
     if single_process(p)
         t = 0.0
-        for i in ItemIdx(1):ItemIdx(nitems(p))
+        order = isempty(p.replay_slots) ? (ItemIdx(1):ItemIdx(nitems(p))) : p.replay_slots[1]
+        for i in order
             push!(items, (t, 1, i))
             t += est[i]
         end

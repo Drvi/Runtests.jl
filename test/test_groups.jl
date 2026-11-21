@@ -402,5 +402,97 @@ end)
         end
     end
 
+    @testset "runtests_dispatch validates coverage, overlaps, and rejects unknown or extra selection args" begin
+        disp = make_pkg(
+            "Dispatched",
+            "test/TestItems.toml" => """
+                [groups]
+                juliac = "juliac || serializer"
+                non_juliac = "!juliac && !manual"
+                """,
+            "test/core_test.jl" => """
+                @testitem "plain core" begin
+                    @test true
+                end
+                @testitem "serializer item" tags=[:serializer] begin
+                    @test true
+                end
+                @testitem "juliac item" tags=[:juliac] begin
+                    @test true
+                end
+                @testitem "manual only" tags=[:manual] begin
+                    @test true
+                end
+                """,
+            "test/qa/Project.toml" => "",
+            "test/qa/qa_test.jl" => """
+                @testitem "qa check" tags=[:manual] begin
+                    @test true
+                end
+                """,
+        )
+        variants = Dict(
+            "juliac"     => (; group = "juliac"),
+            "non_juliac" => (; group = "non_juliac"),
+            "qa"         => (; paths = ["test/qa"]),
+        )
+        # Full coverage with explicit `exclude` for `manual only` (while `qa` covers `qa check`).
+        # `serializer item` is in both `juliac` and `non_juliac`: allowed by default.
+        _, out = capture_run() do
+            Runtests.runtests_dispatch(disp, "juliac", variants;
+                                       exclude = (; name = "manual only"),
+                                       dry_run = true)
+        end
+        @test occursin("\"juliac item\"", out) && occursin("\"serializer item\"", out)
+        @test !occursin("\"plain core\"", out)
+
+        # Path-based variant dispatches cleanly and ignores RUNTESTS_GROUP in the environment.
+        _, out = withenv("RUNTESTS_GROUP" => "juliac") do
+            capture_run() do
+                Runtests.runtests_dispatch(disp, "qa", variants;
+                                           exclude = (; name = "manual only"),
+                                           dry_run = true)
+            end
+        end
+        @test occursin("\"qa check\"", out)
+        @test !occursin("\"juliac item\"", out)
+
+        # `allow_overlaps = false` rejects the overlap on `serializer item`.
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants;
+                                                      exclude = (; name = "manual only"),
+                                                      allow_overlaps = false, dry_run = true))
+        @test err isa ConfigError
+        @test occursin("serializer item", sprint(showerror, err))
+
+        # Missing coverage (`manual only` not covered when `exclude` omitted) throws ConfigError.
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants; dry_run = true))
+        @test err isa ConfigError
+        @test occursin("manual only", sprint(showerror, err))
+
+        # Unknown variant throws ArgumentError listing supported variants.
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "bogus", variants;
+                                                      exclude = (; name = "manual only"), dry_run = true))
+        @test err isa ArgumentError
+        @test occursin("unknown variant", sprint(showerror, err)) && occursin("juliac", sprint(showerror, err))
+
+        # Selection keywords passed outside `variants` are rejected.
+        for kw in ((; tags = :juliac), (; group = "juliac"), (; name = "plain core"),
+                   (; paths = ["test/qa"]), (; skip_environment = ["test/qa"]))
+            err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants;
+                                                          exclude = (; name = "manual only"),
+                                                          dry_run = true, kw...))
+            @test err isa ArgumentError
+            @test occursin("must be declared inside `variants`", sprint(showerror, err))
+        end
+
+        # A variant skipping `test/qa` does not count as covering `qa check`.
+        skip_variants = Dict(
+            "main" => (; skip_environment = ["test/qa"]),
+        )
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "main", skip_variants; dry_run = true))
+        @test err isa ConfigError
+        @test occursin("qa check", sprint(showerror, err))
+    end
+
     end   # withenv
 end

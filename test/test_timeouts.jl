@@ -299,6 +299,31 @@ end
         @test states["overruns alone"] === TIMEDOUT
     end
 
+    @testset "timeout distinguishes an idle/blocked worker from an active/looping one" begin
+        dir = make_pkg("IdleVsActive", "test/t_test.jl" => """
+            @testitem "blocked sleep" timeout=2 begin
+                sleep(60)
+                @test true
+            end
+            @testitem "busy spin" timeout=2 begin
+                x = 0.0
+                while true
+                    x += sin(x + 1.0)
+                end
+                @test x > 0
+            end
+            """)
+        (states, _, _), out = with_fast_inspect() do
+            capture_run(() -> run_states(dir; workers = 2, logs = :issues, monitor = false))
+        end
+        @test states["blocked sleep"] === TIMEDOUT
+        @test states["busy spin"] === TIMEDOUT
+        if Runtests.Private.Platform.process_cpu_time(getpid()) >= 0
+            @test occursin("worker was idle (likely blocked or deadlocked)", out)
+            @test occursin("worker was active (", out)
+        end
+    end
+
     if VERSION >= v"1.12"
         # In a combined run, the item of one package is stopped on its worker, the items
         # of every package run on, and only that package's run state has the verdict.

@@ -2159,4 +2159,119 @@ end
             @test rs.statuses[findfirst(it -> it.name == "passes", rs.items)].state === UNSEEN
         end
     end
+
+    @testset "a replay runs the exact per-worker item sequence recorded in the run state" begin
+        dir = make_pkg("ExactReplayOrder",
+            "test/a_test.jl" => """
+                @testitem "a1" begin
+                    @test true
+                end
+                @testitem "a2" begin
+                    @test true
+                end
+                @testitem "a3" begin
+                    @test true
+                end
+                """,
+            "test/b_test.jl" => """
+                @testitem "b1" begin
+                    @test true
+                end
+                @testitem "b2" begin
+                    @test true
+                end
+                @testitem "b3" begin
+                    @test true
+                end
+                """)
+        with_runstate_dir() do _
+            # Run once on 2 workers and record each slot's exact ordered sequence.
+            (_, run1, _), _ = capture_run(() -> run_states(dir; workers = 2, logs = :issues, monitor = false))
+            path = (@atomic run1.runstate).path
+            rs1 = read_run_state(path)
+            slot_seq(rs) = begin
+                d = Dict{Int, Vector{String}}()
+                for ev in rs.events
+                    ev.kind === :attempt || continue
+                    push!(get!(Vector{String}, d, Int(ev.slot)), rs.items[ev.item].name)
+                end
+                d
+            end
+            seq1 = slot_seq(rs1)
+            @test sum(length, values(seq1)) == 6
+
+            # Change the checkout's [order] completely; replay must still hand out the exact
+            # per-slot sequences recorded in `rs1`, with no stealing and no reordering.
+            write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"b3\", \"a3\"]\n")
+            (_, run2, p2), _ = capture_run(() -> run_states(dir; replay = path, logs = :issues, monitor = false))
+            @test !isempty(p2.replay_slots)
+            rs2 = read_run_state((@atomic run2.runstate).path)
+            seq2 = slot_seq(rs2)
+            @test seq2 == seq1
+        end
+    end
+
+    @testset "Runtests.logs reads captured logs from a logs=:quiet run" begin
+        marker = joinpath(mktempdir(), "retry_flag")
+        dir = make_pkg("QuietLogs", "test/q_test.jl" => """
+            @testitem "quiet pass" begin
+                println("output from quiet pass")
+                @test true
+            end
+            @testitem "quiet fail" begin
+                println("output from quiet fail")
+                @test false
+            end
+            @testitem "quiet retry" retries=1 begin
+                if !isfile($(repr(marker)))
+                    touch($(repr(marker)))
+                    println("retry attempt one log")
+                    @test false
+                else
+                    println("retry attempt two log")
+                    @test true
+                end
+            end
+            """)
+        with_runstate_dir() do _
+            (states, run, _), run_out = capture_run(() -> run_states(dir; workers = 1, logs = :quiet, monitor = false))
+            @test states["quiet pass"] === PASSED
+            @test states["quiet fail"] === FAILED
+            @test states["quiet retry"] === PASSED
+            # `:quiet` prints none of the items' captured logs during the run.
+            @test !occursin("output from quiet pass", run_out)
+            @test !occursin("output from quiet fail", run_out)
+            @test !occursin("retry attempt one log", run_out)
+
+            # Latest run of package `dir`: all non-empty logs shown.
+            all_logs = sprint(io -> Runtests.logs(dir; io))
+            @test occursin("output from quiet pass", all_logs)
+            @test occursin("output from quiet fail", all_logs)
+            @test occursin("retry attempt one log", all_logs)
+            @test occursin("retry attempt two log", all_logs)
+
+            # Filter by exact name, regex, failed=true, and attempt.
+            rs_path = (@atomic run.runstate).path
+            one_log = sprint(io -> Runtests.logs(rs_path; name = "quiet pass", io))
+            @test occursin("output from quiet pass", one_log)
+            @test !occursin("output from quiet fail", one_log)
+
+            only_failed = sprint(io -> Runtests.logs(read_run_state(rs_path); failed = true, io))
+            @test occursin("output from quiet fail", only_failed)
+            @test !occursin("output from quiet pass", only_failed)
+            @test !occursin("retry attempt two log", only_failed)
+
+            att1 = sprint(io -> Runtests.logs(rs_path; name = r"^quiet retry$", attempt = 1, io))
+            @test occursin("retry attempt one log", att1)
+            @test !occursin("retry attempt two log", att1)
+
+            att2 = sprint(io -> Runtests.logs(rs_path; name = "quiet retry", attempt = 2, io))
+            @test occursin("retry attempt two log", att2)
+            @test !occursin("retry attempt one log", att2)
+
+            none_matched = sprint(io -> Runtests.logs(rs_path; name = "does not exist", io))
+            @test occursin("no captured logs matched", none_matched)
+            @test_throws ArgumentError Runtests.logs(rs_path; attempt = 0)
+        end
+    end
 end

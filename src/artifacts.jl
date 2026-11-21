@@ -12,8 +12,10 @@ beside its log, with `prefix` the part of the path a log's shares.
 artifacts_path(prefix::String, index::Integer, attempt::Integer) =
     string(prefix, index, "_", attempt, ".artifacts")
 
-attempt_artifacts(run::Run, i::Integer, attempt::Integer) =
-    artifacts_path(run.artifacts_prefixes[run.plan.items.package[i]], run.local_item[i], attempt)
+function attempt_artifacts(run::Run, i::Integer, attempt::Integer)
+    prefix = run.artifacts_prefixes[run.plan.items.package[i]]
+    return isempty(prefix) ? "" : artifacts_path(prefix, run.local_item[i], attempt)
+end
 
 # A line in the log beside the evidence in `dir`, as a person reads it. Never a reason
 # to fail: the verdict is recorded already, and the evidence is what it is.
@@ -51,6 +53,7 @@ that they did not run and `why`. Returns what the attempt left, as a result says
 """
 function evidence_after_loss!(run::Run, i::ItemIdx, attempt::Int8, why::AbstractString)
     dir = attempt_artifacts(run, i, attempt)
+    isempty(dir) && return 0x00
     flags = (isdir(dir) ? ARTIFACT_FILES : 0x00) | (isfile(artifacts_log_path(dir)) ? ARTIFACT_PRODUCERS : 0x00)
     flags == 0 && return flags
     flags & ARTIFACT_PRODUCERS == 0 ||
@@ -67,27 +70,15 @@ function run_artifact_producers(w::Union{Nothing, RuntestsWorkers.Worker}, index
                         TimeoutException(limit, "collecting the artifacts of", name, "artifacts_timeout"))
 end
 
-"""
-    finish_attempt!(run, slot, i, attempt, res, w) -> Bool
-
-What follows the recorded verdict `res` of attempt `attempt` at item `i`, on worker
-`w`, or in this process when `w` is `nothing`: what an attempt that passed wrote is
-deleted, and its producers let go of when the worker runs its next item; what one
-that failed wrote is kept, and its producers run, within `artifacts_timeout` on a
-worker. Returns whether the worker is still fit to use: one that does not finish in
-time is ended, and one that dies is gone.
-"""
-function finish_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, res::ItemResult,
-                         w::Union{Nothing, RuntestsWorkers.Worker})
-    res.artifacts == 0 && return true
+# Keep a failed attempt's evidence and run its registered producers on `w` (or in this
+# process when `w` is `nothing`). Returns whether `w` is still fit to use.
+function collect_failed_evidence!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, flags::UInt8,
+                                  w::Union{Nothing, RuntestsWorkers.Worker})
+    flags == 0 && return true
     dir = attempt_artifacts(run, i, attempt)
-    if res.state === PASSED
-        discard_evidence(dir)
-        w === nothing && res.artifacts & ARTIFACT_PRODUCERS != 0 && RuntestsWorkers.discard_artifacts!()
-        return true
-    end
+    isempty(dir) && return true
     keep_evidence!(run, i, attempt)
-    res.artifacts & ARTIFACT_PRODUCERS == 0 && return true
+    flags & ARTIFACT_PRODUCERS == 0 && return true
     name = run.plan.items.name[i]
     limit = item_cfg(run.plan, i).artifacts_timeout_s
     survived = true
@@ -110,6 +101,27 @@ function finish_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, res::I
     end
     say(run, "artifacts of ", repr(name), attempt > 1 ? " (attempt $attempt)" : "", ": ", said, " · ", dir)
     return survived
+end
+
+"""
+    finish_attempt!(run, slot, i, attempt, res, w) -> Bool
+
+What follows the recorded verdict `res` of attempt `attempt` at item `i`, on worker
+`w`, or in this process when `w` is `nothing`: what an attempt that passed wrote is
+deleted; what one that failed wrote is kept, and its producers run, within
+`artifacts_timeout` on a worker. Returns whether the worker is still fit to use: one
+that does not finish in time is ended, and one that dies is gone.
+"""
+function finish_attempt!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, res::ItemResult,
+                         w::Union{Nothing, RuntestsWorkers.Worker})
+    res.artifacts == 0 && return true
+    dir = attempt_artifacts(run, i, attempt)
+    isempty(dir) && return true
+    if res.state === PASSED
+        discard_evidence(dir)
+        return true
+    end
+    return collect_failed_evidence!(run, slot, i, attempt, res.artifacts, w)
 end
 
 # A collection that did not complete: why, in the log beside the evidence, and whether

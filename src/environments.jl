@@ -272,7 +272,69 @@ function apply_recorded_replay!(p::Plan, given::RunStateRecord, records::Vector,
         gone, changed, env_moved, policies, ReplayEnvDiff[], snapshots
     )
     dry_run && populate_dry_run_env_diffs!(diff, p, target_project)
-    return with_replay(p, diff)
+    replay_slots, slot_pool = recorded_replay_slots(p, records)
+    return with_replay(p, diff; replay_slots, slot_pool)
+end
+
+# Reconstruct the exact per-slot item sequence recorded in `records`, restricted to the
+# items selected in `p`. Any selected item not seen in the recorded `:attempt` events
+# (e.g. UNSEEN in a crashed recording) is appended after the recorded work so nothing is
+# dropped. Returns `(replay_slots, slot_pool)`.
+function recorded_replay_slots(p::Plan, records::Vector)
+    S = nslots(p)
+    (S == 0 || nitems(p) == 0) && return Vector{ItemIdx}[], p.slot_pool
+    plan_item = Dict{Tuple{Int32, String}, ItemIdx}(
+        (p.items.package[i], p.items.name[i]) => ItemIdx(i) for i in 1:nitems(p)
+    )
+    by_slot = Dict{Int, Vector{Tuple{Float32, Int, ItemIdx}}}()
+    seen = falses(nitems(p))
+    ord = 0
+    for (k, rs) in enumerate(records)
+        rs === nothing && continue
+        pkg = Int32(k)
+        for ev in rs.events
+            ev.kind === :attempt || continue
+            1 <= ev.item <= length(rs.items) || continue
+            slot = Int(ev.slot)
+            slot > 0 || continue
+            idx = get(plan_item, (pkg, rs.items[ev.item].name), ItemIdx(0))
+            (idx == 0 || seen[idx]) && continue
+            seen[idx] = true
+            ord += 1
+            push!(get!(Vector{Tuple{Float32, Int, ItemIdx}}, by_slot, slot), (ev.t0, ord, idx))
+        end
+    end
+    isempty(by_slot) && return Vector{ItemIdx}[], p.slot_pool
+
+    rec_slots = sort!(collect(keys(by_slot)))
+    replay_slots = [ItemIdx[] for _ in 1:S]
+    preserve_ids = maximum(rec_slots) <= S
+    for (pos, r) in enumerate(rec_slots)
+        entries = sort!(by_slot[r]; by = x -> (x[1], x[2]))
+        dest = preserve_ids ? r : mod1(pos, S)
+        for (_, _, idx) in entries
+            push!(replay_slots[dest], idx)
+        end
+    end
+    # Append any selected items never attempted in the recording (e.g. after a crash/failfast).
+    for i in ItemIdx(1):ItemIdx(nitems(p))
+        seen[i] && continue
+        dest = argmin(length, replay_slots)
+        push!(dest, i)
+    end
+    item_pool = zeros(Int32, nitems(p))
+    for (k, pool) in enumerate(p.pools)
+        for range in (pool.head, pool.body, pool.tail)
+            for i in range
+                item_pool[i] = Int32(k)
+            end
+        end
+    end
+    slot_pool = copy(p.slot_pool)
+    for s in 1:S
+        isempty(replay_slots[s]) || (slot_pool[s] = item_pool[replay_slots[s][1]])
+    end
+    return replay_slots, slot_pool
 end
 
 function compare_manifest_texts(here_text::AbstractString, there_text::AbstractString)

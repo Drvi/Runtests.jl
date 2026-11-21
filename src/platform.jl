@@ -9,7 +9,7 @@ module Platform
 
 using ...RuntestsWorkers: is_interrupt, OncePerProcess
 
-export process_rss, child_pids, child_lister, machine_memory, available_fraction, cpu_load, cpu_count,
+export process_rss, process_cpu_time, tree_cpu_time, child_pids, child_lister, machine_memory, available_fraction, cpu_load, cpu_count,
     cpu_ticks, process_cpu_seconds, platform_selfcheck!, ensure_checked!, PER_PROCESS_OK,
     local_host_name
 
@@ -40,6 +40,21 @@ end
 const PROC_PIDTASKINFO = Cint(4)
 const TASKINFO_BYTES = 128
 
+struct MachTimebaseInfo
+    numer::UInt32
+    denom::UInt32
+end
+
+const MACH_TIMEBASE_S = OncePerProcess{Float64}() do
+    @static if Sys.isapple()
+        tb = Ref(MachTimebaseInfo(0, 0))
+        r = ccall(:mach_timebase_info, Cint, (Ref{MachTimebaseInfo},), tb)
+        (r == 0 && tb[].denom > 0) ? (Float64(tb[].numer) / Float64(tb[].denom)) * 1e-9 : 1e-9
+    else
+        1e-9
+    end
+end
+
 function rss_macos(pid::Integer)
     # 16 × UInt64 = 128 bytes stack-allocated; slot 2 is `pti_resident_size` at +8.
     buf = Ref{NTuple{16, UInt64}}()
@@ -49,6 +64,17 @@ function rss_macos(pid::Integer)
     )
     n <= 0 && return Int64(-1)
     return Int64(buf[][2])
+end
+
+function cpu_time_macos(pid::Integer)
+    # Slots 3 and 4 are `pti_total_user` and `pti_total_system` in Mach timebase ticks.
+    buf = Ref{NTuple{16, UInt64}}()
+    n = ccall(
+        :proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint),
+        pid, PROC_PIDTASKINFO, 0, buf, TASKINFO_BYTES
+    )
+    n <= 0 && return -1.0
+    return Float64(buf[][3] + buf[][4]) * MACH_TIMEBASE_S()
 end
 
 # Returns the number of children, not a byte count. Misread, it yields an empty
@@ -83,6 +109,15 @@ end
 
 ### Linux ##################################################################
 
+const CLK_TCK_HZ = OncePerProcess{Float64}() do
+    @static if Sys.islinux()
+        hz = ccall(:sysconf, Clong, (Cint,), Cint(2))   # _SC_CLK_TCK == 2 on Linux
+        hz > 0 ? Float64(hz) : 100.0
+    else
+        100.0
+    end
+end
+
 function rss_linux(pid::Integer)
     fields = try
         split(read("/proc/$(pid)/statm", String))
@@ -94,6 +129,24 @@ function rss_linux(pid::Integer)
     pages = tryparse(Int64, fields[2])
     pages === nothing && return Int64(-1)
     return pages * PAGE_SIZE()
+end
+
+function cpu_time_linux(pid::Integer)
+    text = try
+        read("/proc/$(pid)/stat", String)
+    catch e
+        is_interrupt(e) && rethrow()
+        return -1.0
+    end
+    rparen = findlast(')', text)
+    rparen === nothing && return -1.0
+    fields = split(SubString(text, nextind(text, rparen)))
+    length(fields) >= 13 || return -1.0
+    # After `(comm)`, field 3 is index 1, so fields 14 (utime) and 15 (stime) are 12 and 13.
+    utime = tryparse(UInt64, fields[12])
+    stime = tryparse(UInt64, fields[13])
+    (utime === nothing || stime === nothing) && return -1.0
+    return Float64(utime + stime) / CLK_TCK_HZ()
 end
 
 function children_linux(pid::Integer)
@@ -203,6 +256,24 @@ end
         end
     end
 
+    function cpu_time_windows(pid::Integer)
+        handle = ccall(:OpenProcess, stdcall, Ptr{Cvoid}, (UInt32, Cint, UInt32), 0x1000, 0, UInt32(pid))
+        handle == C_NULL && return -1.0
+        try
+            created, exited, kernel, user = Ref{UInt64}(0), Ref{UInt64}(0), Ref{UInt64}(0), Ref{UInt64}(0)
+            ok = ccall((:GetProcessTimes, "kernel32"), stdcall, Cint,
+                       (Ptr{Cvoid}, Ref{UInt64}, Ref{UInt64}, Ref{UInt64}, Ref{UInt64}),
+                       handle, created, exited, kernel, user)
+            ok == 0 && return -1.0
+            return Float64(kernel[] + user[]) * 1e-7
+        catch e
+            is_interrupt(e) && rethrow()
+            return -1.0
+        finally
+            ccall(:CloseHandle, stdcall, Cint, (Ptr{Cvoid},), handle)
+        end
+    end
+
     # Every process on the machine, `pid => parent pid`, from one toolhelp snapshot.
     # Windows keeps no list of a process's children, only each process's parent.
     function process_parents_windows()
@@ -244,16 +315,38 @@ child_lister() = @static Sys.iswindows() ? children_in(process_parents_windows()
 
 @static if Sys.isapple()
     process_rss(pid::Integer) = rss_macos(pid)
+    process_cpu_time(pid::Integer) = cpu_time_macos(pid)
     child_pids(pid::Integer) = children_macos(pid)
 elseif Sys.islinux()
     process_rss(pid::Integer) = rss_linux(pid)
+    process_cpu_time(pid::Integer) = cpu_time_linux(pid)
     child_pids(pid::Integer) = children_linux(pid)
 elseif Sys.iswindows()
     process_rss(pid::Integer) = rss_windows(pid)
+    process_cpu_time(pid::Integer) = cpu_time_windows(pid)
     child_pids(pid::Integer) = children_windows(pid)
 else
     process_rss(::Integer) = Int64(-1)
+    process_cpu_time(::Integer) = -1.0
     child_pids(::Integer) = Int32[]
+end
+
+"""
+    tree_cpu_time(pid) -> Float64
+
+Total user and system CPU seconds consumed by `pid` and any live child processes it
+started, or `-1.0` if `pid`'s own CPU time cannot be read.
+"""
+function tree_cpu_time(pid::Integer)
+    root = process_cpu_time(pid)
+    root < 0 && return -1.0
+    total = root
+    for p in process_tree((pid,))
+        p == pid && continue
+        c = process_cpu_time(p)
+        c > 0 && (total += c)
+    end
+    return total
 end
 
 ### Memory pressure ########################################################

@@ -547,6 +547,18 @@ function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline
         while !isfile(WHEN)
             sleep(0.05)
         end
+        for i in eachindex(Base.atexit_hooks)
+            h = Base.atexit_hooks[i]
+            label = string("atexit[", i, "]=", typeof(h))
+            Base.atexit_hooks[i] = () -> begin
+                P.write_now(stderr, string("[exit-trace] start ", label, "\\n"))
+                try
+                    hasmethod(h, (Cint,)) ? h(Cint(0)) : h()
+                finally
+                    P.write_now(stderr, string("[exit-trace] done  ", label, "\\n"))
+                end
+            end
+        end
         touch($(repr(called)))
         exit(0)
     end

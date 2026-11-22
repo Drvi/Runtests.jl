@@ -2,6 +2,43 @@
 
 const DISPATCH_SELECTION_KEYS = (:name, :tags, :group, :paths, :replay, :skip_environment)
 const DISPATCH_MONO_SELECTION_KEYS = (:name, :tags, :group, :paths, :packages, :replay, :skip_environment)
+const DISPATCH_EXCLUDE_KEYS = (:name, :tags, :group, :skip_environment)
+const DISPATCH_MONO_EXCLUDE_KEYS = (:name, :tags, :group, :packages, :skip_environment)
+
+function validate_dispatch_spec_kwargs(caller::AbstractString, label::AbstractString, kw::NamedTuple;
+                                       mono::Bool, is_exclude::Bool)
+    prefix = string("`", caller, "`: ", label, ": ")
+    if is_exclude
+        allowed = mono ? DISPATCH_MONO_EXCLUDE_KEYS : DISPATCH_EXCLUDE_KEYS
+        candidates = String["paths"]
+        for x in allowed
+            push!(candidates, String(x))
+        end
+        for (k, v) in pairs(kw)
+            if !(k in allowed)
+                near = nearest(String(k), candidates; cutoff = max(1, length(String(k)) ÷ 3))
+                hint = isempty(near) ? "" : string(" (did you mean ", join(("`$n`" for n in near), " or "), "?)")
+                throw(ArgumentError(string(
+                    prefix, "unexpected keyword `", k, "`", hint,
+                    "; `exclude` only accepts selection keywords: ", join(("`$x`" for x in candidates), ", ")
+                )))
+            end
+            if k === :skip_environment
+                validate_run_setting(k, v; prefix)
+            else
+                validate_call_kwarg(k, v; mono, prefix)
+            end
+        end
+        return nothing
+    end
+    if mono && haskey(kw, :config)
+        throw(ArgumentError(
+            "`runtests_dispatch_mono`: $(label) cannot pass `config` (a combined run reads each package's own file)"
+        ))
+    end
+    validate_run_kwargs(kwargs_dict(kw); mono, allow_call_keys = true, prefix)
+    return nothing
+end
 
 struct DispatchSpec
     paths::Vector{String}
@@ -151,8 +188,10 @@ function runtests_dispatch(root::Union{AbstractString, Module}, selected, varian
             "not passed as a top-level argument"
         ))
     end
+    top_opts = kwargs_dict(kwargs)
+    validate_run_kwargs(top_opts; mono = false, allow_call_keys = true, prefix = "`runtests_dispatch`: ")
     if !haskey(variants, selected)
-        supported = sort!(collect(keys(variants)); by = string)
+        supported = sort_by!(collect(keys(variants)), string)
         throw(ArgumentError(
             "`runtests_dispatch`: unknown variant $(repr(selected)); supported variants are " *
             join(repr.(supported), ", ")
@@ -160,11 +199,22 @@ function runtests_dispatch(root::Union{AbstractString, Module}, selected, varian
     end
 
     target = root isa Module ? target_from_dir(_pkgdir(root)) : target_from_dir(abspath(String(root)))
-    ordered_keys = sort!(collect(keys(variants)); by = string)
+    ordered_keys = sort_by!(collect(keys(variants)), string)
     specs = Dict{Any, DispatchSpec}(
         k => parse_dispatch_spec("variant $(repr(k))", variants[k], target.root) for k in ordered_keys
     )
     excludes = parse_dispatch_excludes(exclude, target.root)
+    for k in ordered_keys
+        validate_dispatch_spec_kwargs("runtests_dispatch", "variant $(repr(k))", specs[k].kwargs;
+                                      mono = false, is_exclude = false)
+    end
+    for (i, s) in enumerate(excludes)
+        label = length(excludes) == 1 ? "`exclude`" : "`exclude[$i]`"
+        validate_dispatch_spec_kwargs("runtests_dispatch", label, s.kwargs;
+                                      mono = false, is_exclude = true)
+    end
+    validate_run_kwargs(merge(top_opts, kwargs_dict(specs[selected].kwargs));
+                        mono = false, allow_call_keys = true, prefix = "`runtests_dispatch`: ")
 
     config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
     groups = read_groups(config_path, toml)
@@ -354,8 +404,10 @@ function runtests_dispatch_mono(root::Union{Nothing, AbstractString, Module}, se
             "not passed as a top-level argument"
         ))
     end
+    top_opts = kwargs_dict(kwargs)
+    validate_run_kwargs(top_opts; mono = true, allow_call_keys = true, prefix = "`runtests_dispatch_mono`: ")
     if !haskey(variants, selected)
-        supported = sort!(collect(keys(variants)); by = string)
+        supported = sort_by!(collect(keys(variants)), string)
         throw(ArgumentError(
             "`runtests_dispatch_mono`: unknown variant $(repr(selected)); supported variants are " *
             join(repr.(supported), ", ")
@@ -367,11 +419,22 @@ function runtests_dispatch_mono(root::Union{Nothing, AbstractString, Module}, se
     ps = find_participants(workspace)
     n = length(ps)
 
-    ordered_keys = sort!(collect(keys(variants)); by = string)
+    ordered_keys = sort_by!(collect(keys(variants)), string)
     specs = Dict{Any, DispatchSpec}(
         k => parse_dispatch_spec("variant $(repr(k))", variants[k], workspace) for k in ordered_keys
     )
     excludes = parse_dispatch_excludes(exclude, workspace)
+    for k in ordered_keys
+        validate_dispatch_spec_kwargs("runtests_dispatch_mono", "variant $(repr(k))", specs[k].kwargs;
+                                      mono = true, is_exclude = false)
+    end
+    for (i, s) in enumerate(excludes)
+        label = length(excludes) == 1 ? "`exclude`" : "`exclude[$i]`"
+        validate_dispatch_spec_kwargs("runtests_dispatch_mono", label, s.kwargs;
+                                      mono = true, is_exclude = true)
+    end
+    validate_run_kwargs(merge(top_opts, kwargs_dict(specs[selected].kwargs));
+                        mono = true, allow_call_keys = true, prefix = "`runtests_dispatch_mono`: ")
 
     configs = [config_toml(joinpath(ps.root[k], "test"), nothing) for k in 1:n]
     pkg_groups = [read_groups(path, toml) for (path, toml) in configs]
@@ -395,7 +458,7 @@ function runtests_dispatch_mono(root::Union{Nothing, AbstractString, Module}, se
         end
         append!(all_items, with_package(it, k) for it in its)
     end
-    isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
+    isempty(errors) || throw(ScanFailure(sort_by!(errors, e -> (e.file, e.line))))
     isempty(all_items) && throw(NoTestsError("no test items found in the workspace at $(workspace)"))
 
     known_envs = unique!(env_names)

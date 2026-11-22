@@ -349,7 +349,7 @@ function environment_variables()
         k in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
               "GITHUB_WORKFLOW", "GITHUB_JOB", "RUNNER_OS", "RUNNER_ARCH")
     secret(k) = occursin(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|KEY"i, k)
-    return join((string(k, "=", v) for (k, v) in sort!(collect(ENV); by = first) if keep(k) && !secret(k)), '\n')
+    return join((string(k, "=", v) for (k, v) in sort_by!(collect(ENV), first) if keep(k) && !secret(k)), '\n')
 end
 
 # Where the run ran, how it was asked for, and against which environment. The test
@@ -381,7 +381,7 @@ function run_meta(p::Plan)
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     # Always written, empty for no `[throttle]`: a record without it predates throttles.
-    push!(meta, "throttle" => join((string(n, '=', l) for (n, l) in sort!(collect(cfg.throttle); by = first)), '\n'))
+    push!(meta, "throttle" => join((string(n, '=', l) for (n, l) in sort_by!(collect(cfg.throttle), first)), '\n'))
     # The slots the plan made, which `idle_worker_seconds` counts against. A package's
     # part of a run of several packages has none (`package_plan`): the run's slots
     # served every package, and its record holds only the package's own attempts.
@@ -662,17 +662,38 @@ function update!(f, rsf::Union{Nothing, RunStateFile}, at::Integer)
     return nothing
 end
 
-function write_status!(
-        rsf::Union{Nothing, RunStateFile}, i::Integer, state::ItemState,
-        attempt::Integer, slot::Integer; start_off = 0.0, elapsed = 0.0,
-        compile = 0.0, recompile = 0.0, alloc_mb = 0.0, peak_rss_mb = 0.0, pid = 0
+function _write_status!(
+        rsf::RunStateFile, i::Int, state::ItemState, attempt::Int8, slot::SlotIdx,
+        start_off::Float64, elapsed::Float64, compile::Float64, recompile::Float64,
+        alloc_mb::Float64, peak_rss_mb::Float64, pid::Int32
     )
-    (rsf === nothing || !(1 <= i <= rsf.n_items)) && return nothing
-    update!(rsf, Int(rsf.off_status) + (Int(i) - 1) * RS_STATUS_BYTES) do io
+    (1 <= i <= rsf.n_items) || return nothing
+    update!(rsf, Int(rsf.off_status) + (i - 1) * RS_STATUS_BYTES) do io
         write_status_record(
-            io, rsf.status_ref, state, Int8(attempt), SlotIdx(slot), start_off,
+            io, rsf.status_ref, state, attempt, slot, start_off,
             elapsed, compile, recompile, alloc_mb, peak_rss_mb, pid
         )
+    end
+end
+
+function write_status!(
+        rsf::Union{Nothing, RunStateFile}, i::Integer, state::ItemState,
+        attempt::Integer, slot::Integer; start_off::Real = 0.0, elapsed::Real = 0.0,
+        compile::Real = 0.0, recompile::Real = 0.0, alloc_mb::Real = 0.0,
+        peak_rss_mb::Real = 0.0, pid::Integer = 0
+    )
+    rsf === nothing && return nothing
+    return _write_status!(
+        rsf, Int(i), state, Int8(attempt), SlotIdx(slot), Float64(start_off),
+        Float64(elapsed), Float64(compile), Float64(recompile), Float64(alloc_mb),
+        Float64(peak_rss_mb), Int32(pid)
+    )
+end
+
+function _append_event!(rsf::RunStateFile, rec::EventRecord)
+    update!(rsf, -1) do io
+        rsf.event_ref[] = rec
+        write_record(io, rsf.event_ref)
     end
 end
 
@@ -681,14 +702,15 @@ function append_event!(
         t0::Real, t1::Real; item::Integer = 0, attempt::Integer = 0, exitcode::Integer = 0, signal::Integer = 0,
         seq::Integer = 0, compile::Real = 0, recompile::Real = 0, alloc_mb::Real = 0, peak_rss_mb::Real = 0
     )
-    update!(rsf, -1) do io
-        rsf.event_ref[] = EventRecord(
+    rsf === nothing && return nothing
+    return _append_event!(
+        rsf,
+        EventRecord(
             kind, UInt8(state), Int8(attempt), 0x00, Int16(slot), Int16(seq), Int32(item), Int32(pid),
             Float32(t0), Float32(t1), Int32(exitcode), Int32(signal), Float32(compile), Float32(recompile),
             Float32(alloc_mb), Float32(peak_rss_mb)
         )
-        write_record(io, rsf.event_ref)
-    end
+    )
 end
 
 function write_memory!(rsf::Union{Nothing, RunStateFile}, m)
@@ -1671,7 +1693,7 @@ function project_runs(root::AbstractString)
         of_project(rs, project) && push!(runs, f => rs)
     end
     others == 0 || warn_other_formats(runstate_dir(root), others)
-    return sort!(runs; by = ((f, rs),) -> (rs.start_unix, f))
+    return sort_by!(runs, ((f, rs),) -> (rs.start_unix, f))
 end
 
 """
@@ -1717,7 +1739,7 @@ function runs_with(root::AbstractString, base::Union{Nothing, RunStateRecord})
     (base === nothing || any(((f, _),) -> samefile(f, base.path), runs)) && return runs
     out = cached ? copy(runs) : runs
     push!(out, base.path => base)
-    return sort!(out; by = ((f, rs),) -> (rs.start_unix, f))
+    return sort_by!(out, ((f, rs),) -> (rs.start_unix, f))
 end
 
 # Of `runs`, the ones whose verdicts count: from the base run on, when there is one.
@@ -2045,7 +2067,7 @@ function sweep_runstate_dirs(
             push!(out, gone)
         end
     end
-    return sort!(reduce(vcat, found; init = GoneCheckout[]); by = g -> g.dir)
+    return sort_by!(reduce(vcat, found; init = GoneCheckout[]), g -> g.dir)
 end
 
 # Whether the folder a gone checkout was in is there with something in it, as an
@@ -2222,7 +2244,7 @@ function borrowed_history(root::AbstractString, nruns::Int = HISTORY_RUNS)
         rs = read_run_state(f; full = false)
         rs !== nothing && of_project(rs, pid) && push!(runs, f => rs)
     end
-    sort!(runs; by = p -> (p.second.start_unix, p.first))
+    sort_by!(runs, p -> (p.second.start_unix, p.first))
     facts = item_facts(runs)
     isempty(facts) && return History()
     now_t = time()

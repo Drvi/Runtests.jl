@@ -68,7 +68,7 @@ function walk_test_dir(testdir::AbstractString)
             push!(strays, misplaced_template_error(path))
         end
     end
-    return (; tests = sort!(tests), strays = sort!(strays; by = e -> e.file), templates = sort!(templates),
+    return (; tests = sort!(tests), strays = sort_by!(strays, e -> e.file), templates = sort!(templates),
             environments = sort!(environments))
 end
 
@@ -136,7 +136,7 @@ end
 # Pre-sorted `(dir => joinpath(dir, ""))` longest-first: zero allocations per file.
 function env_prefixes(environments::Vector{String})
     out = Pair{String, String}[dir => joinpath(dir, "") for dir in environments]
-    sort!(out; by = p -> -ncodeunits(first(p)))
+    sort_by!(out, p -> -ncodeunits(first(p)))
     return out
 end
 
@@ -717,11 +717,11 @@ function scan_files(
     sorted_files = issorted(files) ? files : sort(files)
     file_rank = Dict{String, Int32}(f => Int32(i) for (i, f) in enumerate(sorted_files))
     items = flatten_chunks(RawItem, chunks, 1)
-    sort!(items; by = i -> (get(file_rank, i.file, Int32(0)), i.line))
+    sort_by!(items, i -> (get(file_rank, i.file, Int32(0)), i.line))
     rejected = flatten_chunks(ItemName, chunks, 3)
-    sort!(rejected; by = r -> (get(file_rank, r.file, Int32(0)), r.line))
+    sort_by!(rejected, r -> (get(file_rank, r.file, Int32(0)), r.line))
     append!(errors, duplicate_name_errors(items, rejected, file_rank))
-    sort!(errors; by = e -> (e.file, e.line))
+    sort_by!(errors, e -> (e.file, e.line))
     return items, errors, rejected, reduce(union!, (c[4] for c in chunks); init = Set{Symbol}())
 end
 

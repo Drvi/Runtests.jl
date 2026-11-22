@@ -492,6 +492,53 @@ end)
         err = thrown(() -> Runtests.runtests_dispatch(disp, "main", skip_variants; dry_run = true))
         @test err isa ConfigError
         @test occursin("qa check", sprint(showerror, err))
+
+        # Kwarg hygiene: top-level kwargs, unselected variants, and `exclude` are all validated up front.
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants;
+                                                      exclude = (; name = "manual only"), workres = 2))
+        @test err isa ArgumentError && occursin("unknown keyword `workres`", sprint(showerror, err))
+
+        # Typo or bad setting in an *unselected* variant is caught immediately (never silently matches all items).
+        bad_unselected = Dict(
+            "juliac"     => (; group = "juliac"),
+            "non_juliac" => (; tag = :non_juliac),
+            "qa"         => (; paths = ["test/qa"]),
+        )
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", bad_unselected;
+                                                      exclude = (; name = "manual only"), dry_run = true))
+        @test err isa ArgumentError && occursin("non_juliac", sprint(showerror, err)) &&
+              occursin("unknown keyword `tag`", sprint(showerror, err))
+
+        bad_val_unselected = Dict(
+            "juliac"     => (; group = "juliac"),
+            "non_juliac" => (; group = "non_juliac", workers = -1),
+            "qa"         => (; paths = ["test/qa"]),
+        )
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", bad_val_unselected;
+                                                      exclude = (; name = "manual only"), dry_run = true))
+        @test err isa ArgumentError && occursin("non_juliac", sprint(showerror, err)) &&
+              occursin("workers", sprint(showerror, err))
+
+        # Typo or non-selection kwarg in `exclude` is rejected instead of silently matching all items.
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants;
+                                                      exclude = (; tag = :manual), dry_run = true))
+        @test err isa ArgumentError && occursin("`exclude`", sprint(showerror, err)) &&
+              occursin("did you mean `tags`", sprint(showerror, err))
+
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", variants;
+                                                      exclude = (; name = "manual only", workers = 2), dry_run = true))
+        @test err isa ArgumentError && occursin("`exclude`", sprint(showerror, err)) &&
+              occursin("workers", sprint(showerror, err))
+
+        # Cross-setting conflict between top-level and selected variant is caught before scanning.
+        conflict_variants = Dict(
+            "juliac"     => (; group = "juliac", workers = 0),
+            "non_juliac" => (; group = "non_juliac"),
+            "qa"         => (; paths = ["test/qa"]),
+        )
+        err = thrown(() -> Runtests.runtests_dispatch(disp, "juliac", conflict_variants;
+                                                      exclude = (; name = "manual only"), coverage = true))
+        @test err isa ArgumentError && occursin("coverage", sprint(showerror, err))
     end
 
     end   # withenv

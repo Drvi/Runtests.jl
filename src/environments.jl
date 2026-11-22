@@ -709,7 +709,7 @@ function recorded_replay_slots(p::Plan, records::Vector)
     replay_slots = [ItemIdx[] for _ in 1:S]
     preserve_ids = maximum(rec_slots) <= S
     for (pos, r) in enumerate(rec_slots)
-        entries = sort!(by_slot[r]; by = x -> (x[1], x[2]))
+        entries = sort_by!(by_slot[r], x -> (x[1], x[2]))
         dest = preserve_ids ? r : mod1(pos, S)
         for (_, _, idx) in entries
             push!(replay_slots[dest], idx)

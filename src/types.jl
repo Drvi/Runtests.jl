@@ -217,6 +217,54 @@ their files (empty means all); and `line` picks the item defined at or above it.
 [`FailingItems`](@ref), `"named item"` for any other. Every test file is read
 whatever the selection: a suite that does not parse is broken, not smaller.
 """
+# Stable O(n log n) merge sort over pre-extracted keys. Unlike `Base.sort!(v; by = f)`,
+# which compiles Julia's multi-layer adaptive sort pipeline separately for every closure
+# type `typeof(f)`, this only specializes the sort loop on the key type `K`.
+function sortperm_stable(keys::Vector{K}; rev::Bool = false)::Vector{Int} where {K}
+    n = length(keys)
+    idx = collect(1:n)
+    n <= 1 && return idx
+    buf = Vector{Int}(undef, n)
+    w = 1
+    while w < n
+        lo = 1
+        while lo <= n
+            mid = min(lo + w - 1, n)
+            hi = min(lo + 2 * w - 1, n)
+            i, j, k = lo, mid + 1, lo
+            @inbounds while i <= mid && j <= hi
+                take_right = rev ? isless(keys[idx[i]], keys[idx[j]]) : isless(keys[idx[j]], keys[idx[i]])
+                if take_right
+                    buf[k] = idx[j]; j += 1
+                else
+                    buf[k] = idx[i]; i += 1
+                end
+                k += 1
+            end
+            @inbounds while i <= mid; buf[k] = idx[i]; i += 1; k += 1; end
+            @inbounds while j <= hi;  buf[k] = idx[j]; j += 1; k += 1; end
+            lo += 2 * w
+        end
+        idx, buf = buf, idx
+        w <<= 1
+    end
+    return idx
+end
+
+sortperm_by(xs, key; rev::Bool = false)::Vector{Int} = sortperm_stable(map(key, xs); rev)
+
+function sort_by!(v::Vector{T}, key; rev::Bool = false)::Vector{T} where {T}
+    n = length(v)
+    n <= 1 && return v
+    idx = sortperm_stable(map(key, v); rev)
+    out = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        out[i] = v[idx[i]]
+    end
+    copyto!(v, out)
+    return v
+end
+
 struct Filter
     name::Union{Nothing, String, Regex, Set{String}}
     tags::Union{Nothing, Vector{Symbol}, TagExpr}
@@ -225,9 +273,25 @@ struct Filter
     group::Union{Nothing, GroupSelection}
     names_are::String
 end
-Filter(; name = nothing, tags = nothing, paths = String[], line = 0, group = nothing) =
-    Filter(_asname(name), _astags(tags), collect(paths), Int32(line), group,
-           name isa FailingItems ? "failing item" : "named item")
+function _make_filter(@nospecialize(name), @nospecialize(tags), @nospecialize(paths),
+                      line::Int32, group::Union{Nothing, GroupSelection})::Filter
+    p = if paths isa Vector{String}
+        paths
+    else
+        out = String[]
+        for x in paths
+            push!(out, x isa String ? x : String(x)::String)
+        end
+        out
+    end
+    n::Union{Nothing, String, Regex, Set{String}} = _asname(name)
+    t::Union{Nothing, Vector{Symbol}, TagExpr} = _astags(tags)
+    return Filter(n, t, p, line, group,
+                  name isa FailingItems ? "failing item" : "named item")
+end
+Filter(; name = nothing, tags = nothing, paths = String[], line::Integer = Int32(0),
+       group::Union{Nothing, GroupSelection} = nothing) =
+    _make_filter(name, tags, paths, Int32(line), group)
 
 """
     FailingItems(names, seeds)

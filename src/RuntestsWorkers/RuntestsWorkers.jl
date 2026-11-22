@@ -109,6 +109,8 @@ const PRECOMPILE_SIGNATURES = (
     (read_message, (TCPSocket, FrameReader)),
     (terminate!, (Worker, Symbol)),
     (watch_coordinator, (Base.PipeEndpoint,)),
+    (_connect_worker, (WorkerProcess, Int, Base.DevNull, typeof(default_redirect_fn), Nothing, Nothing)),
+    (kill_leftovers, ()),
 )
 
 # The workload does not *run* a test item: that evaluates code into `Main`, and a

@@ -422,7 +422,7 @@ function relocate(code::String, ex::Expr, name::String, pkg::Union{Nothing, Stri
             break
         end
     end
-    sort!(edits; by = e -> first(e[1]))
+    sort_by!(edits, e -> first(e[1]))
     return replace_ranges(code, edits), rewritten, imported, hazards
 end
 

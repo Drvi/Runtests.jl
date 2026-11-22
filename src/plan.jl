@@ -318,7 +318,7 @@ function plan(
     raw_pools, raw_min_prof = pool_units(draft.profile, profiles, profile_package, packages)
     cold = combined_cold(histories)
     estimate = pool_estimate(raw_pools, draft, gate_limit, cold)
-    order = sortperm(eachindex(raw_pools); by = k -> (-estimate(k, 1), raw_min_prof[k]))
+    order = sortperm_by(eachindex(raw_pools), k -> (-estimate(k, 1), raw_min_prof[k]))
     pools = raw_pools[order]
     min_prof = raw_min_prof[order]
     slots = count_slots(pools, (k, n) -> estimate(order[k], n), cfg)
@@ -363,7 +363,7 @@ function validate_profiles(raw, packages::Packages)
         else
             println(io, "unknown profiles:")
         end
-        for ((k, name), items) in sort!(collect(bad); by = first)
+        for ((k, name), items) in sort_by!(collect(bad), first)
             known = length(packages) == 1 ? "" :
                 string(" (known: ", join(sort!(string.(collect(keys(packages.cfg[k].profiles)))), ", "), ")")
             println(io, "  `profile = :$name` has no [profiles.$name] in ", config_name(packages, k), known, ", used by:")
@@ -414,7 +414,7 @@ end
 
 # Cheap edit-distance-ish suggestion: a typo'd name should not send anyone hunting.
 function nearest(name::AbstractString, names, k::Int = 2; cutoff::Int = max(3, length(name) ÷ 3))
-    scored = sort!([(levenshtein(name, n), n) for n in names]; by = first)
+    scored = sort_by!([(levenshtein(name, n), n) for n in names], first)
     return [n for (d, n) in Iterators.take(scored, k) if d <= cutoff]
 end
 
@@ -443,7 +443,7 @@ function profile_table(packages::Packages, raw::Vector{RawItem})
         push!(triples, (Int32(k), n, ""))
     end
     foreach(it -> push!(triples, (it.package, it.profile, it.environment)), raw)
-    keys_ = sort!(collect(triples); by = ((k, n, env),) -> (k, n !== DEFAULT_PROFILE, string(n), env))
+    keys_ = sort_by!(collect(triples), ((k, n, env),) -> (k, n !== DEFAULT_PROFILE, string(n), env))
     for k in eachindex(packages.name)
         used = count(t -> t[1] == k, keys_)
         used <= MAX_PACKAGE_PROFILES || throw(ConfigError(string(
@@ -576,7 +576,7 @@ function pool_units(u_profile::Vector{ProfileIdx}, profiles::Vector{Profile},
         push!(pools, pool)
         push!(min_prof, minimum(u -> u_profile[u], pool))
     end
-    perm = sortperm(min_prof)
+    perm = sortperm_stable(min_prof)
     return pools[perm], min_prof[perm]
 end
 
@@ -782,7 +782,7 @@ function order_pool!(pool::Vector{Int}, raw::Vector{RawItem}, draft::PlanDraft, 
         draft.key[u] = (Int8(why), why === RECENT ? urgency : p, by_length ? -est : 0.0,
                         by_length ? -est_s : 0.0, draft.file_rank[u], it.line)
     end
-    return sort!(pool; by = u -> draft.key[u])
+    return sort_by!(pool, u -> draft.key[u])
 end
 
 """
@@ -803,7 +803,7 @@ function order_blocks!(pinned::Dict{Int, Int}, pool::Vector{Int}, raw::Vector{Ra
             est[k] = get(est, k, 0.0) + est_s[u]
         end
         length(est) > 1 || continue
-        ranked = sort!(collect(keys(est)); by = k -> (-est[k], k))
+        ranked = sort_by!(collect(keys(est)), k -> (-est[k], k))
         rank = Dict{Int32, Int}(k => r for (r, k) in enumerate(ranked))
         span = maximum(u -> abs(pinned[u]), on_side) + 1
         for u in on_side

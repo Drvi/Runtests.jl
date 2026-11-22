@@ -184,7 +184,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
             combined && ask!(needs[i].by, p.packages.name[package], asked)
         end
     end
-    for ((k, name), names) in sort!(collect(unheld); by = first)
+    for ((k, name), names) in sort_by!(collect(unheld), first)
         isempty(names) && continue
         throw(ConfigError(string(
             "`precompile` of profile `", name, "`", combined ? string(" of ", p.packages.name[k]) : "", " names ",
@@ -303,9 +303,21 @@ const QueueEnv = @NamedTuple{project::String, load_path::Vector{String}}
 # `base_pkg` is `pkg` (or its parent package for an extension), used lazily for UI
 # metadata only when the queue actually has stale caches to compile. `direct` records
 # whether a tested project directly names `pkg` (or its parent).
-const QueueJob = @NamedTuple{env::Int, pkg::Base.PkgId, base_pkg::Base.PkgId, config::Int, deps::Vector{Int},
-                             strict::Bool, exts::Union{Nothing, Vector{Base.PkgId}}, kind::Symbol, group::Int,
-                             name::String, profiles::Set{String}, requesters::Set{String}, direct::Bool}
+struct QueueJob
+    env::Int
+    pkg::Base.PkgId
+    base_pkg::Base.PkgId
+    config::Int
+    deps::Vector{Int}
+    strict::Bool
+    exts::Union{Nothing, Vector{Base.PkgId}}
+    kind::Symbol
+    group::Int
+    name::String
+    profiles::Set{String}
+    requesters::Set{String}
+    direct::Bool
+end
 
 # The environment a group of jobs compiles in, tagged by `kind`:
 # `:test`, `:pkg_test` (`label` = package name), `:env` (`label` = relpath),
@@ -559,7 +571,7 @@ end
 queue_project_file(project::AbstractString) =
     isempty(project) ? nothing : isdir(project) ? project_file(project) : isfile(project) ? String(project) : nothing
 
-function add_job!(q::PrecompileQueue, key, job::NamedTuple)
+function add_job!(q::PrecompileQueue, key::JobKey, job::QueueJob)
     haskey(q.index, key) && return q.index[key]
     push!(q.jobs, job)
     return q.index[key] = lastindex(q.jobs)
@@ -594,9 +606,9 @@ function add_project!(q::PrecompileQueue, project::AbstractString, load_path::Ve
         exts = haskey(g.parent, pkg) ? filter(d -> haskey(g.parent, d), g.triggers[pkg]) : nothing
         base_pkg = get(g.parent, pkg, pkg)
         j = add_job!(q, (String(project), pkg, flags),
-                     (; env = e, pkg, base_pkg, config = c, deps = Int[], strict = !isempty(g.deps[pkg]), exts,
-                      kind = :package, group, name = display_name(g, pkg), profiles = Set{String}(),
-                      requesters = Set{String}(), direct = tested && pkg in g.direct))
+                     QueueJob(e, pkg, base_pkg, c, Int[], !isempty(g.deps[pkg]), exts,
+                              :package, group, display_name(g, pkg), Set{String}(),
+                              Set{String}(), tested && pkg in g.direct))
         union!(q.jobs[j].profiles, profiles)
         # As `Pkg.test` asks the precompiler: the project's own, or else the names, with
         # the extensions of each, as a run of one package asks for its project's.
@@ -670,10 +682,10 @@ function precompile_queue(run::Run, p::Plan, flags_of)
         # Not in the project's manifest: the compile process builds what it waits for.
         haskey(q.index, (here, pkg, flags)) && continue
         push!(q.requested,
-              add_job!(q, (here, pkg, flags), (; env = env_of!(q, here, here_path), pkg, base_pkg = pkg,
-                                              config = config_of!(q, config), deps = Int[], strict = false,
-                                              exts = nothing, kind = :runtests, group, name = "Runtests",
-                                              profiles = Set{String}(), requesters = who, direct = true)))
+              add_job!(q, (here, pkg, flags), QueueJob(env_of!(q, here, here_path), pkg, pkg,
+                                                       config_of!(q, config), Int[], false,
+                                                       nothing, :runtests, group, "Runtests",
+                                                       Set{String}(), who, true)))
     end
     once = Dict{Symbol, String}()
     for (; project, load_path, needs) in setup_needs(run, p, flags_of)
@@ -705,10 +717,9 @@ function add_setups!(q::PrecompileQueue, project::AbstractString, load_path::Vec
                 union!(q.jobs[q.index[key]].requesters, packages)
                 continue
             end
-            i = add_job!(q, key, (; env = e, pkg, base_pkg = pkg, config = config_of!(q, args => flags),
-                                  deps = Int[], strict = false, exts = nothing, kind = :setup, group,
-                                  name = pkg.name, profiles = copy(profiles), requesters = copy(packages),
-                                  direct = true))
+            i = add_job!(q, key, QueueJob(e, pkg, pkg, config_of!(q, args => flags),
+                                          Int[], false, nothing, :setup, group,
+                                          pkg.name, copy(profiles), copy(packages), true))
             push!(q.requested, i)
             for dep in setup_dependencies(pkg)
                 # Named in the setup's own `[deps]`, or for a setup that is not a package,

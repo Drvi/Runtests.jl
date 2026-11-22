@@ -188,7 +188,7 @@ function extract_template_slots(text::String, node)
         collect_interpolation_sites!(sites, text, kids[k], true)
     end
     collect_interpolation_sites!(sites, text, body, false)
-    sort!(sites; by = s -> first(s[1]))
+    sort_by!(sites, s -> first(s[1]))
     return TemplateSlots(byte_range(kids[2]), byte_range(loop), byte_range(body), Expr(node)::Expr, sites)
 end
 

@@ -191,6 +191,49 @@ filtered(paths...; kwargs...) =
             # Every keyword it could have been is listed, selections and settings alike.
             @test all(k -> occursin("`$k`", e.msg), (:name, :tags, :group, :dry_run, :replay, :config, :workers, :seed))
         end
+        # Internal `nunits` is never accepted as a user keyword.
+        e = caught(() -> Runtests.runtests(dir; dry_run = true, nunits = 5))
+        @test e isa ArgumentError && occursin("unknown keyword `nunits`", e.msg)
+    end
+
+    @testset "bad keywords and values fail before scanning or announcing" begin
+        # Unknown keyword and invalid setting values must fail before printing
+        # "reading test files" or resolving/scanning any files.
+        missing_path = joinpath(dir, "does_not_exist_at_all")
+        for call in (
+            () -> Runtests.runtests(missing_path; workres = 2),
+            () -> Runtests.runtests(dir; workers = -1),
+            () -> Runtests.runtests(dir; logs = :bogus),
+            () -> Runtests.runtests(dir; timeout = -5),
+            () -> Runtests.runtests(dir; worker_init = 123),
+            () -> Runtests.runtests(dir; test_end = "not an expr"),
+            () -> Runtests.runtests(dir; config = 123),
+            () -> Runtests.runtests(dir; replay = 123),
+            () -> Runtests.runtests(dir; coverage = true, workers = 0),
+        )
+            err, out = capture_run() do
+                caught(call)
+            end
+            @test err isa ArgumentError
+            @test isempty(out)
+        end
+
+        # `runtestsf` validates all keywords even when nothing is failing / no run state exists.
+        withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            for call in (
+                () -> Runtests.runtestsf(dir; workres = 2),
+                () -> Runtests.runtestsf(dir; nunits = 5),
+                () -> Runtests.runtestsf(dir; workers = -1),
+                () -> Runtests.runtestsf(dir; on_event = 123),
+                () -> Runtests.runtestsf(dir; dry_run = "yes"),
+            )
+                err, out = capture_run() do
+                    caught(call)
+                end
+                @test err isa ArgumentError
+                @test isempty(out)
+            end
+        end
     end
 
     @testset "a path beside test/ is not under it" begin

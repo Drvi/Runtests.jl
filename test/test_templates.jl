@@ -391,6 +391,8 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
             "computed" => "@testtemplate \"c \$T\" for T in (Int8,)\n    @test \$(sizeof(T)) == 1\nend\n",
             "keyword_throws" => "@testtemplate \"kt \$n\" skip = \$(error(\"no skip list today\")) for n in 1:1\n    @test true\nend\n",
             "keyword_not_given_back" => "@testtemplate \"kg \$n\" skip = \$(Ref(n)) for n in 1:1\n    @test true\nend\n",
+            "unknown_keyword" => "@testtemplate \"uk \$n\" bogus = 1 for n in error(\"loop must not run\")\n    @test true\nend\n",
+            "duplicate_keyword" => "@testtemplate \"dk \$n\" retries = 1 retries = 2 for n in error(\"loop must not run\")\n    @test true\nend\n",
             "empty" => "@testtemplate \"e \$T\" for T in ()\n    @test true\nend\n",
             "syntax" => "@testtemplate \"s \$T\" for T in (Int8,\n    @test true\nend\n",
         ]
@@ -417,10 +419,14 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
                         "the body interpolates only a loop variable, as `\$x`, since a `\$(...)` there may be a macro's",
                         "no skip list today",
                         "`\$(Ref(n))` would be written `$(repr(Ref(1)))`, which does not give its value back",
+                        "unknown keyword `bogus`",
+                        "`retries` given twice",
                         "ran no iteration, so it declares no test item",
                         "ParseError"]
                 @test occursin(msg, out)
             end
+            @test !occursin("loop must not run", out)
+            @test Runtests.Private.Expander.ITEM_KEYWORDS == Runtests.Private.ITEM_KEYWORDS
             @test !any(((name, _),) -> isfile(joinpath(pkg, "test", "$(name)_tests.jl")), templates)
         end
     end

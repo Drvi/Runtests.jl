@@ -10,7 +10,7 @@ Where attempt `attempt` at item `index` keeps its evidence: `item_<index>_<attem
 beside its log, with `prefix` the part of the path a log's shares.
 """
 artifacts_path(prefix::String, index::Integer, attempt::Integer) =
-    string(prefix, index, "_", attempt, ".artifacts")
+    string(prefix, Int(index), "_", Int(attempt), ".artifacts")
 
 # Where attempt `attempt` at item `i` keeps its evidence, or `""` when no directory
 # could be created (after a scratch-dir fallback with no run state).

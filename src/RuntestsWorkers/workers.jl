@@ -483,9 +483,10 @@ end
 # `f` in a task stuck to thread `tid`, as `@async` sticks a task to the thread that
 # starts it: while it runs, no other task stuck to that thread is running.
 function on_thread(f, tid::Integer)
+    tid_i = Int(tid)
     t = Task(f)
     t.sticky = true
-    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1) == 1 || error("Runtests: no thread $tid to run a task on")
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, Cint(tid_i - 1)) == 1 || error("Runtests: no thread $tid_i to run a task on")
     return schedule(t)
 end
 
@@ -824,14 +825,16 @@ function abort_worker_process!(wp::WorkerProcess)
 end
 
 # Connect to an already-spawned `WorkerProcess`, returning `(worker, ready_timestamp)`.
-function connect_worker(
-        wp::WorkerProcess;
-        connect_timeout::Int=60,
-        redirect_io::IO=stdout,
-        redirect_fn=(io, pid, line) -> println(io, "      worker ", pid, " | ", line),
-        on_exit=nothing,
-        on_output_done=nothing,
-    )
+# `_connect_worker` avoids specializing on every caller's IO/callback closure types so
+# the first worker start hits the precompiled method directly.
+function _connect_worker(
+        wp::WorkerProcess,
+        connect_timeout::Int,
+        @nospecialize(redirect_io::IO),
+        @nospecialize(redirect_fn),
+        @nospecialize(on_exit),
+        @nospecialize(on_output_done),
+    )::Tuple{Worker, Float64}
     pid, proc, job, cookie = wp.pid, wp.proc, wp.job, wp.cookie
     sock::Union{Nothing, Sockets.TCPSocket} = nothing
     w::Union{Nothing, Worker} = nothing
@@ -843,7 +846,7 @@ function connect_worker(
             Sockets.quickack(conn, true)
             write(conn, cookie)
             (conn, ts)
-        end
+        end::Tuple{Sockets.TCPSocket, Float64}
         sock = s
         worker = Worker(ReentrantLock(), ReentrantLock(), IOBuffer(; sizehint = 1024), Int(pid), proc, s,
                         Base.Event(), Task(nothing), Task(nothing), Task(nothing),
@@ -888,6 +891,19 @@ function connect_worker(
     end
 end
 
+default_redirect_fn(io, pid, line) = println(io, "      worker ", pid, " | ", line)
+
+function connect_worker(
+        wp::WorkerProcess;
+        connect_timeout::Int=60,
+        @nospecialize(redirect_io::IO=stdout),
+        @nospecialize(redirect_fn=default_redirect_fn),
+        @nospecialize(on_exit=nothing),
+        @nospecialize(on_output_done=nothing),
+    )::Tuple{Worker, Float64}
+    return _connect_worker(wp, connect_timeout, redirect_io, redirect_fn, on_exit, on_output_done)
+end
+
 """
     Worker(; julia_args, threads, env, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit, on_output_done)
 
@@ -929,13 +945,13 @@ end
 # became ready); anything it prints before that is relayed like any other output. `eof`
 # blocks until there is a line or the pipe is closed, so a worker that dies before it is
 # ready is reported at once.
-function read_port(proc::Base.Process, io::IO, pid::Integer, fn)
+function read_port(proc::Base.Process, @nospecialize(io::IO), pid::Int32, @nospecialize(fn))::Tuple{Int, Float64}
     while !eof(proc)
         line = readline(proc)
         m = match(r"runtestsworker:(\d+)(?:\s+([0-9.eE+-]+))?", line)
         if m !== nothing
-            port = parse(Int, m.captures[1])
-            ts = m.captures[2] === nothing ? 0.0 : something(tryparse(Float64, m.captures[2]), 0.0)
+            port = parse(Int, m.captures[1]::AbstractString)
+            ts = m.captures[2] === nothing ? 0.0 : something(tryparse(Float64, m.captures[2]::AbstractString), 0.0)
             return port, ts
         end
         isempty(line) || (fn(io, pid, line); flush(io))
@@ -947,7 +963,7 @@ end
 # The result travels through a channel rather than a condition: a condition's
 # notify is lost when nobody is waiting yet, and the task can finish before the
 # caller reaches the wait.
-function with_timeout(f, timeout::Real)
+function with_timeout(@nospecialize(f), timeout::Real)
     result = Channel{Any}(1)
     Threads.@spawn begin
         r = try
@@ -980,7 +996,8 @@ end
 # `eof` blocks until there is a line or the pipe is closed, and the partial last
 # line of a worker that was killed comes back from `readline`: nothing is polled
 # for and nothing is lost.
-function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process, on_output_done = nothing)
+function redirect_worker_output(@nospecialize(io::IO), w::Worker, @nospecialize(fn),
+                                proc::Base.Process, @nospecialize(on_output_done) = nothing)
     try
         while true
             try

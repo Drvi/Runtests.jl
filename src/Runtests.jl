@@ -25,6 +25,8 @@ points into scope; call them through `Runtests`, not this module.
 """
 module Private
 
+Base.Experimental.@optlevel 1
+
 using Base.ScopedValues: ScopedValue, with
 using Logging: Logging, with_logger, current_logger
 using Random: Random, RandomDevice
@@ -174,7 +176,7 @@ function runtests_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tag
             print_plan(stdout, p)
             return nothing
         end
-        run = execute(p, target; on_event)
+        run = execute_impl(p, target, on_event)
         try
             return RunTestSet(report(run))
         finally
@@ -206,6 +208,17 @@ function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags
     replay === nothing && (replay = pop!(kwargs, :replay, nothing))
     worker_init === nothing && (worker_init = pop!(kwargs, :worker_init, nothing))
     test_end === nothing && (test_end = pop!(kwargs, :test_end, nothing))
+    config_arg = pop!(kwargs, :config, nothing)
+    # Reject unknown keywords and invalid call values before touching the filesystem,
+    # reading run states, printing startup lines, or scanning the test suite.
+    validate_call_kwarg(:name, name)
+    validate_call_kwarg(:tags, tags)
+    validate_call_kwarg(:group, group)
+    validate_call_kwarg(:replay, replay)
+    validate_call_kwarg(:worker_init, worker_init)
+    validate_call_kwarg(:test_end, test_end)
+    validate_call_kwarg(:config, config_arg)
+    validate_run_kwargs(kwargs; mono = false)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     named = name !== nothing   # by the caller, not by a replay
@@ -237,7 +250,6 @@ function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags
         end
     end
     # Read before the test files: the group decides what is selected from them.
-    config_arg = get(kwargs, :config, nothing)
     config_path, toml = config_toml(target.testdir, config_arg === nothing ? nothing : String(config_arg))
     selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
     filter = Filter(; name, tags, paths = target.paths, line = target.line,
@@ -305,12 +317,9 @@ function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags
     t_plan = time()
     hist = history(target.root; base = rs)
     peak_worker_mb, rss_coverage = estimate_worker_rss(items, History[hist])
-    cfg_opts = copy(kwargs)
-    cfg_file = pop!(cfg_opts, :config, nothing)
-    cfg_opts[:nunits] = length(items)
     cfg = read_config_impl(
         target.testdir, peak_worker_mb, rss_coverage,
-        cfg_file === nothing ? nothing : String(cfg_file), cfg_opts
+        config_arg === nothing ? nothing : String(config_arg), length(items), kwargs
     )
     naming = naming_root(target.root)
     check_skip_environment(cfg.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming,
@@ -494,7 +503,7 @@ function runtests_mono_impl(args::Vector{Any}, @nospecialize(packages), @nospeci
             return nothing
         end
         project = something(project_file(p.root), joinpath(p.root, "Project.toml"))
-        run = execute(p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)); on_event)
+        run = execute_impl(p, Target(p.root, project, joinpath(p.root, "test"), String[], Int32(0)), on_event)
         try
             return RunTestSet(report(run))
         finally
@@ -551,6 +560,11 @@ until there are none is what it is for. A `name` that none of the failing items
 matches is an error.
 """
 function runtestsf(args...; replay = nothing, name = nothing, kwargs...)
+    # Validate all keywords up front so misspelled or invalid kwargs fail even when
+    # no item is currently failing and before reading run states.
+    validate_call_kwarg(:replay, replay)
+    validate_call_kwarg(:name, name)
+    validate_run_kwargs(kwargs_dict(kwargs); mono = false, allow_call_keys = true)
     target = resolve_target(args)
     return with_runs_read(() -> run_failing(target, args; replay, name, kwargs...), target.root)
 end
@@ -815,21 +829,34 @@ const PRECOMPILE_SIGNATURES = (
     (resolve_target, (Vector{Any},)),
     (runtests, ()),
     (runtests, (String,)),
-    (runtests_impl, (Vector{Any}, Any, Any, Bool, Any, Dict{Symbol, Any})),
+    (runtests_impl, (Vector{Any}, Nothing, Nothing, Bool, Nothing, Dict{Symbol, Any})),
     (prepare, (Tuple{String},)),
-    (prepare_impl, (Vector{Any}, Any, Any, Any, Any, Bool, Bool, Bool, Bool, Any, Any, Dict{Symbol, Any})),
     (runtests_mono, ()),
     (runtests_mono, (String,)),
-    (runtests_mono_impl, (Vector{Any}, Any, Any, Any, Bool, Any, Dict{Symbol, Any})),
-    (prepare_mono_impl, (Vector{Any}, Any, Any, Any, Any, Any, Nothing, Nothing,
-                         Bool, Bool, Bool, Any, Any, Dict{Symbol, Any})),
-    (read_config_impl, (String, Float64, Float64, Nothing, Dict{Symbol, Any})),
+    (runtests_mono_impl, (Vector{Any}, Nothing, Nothing, Nothing, Bool, Nothing, Dict{Symbol, Any})),
+    (prepare_mono_impl, (Vector{Any}, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing,
+                         Bool, Bool, Bool, Nothing, Nothing, Dict{Symbol, Any})),
+    (find_participants, (String,)),
+    (mono_groups, (Vector{Dict{String, TagExpr}}, Vector{String}, Nothing, Bool)),
+    (read_config_impl, (String, Float64, Float64, Nothing, Int, Dict{Symbol, Any})),
     (build_config_impl, (String, Dict{String, Any}, Float64, Float64, Int, String, String,
                          Nothing, Nothing, Dict{Symbol, Any})),
-    (execute, (Plan, Target)),
+    (execute_impl, (Plan, Target, Nothing)),
+    (start_monitor!, (Monitor,)),
+    (monitor_loop, (Monitor,)),
+    (_open_runstate, (Plan, Float64, String, Vector{String})),
+    (path_dep_stamps_match, (Vector{Any},)),
+    (circular_packages, (Dict{Base.PkgId, Vector{Base.PkgId}},)),
+    (add_job!, (PrecompileQueue, JobKey, QueueJob)),
+    (queue_order!, (Vector{QueueJob},)),
+    (note_start!, (Queues, SlotIdx, Float64)),
+    (complete_attempt!, (Run, Slot, ItemIdx, Int8, Int, RuntestsWorkers.ItemSpec, RuntestsWorkers.ItemResult,
+                         RuntestsWorkers.Worker, Float32, Int32, SlotIdx)),
     (report, (Run,)),
     (run_on_workers, (Run,)),
     (run_slot, (Run, Slot)),
+    (logs, (String,)),
+    (report_unfinished_run, ()),
 )
 
 # Everything between `runtests()` and the first test item: reading, configuring,
@@ -878,24 +905,24 @@ const PRECOMPILE_SIGNATURES = (
         tpl_item["line"] = 1
         tpl_item["instances"] = instances
         write_whole(expansion_of(template), render_expansion(template, template_source, Dict{String, Any}[tpl_item]))
-        files, strays, templates = walk_test_dir(testdir)
-        setups = setup_modules(testdir)
-        items = scan(files, Filter(), setups; ntasks = 2, strays, templates)
-        scan(files, Filter(name = "precompile one"), setups; ntasks = 1)
-        cfg = read_config(testdir; nunits = length(items), monitor = false)
-        p = plan(items, cfg; history = history(dir), root = dir)
-        print_plan(devnull, p)
-        Queues(p); Statuses(nitems(p))
         # Exercise the opening `prepare_impl` path so the first log line prints
-        # without first-call compilation delay.
-        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
+        # without first-call compilation delay, and reuse its plan below instead of
+        # scanning and planning the fixture twice.
+        p = withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
             redirect_stdout(devnull) do
-                prepare_impl(Any[dir], nothing, nothing, nothing, nothing, true, false, true, false,
-                             nothing, nothing, Dict{Symbol, Any}(:monitor => false))
+                res = prepare_impl(Any[dir], nothing, nothing, nothing, nothing, true, false, true, false,
+                                   nothing, nothing, Dict{Symbol, Any}(:monitor => false))
                 prepare_impl(Any[joinpath(testdir, "precompile_test.jl")], nothing, :a, nothing, nothing,
                              true, false, true, false, nothing, nothing, Dict{Symbol, Any}(:workers => 2))
+                first(res)
             end
         end
+        print_plan(devnull, p)
+        Queues(p); Statuses(nitems(p))
+        Filter(; name = "precompile one", line = Int32(0))
+        sortperm_stable(Tuple{Float64, String}[(1.0, "a"), (2.0, "b")]; rev = false)
+        path_dep_stamps_match(Any[Any["Pkg", "1", "1:00000000"]])
+        Logging.min_enabled_level(RunLogger(Logging.ConsoleLogger(devnull), nothing))
 
         # The run state, written before the first item starts and read by the run
         # after this one.
@@ -904,6 +931,7 @@ const PRECOMPILE_SIGNATURES = (
         write_status!(rsf, 1, RUNNING, 1, 1)
         write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1, compile = 0.05)
         append_event!(rsf, EVENT_ATTEMPT, UInt8(PASSED), 1, 1, 0.1, 0.2; item = 1, attempt = 1)
+        append_event!(rsf, EVENT_WORKER_UP, 0, SlotIdx(1), 1, 0.1, 0.2)
         write_memory!(rsf, MemStats())
         finish_run_state!(rsf)
         read_run_state(statepath)

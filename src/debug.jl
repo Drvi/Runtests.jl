@@ -116,7 +116,7 @@ function last_failure(target, items::Vector{RawItem} = suite_items(target))
                 "step into; name an item instead: `Runtests.debug(\"name\")`"
         )
     )
-    sort!(failed; by = ((_, f),) -> (f.verdict_at, f.verdict_end), rev = true)
+    sort_by!(failed, ((_, f),) -> (f.verdict_at, f.verdict_end); rev = true)
     return (; name = first(failed)[1], others = [n for (n, _) in failed[2:end]], seed = first(failed)[2].seed)
 end
 

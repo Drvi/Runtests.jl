@@ -266,12 +266,14 @@ so a caller that wants to inspect the outcome does not have to catch anything.
 The caller holds the process (`exclusively`). `on_event` is called with a
 [`TestItemEvent`](@ref) as each attempt starts and ends.
 """
-function execute(p::Plan, target; on_event = nothing)
+function execute_impl(p::Plan, target, @nospecialize(on_event))
     # Items that run in this process run on the caller's thread, as the code around
     # the call would run them.
     single_process(p) && return execute_here(p, target, on_event)
     return in_default_pool(() -> execute_here(p, target, on_event))
 end
+
+execute(p::Plan, target; on_event = nothing) = execute_impl(p, target, on_event)
 
 """
     in_default_pool(f)
@@ -426,7 +428,7 @@ function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
                 @atomic run.runstate = is_combined(p) ?
                     open_runstate_set(p, run.t0, run.runid; worktree = state,
                                       worker_projects = [worker_projects(run, k) for k in eachindex(p.packages.name)]) :
-                    open_runstate(p, run.t0; worktree = state, worker_projects = worker_projects(run, 1))
+                    _open_runstate(p, run.t0, String(state), worker_projects(run, 1))
                 keep_logs_by_runstate!(run)
                 # Until the first item can start, a throw ends the run here, and its file
                 # must say so: unfinished, its beats would keep it looking alive for as
@@ -569,12 +571,11 @@ end
 
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
-function open_runstate(p::Plan, start::Float64; worktree::AbstractString = "unknown",
-                       worker_projects::Vector{String} = String[])
+function _open_runstate(p::Plan, start::Float64, worktree::String, worker_projects::Vector{String})
     path = nothing
     try
         path = new_runstate_path(p.root)
-        return init_run_state(path, p; start, meta = ["worktree" => String(worktree)], worker_projects)
+        return init_run_state(path, p; start, meta = ["worktree" => worktree], worker_projects)
     catch e
         # A directory claimed and left without a record would never be read, nor pruned.
         path === nothing || remove_runstate(path)
@@ -582,6 +583,10 @@ function open_runstate(p::Plan, start::Float64; worktree::AbstractString = "unkn
         return nothing
     end
 end
+
+open_runstate(p::Plan, start::Float64; worktree::AbstractString = "unknown",
+              worker_projects::Vector{String} = String[]) =
+    _open_runstate(p, start, String(worktree)::String, worker_projects)
 
 # The items' logs go beside the run state once it is open, so that they last as long
 # as it does: each package's beside its own. Without one, or without a directory

@@ -27,6 +27,7 @@ import TOML
 
 const TESTITEM = Symbol("@testitem")
 const TESTTEMPLATE = Symbol("@testtemplate")
+const ITEM_KEYWORDS = (:tags, :timeout, :retries, :skip, :failfast, :throttle, :sandbox, :profile)
 
 is_testitem(@nospecialize ex) = ex isa Expr && ex.head === :macrocall && ex.args[1] === TESTITEM
 is_testtemplate(@nospecialize ex) = ex isa Expr && ex.head === :macrocall && ex.args[1] === TESTTEMPLATE
@@ -229,11 +230,18 @@ function declaration(ex::Expr, line::Int, path::String, project::String, names::
         any(p -> first(p) == key, computed) || push!(computed, key => a)
         return nothing
     end
+    seen_kw = Symbol[]
     for kw in keywords
-        kw isa Expr && kw.head === :(=) || continue
+        (kw isa Expr && kw.head === :(=) && kw.args[1] isa Symbol) ||
+            throw(TemplateError(line, "`@testtemplate`: expected `key=value`, got `$kw`"))
+        key = kw.args[1]::Symbol
+        key in ITEM_KEYWORDS || throw(TemplateError(line,
+            "`@testtemplate`: unknown keyword `$key`; known keywords are $(join(ITEM_KEYWORDS, ", "))"))
+        key in seen_kw && throw(TemplateError(line, "`@testtemplate`: `$key` given twice"))
+        push!(seen_kw, key)
         v = first_bare_mention(kw.args[2], vars)
         v === nothing || throw(TemplateError(line,
-            "`$(kw.args[1])` names the loop variable `$v`, which nothing binds in the item: write `\$$v` " *
+            "`$key` names the loop variable `$v`, which nothing binds in the item: write `\$$v` " *
             "where its value goes, or `\$(...)` around what is computed from it as the template expands"))
         header_interpolations(header!, kw.args[2])
     end

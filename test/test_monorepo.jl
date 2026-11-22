@@ -1661,6 +1661,32 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 err = try Runtests.runtests_dispatch_mono(ws, "core", disjoint_variants; dry_run = true, kw...); nothing catch e; e end
                 @test err isa ArgumentError && occursin("must be declared inside `variants`", sprint(showerror, err))
             end
+
+            # Kwarg hygiene: bad top-level kwargs, unselected variant kwargs, and `exclude` kwargs fail up front.
+            err = try Runtests.runtests_dispatch_mono(ws, "core", disjoint_variants; workres = 2); nothing catch e; e end
+            @test err isa ArgumentError && occursin("unknown keyword `workres`", sprint(showerror, err))
+
+            bad_mono_variants = Dict(
+                "core"  => (; packages = ["Core"]),
+                "extra" => (; packages = ["Extra"], tag = :juliac),
+            )
+            err = try Runtests.runtests_dispatch_mono(ws, "core", bad_mono_variants; dry_run = true); nothing catch e; e end
+            @test err isa ArgumentError && occursin("extra", sprint(showerror, err)) &&
+                  occursin("unknown keyword `tag`", sprint(showerror, err))
+
+            err = try Runtests.runtests_dispatch_mono(ws, "core", disjoint_variants;
+                                                      exclude = (; tag = :manual), dry_run = true); nothing catch e; e end
+            @test err isa ArgumentError && occursin("`exclude`", sprint(showerror, err)) &&
+                  occursin("did you mean `tags`", sprint(showerror, err))
+
+            err = try Runtests.runtests_dispatch_mono(ws, "core", disjoint_variants;
+                                                      exclude = (; workers = 2), dry_run = true); nothing catch e; e end
+            @test err isa ArgumentError && occursin("`exclude`", sprint(showerror, err)) &&
+                  occursin("workers", sprint(showerror, err))
+
+            # `runtests_mono` validates setting values before workspace discovery / scanning.
+            err = try Runtests.runtests_mono(joinpath(ws, "does_not_exist"); workers = -1); nothing catch e; e end
+            @test err isa ArgumentError && occursin("workers", sprint(showerror, err))
         end
     end
 end

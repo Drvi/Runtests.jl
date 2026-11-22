@@ -227,7 +227,7 @@ function run_order(p::Plan)
         free[s] += est[claim.item]
         q.gate[claim.item] == 0 || push!(gated, (free[s], claim.item))
     end
-    return (; items = sort!(items; by = x -> (x[1], x[2])), work = free .- waited)
+    return (; items = sort_by!(items, x -> (x[1], x[2])), work = free .- waited)
 end
 
 # An estimate as the dry run gives it: to a tenth of a second like every other
@@ -671,17 +671,25 @@ end
 # starts at a printed line's size, colour codes included, so that a line does not
 # grow it several times over.
 const LINE_BYTES = 160
-styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool, sizehint = LINE_BYTES)
+function styled(@nospecialize(f))::String
+    buf = IOBuffer(; sizehint = LINE_BYTES)
+    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
+    f(io)
+    return String(take!(buf))
+end
 
 # A line the run says about itself.
 say(run, parts...) = printline(run, string(label_prefix(), parts...))
 
 # A line of a worker's life, `UP`, `EXIT` and the like, under `mark`.
-lifecycle_line(run, mark::AbstractString, id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
-    print_line_head(io, mark, id, clock_now())
+function lifecycle_line(run, mark::AbstractString, id::Union{Nothing, Integer}, state::AbstractString, text::AbstractString)
+    buf = IOBuffer(; sizehint = LINE_BYTES)
+    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
+    print_line_head(io, mark, id === nothing ? nothing : Int(id), clock_now())
     print_word(io, state)
     print(io, text)
-end)
+    return printline(run, String(take!(buf)))
+end
 
 print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) =
     lifecycle_line(run, MARK_WORKER, slot_id, state, text)
@@ -701,8 +709,10 @@ wide. A retry is the same item again, so it gets the same line with a field of i
 own; `total` is 0 when there is no count to give. In a run of several packages,
 `package` names the item's, in a column `package_width` wide.
 """
-item_line(slot_id, i, total, shown, width, attempt, attempts, how; package::AbstractString = "", package_width::Integer = 0) =
-styled() do io
+function _item_line(slot_id::Union{Nothing, Int}, i::Int, total::Int, shown::String, width::Int,
+                    attempt::Int, attempts::Int, how, package::String, package_width::Int)::String
+    buf = IOBuffer(; sizehint = LINE_BYTES)
+    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
     done = !(how isa AbstractString)
     print_line_head(io, done ? state_mark(how.state) : MARK_RUNNING, slot_id, clock_now())
     print_word(io, done ? "DONE" : "RUN")
@@ -738,7 +748,15 @@ styled() do io
         print(io, "at ")
         print_bold(io, how)
     end
+    return String(take!(buf))
 end
+
+item_line(slot_id::Union{Nothing, Integer}, i::Integer, total::Integer, shown::AbstractString, width::Integer,
+          attempt::Integer, attempts::Integer, how; package::AbstractString = "", package_width::Integer = 0) =
+    _item_line(slot_id === nothing ? nothing : Int(slot_id), Int(i), Int(total),
+               shown isa String ? shown : String(shown)::String,
+               Int(width), Int(attempt), Int(attempts), how,
+               package isa String ? package : String(package)::String, Int(package_width))
 
 outcome(r::ItemResult) = (; r.state, r.stats.elapsed_ns, r.stats.compile_ns, r.stats.maxrss)
 
@@ -812,7 +830,9 @@ function print_run_header(run)
         print_selection(io, p)
         # The project's path in the run-state path's colour, as the log paths are.
         env = something(Base.active_project(), "none")
-        println(io, "env: ", styled(x -> printstyled(x, env; color = :light_black)))
+        env_buf = IOBuffer(; sizehint = LINE_BYTES)
+        printstyled(IOContext(env_buf, :color => get(stdout, :color, false)::Bool), env; color = :light_black)
+        println(io, "env: ", String(take!(env_buf)))
         print_machine(io)
         print_packages(io, p)
         print_startup(io, p.startup)
@@ -911,8 +931,8 @@ Routes every log record of a run through [`printline`](@ref), formatted whole an
 written once: a `ConsoleLogger` on `stdout` writes a record in several pieces, and
 a warning ends up spliced into the status line.
 """
-struct RunLogger{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
-    parent::L
+struct RunLogger <: Logging.AbstractLogger
+    parent::Logging.AbstractLogger
     run::Any
 end
 

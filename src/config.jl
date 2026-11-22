@@ -232,17 +232,184 @@ end
 # The keywords of `runtests` that are not run settings: what it selects, and what it
 # does with the selection.
 const CALL_KEYS = (:name, :tags, :group, :dry_run, :replay, :config, :on_event, :worker_init, :test_end)
+const MONO_CALL_KEYS = (:packages, :name, :tags, :group, :dry_run, :replay, :on_event, :worker_init, :test_end)
 
-# A keyword `runtests` does not take, with the nearest it does: a misspelled one would
-# otherwise be the one setting a run quietly goes without.
-function unknown_keyword(k::Symbol)
+# A keyword `runtests` / `runtests_mono` does not take, with the nearest it does: a
+# misspelled one would otherwise be the one setting a run quietly goes without.
+function unknown_keyword(k::Symbol; mono::Bool = false, prefix::AbstractString = "")
+    call_keys = mono ? MONO_CALL_KEYS : CALL_KEYS
+    caller = mono ? "runtests_mono" : "runtests"
+    sel_end = mono ? 4 : 3
+    candidates = String[String(x) for x in call_keys]
+    for x in RUN_KEYS
+        push!(candidates, String(x))
+    end
     # Keywords are short, and three edits turn `tag` into `name`: one in three letters.
-    near = nearest(String(k), String[String(x) for x in (CALL_KEYS..., RUN_KEYS...)]; cutoff = max(1, length(String(k)) ÷ 3))
+    near = nearest(String(k), candidates; cutoff = max(1, length(String(k)) ÷ 3))
     return ArgumentError(string(
-        "unknown keyword `", k, "`", isempty(near) ? "" : string(" (did you mean ", join(("`$n`" for n in near), " or "), "?)"),
-        "; `runtests` selects with ", join(("`$x`" for x in CALL_KEYS[1:3]), ", "), ", takes ",
-        join(("`$x`" for x in CALL_KEYS[4:end]), ", "), ", and the run settings ", join(("`$x`" for x in RUN_KEYS), ", ")
+        prefix, "unknown keyword `", k, "`",
+        isempty(near) ? "" : string(" (did you mean ", join(("`$n`" for n in near), " or "), "?)"),
+        "; `", caller, "` selects with ", join(("`$x`" for x in call_keys[1:sel_end]), ", "), ", takes ",
+        join(("`$x`" for x in call_keys[(sel_end + 1):end]), ", "), ", and the run settings ",
+        join(("`$x`" for x in RUN_KEYS), ", ")
     ))
+end
+
+# Pure (no-I/O) validation of one run setting keyword value given directly by a caller.
+# `nothing` means unset (fall through to env / TOML / default), matching `pick_run_setting`.
+function validate_run_setting(k::Symbol, @nospecialize(v); prefix::AbstractString = "")
+    v === nothing && return nothing
+    if k === :workers
+        ((is_whole_number(v) && 0 <= v <= typemax(SlotIdx)) || v == "auto") || throw(ArgumentError(string(
+            prefix, "`workers` must be \"auto\" or an integer from 0 to ", typemax(SlotIdx), ", got ", repr(v)
+        )))
+    elseif k === :threads
+        threads_spec("threads", v, msg -> ArgumentError(string(prefix, msg)))
+    elseif k === :timeout || k === :init_timeout || k === :test_end_timeout || k === :artifacts_timeout
+        (is_number(v) && 0 < v <= MAX_TIMEOUT_S) || throw(ArgumentError(string(
+            prefix, "`", k, "` must be a positive number of seconds, at most ", MAX_TIMEOUT_S, ", got ", repr(v)
+        )))
+    elseif k === :monitor_interval
+        (is_number(v) && 0 <= v <= MAX_TIMEOUT_S) || throw(ArgumentError(string(
+            prefix, "`monitor_interval` must be a number of seconds from 0 to ", MAX_TIMEOUT_S, ", got ", repr(v)
+        )))
+    elseif k === :retries
+        (is_whole_number(v) && 0 <= v <= MAX_RETRIES) || throw(ArgumentError(string(
+            prefix, "`retries` must be an integer from 0 to ", MAX_RETRIES, ", got ", repr(v)
+        )))
+    elseif k === :memory_threshold
+        (is_number(v) && 0 < v <= 1) || throw(ArgumentError(string(
+            prefix, "`memory_threshold` must be in (0, 1], got ", repr(v)
+        )))
+    elseif k === :logs
+        ok = (v isa Symbol || v isa AbstractString) && Symbol(v) in LOG_MODES
+        ok || throw(ArgumentError(string(
+            prefix, "`logs` must be one of ", LOG_MODES, ", got ", repr(v)
+        )))
+    elseif k in FLAG_SETTINGS
+        v isa Bool || throw(ArgumentError(string(
+            prefix, "`", k, "` must be true or false, got ", repr(v)
+        )))
+    elseif k === :seed
+        (is_whole_number(v) && 0 <= v <= typemax(UInt64)) || throw(ArgumentError(string(
+            prefix, "`seed` must be an integer from 0 to ", typemax(UInt64), ", got ", repr(v)
+        )))
+    elseif k === :testset_name
+        (v isa AbstractString && !isempty(v)) || throw(ArgumentError(string(
+            prefix, "`testset_name` must be a non-empty string, got ", repr(v)
+        )))
+    elseif k === :skip_environment
+        ok = if v isa AbstractString
+            !isempty(v)
+        elseif v isa AbstractVector
+            all_ok = true
+            for n in v
+                if !(n isa AbstractString && !isempty(n))
+                    all_ok = false
+                    break
+                end
+            end
+            all_ok
+        else
+            false
+        end
+        ok || throw(ArgumentError(string(
+            prefix, "`skip_environment` must be the path of an environment directory from the root of the " *
+                "repository, as in \"test/qa\", or a vector of them, got ", repr(v)
+        )))
+    else
+        throw(unknown_keyword(k; prefix))
+    end
+    return nothing
+end
+
+# Pure (no-I/O) validation of one selection or call-level keyword value.
+function validate_call_kwarg(k::Symbol, @nospecialize(v); mono::Bool = false, prefix::AbstractString = "")
+    if k === :name
+        (v === nothing || v isa FailingItems) && return nothing
+        Filter(; name = v)
+    elseif k === :tags
+        v === nothing && return nothing
+        Filter(; tags = v)
+    elseif k === :group
+        (v === nothing || v isa DefaultGroupCall) && return nothing
+        (v isa Union{AbstractString, Symbol} && !isempty(string(v))) || throw(ArgumentError(string(
+            prefix, "`group = ", repr(v), "`: expected the name of a group of [groups], \"",
+            ALL_GROUP, "\" or \"", DEFAULT_GROUP, "\""
+        )))
+    elseif k === :dry_run
+        v isa Bool || throw(ArgumentError(string(prefix, "`dry_run` must be true or false, got ", repr(v))))
+    elseif k === :on_event
+        (v === nothing || hasmethod(v, Tuple{TestItemEvent})) || throw(ArgumentError(string(
+            prefix, "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got ", repr(v)
+        )))
+    elseif k === :config
+        mono && throw(ArgumentError(string(
+            prefix, "`config` names a file to read in place of one package's test/TestItems.toml, " *
+                "and a combined run reads each package's own"
+        )))
+        (v === nothing || v isa AbstractString) || throw(ArgumentError(string(
+            prefix, "`config` must be a path string, got ", repr(v)
+        )))
+    elseif k === :replay
+        (v === nothing || v isa AbstractString) || throw(ArgumentError(string(
+            prefix, "`replay` must be a path string, got ", repr(v)
+        )))
+    elseif k === :worker_init || k === :test_end
+        (v === nothing || v isa Expr) || throw(ArgumentError(string(
+            prefix, "`", k, "` must be an expression, as in `", k,
+            " = :(using Foo)` or a `quote` block, got ", repr(v)
+        )))
+    elseif k === :packages
+        mono || throw(unknown_keyword(k; mono, prefix))
+        v === nothing && return nothing
+        ok = if v isa Union{AbstractString, Symbol}
+            true
+        elseif v isa Union{AbstractVector, Tuple} && !isempty(v)
+            all_ok = true
+            for p in v
+                if !(p isa Union{AbstractString, Symbol})
+                    all_ok = false
+                    break
+                end
+            end
+            all_ok
+        else
+            false
+        end
+        ok || throw(ArgumentError(string(
+            prefix, "`packages` must be package names or directories, as in `packages = [\"A\", \"lib/B\"]`, got ",
+            repr(v)
+        )))
+    else
+        throw(unknown_keyword(k; mono, prefix))
+    end
+    return nothing
+end
+
+# Validate every keyword name and value in `opts` up front, before any filesystem I/O,
+# suite scan, or runstate read.
+function validate_run_kwargs(opts::Dict{Symbol, Any}; mono::Bool = false, allow_call_keys::Bool = false,
+                             prefix::AbstractString = "")
+    call_keys = mono ? MONO_CALL_KEYS : CALL_KEYS
+    for (k, v) in opts
+        if k in RUN_KEYS
+            validate_run_setting(k, v; prefix)
+        elseif mono && k === :config
+            validate_call_kwarg(k, v; mono = true, prefix)
+        elseif allow_call_keys && k in call_keys
+            validate_call_kwarg(k, v; mono, prefix)
+        else
+            throw(unknown_keyword(k; mono, prefix))
+        end
+    end
+    if get(opts, :coverage, nothing) === true && get(opts, :workers, nothing) == 0
+        throw(ArgumentError(string(
+            prefix, "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
+                "whose coverage was fixed when it started; use one worker or more"
+        )))
+    end
+    return nothing
 end
 
 const ORDER_KEYS = (:first, :last)
@@ -336,23 +503,21 @@ function kwargs_dict(kwargs)
 end
 
 function read_config(testdir::AbstractString, peak_worker_mb::Real = 0.0, rss_coverage::Real = 1.0;
-                     config::Union{Nothing, AbstractString} = nothing, kwargs...)
+                     config::Union{Nothing, AbstractString} = nothing, nunits::Integer = 0, kwargs...)
     return read_config_impl(
         String(testdir), Float64(peak_worker_mb), Float64(rss_coverage),
-        config === nothing ? nothing : String(config), kwargs_dict(kwargs)
+        config === nothing ? nothing : String(config), Int(nunits), kwargs_dict(kwargs)
     )
 end
 
 function read_config_impl(testdir::String, peak_worker_mb::Float64, rss_coverage::Float64,
-                          config::Union{Nothing, String}, opts::Dict{Symbol, Any})
+                          config::Union{Nothing, String}, nunits::Int, opts::Dict{Symbol, Any})
     path, toml = config_toml(testdir, config)
     # The code of the profiles is the suite's, wherever the file that `config` names is.
-    nunits = Int(get(opts, :nunits, 0))
-    cfg_opts = haskey(opts, :nunits) ? delete!(copy(opts), :nunits) : opts
     return build_config_impl(
         path, toml, peak_worker_mb, rss_coverage, nunits,
         config === nothing ? "" : path, testdir,
-        package_shared_profiles(dirname(abspath(testdir))), nothing, cfg_opts
+        package_shared_profiles(dirname(abspath(testdir))), nothing, opts
     )
 end
 
@@ -836,7 +1001,7 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::A
     for (k, v) in vars
         push!(env, (k isa String ? k : string(k)::String) => (v isa String ? v : string(v)::String))
     end
-    sort!(env; by = first)
+    sort_by!(env, first)
     shares = get(p, "monorepo_default", false)
     shares isa Bool || throw(ConfigError(
         "`monorepo_default` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(shares))"

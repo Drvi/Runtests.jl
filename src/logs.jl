@@ -49,8 +49,8 @@ function logs(run = nothing; name = nothing, failed::Bool = false,
               attempt::Union{Nothing, Integer} = nothing, io::IO = stdout)
     attempt === nothing || attempt >= 1 ||
         throw(ArgumentError("`attempt` must be >= 1, got $(repr(attempt))"))
-    rs = resolve_logs_run(run)
     name_filter = name === nothing ? nothing : Filter(; name).name
+    rs = resolve_logs_run(run)
     prefix = joinpath(rundata_dir(rs.path), "item_")
     shown = 0
     for (i, it) in enumerate(rs.items)

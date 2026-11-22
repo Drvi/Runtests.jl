@@ -205,7 +205,7 @@ function package_candidates(workspace::String, project::String)
         push!(name, raw_name isa String ? raw_name : string(raw_name)::String); push!(uuid, u); push!(root, d)
     end
     keep = [k for k in eachindex(root) if !any(r -> startswith(root[k], joinpath(r, "test", "")), root)]
-    sort!(keep; by = k -> root[k])
+    sort_by!(keep, k -> root[k])
     return (; name = name[keep], uuid = uuid[keep], root = root[keep])
 end
 
@@ -614,13 +614,15 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
     replay === nothing && (replay = pop!(kwargs, :replay, nothing))
     worker_init === nothing && (worker_init = pop!(kwargs, :worker_init, nothing))
     test_end === nothing && (test_end = pop!(kwargs, :test_end, nothing))
-    haskey(kwargs, :config) && throw(ArgumentError(
-        "`config` names a file to read in place of one package's test/TestItems.toml, and a combined run reads " *
-            "each package's own"
-    ))
-    for k in keys(kwargs)
-        k in RUN_KEYS || throw(unknown_keyword(k))
-    end
+    # Reject unknown keywords and invalid call values before workspace discovery or scanning.
+    validate_call_kwarg(:packages, packages; mono = true)
+    validate_call_kwarg(:name, name; mono = true)
+    validate_call_kwarg(:tags, tags; mono = true)
+    validate_call_kwarg(:group, group; mono = true)
+    validate_call_kwarg(:replay, replay; mono = true)
+    validate_call_kwarg(:worker_init, worker_init; mono = true)
+    validate_call_kwarg(:test_end, test_end; mono = true)
+    validate_run_kwargs(kwargs; mono = true)
     workspace, chosen, line = mono_paths(paths)
     PROJECT_ROOT[] = workspace
     ps = find_participants(workspace; packages)
@@ -718,7 +720,7 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
         isempty(its) && (reasons[k] = "no item matches the selection")
         append!(items, with_package(it, k) for it in its)
     end
-    isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
+    isempty(errors) || throw(ScanFailure(sort_by!(errors, e -> (e.file, e.line))))
     tags === nothing || check_tags_exist(Filter(; tags), all_tags)
     description = mono_description(name, tags, group, group_name, gsel, chosen, workspace)
     all_names = reduce(vcat, suite_names)
@@ -1246,7 +1248,7 @@ function print_worker_groups(io::IO, ps::Participants, root_path::String, root_t
         profiles = pkg_profiles[k]
         rt = get(toml, "run", nothing)
         threads = string(pick_run_setting(:threads, DEFAULT_THREADS, (;), rt isa AbstractDict ? rt : Dict{String, Any}()))
-        for name in sort!(collect(keys(profiles)); by = n -> (n !== DEFAULT_PROFILE, string(n)))
+        for name in sort_by!(collect(keys(profiles)), n -> (n !== DEFAULT_PROFILE, string(n)))
             prof = profiles[name]
             s = get(shared.profiles, name, nothing)
             how = s === nothing ? :own : ps.root[k] == ps.workspace || !(name in declared) ? :shared :

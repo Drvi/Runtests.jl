@@ -425,6 +425,41 @@ end
         port!(pkg)
         @test sort!(collect(keys(ported_items(pkg)))) == ["alpha", "beta", "gamma"]
     end
+
+    @testset "testfixtures and testconfigs are left alone, @allocated works, and file-list shared helpers handle empty exports" begin
+        pkg = port_pkg("PortSpecialDirs",
+            "test/runtests.jl" => "using Test\ninclude(\"alloc.jl\")\n",
+            "test/alloc.jl" => """
+                @testset "allocs" begin
+                    x = [1, 2, 3]
+                    @test (@allocated sum(x)) >= 0
+                    @test (@allocated (sum(x) + 1)) >= 0
+                end
+                """,
+            "test/testfixtures/sample.jl" => "const FIXTURE = 1\n",
+            "test/testconfigs/worker_init.jl" => "const INIT_RAN = true\n")
+        out = port!(pkg)
+        @test isfile(joinpath(pkg, "test", "testfixtures", "sample.jl"))
+        @test isfile(joinpath(pkg, "test", "testconfigs", "worker_init.jl"))
+        @test !occursin("testfixtures", out) && !occursin("testconfigs", out)
+        alloc_ported = read(joinpath(pkg, "test", "alloc_tests.jl"), String)
+        @test occursin("let", alloc_ported)
+        @test sort!(collect(keys(ported_items(pkg)))) == ["allocs"]
+
+        # File-list mode with a shared helper that defines no exported names must not write bare `export `.
+        pkg2 = port_pkg("PortFileList",
+            "test/runtests.jl" => "using Test\n",
+            "test/shared.jl" => "using Random\n",
+            "test/a.jl" => "@testset \"a\" begin\n    @test true\nend\n")
+        mktemp() do _, io
+            redirect_stdout(io) do
+                PortScript.main([joinpath(pkg2, "test"), "shared.jl=SharedSetup", "a.jl"])
+            end
+        end
+        setup = read(joinpath(pkg2, "test", "testsetups", "SharedSetup.jl"), String)
+        @test !occursin("export ", setup)
+        @test Meta.parseall(setup).head === :toplevel
+    end
 end
 
 # What `port_retestitems.jl` printed, porting `pkg`'s test directory in place.
@@ -524,5 +559,40 @@ end
         @test occursin("`skip = :yes` quotes something other than an expression in parentheses", out)
         # A runtests.jl already ported needs nothing.
         @test !occursin("calls ReTestItems", out)
+    end
+
+    @testset "hyphenated names, Runtests item keywords, special dirs, and comments before removed keywords" begin
+        pkg = port_pkg("PortRTIEdges",
+            "test/runtests.jl" => "using Runtests\nRuntests.runtests()\n",
+            "test/testfixtures/input.jl" => "const X = 1\n",
+            "test/testconfigs/worker_init.jl" => "const Y = 2\n",
+            "test/testtemplates/gen_tests_template.jl" => "@testtemplate \"g \$i\" for i in 1:1\n    @test \$i == 1\nend\n",
+            "test/foo-test.jl" => """
+                @testsetup module S
+                export VAL
+                const VAL = 7
+                end
+
+                @testitem("keeps comment newline",
+                    # keep me
+                    setup=[S],
+                    throttle=:gpu, sandbox=true, profile=:default,
+                    begin
+                        @test VAL == 7
+                    end)
+                """,
+            "test/test.jl" => "@testitem \"bare test file\" begin\n    @test true\nend\n")
+        out = port_rti!(pkg)
+        test = joinpath(pkg, "test")
+        @test occursin("moved foo-test.jl -> foo_tests.jl", out)
+        @test occursin("moved test.jl -> test_tests.jl", out)
+        @test !occursin("Runtests has no", out)
+        @test !occursin("testfixtures", out) && !occursin("testconfigs", out) && !occursin("testtemplates", out)
+        @test isfile(joinpath(test, "testfixtures", "input.jl"))
+        @test isfile(joinpath(test, "testconfigs", "worker_init.jl"))
+        @test isfile(joinpath(test, "testtemplates", "gen_tests_template.jl"))
+        foo = read(joinpath(test, "foo_tests.jl"), String)
+        @test occursin("# keep me\n    throttle=:gpu, sandbox=true, profile=:default,\n    begin\n        using S\n", foo)
+        @test Meta.parseall(foo).head === :toplevel
     end
 end

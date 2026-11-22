@@ -73,7 +73,7 @@ function port_file!(path, testdir, setupdir, notes, moves)
             from = comments_above(src, first(r))
             # A comment after the module's `end`, on its line, goes with it.
             eol = something(findnext(==('\n'), src, last(r)), ncodeunits(src) + 1)
-            code = replace(src[first(r):prevind(src, eol)], r"^@testsetup\s+" => "")
+            code = replace(rstrip(src[first(r):prevind(src, eol)], '\r'), r"^@testsetup\s+" => "")
             # `@__DIR__` was the directory of the file the setup was in, and is now
             # `testsetups/`: say the old one, so the paths built from it stay the same.
             moved = relpath(dirname(path), setupdir)
@@ -88,7 +88,7 @@ function port_file!(path, testdir, setupdir, notes, moves)
             # The setup, the rest of its last line, and the newline that ends it; and the
             # blank lines after it, where they would open the file or follow another.
             stop = min(eol, ncodeunits(src))
-            if from == 1 || endswith(src[1:prevind(src, from)], "\n\n")
+            if from == 1 || occursin(r"(\r?\n){2}$", src[1:prevind(src, from)])
                 while stop < ncodeunits(src)
                     nl = something(findnext(==('\n'), src, nextind(src, stop)), ncodeunits(src))
                     isempty(strip(src[nextind(src, stop):nl])) || break
@@ -112,7 +112,9 @@ function port_file!(path, testdir, setupdir, notes, moves)
         rm(path)
         push!(moves, "deleted $rel: nothing is left in it")
     elseif nitems > 0 && !is_test_file(basename(path))
-        to = joinpath(dirname(path), replace(basename(path), r"(_?test(s)?)?\.jl$" => "") * "_tests.jl")
+        stem = replace(basename(path), r"([_-]?tests?)?\.jl$" => "")
+        isempty(stem) && (stem = chopsuffix(basename(path), ".jl"))
+        to = joinpath(dirname(path), stem * "_tests.jl")
         write(to, src); rm(path)
         push!(moves, "moved $rel -> $(relpath(to, testdir))")
     else
@@ -121,17 +123,46 @@ function port_file!(path, testdir, setupdir, notes, moves)
     return nothing
 end
 
+function kw_delete_range(src::String, kw)
+    # Start at the keyword name itself, not any leading trivia/comments on the `=` node.
+    first_b = JS.first_byte(kids(kw)[1])
+    last_b = JS.last_byte(kw)
+    # In parenthesized `@testitem("x", setup=[S], ...)`, include the trailing comma.
+    after = nextind(src, last_b)
+    if after <= ncodeunits(src) && src[after] == ','
+        last_b = after
+    end
+    hstart = first_b
+    while hstart > 1
+        p = prevind(src, hstart)
+        c = src[p]
+        (c == ' ' || c == '\t') || break
+        hstart = p
+    end
+    at_line_start = hstart == 1 || src[prevind(src, hstart)] == '\n'
+    if at_line_start
+        hend = nextind(src, last_b)
+        while hend <= ncodeunits(src) && (src[hend] == ' ' || src[hend] == '\t' || src[hend] == '\r')
+            hend = nextind(src, hend)
+        end
+        if hend <= ncodeunits(src) && src[hend] == '\n'
+            return hstart:hend
+        end
+        hend > nextind(src, last_b) && return first_b:prevind(src, hend)
+    end
+    return hstart:last_b
+end
+
+const RUNTESTS_ITEM_KEYWORDS = ("tags", "timeout", "retries", "skip", "failfast", "throttle", "sandbox", "profile")
+
 function item_edits!(edits, notes, src, rel, call)
     name = text_of(src, kids(call)[2])
     used = String[]
     for (key, kw) in keywords(call)
-        r = byte_range(kw)
-        # The keyword and the blank before it.
-        from = something(findprev(!isspace, src, prevind(src, first(r))), 0) + 1
         if key == "setup"
             v = kids(kw)[2]
             append!(used, [JS.sourcetext(x) for x in kids(v)])
-            push!(edits, (from:last(r), ""))
+            push!(edits, (kw_delete_range(src, kw), ""))
         elseif key == "skip"
             v = kids(kw)[2]
             if JS.kind(v) == JS.K"quote"
@@ -142,8 +173,8 @@ function item_edits!(edits, notes, src, rel, call)
                 push!(edits, (byte_range(v), unq))
             end
         elseif key in ("default_imports", "_id")
-            push!(edits, (from:last(r), ""))
-        elseif !(key in ("tags", "timeout", "retries", "failfast", "skip"))
+            push!(edits, (kw_delete_range(src, kw), ""))
+        elseif !(key in RUNTESTS_ITEM_KEYWORDS)
             push!(notes, "$rel: @testitem $name: Runtests has no `$key`; see the table in reference/source-shapes.md")
         end
     end
@@ -164,14 +195,16 @@ end
 
 function main(args)
     length(args) == 1 || error("usage: julia port_retestitems.jl <testdir>")
-    testdir = abspath(args[1])
+    testdir = rstrip(abspath(args[1]), ('/', '\\'))
     setupdir = joinpath(testdir, "testsetups")
     notes, moves = String[], String[]
     files = String[]
     for (dir, dirs, names) in walkdir(testdir)
-        # Hidden directories, setups already moved, and directories with an
-        # environment of their own (ported in place, on their own).
+        # Hidden directories, setups, top-level templates/fixtures/configs, and
+        # directories with an environment of their own (ported in place, on their own).
+        # Matches `suite_descends` in `src/scan.jl`.
         filter!(d -> !startswith(d, '.') && d != "testsetups" &&
+                     !(dir == testdir && d in ("testtemplates", "testfixtures", "testconfigs")) &&
                      !any(p -> isfile(joinpath(dir, d, p)), ("Project.toml", "JuliaProject.toml")), dirs)
         append!(files, (joinpath(dir, f) for f in names if endswith(f, ".jl") && !(dir == testdir && f == "runtests.jl")))
     end

@@ -24,14 +24,15 @@ test/
   testsetups/MySetup.jl     code that items share: a module, loaded with `using MySetup`
   testtemplates/            loops that generate items
   TestItems.toml            optional: workers, threads, timeouts, groups, profiles
+  testconfigs/              optional: profile `worker_init.jl` and `test_end.jl` files
   testfixtures/             input for the tests (packages, projects, data), never read as tests
   .scripts/                 Julia files that tests run or read, out of Runtests' way
 ```
 
 - Test files are named `*_test.jl` or `*_tests.jl` and hold only `@testitem`
   declarations. Any other `.jl` file under `test/` stops the run. The exceptions are
-  `test/runtests.jl`, `testsetups/`, `testtemplates/`, `testfixtures/`, and hidden
-  directories. Any other directory with a `Project.toml` or `JuliaProject.toml`
+  `test/runtests.jl`, `testsetups/`, `testtemplates/`, `testfixtures/`, `testconfigs/`,
+  and hidden directories. Any other directory with a `Project.toml` or `JuliaProject.toml`
   of its own is an environment: the test files in it run there.
 - An item's name is a nonblank string literal, unique across the whole suite. Its
   keywords (`tags`, `timeout`, `retries`, `skip`, `failfast`, `throttle`, `sandbox`,

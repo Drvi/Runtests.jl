@@ -298,15 +298,16 @@ function defines_method(@nospecialize lhs)
 end
 is_import(@nospecialize ex) = ex isa Expr && ex.head in (:using, :import)
 
-# Whether a body measures the allocations of anything but a plain call. Julia
-# measures `@allocated f(x, y)`, a call whose function and arguments are names or
-# literals, from inside `f`; anything else it measures where it stands, which at a
-# module's top level includes reaching the body's untyped globals.
+# Whether a body measures the allocations of anything but a plain call. From Julia 1.12,
+# `@allocated f(x, y)` (a call whose function and arguments are names or literals) is
+# measured inside `f`; anything else — and every call on Julia 1.11, where
+# `Base.is_simply_call` does not exist — is measured in place, which at a module's top
+# level includes reaching the body's untyped globals.
 function measures_in_place(body)
     found = false
     walk(ex) = ex isa Expr && (
         ex.head === :macrocall && ex.args[1] in (Symbol("@allocated"), Symbol("@allocations")) &&
-            !Base.is_simply_call(ex.args[end]) && (found = true);
+            !(isdefined(Base, :is_simply_call) && Base.is_simply_call(ex.args[end])) && (found = true);
         foreach(walk, ex.args))
     walk(Meta.parseall(body))
     return found
@@ -1176,7 +1177,7 @@ function condition(s::Suite, @nospecialize(cond), ctx::Context, holds::Bool)
     if !isempty(names) || (cond isa Expr && any(g -> g in s.groups, collect_symbols(cond)))
         tags = holds ? Symbol[group_tag(s, g) for g in names] : Symbol[]
         runs = holds_by_default(cond, s)
-        runs === missing && push!(s.notes, "runtests.jl: cannot tell whether files under `$cond` ran with GROUP unset; they are ported to")
+        runs === missing && push!(s.notes, "runtests.jl: cannot tell whether files under `$cond` ran with GROUP unset; they are ported to run by default")
         if runs === (!holds) && !isempty(tags)
             append!(s.exclude, tags)
         end
@@ -1388,11 +1389,12 @@ function write_helper_setup(testdir, file, setup, pkg, imports)
 end
 
 # Every Julia file under `testdir` that a run would read or refuse: what the port has
-# to account for.
+# to account for. Matches `suite_descends` in `src/scan.jl`.
 function julia_files(testdir)
     out = String[]
     for (dir, dirs, files) in walkdir(testdir)
-        filter!(d -> !startswith(d, '.') && d != "testsetups" && d != "testtemplates" &&
+        filter!(d -> !startswith(d, '.') && d != "testsetups" &&
+                     !(dir == testdir && d in ("testtemplates", "testfixtures", "testconfigs")) &&
                      !any(p -> isfile(joinpath(dir, d, p)), ("Project.toml", "JuliaProject.toml")), dirs)
         for f in files
             endswith(f, ".jl") && push!(out, posix_relpath(joinpath(dir, f), testdir))
@@ -1593,21 +1595,24 @@ function port_suite(testdir)
 end
 
 function main(args)
-    testdir = rstrip(abspath(args[1]), '/')
+    testdir = rstrip(abspath(args[1]), ('/', '\\'))
     length(args) == 1 && return port_suite(testdir)
     shared = args[2] == "-" ? nothing : String(split(args[2], '=')[2])
     if shared !== nothing
         # A file of shared helpers becomes a setup module that every ported file uses.
         file = String(split(args[2], '=')[1])
         text = read(joinpath(testdir, file), String)
-        exports = Symbol[]
+        exports = Symbol[]; statements_ = String[]
         for (r, k) in toplevel_spans(text)
             k in TRIVIA && continue
-            append!(exports, defined_names(Meta.parse(bytes(text, r); raise = false)))
+            src = bytes(text, r)
+            append!(exports, defined_names(Meta.parse(src; raise = false)))
+            push!(statements_, src)
         end
         mkpath(joinpath(testdir, "testsetups"))
         open(joinpath(testdir, "testsetups", shared * ".jl"), "w") do io
-            pkg = get(TOML.parsefile(joinpath(dirname(testdir), "Project.toml")), "name", "")
+            project = joinpath(dirname(testdir), "Project.toml")
+            pkg = isfile(project) ? get(TOML.parsefile(project), "name", "") : ""
             println(io, "# Helpers shared by every test file (", file, ").\nmodule ", shared, "\n")
             # The file ran in Main after every test file's imports; it may use any of them.
             lines = ["using Test" * (isempty(pkg) ? "" : ", " * pkg)]
@@ -1615,12 +1620,17 @@ function main(args)
                 t = read(joinpath(testdir, f), String)
                 for (r2, k2) in toplevel_spans(t)
                     src2 = bytes(t, r2)
-                    k2 in TRIVIA || !is_import(Meta.parse(src2; raise = false)) || push!(lines, strip(src2))
+                    k2 in TRIVIA && continue
+                    s2 = strip(src2)
+                    is_import(Meta.parse(s2; raise = false)) && !is_relative_import(s2) && push!(lines, s2)
                 end
             end
             foreach(l -> println(io, l), unique(lines))
             println(io)
-            print(io, strip(text), "\n\nexport ", join(unique(exports), ", "), "\n\nend\n")
+            print(io, strip(text), "\n\n")
+            isempty(exports) || println(io, "export ", join(written.(unique(exports)), ", "))
+            needs_export_all(statements_) && println(io, EXPORT_ALL)
+            println(io, "\nend")
         end
     end
     log = String[]; taken = Set{String}()

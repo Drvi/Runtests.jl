@@ -324,28 +324,26 @@ function in_default_pool(f)
     return fetch(t)
 end
 
-function execute_here(p::Plan, target, on_event)
-    cfg = p.cfg
-    warn_sandboxed_workers(p)
+function execute_here(p_in::Plan, target, on_event)
+    warn_sandboxed_workers(p_in)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
-    npkg = length(p.packages)
-    scratch, logdirs, logprefixes, artifacts_prefixes = try
+    npkg = length(p_in.packages)
+    cfg, p, scratch, logdirs, logprefixes, artifacts_prefixes = try
         dir = mktempdir(; prefix = "runtests_")
-        dirs = npkg == 1 ? [dir] : [mkpath(joinpath(dir, string(k))) for k in 1:npkg]
-        prefixes = [joinpath(d, "item_") for d in dirs]
+        dirs = npkg == 1 ? String[dir] : String[mkpath(joinpath(dir, string(k))) for k in 1:npkg]
+        prefixes = String[joinpath(d, "item_") for d in dirs]
         evidence = joinpath(tempdir(), string("runtests_artifacts_", runid))
-        art = npkg == 1 ? [joinpath(evidence, "item_")] : [joinpath(evidence, string(k), "item_") for k in 1:npkg]
-        dir, dirs, prefixes, art
+        art = npkg == 1 ? String[joinpath(evidence, "item_")] : String[joinpath(evidence, string(k), "item_") for k in 1:npkg]
+        p_in.cfg, p_in, dir, dirs, prefixes, art
     catch e
         is_interrupt(e) && rethrow()
         @warn string(
             "Runtests: could not create temporary directory for logs; falling back to `logs = :eager`",
-            cfg.coverage ? " and disabling coverage" : ""
+            p_in.cfg.coverage ? " and disabling coverage" : ""
         ) exception = e
-        cfg = with_config(cfg; logs = :eager, coverage = false)
-        p = with_plan_cfg(p, cfg)
-        "", fill("", npkg), fill("", npkg), fill("", npkg)
+        cfg2 = with_config(p_in.cfg; logs = :eager, coverage = false)
+        cfg2, with_plan_cfg(p_in, cfg2), "", fill("", npkg), fill("", npkg), fill("", npkg)
     end
     names, column = item_names(p, run_name_width(p))
     local_item = zeros(ItemIdx, nitems(p))
@@ -356,12 +354,12 @@ function execute_here(p::Plan, target, on_event)
     # Precompute once per run rather than walking `.git` on every item or taking
     # `maximum(textwidth, ...)` on every printed RUN/DONE line.
     root_for_names = any(k -> !isempty(p.packages.cfg[k].skip_environment), 1:npkg) ? naming_root(p.root) : ""
-    skipped_profiles = BitVector(
-        !isempty(p.profiles[j].environment) &&
-        !isempty(p.packages.cfg[p.profile_package[j]].skip_environment) &&
-        (rel_slash(p.profiles[j].environment, root_for_names) in p.packages.cfg[p.profile_package[j]].skip_environment)
-        for j in eachindex(p.profiles)
-    )
+    skipped_profiles = BitVector(undef, length(p.profiles))
+    for j in eachindex(p.profiles)
+        skipped_profiles[j] = !isempty(p.profiles[j].environment) &&
+            !isempty(p.packages.cfg[p.profile_package[j]].skip_environment) &&
+            (rel_slash(p.profiles[j].environment, root_for_names) in p.packages.cfg[p.profile_package[j]].skip_environment)
+    end
     package_width = Int32(maximum(textwidth, p.packages.name; init = 0))
     # As its first `@async` would: the run's tasks share this thread from here.
     current_task().sticky = true

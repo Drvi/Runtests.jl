@@ -184,7 +184,7 @@ function parse_tag_expr(text::AbstractString; what::AbstractString = "`tags = $(
         end
         push!(alternatives, terms)
     end
-    return TagExpr(String(text), alternatives)
+    return TagExpr(String(text)::String, alternatives)
 end
 
 # Every tag a selection names, present or negated.

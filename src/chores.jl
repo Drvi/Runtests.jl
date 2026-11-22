@@ -86,12 +86,13 @@ end
 # The last line of a chores report: what was done, or is to do and which call does it,
 # and what is left to a person.
 function print_chores_outcome(io::IO, fix::Bool, todo::Integer, problems::Integer, call::AbstractString)
-    if problems > 0
-        fix && todo > 0 && print(io, "done: ", todo, " · ")
-        print(io, "to fix by hand: ", problems)
-        !fix && todo > 0 && print(io, " · the rest `", call, "` does")
-    elseif todo > 0
-        print(io, fix ? "done: $todo" : "to do: $todo, which `$call` does")
+    t, p = Int(todo), Int(problems)
+    if p > 0
+        fix && t > 0 && print(io, "done: ", t, " · ")
+        print(io, "to fix by hand: ", p)
+        !fix && t > 0 && print(io, " · the rest `", call, "` does")
+    elseif t > 0
+        print(io, fix ? "done: $t" : "to do: $t, which `$call` does")
     else
         print(io, "nothing to do")
     end

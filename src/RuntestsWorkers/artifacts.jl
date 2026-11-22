@@ -196,7 +196,7 @@ failed, and how long they took. Throws when no producers of that attempt are wai
 function finish_artifacts(index::Integer, attempt::Integer, collect::Bool)
     a = PENDING_ARTIFACTS[]
     (a === nothing || a.index != index || a.attempt != attempt) &&
-        error("no producers of attempt $attempt at item $index are waiting")
+        error("no producers of attempt $(Int(attempt)) at item $(Int(index)) are waiting")
     PENDING_ARTIFACTS[] = nothing
     try
         return collect ? run_producers(a) : (producers = 0, failed = 0, seconds = 0.0)

@@ -1039,7 +1039,7 @@ function process_responses(w::Worker)
                     isopen(fut.value) && rethrow()
                 end
             elseif frame.kind === KIND_ERROR
-                close(fut.value, RemoteException(w.pid, string(frame.payload)))
+                close(fut.value, RemoteException(w.pid, string(frame.payload)::String))
             else
                 error("worker $(w.pid) sent a reply of unknown kind $(frame.kind)")
             end

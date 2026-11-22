@@ -448,7 +448,7 @@ end
 # The plural is spelled out when adding an `s` does not make one: "2 processs" is
 # the kind of thing a reader notices instead of the number in front of it.
 plural(n::Integer, one::AbstractString, many::AbstractString = one * "s") =
-    string(n, " ", n == 1 ? one : many)
+    string(Int(n), " ", n == 1 ? one : many)
 
 # The same shape `Test` uses for its own Time column, so every duration a run
 # prints reads the same way.
@@ -1142,6 +1142,7 @@ function report(run)
         Test.record(root, ts)
     end
     record_unrun!(root, run)
+    ensure_nonpass_recorded!(root, run)
     print_conclusion(run)
     Test.finish(root)
     return root
@@ -1159,6 +1160,7 @@ also read through it. Recorded into a parent or finished inside one, it is the
 """
 struct RunTestSet <: Test.AbstractTestSet
     testset::Test.DefaultTestSet
+    RunTestSet(testset::Test.DefaultTestSet) = new(testset)
 end
 
 # `@testset RunTestSet "name" begin … end`, which names the type to make.
@@ -1207,7 +1209,7 @@ end
 function record_unrun!(root::Test.AbstractTestSet, run)
     p = run.plan
     st = run.statuses
-    idxs = [i for i in 1:nitems(p) if st.state[i] === UNSEEN || st.state[i] === CANCELLED]
+    idxs = [i for i in 1:nitems(p) if st.state[i] === UNSEEN || st.state[i] === RUNNING || st.state[i] === CANCELLED]
     isempty(idxs) && return nothing
     shown = join((repr(p.items.name[i]) for i in Iterators.take(idxs, 5)), ", ")
     why = is_cancelled(run.queues) ? "did not run because the run stopped early" :
@@ -1216,6 +1218,23 @@ function record_unrun!(root::Test.AbstractTestSet, run)
     # The conclusion block above says the same thing in the run's own words; this
     # record exists so the verdict is wrong when the run was.
     add_error!(root, msg, source_of(p, first(idxs)))
+    return nothing
+end
+
+# Belt-and-suspenders invariant: any item whose final state is neither PASSED nor SKIPPED
+# must leave at least one Fail or Error in `root` so `Test.finish(root)` cannot succeed.
+function ensure_nonpass_recorded!(root::Test.DefaultTestSet, run)
+    p = run.plan
+    st = run.statuses
+    nonpass = [i for i in 1:nitems(p) if st.state[i] !== PASSED && st.state[i] !== SKIPPED]
+    isempty(nonpass) && return nothing
+    tc = Test.get_test_counts(root)
+    tc.fails + tc.errors + tc.cumulative_fails + tc.cumulative_errors > 0 && return nothing
+    shown = join((repr(p.items.name[i]) for i in Iterators.take(nonpass, 5)), ", ")
+    msg = string(length(nonpass), " of ", plural(nitems(p), "test item"),
+                 " did not pass without recording a test failure (a Runtests bug): ",
+                 shown, length(nonpass) > 5 ? ", …" : "")
+    add_error!(root, msg, source_of(p, first(nonpass)))
     return nothing
 end
 

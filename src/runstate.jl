@@ -309,7 +309,7 @@ StringTable() = StringTable(Dict{String, UInt32}(), String[])
 # Not `get!` with a do-block: the closure allocates on every call, hits included,
 # and a run interns two strings per item before it starts.
 function intern!(t::StringTable, s::AbstractString)
-    str = String(s)
+    str = s isa String ? s : String(s)::String
     i = get(t.index, str, UInt32(0))
     i == 0 || return i
     push!(t.order, str)
@@ -2398,8 +2398,14 @@ function project_id(root::AbstractString)::String
         catch
             Dict{String, Any}()
         end
-        haskey(proj, "uuid") && return string(proj["uuid"])
-        haskey(proj, "name") && return string(proj["name"])
+        if haskey(proj, "uuid")
+            u = proj["uuid"]
+            return u isa String ? u : string(u)::String
+        end
+        if haskey(proj, "name")
+            nm = proj["name"]
+            return nm isa String ? nm : string(nm)::String
+        end
         return last(splitpath(abspath(root)))
     end
     return ""

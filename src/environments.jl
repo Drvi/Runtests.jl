@@ -396,7 +396,7 @@ end
 
 const ENV_CACHE_STAMP = "stamp.toml"
 
-function load_disk_test_env(target)
+function load_disk_test_env(target)::Union{Nothing, String}
     try
         cache_root = test_env_cache_root(target)
         isdir(cache_root) || return nothing
@@ -421,7 +421,8 @@ function load_disk_test_env(target)
             get(stamp, "mode", "") == want_mode || continue
             get(stamp, "julia_version", "") == ver || continue
             get(stamp, "input_key", "") == input_key || continue
-            env_proj = workspace ? String(get(stamp, "env_path", "")) : joinpath(entry_dir, "Project.toml")
+            raw_ep = workspace ? get(stamp, "env_path", "") : joinpath(entry_dir, "Project.toml")
+            env_proj = raw_ep isa String ? raw_ep : String(raw_ep)::String
             (isempty(env_proj) || !isfile(env_proj)) && continue
             workspace && !samefile(env_proj, testproj) && continue
             mf = Base.project_file_manifest_path(env_proj)
@@ -446,10 +447,11 @@ function load_disk_test_env(target)
     end
 end
 
-function save_disk_test_env(target, env::AbstractString, workspace::Bool)
+function save_disk_test_env(target, env::AbstractString, workspace::Bool)::String
+    env_s = env isa String ? env : String(env)::String
     try
-        mf = Base.project_file_manifest_path(env)
-        (mf === nothing || !isfile(mf)) && return String(env)
+        mf = Base.project_file_manifest_path(env_s)
+        (mf === nothing || !isfile(mf)) && return env_s
         mf_toml = TOML.parsefile(mf)
         cache_root = test_env_cache_root(target)
         mkpath(cache_root)
@@ -476,21 +478,20 @@ function save_disk_test_env(target, env::AbstractString, workspace::Bool)
                 cached_proj_crc = ""
                 cached_mf_crc = ""
                 if !workspace
-                    copy_env_files(tmp, env)
-                    prefs = joinpath(dirname(env), "LocalPreferences.toml")
+                    copy_env_files(tmp, env_s)
+                    prefs = joinpath(dirname(env_s), "LocalPreferences.toml")
                     isfile(prefs) && cp(prefs, joinpath(tmp, "LocalPreferences.toml"); force = true)
                     cached_proj_crc = file_tag(joinpath(tmp, "Project.toml"))
                     cached_mf_crc = file_tag(joinpath(tmp, "Manifest.toml"))
                 end
-                stamp = Dict{String, Any}(
-                    "mode" => workspace ? "workspace" : "testenv",
-                    "julia_version" => string(VERSION),
-                    "input_key" => input_key,
-                    "env_path" => workspace ? abspath(env) : "",
-                    "cached_proj_crc" => cached_proj_crc,
-                    "cached_mf_crc" => cached_mf_crc,
-                    "path_deps" => dep_rows,
-                )
+                stamp = Dict{String, Any}()
+                stamp["mode"] = workspace ? "workspace" : "testenv"
+                stamp["julia_version"] = string(VERSION)
+                stamp["input_key"] = input_key
+                stamp["env_path"] = workspace ? abspath(env_s) : ""
+                stamp["cached_proj_crc"] = cached_proj_crc
+                stamp["cached_mf_crc"] = cached_mf_crc
+                stamp["path_deps"] = dep_rows
                 open(io -> TOML.print(io, stamp; sorted = true), joinpath(tmp, ENV_CACHE_STAMP), "w")
                 try
                     mv(tmp, entry_dir)
@@ -920,9 +921,15 @@ end
 
 # The package-entry table of a parsed manifest: Format 2 puts it under `"deps"`,
 # Format 1 puts the packages directly at the top level.
-function manifest_entries(data::AbstractDict)
+function manifest_entries(data::AbstractDict)::Dict{String, Any}
     entries = get(data, "deps", nothing)
-    return entries isa AbstractDict ? entries : data
+    src = entries isa AbstractDict ? entries : data
+    src isa Dict{String, Any} && return src
+    out = Dict{String, Any}()
+    for (k, v) in src
+        out[k isa String ? k : string(k)::String] = v
+    end
+    return out
 end
 
 # What identifies a package's code in a manifest: its UUID, version and source tree
@@ -942,7 +949,7 @@ function manifest_versions(text::AbstractString)
         entries isa AbstractVector || continue
         for entry in entries
             entry isa AbstractDict || continue
-            field(k) = (v = get(entry, k, ""); v isa AbstractString ? String(v) : string(v))
+            field(k)::String = (v = get(entry, k, ""); v isa String ? v : v isa AbstractString ? String(v)::String : string(v)::String)
             out[name] = (; uuid = field("uuid"), version = field("version"), tree = field("git-tree-sha1"),
                          path = haskey(entry, "path"))
         end
@@ -958,9 +965,10 @@ same_code(a, b) = a !== nothing && b !== nothing && a.uuid == b.uuid && a.versio
 code_text(c) = c === nothing ? "absent" :
     string(isempty(c.version) ? "stdlib" : c.version, isempty(c.tree) ? "" : string(" (tree ", first(c.tree, 10), ")"))
 
-function project_name_of(projectfile::AbstractString)
+function project_name_of(projectfile::AbstractString)::Union{Nothing, String}
     try
-        return get(TOML.parsefile(projectfile), "name", nothing)
+        v = get(TOML.parsefile(projectfile), "name", nothing)
+        return v isa String ? v : v isa AbstractString ? String(v)::String : nothing
     catch
         return nothing
     end
@@ -1094,16 +1102,18 @@ function runtests_base_env()
     end
 end
 
-function enqueue_manifest_deps!(queue::Vector{Tuple{String, String}}, src_deps::AbstractDict, d)
+function enqueue_manifest_deps!(queue::Vector{Tuple{String, String}}, src_deps::Dict{String, Any}, d)
     if d isa AbstractDict
         for (dn, du) in d
-            push!(queue, (String(dn), string(du)))
+            push!(queue, (dn isa String ? dn : String(dn)::String, du isa String ? du : string(du)::String))
         end
     elseif d isa AbstractVector
         for dn in d
-            es = get(src_deps, String(dn), nothing)
+            dn_s = dn isa String ? dn : String(dn)::String
+            es = get(src_deps, dn_s, nothing)
             if es isa AbstractVector && length(es) == 1 && es[1] isa AbstractDict
-                push!(queue, (String(dn), string(get(es[1], "uuid", ""))))
+                u = get(es[1], "uuid", "")
+                push!(queue, (dn_s, u isa String ? u : string(u)::String))
             end
         end
     end
@@ -1153,17 +1163,28 @@ function build_runtests_base_env()
             rt_pf = project_file(rt_root)
             rt_pf === nothing && continue
             rt_proj = parse_project(rt_pf)
-            rt_deps = get(Dict{String, Any}, rt_proj, "deps")
-            rt_weak = get(Dict{String, Any}, rt_proj, "weakdeps")
-            rt_ext = get(Dict{String, Any}, rt_proj, "extensions")
-            rt_entry = Dict{String, Any}(
-                "uuid" => rt_uuid,
-                "version" => string(get(rt_proj, "version", "0.1.0")),
-                "path" => abspath(rt_root),
-                "deps" => sort!(String[string(k) for k in keys(rt_deps)]),
-            )
-            isempty(rt_weak) || (rt_entry["weakdeps"] = Dict{String, Any}(string(k) => string(v) for (k, v) in rt_weak))
-            isempty(rt_ext) || (rt_entry["extensions"] = Dict{String, Any}(string(k) => v for (k, v) in rt_ext))
+            rt_deps = toml_table(rt_proj, "deps")
+            rt_weak = toml_table(rt_proj, "weakdeps")
+            rt_ext = toml_table(rt_proj, "extensions")
+            rt_entry = Dict{String, Any}()
+            rt_entry["uuid"] = rt_uuid
+            rt_entry["version"] = string(get(rt_proj, "version", "0.1.0"))::String
+            rt_entry["path"] = abspath(rt_root)
+            rt_entry["deps"] = sort!(collect(String, keys(rt_deps)))
+            if !isempty(rt_weak)
+                wd = Dict{String, Any}()
+                for (k, v) in rt_weak
+                    wd[k] = v isa String ? v : string(v)::String
+                end
+                rt_entry["weakdeps"] = wd
+            end
+            if !isempty(rt_ext)
+                ed = Dict{String, Any}()
+                for (k, v) in rt_ext
+                    ed[k] = v
+                end
+                rt_entry["extensions"] = ed
+            end
             kept[pkgid.name] = Dict{String, Any}[rt_entry]
             push!(visited, rt_uuid)
             enqueue_manifest_deps!(queue, src_deps, rt_deps)

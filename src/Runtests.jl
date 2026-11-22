@@ -621,7 +621,7 @@ function resolve_target(args)
     paths = String[]; orig = String[]; line = Int32(0); line_arg = ""
     for a in args
         a isa AbstractString || throw(ArgumentError("Runtests.runtests takes paths or a module, got $(repr(a))"))
-        s = String(a)
+        s = a isa String ? a : String(a)::String
         path, ln = split_line_suffix(s)
         ln == 0 || (line = ln; line_arg = s)
         push!(orig, s)
@@ -866,10 +866,18 @@ const PRECOMPILE_SIGNATURES = (
     template_source = "@testtemplate \"precompile three \$n\" skip = \$(n > 2) for n in 1:2\n    @test \$n > 0\nend\n"
     write(template, template_source)
     @compile_workload begin
-        instances = [Dict{String, Any}("name" => "precompile three $n", "values" => [["n", string(n)]],
-                                       "computed" => [["n > 2", "false"]]) for n in 1:2]
-        write_whole(expansion_of(template), render_expansion(template, template_source,
-            [Dict{String, Any}("line" => 1, "instances" => instances)]))
+        instances = Dict{String, Any}[]
+        for n in 1:2
+            d = Dict{String, Any}()
+            d["name"] = "precompile three $n"
+            d["values"] = [["n", string(n)]]
+            d["computed"] = [["n > 2", "false"]]
+            push!(instances, d)
+        end
+        tpl_item = Dict{String, Any}()
+        tpl_item["line"] = 1
+        tpl_item["instances"] = instances
+        write_whole(expansion_of(template), render_expansion(template, template_source, Dict{String, Any}[tpl_item]))
         files, strays, templates = walk_test_dir(testdir)
         setups = setup_modules(testdir)
         items = scan(files, Filter(), setups; ntasks = 2, strays, templates)

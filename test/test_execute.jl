@@ -963,6 +963,36 @@ end
         end
     end
 
+    @testset "report throws TestSetException for any non-passing item even without a failing Test.Result" begin
+        P = Runtests.Private
+        with_runstate_dir() do _
+            p, target = P.prepare((BASICPKG,); workers = 0, logs = :issues, monitor = false, announce = false)
+            run = P.execute(p, target)
+            try
+                # Case 1: item stuck in RUNNING (e.g. an unexpected slot crash before recording).
+                saved_state = run.statuses.state[1]
+                saved_ts = run.statuses.testsets[1]
+                run.statuses.state[1] = P.RUNNING
+                run.statuses.testsets[1] = nothing
+                err, _ = capture_run(() -> outside(() -> P.report(run)))
+                @test err isa Test.TestSetException
+
+                # Case 2: item marked FAILED/ERRORED whose recorded testset has no Fail/Error.
+                run.statuses.state[1] = P.FAILED
+                run.statuses.testsets[1] = saved_ts
+                err2, _ = capture_run(() -> outside(() -> P.report(run)))
+                @test err2 isa Test.TestSetException
+
+                # Restoring PASSED lets report succeed cleanly.
+                run.statuses.state[1] = saved_state
+                ts, _ = capture_run(() -> outside(() -> P.report(run)))
+                @test ts isa Test.DefaultTestSet
+            finally
+                rm(run.scratch; force = true, recursive = true)
+            end
+        end
+    end
+
     @testset "a retry draws the numbers the first attempt drew, and reseeds from its attempt as documented" begin
         dir = make_pkg("RetrySeeds", "test/r_test.jl" => """
             @testitem "draws again" retries=1 begin

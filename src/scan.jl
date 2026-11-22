@@ -468,12 +468,12 @@ function parse_testitem_header(ex::Expr, path, line, errors)
             v = literal(val)
             (is_number(v) && 0 < v <= MAX_TIMEOUT_S) ||
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got `$(_show(val))`")
-            timeout = Int32(ceil(v))
+            timeout = Int32(ceil(v))::Int32
         elseif key === :retries
             v = literal(val)
             (is_whole_number(v) && 0 <= v <= MAX_RETRIES) ||
                 return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `retries` must be an integer from 0 to $MAX_RETRIES, got `$(_show(val))`")
-            retries = Int32(v)
+            retries = Int32(v)::Int32
         elseif key === :failfast
             v = literal(val)
             v isa Bool || return scan_error!(errors, path, at, "`@testitem $(repr(name))`: `failfast` must be `true` or `false`, got `$(_show(val))`")
@@ -507,8 +507,9 @@ function parse_testitem_header(ex::Expr, path, line, errors)
             )
         end
     end
-    return (; name, at, tags = tags === nothing ? Symbol[] : tags, body, skip,
-            timeout, retries, failfast, throttle, profile, exclusive)
+    return (; name = name::String, at = at::Int32, tags = tags === nothing ? Symbol[] : tags, body = body::Expr, skip,
+            timeout = timeout::Int32, retries = retries::Int32, failfast = failfast::Int8,
+            throttle = throttle::Symbol, profile = profile::Symbol, exclusive = exclusive::Bool)
 end
 
 # `environment` is the directory whose environment the item's file is in (see
@@ -580,9 +581,9 @@ function collect_setups!(out::Vector{Symbol}, @nospecialize(ex), known)
 end
 
 # The module a `using` or `import` names, as in `M`, `M.x`, `M: f` and `M as N`.
-function module_head(@nospecialize(a))
+function module_head(@nospecialize(a))::Union{Nothing, Symbol}
     a isa Expr || return nothing
-    a.head === :. && !isempty(a.args) && a.args[1] isa Symbol && return a.args[1]
+    a.head === :. && !isempty(a.args) && a.args[1] isa Symbol && return a.args[1]::Symbol
     (a.head === :(:) || a.head === :as) && return module_head(a.args[1])
     return nothing
 end

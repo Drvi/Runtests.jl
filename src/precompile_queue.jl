@@ -92,7 +92,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
     deps_of(project) = get!(env_deps, project) do
         file = file_of(project)
         file === nothing && return Set{String}()
-        return Set{String}(keys(get(parse_project(file), "deps", Dict{String, Any}())))
+        return Set{String}(keys(toml_table(parse_project(file), "deps")))
     end
     # Every package that the precompiler can find in `project`: its own, its
     # dependencies and theirs.
@@ -118,7 +118,7 @@ function precompile_needs(run::Run, p::Plan, flags_of)
     test_dep_names(k::Integer) = get!(names_of, Int32(k)) do
         names = Set{String}([p.packages.name[k], "Runtests"])
         test = project_file(joinpath(p.packages.root[k], "test"))
-        test === nothing || union!(names, keys(get(parse_project(test), "deps", Dict{String, Any}())))
+        test === nothing || union!(names, keys(toml_table(parse_project(test), "deps")))
         return names
     end
     # The packages whose names each need holds already.
@@ -286,8 +286,7 @@ function setup_dependencies(pkg::Base.PkgId)
     end
     project = project_file(dirname(dirname(path)))
     project === nothing && return Set{String}()
-    deps = get(parse_project(project), "deps", nothing)
-    return deps isa AbstractDict ? Set{String}(keys(deps)) : Set{String}()
+    return Set{String}(keys(toml_table(parse_project(project), "deps")))
 end
 
 # An environment the queue compiles in: a project, `""` for none, and the load path of
@@ -461,7 +460,9 @@ function versions_by_uuid(project_file::AbstractString)
         list isa AbstractVector || continue
         for e in list
             (e isa AbstractDict && haskey(e, "uuid") && haskey(e, "version")) || continue
-            versions[Base.UUID(e["uuid"])] = string(e["version"])
+            u = e["uuid"]
+            v = e["version"]
+            versions[Base.UUID(u isa String ? u : string(u)::String)] = v isa String ? v : string(v)::String
         end
     end
     return versions
@@ -469,12 +470,13 @@ end
 
 # The version in the project file of the package whose source `pkg` is, as a setup or
 # Runtests has it, or `""`.
-function source_version(pkg::Base.PkgId)
+function source_version(pkg::Base.PkgId)::String
     path = Base.locate_package(pkg)
     path === nothing && return ""
     project = project_file(dirname(dirname(path)))
     project === nothing && return ""
-    return string(get(parse_project(project), "version", ""))
+    v = get(parse_project(project), "version", "")
+    return v isa String ? v : string(v)::String
 end
 
 # The packages that are in a cycle or wait for one.
@@ -626,8 +628,8 @@ function named_packages(p::Plan)
         file === nothing && continue
         toml = parse_project(file)
         for section in ("deps", "weakdeps", "extras")
-            entries = get(toml, section, nothing)
-            entries isa AbstractDict && union!(named, keys(entries))
+            entries = toml_table(toml, section)
+            isempty(entries) || union!(named, keys(entries))
         end
     end
     return named
@@ -882,7 +884,7 @@ end
 # helper answers it (`build!`). `caches` holds the cache files that the compiles of each
 # set of flags are held to, which the jobs in `upstream` and the job itself add to.
 function build_here!(caches::Dict{Int, Dict{Base.PkgId, Vector{String}}}, q::PrecompileQueue, i::Int, upstream,
-                     paths::Vector{Union{Nothing, String}})
+                     paths::Vector{Union{Nothing, String}})::HelperReply
     job = q.jobs[i]
     cache = get!(Dict{Base.PkgId, Vector{String}}, caches, job.config)
     for d in upstream
@@ -894,9 +896,10 @@ function build_here!(caches::Dict{Int, Dict{Base.PkgId, Vector{String}}}, q::Pre
     args, flags = q.configs[job.config]
     s, seconds, path, _, text = PrecompileHelper.compile(job.pkg, args, flags; strict = job.strict,
                                                          loadable_exts = job.exts, cachepath_cache = snapshot)
-    path === nothing || (cache[job.pkg] = [path])
+    path_s = path === nothing ? nothing : (path isa String ? path : String(path)::String)
+    path_s === nothing || (cache[job.pkg] = [path_s])
     # No peak memory: the children of this process are its test workers too.
-    return (String(s), seconds, path, 0.0, text)
+    return (s isa String ? s : String(s)::String, Float64(seconds)::Float64, path_s, 0.0, text isa String ? text : String(text)::String)
 end
 
 # Stops helper `h`, once, with the compiles it started. A helper whose environment has no
@@ -1020,7 +1023,7 @@ function stale_metadata(run::Run, q::PrecompileQueue, work::BitVector)
             env = q.envs[job.env]
             versions[i] = in_worker_environment(env.project, env.load_path) do
                 source_version(job.pkg)
-            end
+            end::String
             kinds[i] = "testsetup"
         else
             versions[i] = source_version(job.pkg)

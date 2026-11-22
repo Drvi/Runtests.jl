@@ -201,7 +201,8 @@ function package_candidates(workspace::String, project::String)
         (haskey(t, "name") && haskey(t, "uuid")) || continue
         u = tryparse(Base.UUID, string(t["uuid"]))
         u === nothing && throw(ConfigError("`uuid` of $p is not a UUID: $(repr(t["uuid"]))"))
-        push!(name, string(t["name"])); push!(uuid, u); push!(root, d)
+        raw_name = t["name"]
+        push!(name, raw_name isa String ? raw_name : string(raw_name)::String); push!(uuid, u); push!(root, d)
     end
     keep = [k for k in eachindex(root) if !any(r -> startswith(root[k], joinpath(r, "test", "")), root)]
     sort!(keep; by = k -> root[k])
@@ -358,7 +359,10 @@ function import_problems(
     for k in eachindex(ps.name)
         ps.isolated[k] && continue
         testproj = existing_project_file(joinpath(ps.root[k], "test"))
-        allowed = union(common, dependency_names(testproj), (Symbol(ps.name[k]),), keys(setups[k]))
+        allowed = copy(common)
+        union!(allowed, dependency_names(testproj))
+        push!(allowed, Symbol(ps.name[k]))
+        union!(allowed, keys(setups[k]))
         declarer = string(ps.name[k], "'s test project, ", relpath_or_path(testproj, ps.workspace))
         check(file, ex, what) = for (root, line) in imports_in(ex)
             (root in allowed || !(root in shared)) || push!(problems, ScanError(file, line, string(
@@ -440,8 +444,12 @@ end
 # The names in [deps] of the project file `project`, none when there is none.
 function dependency_names(project::Union{Nothing, AbstractString})
     project === nothing && return Set{Symbol}()
-    deps = get(parse_project(project), "deps", Dict{String, Any}())
-    return Set{Symbol}(Symbol(n) for n in keys(deps))
+    deps = toml_table(parse_project(project), "deps")
+    out = Set{Symbol}()
+    for n in keys(deps)
+        push!(out, Symbol(n))
+    end
+    return out
 end
 
 # The packages of the standard library that `@stdlib` holds.
@@ -507,7 +515,7 @@ union_dependencies(ps::Participants) = union_dependencies(ps, ps.workspace)
 function union_dependencies(ps::Union{Participants, Packages}, workspace::AbstractString)
     deps = Dict{String, String}()
     declared = Dict{String, String}()
-    function declare!(name, uuid, where_)
+    function declare!(name::String, uuid::String, where_::String)
         seen = get(deps, name, nothing)
         seen === nothing && (deps[name] = uuid; declared[name] = where_; return)
         seen == uuid || throw(ConfigError(string(
@@ -520,8 +528,8 @@ function union_dependencies(ps::Union{Participants, Packages}, workspace::Abstra
         ps.isolated[k] && continue
         declare!(ps.name[k], string(ps.uuid[k]), relpath_or_path(existing_project_file(ps.root[k]), workspace))
         testproj = existing_project_file(joinpath(ps.root[k], "test"))
-        for (name, uuid) in get(parse_project(testproj), "deps", Dict{String, Any}())
-            declare!(name, string(uuid), relpath_or_path(testproj, workspace))
+        for (name, uuid) in toml_table(parse_project(testproj), "deps")
+            declare!(name, uuid isa String ? uuid : string(uuid)::String, relpath_or_path(testproj, workspace))
         end
     end
     runtests = Base.PkgId(parentmodule(@__MODULE__))
@@ -540,7 +548,7 @@ function merged_preferences(ps::Union{Participants, Packages}, workspace::Abstra
         path = joinpath(ps.root[k], "test", "LocalPreferences.toml")
         isfile(path) || continue
         for (pkg, prefs) in parse_project(path)
-            prefs isa AbstractDict || continue
+            prefs isa Dict{String, Any} || continue
             mine = get!(Dict{String, Any}, out, pkg)
             for (key, value) in prefs
                 if haskey(mine, key) && mine[key] != value
@@ -636,8 +644,8 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
     configs = [config_toml(joinpath(ps.root[k], "test"), nothing) for k in 1:n]
     selected = name !== nothing || tags !== nothing || !isempty(chosen) || item_keys !== nothing ||
         (replayed !== nothing && !called)
-    gsel, lacking, group_name = mono_groups([read_groups(path, toml) for (path, toml) in configs],
-                                            [path for (path, _) in configs], group, selected)
+    gsel, lacking, group_name = mono_groups(Dict{String, TagExpr}[read_groups(path, toml) for (path, toml) in configs],
+                                            String[path for (path, _) in configs], group, selected)
     # A replay runs what each run state recorded, narrowed by what the call selects,
     # as `prepare` narrows it, keys included. A package that no key names is not read.
     # Failing items, which come with their seeds, are the base's and the later runs',
@@ -738,7 +746,17 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
             rs = replayed.records[k]
             (rs === nothing || !scanned[k]) && continue
             selection = package_names[k]
-            selection isa AbstractSet && append!(gone, string(ps.name[k], " ", repr(m)) for m in sort!(collect(setdiff(selection, suite_names[k]))))
+            if selection isa AbstractSet
+                missing_names = String[]
+                suite_set = Set{String}(suite_names[k])
+                for m in selection
+                    ms = m isa String ? m : String(m)::String
+                    ms in suite_set || push!(missing_names, ms)
+                end
+                for m in sort!(missing_names)
+                    push!(gone, string(ps.name[k], " ", repr(m)))
+                end
+            end
             append!(changed, string(ps.name[k], " ", repr(m)) for m in changed_since(rs, (it for it in items if it.package == k)))
         end
     end
@@ -887,7 +905,7 @@ function mono_groups(groups::Vector{Dict{String, TagExpr}}, paths::Vector{String
     name, asker = requested_group(requested, selected)
     (name === nothing || name == ALL_GROUP) && return none
     source = string("from ", asker)
-    sel = Union{Nothing, GroupSelection}[haskey(g, name) ? GroupSelection(name, g[name], source, paths[k]) : nothing
+    sel = Union{Nothing, GroupSelection}[haskey(g, name) ? GroupSelection(name isa String ? name : String(name)::String, g[name], source, paths[k]) : nothing
                                          for (k, g) in enumerate(groups)]
     name == DEFAULT_GROUP && return sel, falses(n), name
     lacking = BitVector([!haskey(g, name) for g in groups])

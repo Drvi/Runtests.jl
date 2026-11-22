@@ -41,16 +41,28 @@ function package_plan(p::Plan, k::Integer)
     )
 end
 
-# The settings a package's items ran with in a run of several packages: its own, and
-# the run's for what is the run's (`RUN_WIDE_KEYS`) and how the run was made.
-const PACKAGE_OWN_FIELDS = (
-    (s.field for s in SETTING_SPECS if s.scope === :pkg)...,
-    :profiles, :groups, :order_first, :order_last, :throttle, :item_seeds, :config_file,
-)
-function under_run_settings(own::RunConfig, run::RunConfig)
-    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(n -> getfield(fieldname(RunConfig, n) in PACKAGE_OWN_FIELDS ? own : run, n),
-                                                      fieldcount(RunConfig)))
-    return RunConfig(; fields...)
+# The settings a package's items ran with in a run of several packages: its own
+# (`PACKAGE_KEYS` plus per-package tables/metadata), and the run's for what is the
+# run's (`RUN_WIDE_KEYS`) and how the run was made.
+function under_run_settings(own::RunConfig, run::RunConfig)::RunConfig
+    return with_config(
+        run;
+        threads = own.threads,
+        timeout_s = own.timeout_s,
+        init_timeout_s = own.init_timeout_s,
+        test_end_timeout_s = own.test_end_timeout_s,
+        artifacts_timeout_s = own.artifacts_timeout_s,
+        retries = own.retries,
+        item_failfast = own.item_failfast,
+        skip_environment = own.skip_environment,
+        profiles = own.profiles,
+        groups = own.groups,
+        order_first = own.order_first,
+        order_last = own.order_last,
+        throttle = own.throttle,
+        item_seeds = own.item_seeds,
+        config_file = own.config_file,
+    )
 end
 
 """

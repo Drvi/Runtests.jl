@@ -139,11 +139,49 @@ Base.@kwdef struct RunConfig
     skip_environment::Vector{String} = String[]
 end
 
-# A copy of `cfg` with selected fields replaced.
-function with_config(cfg::RunConfig; kwargs...)
-    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, values(kwargs))...)
-end
+# A copy of `cfg` with selected fields replaced. Explicit typed keywords avoid
+# constructing a dynamic `NamedTuple` and compiling `RunConfig(::Any, ...)`.
+with_config(
+    cfg::RunConfig;
+    workers::Int = cfg.workers,
+    threads::String = cfg.threads,
+    timeout_s::Int = cfg.timeout_s,
+    init_timeout_s::Int = cfg.init_timeout_s,
+    test_end_timeout_s::Int = cfg.test_end_timeout_s,
+    artifacts_timeout_s::Int = cfg.artifacts_timeout_s,
+    retries::Int = cfg.retries,
+    failfast::Bool = cfg.failfast,
+    item_failfast::Bool = cfg.item_failfast,
+    logs::Symbol = cfg.logs,
+    verbose::Bool = cfg.verbose,
+    memory_threshold::Float64 = cfg.memory_threshold,
+    full_stacktraces::Bool = cfg.full_stacktraces,
+    full_names::Bool = cfg.full_names,
+    testset_name::String = cfg.testset_name,
+    coverage::Bool = cfg.coverage,
+    coverage_source::String = cfg.coverage_source,
+    env_settings::Vector{Pair{String, String}} = cfg.env_settings,
+    monitor::Bool = cfg.monitor,
+    monitor_interval::Int = cfg.monitor_interval,
+    profiles::Dict{Symbol, Profile} = cfg.profiles,
+    groups::Dict{String, TagExpr} = cfg.groups,
+    order_first::Vector{String} = cfg.order_first,
+    order_last::Vector{String} = cfg.order_last,
+    throttle::Dict{Symbol, Int} = cfg.throttle,
+    seed::UInt64 = cfg.seed,
+    item_seeds::Dict{String, UInt64} = cfg.item_seeds,
+    julia_flags::Vector{String} = cfg.julia_flags,
+    replayed_manifest::String = cfg.replayed_manifest,
+    replayed_from::String = cfg.replayed_from,
+    config_file::String = cfg.config_file,
+    skip_environment::Vector{String} = cfg.skip_environment,
+) = RunConfig(
+    workers, threads, timeout_s, init_timeout_s, test_end_timeout_s, artifacts_timeout_s,
+    retries, failfast, item_failfast, logs, verbose, memory_threshold, full_stacktraces,
+    full_names, testset_name, coverage, coverage_source, env_settings, monitor,
+    monitor_interval, profiles, groups, order_first, order_last, throttle, seed,
+    item_seeds, julia_flags, replayed_manifest, replayed_from, config_file, skip_environment,
+)
 
 # Declarative table of the 20 run settings. Each is a keyword, a `RUNTESTS_<KEY>`
 # variable, and a key of `[run]` (except `skip_environment`, which `[run]` refuses).
@@ -338,8 +376,18 @@ function config_toml(testdir::AbstractString, config::Union{Nothing, AbstractStr
     return path, toml
 end
 
+# A TOML table value as a concrete `Dict{String, Any}`, empty when absent or not a table.
+function toml_table(d::Dict{String, Any}, key::AbstractString)::Dict{String, Any}
+    v = get(d, key, nothing)
+    return v isa Dict{String, Any} ? v : Dict{String, Any}()
+end
+
 function check_keys(path, tbl::AbstractDict, allowed::Tuple, where_)
-    for k in sort!(collect(keys(tbl)))
+    ks = String[]
+    for k in keys(tbl)
+        push!(ks, k isa String ? k : string(k)::String)
+    end
+    for k in sort!(ks)
         Symbol(k) in allowed && continue
         loc = isempty(where_) ? "" : " in [$where_]"
         throw(
@@ -357,15 +405,21 @@ format_case_clashes(clashes::Vector{Vector{String}}) =
     join((join(("`$n`" for n in g), " and ") for g in clashes), ", ")
 
 # A table of the configuration, validated to be a TOML table.
-function table_section(path, parent::AbstractDict, key::AbstractString, label = key)
-    t = get(Dict{String, Any}, parent, key)
+function table_section(path, parent::AbstractDict, key::AbstractString, label = key)::Dict{String, Any}
+    t = get(parent, key, nothing)
+    t === nothing && return Dict{String, Any}()
+    t isa Dict{String, Any} && return t
     t isa AbstractDict || throw(ConfigError("[$label] of $(relpath_or_path(path)) must be a table"))
-    return t
+    out = Dict{String, Any}()
+    for (k, v) in t
+        out[k isa String ? k : string(k)::String] = v
+    end
+    return out
 end
 
 # A table of the configuration, holding only the keys it may hold. `label` is how
 # a message names it.
-function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple, label = key)
+function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple, label = key)::Dict{String, Any}
     t = table_section(path, parent, key, label)
     check_keys(path, t, allowed, label)
     return t
@@ -374,13 +428,18 @@ end
 # `key` of the table labelled `label`, a list of strings, empty when absent. A string on
 # its own is refused rather than read as the list of its characters: `key = "a"` for
 # `key = ["a"]` is the likeliest slip.
-function string_list(path, table::AbstractDict, key::AbstractString, label::AbstractString)
-    v = get(Vector{String}, table, key)
+function string_list(path, table::AbstractDict, key::AbstractString, label::AbstractString)::Vector{String}
+    v = get(table, key, nothing)
+    v === nothing && return String[]
     (v isa AbstractVector && all(x -> x isa AbstractString, v)) || throw(ConfigError(
         "`$key` of [$label] in $(relpath_or_path(path)) must be a list of strings, as in " *
             "`$key = [\"…\"]`, got $(repr(v))"
     ))
-    return String[x for x in v]
+    out = String[]
+    for x in v
+        push!(out, x isa String ? x : String(x)::String)
+    end
+    return out
 end
 
 # `true` or `false` from an environment variable, or `nothing` when it is unset or empty.
@@ -462,36 +521,39 @@ function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb
         vars = [n for k in keys for (n, _) in from_env if n == env_setting_name(k)]
         return ConfigError(isempty(vars) ? msg : string(msg, " (from `", join(vars, "`, `"), "`)"))
     end
-    seconds(key, x) = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+    seconds(key, x)::Int = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(bad("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))", key))
     # 0 prints at every sample, five times a second: a test's way to make the
     # monitor print as often as it can.
-    interval(x) = (is_number(x) && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+    interval(x)::Int = (is_number(x) && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(bad("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))", :monitor_interval))
-    flag(key, default) = (v = pick(key, default); v isa Bool ? v :
+    flag(key, default)::Bool = (v = pick(key, default); v isa Bool ? v :
         throw(bad("`$key` must be true or false, got $(repr(v))", key)))
 
     threads = threads_spec("threads", pick(:threads, DEFAULT_THREADS), msg -> bad(msg, :threads))
     mt = pick(:memory_threshold, 0.9)
     (is_number(mt) && 0 < mt <= 1) || throw(bad("`memory_threshold` must be in (0, 1], got $(repr(mt))", :memory_threshold))
+    mt_f = Float64(mt)::Float64
     w = pick(:workers, "auto")
     # A worker is a slot, and slots are numbered in a `SlotIdx`.
     ((is_whole_number(w) && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(bad(
         "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))", :workers
     ))
-    workers = w isa Integer ? Int(w) :
-        auto_workers(threads, nunits; peak_worker_mb, coverage = rss_coverage, memory_threshold = Float64(mt))
+    workers = (w isa Integer ? Int(w) :
+        auto_workers(threads, nunits; peak_worker_mb, coverage = rss_coverage, memory_threshold = mt_f))::Int
     logs = Symbol(pick(:logs, default_logs(workers)))::Symbol
     logs in LOG_MODES || throw(bad("`logs` must be one of $(LOG_MODES), got $(repr(logs))", :logs))
     timeout = seconds(:timeout, pick(:timeout, DEFAULT_TIMEOUT_S))
     retries = pick(:retries, 0)
     (is_whole_number(retries) && 0 <= retries <= MAX_RETRIES) ||
         throw(bad("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))", :retries))
+    retries_i = Int(retries)::Int
     failfast = flag(:failfast, false)
     # Absent, a random one: 0 is a seed like any other.
     seed = pick(:seed, nothing)
     (seed === nothing || (is_whole_number(seed) && 0 <= seed <= typemax(UInt64))) ||
         throw(bad("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))", :seed))
+    seed_u = (seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed))::UInt64
     order = section(path, toml, "order", ORDER_KEYS)
     coverage = flag(:coverage, false)
     coverage_source = given(:coverage) ? "the `coverage` keyword" :
@@ -504,46 +566,54 @@ function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb
     testset_name = pick(:testset_name, "Runtests")
     (testset_name isa AbstractString && !isempty(testset_name)) ||
         throw(bad("`testset_name` must be a non-empty string, got $(repr(testset_name))", :testset_name))
+    testset_name_s = testset_name isa String ? testset_name : String(testset_name)::String
     skip = pick(:skip_environment, String[])
     skip isa AbstractString && (skip = [skip])
     (skip isa AbstractVector && all(n -> n isa AbstractString && !isempty(n), skip)) || throw(bad(
         "`skip_environment` must be the path of an environment directory from the root of the repository, " *
             "as in \"test/qa\", or a vector of them, got $(repr(skip))", :skip_environment
     ))
+    skip_env = String[]
+    for n in skip
+        ns = n isa String ? n : String(n)::String
+        push!(skip_env, String(rstrip(replace(ns, '\\' => '/'), '/')))
+    end
+    unique!(skip_env)
+    cfg_file_s = config_file isa String ? config_file : String(config_file)::String
 
     return RunConfig(;
         workers, threads, timeout_s = timeout,
         init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout)),
         test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout)),
         artifacts_timeout_s = seconds(:artifacts_timeout, pick(:artifacts_timeout, timeout)),
-        retries = Int(retries), failfast, item_failfast = flag(:item_failfast, failfast), logs,
+        retries = retries_i, failfast, item_failfast = flag(:item_failfast, failfast), logs,
         verbose = flag(:verbose, false),
-        memory_threshold = Float64(mt), monitor = flag(:monitor, true),
+        memory_threshold = mt_f, monitor = flag(:monitor, true),
         full_stacktraces = flag(:full_stacktraces, false),
         full_names = flag(:full_names, false),
-        testset_name = String(testset_name), coverage, coverage_source, env_settings = from_env,
+        testset_name = testset_name_s, coverage, coverage_source, env_settings = from_env,
         monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = profiles === nothing ? read_profiles(path, toml; shared, testdir) : profiles,
         groups = read_groups(path, toml),
         order_first = string_list(path, order, "first", "order"),
         order_last = string_list(path, order, "last", "order"),
         throttle = read_throttle(path, toml),
-        seed = seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed),
-        config_file = String(config_file),
+        seed = seed_u,
+        config_file = cfg_file_s,
         # With `/` between the directories, whatever the system writes.
-        skip_environment = unique!(String[rstrip(replace(n, '\\' => '/'), '/') for n in skip])
+        skip_environment = skip_env
     )
 end
 
 # What `--threads` takes: default threads, `auto` or at least one, then optionally
 # interactive ones, `auto` or any number. Checked here, or the first worker dies of it.
 # `where_` says where the setting is, after its name.
-function threads_spec(what, x, err = ConfigError; where_ = "")
-    s = x isa Integer ? string(x) : x
+function threads_spec(what, x, err = ConfigError; where_ = "")::String
+    s = x isa Integer ? string(Int(x)) : x
     (s isa AbstractString && occursin(r"^(auto|[1-9][0-9]*)(,(auto|[0-9]+))?$", s)) || throw(err(
         "`$what`$where_ must be what `--threads` takes (\"4\", \"4,1\", \"auto\"), got $(repr(x))"
     ))
-    return String(s)
+    return s isa String ? s : String(s)::String
 end
 
 # One interactive worker streams its logs; several would interleave unreadably, so
@@ -762,7 +832,10 @@ function parse_profile(path, tbl::AbstractDict, name::AbstractString; testdir::A
         "`env` of [$label] in $(relpath_or_path(path)) must be a table of variables, as in " *
             "`env = { NAME = \"value\" }`, got $(repr(vars))"
     ))
-    env = Pair{String, String}[string(k) => string(v) for (k, v) in vars]
+    env = Pair{String, String}[]
+    for (k, v) in vars
+        push!(env, (k isa String ? k : string(k)::String) => (v isa String ? v : string(v)::String))
+    end
     sort!(env; by = first)
     shares = get(p, "monorepo_default", false)
     shares isa Bool || throw(ConfigError(
@@ -850,15 +923,21 @@ the rest of the file is the root's own, which its own runs check.
 function shared_profiles(path::AbstractString, toml, workspace::AbstractString)
     out = Dict{Symbol, Profile}()
     tbl = get(Dict{String, Any}, toml, "profiles")
-    tbl isa AbstractDict || return SharedProfiles(String(path), out)
-    marked = String[name for (name, given) in tbl if given isa AbstractDict && get(given, "monorepo_default", false) === true]
+    tbl isa AbstractDict || return SharedProfiles(String(path)::String, out)
+    marked = String[]
+    for (name, given) in tbl
+        if given isa AbstractDict && get(given, "monorepo_default", false) === true
+            push!(marked, name isa String ? name : String(name)::String)
+        end
+    end
     check_profile_names(path, marked)
+    ws = workspace isa String ? workspace : String(workspace)::String
     for name in marked
         # Its code is in the workspace root's `test/testconfigs/`.
         prof, _ = parse_profile(path, tbl, name)
-        out[prof.name] = with_profile(prof; dir = String(workspace))
+        out[prof.name] = with_profile(prof; dir = ws)
     end
-    return SharedProfiles(String(path), out)
+    return SharedProfiles(path isa String ? path : String(path)::String, out)
 end
 
 # The profiles that the workspace of the package at `root` shares with its packages:
@@ -980,7 +1059,7 @@ function select_group(groups::Dict{String, TagExpr}, path::AbstractString, reque
     name, asker = requested_group(requested, selected)
     name === nothing && return nothing
     name == ALL_GROUP && return nothing
-    haskey(groups, name) && return GroupSelection(name, groups[name], string("from ", asker), path)
+    haskey(groups, name) && return GroupSelection(name isa String ? name : String(name)::String, groups[name], string("from ", asker)::String, path isa String ? path : String(path)::String)
     name == DEFAULT_GROUP && return nothing
     file = relpath_or_path(path)
     declared = sort!(collect(keys(groups)))
@@ -1028,11 +1107,12 @@ end
 The absolute path to a profile's preferences file, or `""` when it declares none.
 Parsed here, so a missing or malformed file fails before any worker starts.
 """
-function profile_preferences(config_path, name, value)
+function profile_preferences(config_path, name, value)::String
     bad(what) = ConfigError("`preferences` of [profiles.$name]" * what)
     value isa AbstractString || throw(bad(" must be a path to a TOML file"))
     isempty(value) && return ""
-    path = isabspath(value) ? value : normpath(joinpath(dirname(config_path), value))
+    val = value isa String ? value : String(value)::String
+    path = isabspath(val) ? val : normpath(joinpath(dirname(config_path), val))
     isfile(path) || throw(bad(" points at $(relpath_or_path(path)), which does not exist"))
     try
         TOML.parsefile(path)

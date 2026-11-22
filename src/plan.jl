@@ -137,10 +137,11 @@ function single_package(cfg::RunConfig, root::AbstractString, suite_names::Vecto
     t = project === nothing ? Dict{String, Any}() : parse_project(project)
     raw_uuid = get(t, "uuid", "")
     raw_name = get(t, "name", "")
-    uuid_str = raw_uuid isa AbstractString ? String(raw_uuid) : ""
-    name_str = raw_name isa AbstractString ? String(raw_name) : ""
+    uuid_str = raw_uuid isa String ? raw_uuid : raw_uuid isa AbstractString ? String(raw_uuid)::String : ""
+    name_str = raw_name isa String ? raw_name : raw_name isa AbstractString ? String(raw_name)::String : ""
     uuid = something(tryparse(Base.UUID, uuid_str), Base.UUID(0))
-    return Packages(String[name_str], Base.UUID[uuid], String[String(root)], Bool[false], RunConfig[cfg], Vector{String}[suite_names])
+    root_s = root isa String ? root : String(root)::String
+    return Packages(String[name_str], Base.UUID[uuid], String[root_s], Bool[false], RunConfig[cfg], Vector{String}[suite_names])
 end
 
 struct ReplayPolicyDiff

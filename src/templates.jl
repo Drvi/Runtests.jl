@@ -189,7 +189,7 @@ function extract_template_slots(text::String, node)
     end
     collect_interpolation_sites!(sites, text, body, false)
     sort!(sites; by = s -> first(s[1]))
-    return TemplateSlots(byte_range(kids[2]), byte_range(loop), byte_range(body), Expr(node), sites)
+    return TemplateSlots(byte_range(kids[2]), byte_range(loop), byte_range(body), Expr(node)::Expr, sites)
 end
 
 function collect_interpolation_sites!(out, text::String, node, in_header::Bool)
@@ -218,22 +218,31 @@ of its keywords by the code of what it computed, the rest as written. The stamp 
 its third line is what a run checks it by.
 """
 function render_expansion(template::AbstractString, text::String, items::Vector)
-    nodes = declaration_nodes(JuliaSyntax.parseall(JuliaSyntax.SyntaxNode, text; filename = String(template)))
+    tpl = template isa String ? template : String(template)::String
+    nodes = declaration_nodes(JuliaSyntax.parseall(JuliaSyntax.SyntaxNode, text; filename = tpl))
     length(nodes) == length(items) ||
         error("the expanding process read $(length(items)) `@testtemplate`s in the template, and Runtests $(length(nodes))")
     pieces = String[]
     for (node, item) in zip(nodes, items)
         slots = extract_template_slots(text, node)
         for inst in item["instances"]
-            values = Dict{Symbol, String}(Symbol(v) => String(code) for (v, code) in inst["values"])
-            computed = Dict{String, String}(String(k) => String(code) for (k, code) in inst["computed"])
-            push!(pieces, render_instance(text, slots, String(inst["name"]), values, computed))
+            values = Dict{Symbol, String}()
+            for (v, code) in inst["values"]
+                vsym = v isa Symbol ? v : Symbol(v isa String ? v : String(v)::String)
+                values[vsym] = code isa String ? code : String(code)::String
+            end
+            computed = Dict{String, String}()
+            for (k, code) in inst["computed"]
+                computed[k isa String ? k : String(k)::String] = code isa String ? code : String(code)::String
+            end
+            iname = inst["name"]
+            push!(pieces, render_instance(text, slots, iname isa String ? iname : String(iname)::String, values, computed))
         end
     end
     body = string("\n", join(pieces, "\n\n"), "\n")
     # With `/` on every system: the header is part of the file that is committed.
     return string(
-        "# Expanded from ", TESTTEMPLATES_DIR, "/", basename(template), " by `Runtests.chores()`.\n",
+        "# Expanded from ", TESTTEMPLATES_DIR, "/", basename(tpl), " by `Runtests.chores()`.\n",
         "# Change the template and run `Runtests.chores()` again, rather than editing this file.\n",
         "# runtests-expansion ", STAMP_FORMAT, " ", hex8(text_crc(text)), " ", hex8(text_crc(body)), "\n",
         body
@@ -382,7 +391,10 @@ function expand_templates(target, templates::Vector{String})
     request, response = tempname() * ".toml", tempname() * ".toml"
     try
         project = something(project_name_of(target.project), "")
-        open(io -> TOML.print(io, Dict("project" => project, "templates" => templates)), request, "w")
+        req = Dict{String, Any}()
+        req["project"] = project
+        req["templates"] = templates
+        open(io -> TOML.print(io, req), request, "w")
         failure = with_test_env(target) do
             with_load_path(joinpath(target.testdir, TESTSETUPS_DIR)) do
                 # The process's own `TOML` is a standard library, which a load path such
@@ -500,14 +512,16 @@ function chore_templates!(io::IO, target, fix::Bool)
         answers = isempty(todo) ? Dict{String, Any}[] : expand_templates(target, todo)
         answers isa String && push!(problems, target.testdir => answers)
         for answer in (answers isa String ? Dict{String, Any}[] : answers)
-            t = String(answer["path"])
+            raw_t = answer["path"]
+            t = raw_t isa String ? raw_t : String(raw_t)::String
             if haskey(answer, "error")
                 line = Int(get(answer, "line", 0))
                 push!(problems, t => string(line == 0 ? "" : "line $line: ", answer["error"]))
                 continue
             end
             text = try
-                render_expansion(t, String(answer["text"]), answer["items"])
+                raw_text = answer["text"]
+                render_expansion(t, raw_text isa String ? raw_text : String(raw_text)::String, answer["items"])
             catch e
                 e isa InterruptException && rethrow()
                 push!(problems, t => sprint(showerror, e))

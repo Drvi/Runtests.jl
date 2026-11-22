@@ -83,7 +83,7 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
     available = test_env_packages(target, own)
     # What a moved setup's `@__DIR__` becomes `pkgdir` of; `nothing` for a project
     # that is not a package.
-    pkg = haskey(own, "uuid") ? String(own["name"]) : nothing
+    pkg = haskey(own, "uuid") ? (own["name"] isa String ? own["name"]::String : String(own["name"])::String) : nothing
     stdlib_cache = Dict{String, Union{Nothing, Base.UUID}}()
     plans = SetupPackage[]
     for name in names
@@ -120,7 +120,7 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
                 "the test environment nor the standard library provides"
         )
         toml = tomls[name]
-        have = get(Dict{String, Any}, toml, "deps")
+        have = toml_table(toml, "deps")
         for (n, u) in deps
             haskey(have, n) || continue
             listed = tryparse(Base.UUID, string(have[n]))
@@ -134,16 +134,20 @@ function plan_setup_packages(target, dir::String, modules::Dict{Symbol, String})
                 push!(problems, "$(shown(source)):$(line_at(code, at)): $what")
             end
             code = moved
-            imported && (deps[pkg] = available[pkg])
+            imported && pkg !== nothing && (deps[pkg] = available[pkg])
         end
-        added = sort!([n for n in keys(deps) if !haskey(have, n)])
+        added = sort!(String[n for n in keys(deps) if !haskey(have, n)])
         after = copy(toml)
         after["name"] = name
         after["uuid"] = string(uuids[name])
-        alldeps = merge(Dict{String, Any}(have), Dict{String, Any}(n => string(deps[n]) for n in added))
+        alldeps = copy(have)
+        for n in added
+            alldeps[n] = string(deps[n])
+        end
         isempty(alldeps) || (after["deps"] = alldeps)
-        push!(plans, SetupPackage(name, source, entry, code, rewritten, imported ? pkg : "", project, after,
-                                  after != toml, sort!(collect(keys(alldeps))), added))
+        imported_pkg = (imported && pkg !== nothing) ? pkg : ""
+        push!(plans, SetupPackage(name, source, entry, code, rewritten, imported_pkg, project, after,
+                                  (after != toml)::Bool, sort!(collect(String, keys(alldeps))), added))
     end
     isempty(problems) || throw(
         ConfigError("no setup can be made a package until these are fixed:\n" * join(("  " * p for p in problems), "\n"))
@@ -209,19 +213,24 @@ names, and the package itself either way.
 """
 function test_env_packages(target, root::Dict{String, Any} = parse_project(target.project))
     out = Dict{String, Base.UUID}()
-    haskey(root, "uuid") && (out[root["name"]] = Base.UUID(root["uuid"]))
+    if haskey(root, "uuid")
+        rn = root["name"]
+        ru = root["uuid"]
+        out[rn isa String ? rn : String(rn)::String] = Base.UUID(ru isa String ? ru : String(ru)::String)
+    end
     testproj = project_file(target.testdir)
     if testproj !== nothing
-        for (n, u) in get(Dict{String, Any}, parse_project(testproj), "deps")
-            out[n] = Base.UUID(u)
+        for (n, u) in toml_table(parse_project(testproj), "deps")
+            out[n] = Base.UUID(u isa String ? u : string(u)::String)
         end
     else
-        for (n, u) in get(Dict{String, Any}, root, "deps")
-            out[n] = Base.UUID(u)
+        for (n, u) in toml_table(root, "deps")
+            out[n] = Base.UUID(u isa String ? u : string(u)::String)
         end
-        test = get(Vector{String}, get(Dict{String, Any}, root, "targets"), "test")
-        for section in ("extras", "weakdeps"), (n, u) in get(Dict{String, Any}, root, section)
-            n in test && (out[n] = Base.UUID(u))
+        raw_test = get(toml_table(root, "targets"), "test", nothing)
+        test = raw_test isa AbstractVector ? String[x isa String ? x : String(x)::String for x in raw_test] : String[]
+        for section in ("extras", "weakdeps"), (n, u) in toml_table(root, section)
+            n in test && (out[n] = Base.UUID(u isa String ? u : string(u)::String))
         end
     end
     return out

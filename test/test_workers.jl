@@ -539,6 +539,34 @@ end
         end
     end
 
+    @testset "abort_worker_process! and interrupted connect_worker leave no process behind" begin
+        wp = RuntestsWorkers.spawn_worker_process(; threads="1")
+        @test wp.pid > 0
+        RuntestsWorkers.abort_worker_process!(wp)
+        @test Base.process_exited(wp.proc)
+        @test @lock(RuntestsWorkers.LIVE_LOCK, !(wp.proc in RuntestsWorkers.LIVE_PROCESSES))
+        Sys.iswindows() || @test all_gone([wp.pid])
+
+        # Interrupting `connect_worker` while the process is still booting must kill
+        # and reap it rather than leaving a detached worker behind.
+        wp2 = RuntestsWorkers.spawn_worker_process(; threads="1")
+        pid2 = wp2.pid
+        t = @async RuntestsWorkers.connect_worker(wp2; redirect_io=IOBuffer())
+        yield()
+        schedule(t, InterruptException(); error=true)
+        err = try
+            w, _ = fetch(t)
+            close(w)
+            nothing
+        catch e
+            e
+        end
+        @test err isa TaskFailedException && err.task.exception isa InterruptException
+        @test Base.process_exited(wp2.proc)
+        @test @lock(RuntestsWorkers.LIVE_LOCK, !(wp2.proc in RuntestsWorkers.LIVE_PROCESSES))
+        Sys.iswindows() || @test all_gone([pid2])
+    end
+
     @testset "these tests leave no worker running" begin
         @test @lock(RuntestsWorkers.LIVE_LOCK, count(Base.process_running, RuntestsWorkers.LIVE_PROCESSES)) == 0
     end

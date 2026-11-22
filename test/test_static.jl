@@ -140,6 +140,8 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("removable_runs", P.removable_runs, (Vector{Pair{String, P.RunStateRecord}}, Vector{String})),
             ("serve_requests", W.serve_requests, (TCPSocket,)),
             ("process_responses", W.process_responses, (W.Worker,)),
+            ("connect_worker", W.connect_worker, (W.WorkerProcess,)),
+            ("prespawn_workers!", P.prespawn_workers!, (P.Run, P.Plan)),
             ("read_run_state", P.read_run_state, (String,)),
             ("read_run_meta", P.read_run_meta, (String,)),
         )

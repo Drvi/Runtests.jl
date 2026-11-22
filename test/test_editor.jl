@@ -401,11 +401,52 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             @test done["id"] == 1 && done["state"] == "cancelled"
             @test t < 30
             @test !isempty(done["not_run"]) || done["counts"]["cancelled"] > 0
+            @test isempty(live_worker_pids())
             Sys.iswindows() || @test all_gone(pids)
             # The session is still there for the next command.
             send(s, (; id = 3, command = "list"))
             @test next_event(s)["event"] == "items"
             close_session(s)
+        end
+    end
+
+    @testset "a cancel during worker startup stops the run at once and leaves no workers" begin
+        work = mktempdir()
+        dir = make_pkg(
+            "CancelledInInit",
+            "test/a_test.jl" => join((item("never $i", "@test true") for i in 1:2)),
+            profile_files(; init = "write(joinpath(ENV[\"RUNTESTS_INIT_MARKER_DIR\"], string(getpid())), \"1\"); sleep(600)")...,
+        )
+        try
+            withenv("RUNTESTS_INIT_MARKER_DIR" => work) do
+                with_runstate_dir() do _
+                    s = open_session(dir)
+                    next_event(s)
+                    send(s, (; id = 1, command = "run", options = (; workers = 2)))
+                    deadline = time() + 60
+                    while isempty(readdir(work)) && time() < deadline
+                        sleep(0.05)
+                    end
+                    @test !isempty(readdir(work))
+                    pids = live_worker_pids()
+                    @test !isempty(pids)
+                    t = @elapsed begin
+                        send(s, (; id = 2, command = "cancel"))
+                        seen = events_until(e -> e["event"] == "run_finished", s)
+                    end
+                    done = last(seen)
+                    @test done["id"] == 1 && done["state"] == "cancelled"
+                    @test t < 30
+                    @test isempty(live_worker_pids())
+                    Sys.iswindows() || @test all_gone(pids)
+                    # The session stays usable after cancelling mid-startup.
+                    send(s, (; id = 3, command = "list"))
+                    @test next_event(s)["event"] == "items"
+                    close_session(s)
+                end
+            end
+        finally
+            rm(work; force = true, recursive = true)
         end
     end
 

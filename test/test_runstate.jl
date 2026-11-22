@@ -339,6 +339,9 @@ end
                 push!(errors, e)
             end
         end
+        # Wait until the reader has completed its first warm read so it actually
+        # overlaps with the 25 write rounds below rather than compiling after they end.
+        timedwait(() -> reads[] > 0 || istaskdone(reader), 30.0)
         # Drive in-place status, memory, event, and ending writes while the reader polls.
         stats = Runtests.Private.MemStats()
         for round in 1:25

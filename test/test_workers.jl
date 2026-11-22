@@ -436,8 +436,8 @@ end
         script = joinpath(dir, "coordinator.jl")
         write(script, """
             using Runtests: RuntestsWorkers
-            w = RuntestsWorkers.Worker(; threads = "1", redirect_io = devnull)
-            RuntestsWorkers.remote_eval(w, :(begin
+            w = RuntestsWorkers.Worker(; threads = "1", connect_timeout = 120, redirect_io = stderr)
+            fut = RuntestsWorkers.remote_eval(w, :(begin
                 child = run(Sys.iswindows() ? Cmd([Base.julia_cmd().exec..., "--startup-file=no", "-e", "sleep(600)"]) :
                             `sleep 600`; wait = false)
                 tmp = $(repr(pidfile)) * ".tmp"
@@ -445,16 +445,32 @@ end
                 mv(tmp, $(repr(pidfile)); force = true)
                 sleep(600)
             end))
+            try
+                fetch(fut)
+            catch e
+                showerror(stderr, e)
+                println(stderr)
+                exit(1)
+            end
             sleep(600)
             """)
-        coordinator = run(worker_child_env(`$(Base.julia_cmd()) --startup-file=no $script`); wait = false)
+        log = Base.BufferStream()
+        coordinator = run(pipeline(worker_child_env(`$(Base.julia_cmd()) --startup-file=no $script`);
+                                   stdout = log, stderr = log); wait = false)
         pids = Int32[]
         try
-            timedwait(() -> isfile(pidfile), 300)
+            timedwait(() -> isfile(pidfile) || process_exited(coordinator), 300)
             isfile(pidfile) && append!(pids, parse.(Int32, split(read(pidfile, String))))
+            if length(pids) != 2
+                process_running(coordinator) && kill(coordinator, Base.SIGKILL)
+                wait(coordinator)
+                close(log)
+                @info "coordinator did not write pidfile (exitcode=$(coordinator.exitcode)); output:\n$(read(log, String))"
+            end
             @test length(pids) == 2
             kill(coordinator, Base.SIGKILL)
             wait(coordinator)
+            close(log)
             # By the job that holds them on Windows; elsewhere, by the worker's watch on
             # the coordinator.
             gone = timedwait(() -> !any(alive, pids), 30) === :ok
@@ -462,6 +478,7 @@ end
             gone || foreach(p -> ccall(:uv_kill, Cint, (Cint, Cint), p, Base.SIGKILL), pids)
         finally
             process_running(coordinator) && kill(coordinator, Base.SIGKILL)
+            isopen(log) && close(log)
             rm(dir; force = true, recursive = true)
         end
     end

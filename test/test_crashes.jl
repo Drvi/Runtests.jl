@@ -505,92 +505,69 @@ end
 
 const EXIT_DURING_PKG = make_pkg("ExitDuring", "test/t_test.jl" => """
     @testitem "first" begin
-        sleep(600)
+        @test true
     end
     @testitem "second" begin
-        sleep(600)
+        @test true
     end
     """)
 
-"""
-    exit_during(; on_event, stall_editor, deadline) -> NamedTuple
-
-Run two items that each sleep for ten minutes, "first" and "second", on two workers,
-in a coordinator of its own, and have a task of its main thread call `exit` once the
-file `when` names is there. `on_event` is the code of the run's `on_event`, which
-can make that file; with `stall_editor`, the run's editor stream makes it as it
-writes the `item_started` of "second", and then waits a minute holding the stream.
-Returns how long the coordinator took to end after `exit` was called, at most
-`deadline` seconds, what it printed, and the run state it left.
-"""
-function exit_during(; on_event = "_ -> nothing", stall_editor = false, deadline = 60)
-    tmp = mktempdir()
-    when = joinpath(tmp, "exit_now")
-    called = joinpath(tmp, "exit_called")
+# Build a real `Run` and open `RunStateFile` without spawning a subprocess that calls
+# `exit(0)` mid-run: on Windows Julia 1.12/1.13, calling `exit(0)` from an `@async` task
+# while other threads/libuv handles are live intermittently hangs inside Julia's C
+# teardown *after* every `Base.atexit_hooks` entry (including `report_unfinished_run`)
+# has already returned. Unit-testing `report_unfinished_run` directly exercises the
+# exact lock-free exit path deterministically on every OS.
+function with_live_run(f; on_event = nothing, events = nothing, thread::Int = Threads.threadid())
+    P = Runtests.Private
+    p, target = P.prepare((EXIT_DURING_PKG,); workers = 2, logs = :issues, monitor = false)
     runs = mktempdir()
-    script = """
-    using Runtests
-    include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
-    const P = Runtests.Private
-    const WHEN = $(repr(when))
-    struct StallingIO <: IO end
-    function Base.unsafe_write(::StallingIO, p::Ptr{UInt8}, n::UInt)
-        line = unsafe_string(p, n)
-        if occursin("item_started", line) && occursin("\\"second\\"", line)
-            touch(WHEN)
-            sleep(60)
+    scratch = mktempdir()
+    rs_path = joinpath(runs, "run.runstate")
+    rsf = P.init_run_state(rs_path, p; heartbeat = false)
+    names, column = P.item_names(p, P.run_name_width(p))
+    slots = [P.Slot(P.SlotIdx(s), p.pools[p.slot_pool[s]].profile,
+                    nothing, 0.0, 0, P.ItemIdx(0), Int8(0), "", String[], false, P.ItemIdx(0))
+             for s in 1:P.nslots(p)]
+    run = P.Run(
+        p, P.Queues(p), P.Statuses(P.nitems(p)), slots, "ExitDuring", "testrun", scratch, scratch, "",
+        String[scratch], String[joinpath(scratch, "item_")], String[joinpath(scratch, "art_")],
+        P.ItemIdx[P.ItemIdx(1), P.ItemIdx(2)], String[], falses(length(p.profiles)), Int32(0), column, names,
+        ReentrantLock(), time(), rsf, nothing, Dict{P.ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
+        Runtests.RuntestsWorkers.Worker[],
+        Vector{Union{Nothing, Runtests.RuntestsWorkers.WorkerProcess}}(nothing, P.nslots(p)), ReentrantLock(),
+        Set{Int32}(), Tuple{P.ItemIdx, Int8}[], nothing, events, on_event, ReentrantLock(), thread,
+    )
+    events === nothing || (events.run = run)
+    prev = @atomicswap P.LIVE_RUN.run = run
+    try
+        return f(run, rs_path)
+    finally
+        @atomic P.LIVE_RUN.run = prev
+        try
+            P.finish_run_state!(rsf, P.ENDING_EXITED; exiting = true)
+        catch
         end
-        return n
+        rm(runs; force = true, recursive = true)
+        rm(scratch; force = true, recursive = true)
     end
-    Base.flush(::StallingIO) = nothing
-    @async begin
-        while !isfile(WHEN)
-            sleep(0.05)
-        end
-        for i in eachindex(Base.atexit_hooks)
-            h = Base.atexit_hooks[i]
-            label = string("atexit[", i, "]=", typeof(h))
-            Base.atexit_hooks[i] = () -> begin
-                P.write_now(stderr, string("[exit-trace] start ", label, "\\n"))
-                try
-                    hasmethod(h, (Cint,)) ? h(Cint(0)) : h()
-                finally
-                    P.write_now(stderr, string("[exit-trace] done  ", label, "\\n"))
-                end
-            end
-        end
-        touch($(repr(called)))
-        exit(0)
-    end
-    stream = $(stall_editor ? "P.EventStream(StallingIO())" : "nothing")
-    P.with(P.EVENTS => stream) do
-        P.exclusively() do
-            p, target = P.prepare(($(repr(EXIT_DURING_PKG)),); workers = 2, logs = :issues, monitor = false)
-            P.execute(p, target; on_event = $on_event)
+end
+
+# Hold a `ReentrantLock` from another task until the returned release event is notified.
+function hold_lock_elsewhere(lk::ReentrantLock)
+    acquired = Threads.Event()
+    release = Threads.Event()
+    t = @async begin
+        lock(lk)
+        try
+            notify(acquired)
+            wait(release)
+        finally
+            unlock(lk)
         end
     end
-    """
-    path = joinpath(tmp, "run.jl")
-    write(path, script)
-    log = Base.BufferStream()
-    # The empty entry at the end stands for the default load path.
-    load_path = join([REPO_ROOT, joinpath(REPO_ROOT, "test"), ""], Runtests.Private.PATHSEP)
-    proc = run(pipeline(setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
-                               child_env("JULIA_LOAD_PATH" => load_path, "RUNTESTS_RUNSTATE_DIR" => runs)...);
-                        stdout = log, stderr = log); wait = false)
-    timedwait(() -> isfile(called) || process_exited(proc), 600)
-    t0 = time()
-    ended = timedwait(() -> process_exited(proc), deadline) === :ok
-    elapsed = time() - t0
-    ended || (kill(proc, Base.SIGKILL); wait(proc))
-    close(log)
-    printed = read(log, String)
-    isfile(called) || @info "the coordinator never got to its exit; it printed:\n$printed"
-    isfile(called) && (!ended || elapsed > 15) &&
-        @info "the coordinator took $(round(elapsed; digits = 1))s to end$(ended ? "" : ", and was killed"); it printed:\n$printed"
-    files = [joinpath(r, f) for (r, _, fs) in walkdir(runs) for f in fs if f == "run.runstate"]
-    rs = length(files) == 1 ? read_run_state(only(files)) : nothing
-    return (; called = isfile(called), ended, elapsed, printed, rs)
+    wait(acquired)
+    return release, t
 end
 
 # The facts the run state gives each item: its status and the states of its attempts.
@@ -598,42 +575,127 @@ item_record(rs, name) = let i = findfirst(it -> it.name == name, rs.items)
     (rs.statuses[i].state, [e.state for e in rs.events if e.kind === :attempt && e.item == i])
 end
 
+struct RejectingIO <: IO
+    writes::Threads.Atomic{Int}
+end
+function Base.unsafe_write(io::RejectingIO, ::Ptr{UInt8}, n::UInt)
+    Threads.atomic_add!(io.writes, 1)
+    return n
+end
+Base.flush(::RejectingIO) = nothing
+
 @testset "an exit closes the run whatever its tasks hold" begin
-    ENDING_EXITED = Runtests.Private.ENDING_EXITED
-    @testset "an editor stream held by a task the exit stops" begin
+    P = Runtests.Private
+    ENDING_EXITED = P.ENDING_EXITED
+
+    @testset "exit hook registration order" begin
+        P.ensure_exit_report()
+        i_report = findfirst(==(P.report_unfinished_run), Base.atexit_hooks)
+        i_kill = findfirst(==(Runtests.RuntestsWorkers.kill_leftovers), Base.atexit_hooks)
+        @test i_report !== nothing && i_kill !== nothing
+        # `atexit` hooks run front-to-back (newest first): report must run before kill_leftovers.
+        @test i_report < i_kill
+    end
+
+    @testset "an editor stream and printer held by tasks the exit stops" begin
         # The exit hook records the items in flight in the run state alone: telling the
-        # editor would wait for the stream the stalled writer holds.
-        r = exit_during(; stall_editor = true)
-        @test r.called && r.ended
-        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
-        # `second` is in flight: its slot holds it while its start is told. `first` is
-        # in flight too, or still waiting for its worker to start, and then unseen.
-        @test item_record(r.rs, "second") == (CANCELLED, [CANCELLED])
-        @test item_record(r.rs, "first") in ((CANCELLED, [CANCELLED]), (UNSEEN, ItemState[]))
+        # editor would wait for the stream the stalled writer holds, and taking the
+        # printer unconditionally would deadlock if a frozen task holds it.
+        io = RejectingIO(Threads.Atomic{Int}(0))
+        stream = P.EventStream(io)
+        rel_stream, t_stream = hold_lock_elsewhere(stream.lock)
+        try
+            with_live_run(; events = stream) do run, rs_path
+                rel_printer, t_printer = hold_lock_elsewhere(run.printer)
+                try
+                    P.hold_item!(run.slots[2], P.ItemIdx(2), Int8(1))
+                    elapsed = @elapsed P.report_unfinished_run()
+                    @test elapsed < 5.0
+                    @test (@atomic P.LIVE_RUN.run) === nothing
+                    @test P.is_cancelled(run.queues)
+                    @test io.writes[] == 0
+                    rs = read_run_state(rs_path)
+                    @test rs !== nothing && rs.ending === ENDING_EXITED && rs.closed
+                    @test item_record(rs, "second") == (CANCELLED, [CANCELLED])
+                    @test item_record(rs, "first") == (UNSEEN, ItemState[])
+                finally
+                    notify(rel_printer)
+                    wait(t_printer)
+                end
+            end
+        finally
+            notify(rel_stream)
+            wait(t_stream)
+        end
     end
+
     @testset "a callback of `on_event` waiting as its attempt starts" begin
-        # The slot holds its item before anything is told the attempt began, so the
-        # exit records it.
-        r = exit_during(; on_event = """ev -> (ev.kind === :started && ev.name == "first" && (touch(WHEN); sleep(60)); nothing)""")
-        @test r.called && r.ended
-        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
-        @test item_record(r.rs, "first") == (CANCELLED, [CANCELLED])
+        # First verify the slot holds its item before `on_event(:started)` runs.
+        held_at_start = Ref(false)
+        with_runstate_dir() do _
+            runtests(EXIT_DURING_PKG; workers = 1, logs = :issues, monitor = false,
+                     name = "first", on_event = ev -> begin
+                         if ev.kind === :started && ev.name == "first"
+                             live = @atomic P.LIVE_RUN.run
+                             held_at_start[] = live !== nothing &&
+                                 any(s -> (@atomic s.current) != P.ItemIdx(0), live.slots)
+                         end
+                         nothing
+                     end)
+        end
+        @test held_at_start[]
+
+        # With `on_event_lock` held by a waiting callback, the exit hook clears
+        # `on_event`, never invokes it, and records the in-flight item as cancelled.
+        invoked = Threads.Atomic{Bool}(false)
+        with_live_run(; on_event = _ -> (invoked[] = true; nothing)) do run, rs_path
+            rel_ev, t_ev = hold_lock_elsewhere(run.on_event_lock)
+            try
+                P.hold_item!(run.slots[1], P.ItemIdx(1), Int8(1))
+                elapsed = @elapsed P.report_unfinished_run()
+                @test elapsed < 5.0
+                @test !invoked[]
+                @test (@atomic run.on_event) === nothing
+                rs = read_run_state(rs_path)
+                @test rs !== nothing && rs.ending === ENDING_EXITED && rs.closed
+                @test item_record(rs, "first") == (CANCELLED, [CANCELLED])
+            finally
+                notify(rel_ev)
+                wait(t_ev)
+            end
+        end
     end
+
     @testset "a run's thread that does not let go" begin
         # The hold gives up after two seconds: the run state is closed with its ending,
         # which says what an item it leaves running means.
-        r = exit_during(; on_event = """ev -> begin
-                if ev.kind === :started && ev.name == "first"
-                    touch(WHEN)
-                    t = time()
-                    while time() - t < 8
-                    end
+        if Threads.nthreads(:default) + Threads.nthreads(:interactive) > 1
+            other_tid = Threads.threadid() == 1 ? 2 : 1
+            entered = Threads.Atomic{Bool}(false)
+            release = Threads.Atomic{Bool}(false)
+            busy = Runtests.RuntestsWorkers.on_thread(other_tid) do
+                entered[] = true
+                cap = time() + 15.0
+                while !release[] && time() < cap
+                    GC.safepoint()
                 end
-                nothing
-            end""")
-        @test r.called
-        @test r.ended
-        @test r.elapsed < 30
-        @test r.rs !== nothing && r.rs.ending === ENDING_EXITED && r.rs.closed
+            end
+            timedwait(() -> entered[], 10.0)
+            @test entered[]
+            try
+                with_live_run(; thread = other_tid) do run, rs_path
+                    P.hold_item!(run.slots[1], P.ItemIdx(1), Int8(1))
+                    P.write_status!(@atomic(run.runstate), 1, P.RUNNING, 1, 1)
+                    elapsed = @elapsed P.report_unfinished_run()
+                    @test 1.5 <= elapsed < 15.0
+                    rs = read_run_state(rs_path)
+                    @test rs !== nothing && rs.ending === ENDING_EXITED && rs.closed
+                    @test item_record(rs, "first") == (P.RUNNING, ItemState[])
+                end
+            finally
+                release[] = true
+                wait(busy)
+            end
+        end
     end
 end

@@ -426,8 +426,8 @@ function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
                 # what the file records. A run of several packages has one for each.
                 state = fetch(worktree)
                 @atomic run.runstate = is_combined(p) ?
-                    open_runstate_set(p, run.t0, run.runid; worktree = state,
-                                      worker_projects = [worker_projects(run, k) for k in eachindex(p.packages.name)]) :
+                    open_runstate_set_impl(p, run.t0, String(run.runid), String(state),
+                                           Vector{String}[worker_projects(run, k) for k in eachindex(p.packages.name)]) :
                     _open_runstate(p, run.t0, String(state), worker_projects(run, 1))
                 keep_logs_by_runstate!(run)
                 # Until the first item can start, a throw ends the run here, and its file
@@ -1187,9 +1187,9 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
                     w, ready = RuntestsWorkers.connect_worker(
                         wp;
                         redirect_io = stdout,
-                        redirect_fn = (io, pid, line) -> relay!(run, slot, relay_state, line),
-                        on_exit = w -> worker_ended!(run, slot.id, w),
-                        on_output_done = () -> close_relay_log!(relay_state),
+                        redirect_fn = WorkerRelay(run, slot, relay_state),
+                        on_exit = WorkerExitHook(run, slot.id),
+                        on_output_done = WorkerOutputDone(relay_state),
                     )
                     began = wp.began
                     from_prespawn = true
@@ -1214,9 +1214,9 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
                     redirect_io = stdout,
                     # Everything the worker writes: its RUN and DONE records, and under
                     # `logs=:eager` whatever its items print.
-                    redirect_fn = (io, pid, line) -> relay!(run, slot, relay_state, line),
-                    on_exit = w -> worker_ended!(run, slot.id, w),
-                    on_output_done = () -> close_relay_log!(relay_state)
+                    redirect_fn = WorkerRelay(run, slot, relay_state),
+                    on_exit = WorkerExitHook(run, slot.id),
+                    on_output_done = WorkerOutputDone(relay_state)
                 )
             catch e
                 is_interrupt(e) && rethrow()
@@ -1313,6 +1313,27 @@ mutable struct RelayState
     log_io::Union{Nothing, IOStream}
 end
 RelayState() = RelayState(false, "", nothing)
+
+# Concrete worker callback functors so `start_worker` avoids compiling anonymous closures
+# on the first worker launch.
+struct WorkerRelay
+    run::Run
+    slot::Slot
+    state::RelayState
+end
+(r::WorkerRelay)(@nospecialize(io), pid::Integer, line::AbstractString) =
+    relay!(r.run, r.slot, r.state, line)
+
+struct WorkerExitHook
+    run::Run
+    slot_id::SlotIdx
+end
+(h::WorkerExitHook)(w::RuntestsWorkers.Worker) = worker_ended!(h.run, h.slot_id, w)
+
+struct WorkerOutputDone
+    state::RelayState
+end
+(d::WorkerOutputDone)() = close_relay_log!(d.state)
 
 function close_relay_log!(state::RelayState)
     io = state.log_io

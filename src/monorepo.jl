@@ -39,6 +39,10 @@ be a workspace member. Returned package names must be unique, also when case is
 ignored. A mistake in a file is a `ConfigError`, one in the call an `ArgumentError`.
 """
 function find_participants(dir::Union{Nothing, AbstractString} = nothing; packages = nothing)
+    return find_participants_impl(dir === nothing ? nothing : String(dir)::String, packages)
+end
+
+function find_participants_impl(dir::Union{Nothing, String}, @nospecialize(packages))
     VERSION >= MONOREPO_JULIA || error(
         "a combined run needs Julia $(MONOREPO_JULIA.major).$(MONOREPO_JULIA.minor) or later, whose workspaces it ",
         "runs in; this is Julia $VERSION. `Runtests.runtests` runs one package at a time on this version"
@@ -625,7 +629,7 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
     validate_run_kwargs(kwargs; mono = true)
     workspace, chosen, line = mono_paths(paths)
     PROJECT_ROOT[] = workspace
-    ps = find_participants(workspace; packages)
+    ps = find_participants_impl(workspace, packages)
     n = length(ps)
     narrowing, whole = assign_paths(ps, chosen)
     wanted = Dict{String, Set{String}}()
@@ -1106,6 +1110,119 @@ function workspace_stamp(root::AbstractString)
     return (mf_str, mf_mtime, projs)
 end
 
+# Collect every workspace project, manifest, preferences, and registry metadata file that
+# determines whether `Pkg.instantiate()` needs to re-run for the workspace at `root`.
+function workspace_input_files(root::String)::Vector{String}
+    seen = Set{String}()
+    files = String[]
+    add!(p::String) = (isempty(p) || p in seen) ? nothing : (push!(seen, p); push!(files, p); nothing)
+    add_dir!(d::String) = begin
+        for name in ("JuliaProject.toml", "Project.toml", "LocalPreferences.toml")
+            add!(joinpath(d, name))
+        end
+        pf = project_file(d)
+        if pf !== nothing
+            mf = Base.project_file_manifest_path(pf)
+            mf === nothing || add!(String(mf)::String)
+        end
+    end
+    add_dir!(root)
+    pf = project_file(root)
+    if pf !== nothing && isfile(pf)
+        t = parse_project(pf)
+        ws = get(t, "workspace", nothing)
+        if ws isa AbstractDict
+            for rel in get(ws, "projects", Any[])
+                rel isa AbstractString || continue
+                add_dir!(abspath(joinpath(root, String(rel))))
+            end
+        end
+    end
+    for depot in DEPOT_PATH
+        reg_dir = joinpath(depot, "registries")
+        isdir(reg_dir) || continue
+        entries = try
+            readdir(reg_dir)
+        catch
+            continue
+        end
+        for entry in entries
+            p = joinpath(reg_dir, entry)
+            if endswith(entry, ".toml") && isfile(p)
+                add!(p)
+            elseif isdir(p)
+                rt = joinpath(p, "Registry.toml")
+                isfile(rt) && add!(rt)
+            end
+        end
+    end
+    return sort!(files)
+end
+
+function workspace_disk_input_key(root::String)::String
+    io = IOBuffer()
+    print(io, VERSION, '\0', string(depot_artifacts_hash(); base = 16, pad = 8))
+    for f in workspace_input_files(root)
+        exists, h = file_crc32c(f)
+        print(io, '\0', f, '\0', exists ? '1' : '0', '\0', string(h; base = 16, pad = 8))
+    end
+    return string(crc32c(take!(io)); base = 16, pad = 8)
+end
+
+workspace_disk_stamp_path(root::String) = joinpath(
+    runstate_dir(root), ENV_CACHE_DIR,
+    string("workspace-", string(crc32c(root); base = 16, pad = 8), "-v", VERSION.major, ".", VERSION.minor, ".toml")
+)
+
+# True when a prior `instantiate_workspace(root)` already succeeded for the exact same
+# workspace inputs, Julia version, depot artifacts, path-dep stamps, and on-disk packages.
+# Avoids loading `Pkg` or running `Pkg.instantiate()` on warm fresh-process monorepo runs.
+function workspace_disk_instantiated(root::String)::Bool
+    try
+        pf = project_file(root)
+        pf === nothing && return false
+        mf = Base.project_file_manifest_path(pf)
+        (mf === nothing || !isfile(mf)) && return false
+        stamp_file = workspace_disk_stamp_path(root)
+        isfile(stamp_file) || return false
+        stamp = TOML.parsefile(stamp_file)
+        get(stamp, "julia_version", "") == string(VERSION) || return false
+        get(stamp, "manifest", "") == String(mf) || return false
+        get(stamp, "input_key", "") == workspace_disk_input_key(root) || return false
+        path_dep_stamps_match(get(stamp, "path_deps", nothing)) || return false
+        toml = TOML.parsefile(String(mf))
+        return manifest_packages_present(String(mf), toml)
+    catch
+        return false
+    end
+end
+
+function save_workspace_disk_stamp(root::String)
+    try
+        pf = project_file(root)
+        pf === nothing && return nothing
+        mf = Base.project_file_manifest_path(pf)
+        (mf === nothing || !isfile(mf)) && return nothing
+        mf_s = String(mf)::String
+        toml = TOML.parsefile(mf_s)
+        stamp_file = workspace_disk_stamp_path(root)
+        mkpath(dirname(stamp_file))
+        tmp = string(stamp_file, ".tmp.", getpid(), ".", rand(UInt32))
+        data = Dict{String, Any}(
+            "julia_version" => string(VERSION),
+            "manifest" => mf_s,
+            "input_key" => workspace_disk_input_key(root),
+            "path_deps" => manifest_path_dep_stamps(mf_s, toml),
+        )
+        open(tmp, "w") do io
+            TOML.print(io, data)
+        end
+        mv(tmp, stamp_file; force = true)
+    catch
+    end
+    return nothing
+end
+
 # Instantiate the workspace manifest shared by its packages and test projects.
 # Explicitly resolve when the manifest is missing; Pkg handles the manifest during
 # instantiate in either case.
@@ -1116,6 +1233,10 @@ function instantiate_workspace(root::AbstractString)
         if !isempty(stamp[1]) && isfile(stamp[1]) && get(WORKSPACE_INSTANTIATED, key, nothing) == stamp
             return nothing
         end
+        if workspace_disk_instantiated(key)
+            WORKSPACE_INSTANTIATED[key] = stamp
+            return nothing
+        end
         with_pkg_isolated("could not instantiate the workspace at $root: ") do Pkg, _
             Pkg.activate(root; io = devnull)
             manifest = Base.project_file_manifest_path(project_file(root))
@@ -1123,6 +1244,7 @@ function instantiate_workspace(root::AbstractString)
             Pkg.instantiate(; allow_autoprecomp = false, io = devnull)
         end
         WORKSPACE_INSTANTIATED[key] = workspace_stamp(key)
+        save_workspace_disk_stamp(key)
         return nothing
     end
 end

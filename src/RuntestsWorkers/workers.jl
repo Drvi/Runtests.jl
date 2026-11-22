@@ -827,6 +827,33 @@ end
 # Connect to an already-spawned `WorkerProcess`, returning `(worker, ready_timestamp)`.
 # `_connect_worker` avoids specializing on every caller's IO/callback closure types so
 # the first worker start hits the precompiled method directly.
+# Concrete boxed helpers so `_connect_worker` and `with_timeout` spawn one monomorphic
+# task body regardless of the caller's IO type or callback functor types.
+function _connect_port_and_socket(proc::Base.Process, redirect_io::Base.RefValue{Any}, pid::Int32,
+                                  redirect_fn::Base.RefValue{Any}, cookie::String)::Tuple{Sockets.TCPSocket, Float64}
+    port, ts = read_port(proc, redirect_io[]::IO, pid, redirect_fn[])
+    conn = Sockets.connect(Sockets.localhost, port)
+    Sockets.nagle(conn, false)
+    Sockets.quickack(conn, true)
+    write(conn, cookie)
+    return (conn, ts)
+end
+
+struct _ConnectBody
+    proc::Base.Process
+    redirect_io::Base.RefValue{Any}
+    pid::Int32
+    redirect_fn::Base.RefValue{Any}
+    cookie::String
+end
+(b::_ConnectBody)() = _connect_port_and_socket(b.proc, b.redirect_io, b.pid, b.redirect_fn, b.cookie)
+
+function _run_redirect_task(redirect_io::Base.RefValue{Any}, worker::Worker,
+                            redirect_fn::Base.RefValue{Any}, proc::Base.Process,
+                            on_output_done::Base.RefValue{Any})
+    return redirect_worker_output(redirect_io[]::IO, worker, redirect_fn[], proc, on_output_done[])
+end
+
 function _connect_worker(
         wp::WorkerProcess,
         connect_timeout::Int,
@@ -836,17 +863,14 @@ function _connect_worker(
         @nospecialize(on_output_done),
     )::Tuple{Worker, Float64}
     pid, proc, job, cookie = wp.pid, wp.proc, wp.job, wp.cookie
+    io_box = Ref{Any}(redirect_io)
+    fn_box = Ref{Any}(redirect_fn)
+    done_box = Ref{Any}(on_output_done)
     sock::Union{Nothing, Sockets.TCPSocket} = nothing
     w::Union{Nothing, Worker} = nothing
     try
-        s, ready_ts = with_timeout(connect_timeout) do
-            port, ts = read_port(proc, redirect_io, pid, redirect_fn)
-            conn = Sockets.connect(Sockets.localhost, port)
-            Sockets.nagle(conn, false)
-            Sockets.quickack(conn, true)
-            write(conn, cookie)
-            (conn, ts)
-        end::Tuple{Sockets.TCPSocket, Float64}
+        s, ready_ts = with_timeout(_ConnectBody(proc, io_box, pid, fn_box, cookie),
+                                   connect_timeout)::Tuple{Sockets.TCPSocket, Float64}
         sock = s
         worker = Worker(ReentrantLock(), ReentrantLock(), IOBuffer(; sizehint = 1024), Int(pid), proc, s,
                         Base.Event(), Task(nothing), Task(nothing), Task(nothing),
@@ -856,7 +880,7 @@ function _connect_worker(
         # what the caller's teardown waits for.
         shielded() do
             worker.process_watch = Threads.@spawn watch_and_terminate!(worker)
-            worker.output = Threads.@spawn redirect_worker_output(redirect_io, worker, redirect_fn, proc, on_output_done)
+            worker.output = Threads.@spawn _run_redirect_task(io_box, worker, fn_box, proc, done_box)
             worker.messages = Threads.@spawn process_responses(worker)
         end
         now_t = time()
@@ -917,10 +941,10 @@ function Worker(;
         dir::String=pwd(),
         project::Union{Nothing,String}=Base.ACTIVE_PROJECT[],
         connect_timeout::Int=60,
-        redirect_io::IO=stdout,
-        redirect_fn=(io, pid, line) -> println(io, "      worker ", pid, " | ", line),
-        on_exit=nothing,
-        on_output_done=nothing,
+        @nospecialize(redirect_io::IO=stdout),
+        @nospecialize(redirect_fn=default_redirect_fn),
+        @nospecialize(on_exit=nothing),
+        @nospecialize(on_output_done=nothing),
     )
     wp = spawn_worker_process(;
         julia_args, threads, env, extra_env, dir, project, connect_timeout,
@@ -960,26 +984,30 @@ function read_port(proc::Base.Process, @nospecialize(io::IO), pid::Int32, @nospe
     error("the worker process ", exit_description(proc), " before it was ready")
 end
 
+function _run_with_timeout_task(result::Channel{Any}, f_box::Base.RefValue{Any})
+    r = try
+        Some(f_box[]())
+    catch e
+        is_interrupt(e) && forward_interrupt(e)
+        CapturedException(e, catch_backtrace())
+    end
+    try
+        put!(result, r)
+    catch e
+        # Closed by the timer: the caller has already given up. Interrupted, the
+        # caller is woken by the target the interrupt goes to.
+        is_interrupt(e) && forward_interrupt(e)
+    end
+    return nothing
+end
+
 # The result travels through a channel rather than a condition: a condition's
 # notify is lost when nobody is waiting yet, and the task can finish before the
 # caller reaches the wait.
 function with_timeout(@nospecialize(f), timeout::Real)
     result = Channel{Any}(1)
-    Threads.@spawn begin
-        r = try
-            Some($f())
-        catch e
-            is_interrupt(e) && forward_interrupt(e)
-            CapturedException(e, catch_backtrace())
-        end
-        try
-            put!(result, r)
-        catch e
-            # Closed by the timer: the caller has already given up. Interrupted, the
-            # caller is woken by the target the interrupt goes to.
-            is_interrupt(e) && forward_interrupt(e)
-        end
-    end
+    f_box = Ref{Any}(f)
+    Threads.@spawn _run_with_timeout_task(result, f_box)
     timer = after(timeout) do
         close(result, ErrorException("timed out after $timeout seconds"))
     end

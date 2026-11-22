@@ -174,6 +174,11 @@ others are written.
 """
 function open_runstate_set(p::Plan, start::Float64, runid::AbstractString; worktree::AbstractString = "unknown",
                            worker_projects::Vector{Vector{String}} = [String[] for _ in p.packages.name])
+    return open_runstate_set_impl(p, start, String(runid)::String, String(worktree)::String, worker_projects)
+end
+
+function open_runstate_set_impl(p::Plan, start::Float64, runid::String, worktree::String,
+                                worker_projects::Vector{Vector{String}})
     n = length(p.packages)
     plans = Plan[package_plan(p, k) for k in 1:n]
     workspace = p.root

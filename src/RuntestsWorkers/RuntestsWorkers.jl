@@ -110,6 +110,13 @@ const PRECOMPILE_SIGNATURES = (
     (terminate!, (Worker, Symbol)),
     (watch_coordinator, (Base.PipeEndpoint,)),
     (_connect_worker, (WorkerProcess, Int, Base.DevNull, typeof(default_redirect_fn), Nothing, Nothing)),
+    (_connect_port_and_socket, (Base.Process, Base.RefValue{Any}, Int32, Base.RefValue{Any}, String)),
+    (_run_with_timeout_task, (Channel{Any}, Base.RefValue{Any})),
+    (_run_redirect_task, (Base.RefValue{Any}, Worker, Base.RefValue{Any}, Base.Process, Base.RefValue{Any})),
+    (put!, (Channel{Any}, ItemResult)),
+    (put!, (Channel{Any}, Nothing)),
+    (eval_block!, (Test.DefaultTestSet, ItemSpec, Expr, String, Nothing, AttemptArtifacts)),
+    (_release_globals!, (Module, Symbol)),
     (kill_leftovers, ()),
 )
 
@@ -138,9 +145,10 @@ const PRECOMPILE_SIGNATURES = (
         write(io, encode_message(UInt64(3), KIND_ACTIVATE, ("", String["@"])))
         seekstart(io)
         try
-            read_message(io)
-            read_message(io)
-            read_message(io)
+            for _ in 1:3
+                frame = read_message(io)
+                frame === nothing || deserialize(IOBuffer(frame.payload))
+            end
         catch
         end
     end

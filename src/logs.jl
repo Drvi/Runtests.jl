@@ -46,9 +46,18 @@ Keywords:
 - `io::IO`: output stream (default: `stdout`).
 """
 function logs(run = nothing; name = nothing, failed::Bool = false,
-              attempt::Union{Nothing, Integer} = nothing, io::IO = stdout)
+              attempt::Union{Nothing, Integer} = nothing, @nospecialize(io::IO = stdout))
     attempt === nothing || attempt >= 1 ||
         throw(ArgumentError("`attempt` must be >= 1, got $(repr(attempt))"))
+    buf = IOBuffer()
+    ctx = IOContext(buf, :color => get(io, :color, false))
+    logs_impl(ctx, run, name, failed, attempt === nothing ? 0 : Int(attempt))
+    write(io, take!(buf))
+    return nothing
+end
+
+function logs_impl(io::IOContext{IOBuffer}, @nospecialize(run), @nospecialize(name),
+                   failed::Bool, attempt_i::Int)
     name_filter = name === nothing ? nothing : Filter(; name).name
     rs = resolve_logs_run(run)
     prefix = joinpath(rundata_dir(rs.path), "item_")
@@ -59,7 +68,7 @@ function logs(run = nothing; name = nothing, failed::Bool = false,
         state = st === nothing ? UNSEEN : st.state
         failed && !is_non_pass(state) && continue
         max_att = st === nothing ? 1 : max(Int(st.attempt), 1)
-        atts = attempt === nothing ? (1:max_att) : (Int(attempt):Int(attempt))
+        atts = attempt_i == 0 ? (1:max_att) : (attempt_i:attempt_i)
         for a in atts
             path = item_log_path(prefix, i, a)
             (isfile(path) && filesize(path) > 0) || continue
@@ -76,7 +85,7 @@ function logs(run = nothing; name = nothing, failed::Bool = false,
         end
     end
     if shown == 0
-        println(io, label_prefix(), "no captured logs matched in ", basename(run_location(rs.path)))
+        println(io, label_prefix(io), "no captured logs matched in ", basename(run_location(rs.path)))
     end
     return nothing
 end

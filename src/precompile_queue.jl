@@ -492,23 +492,30 @@ function source_version(pkg::Base.PkgId)::String
 end
 
 # The packages that are in a cycle or wait for one.
+function _circular_visit!(p::Base.PkgId, deps::Dict{Base.PkgId, Vector{Base.PkgId}},
+                          state::Dict{Base.PkgId, Int8}, circular::Set{Base.PkgId})::Bool
+    s = get(state, p, Int8(0))
+    s == 1 && return true
+    s == 2 && return p in circular
+    state[p] = Int8(1)
+    found = false
+    children = get(deps, p, nothing)
+    if children !== nothing
+        for d in children
+            _circular_visit!(d, deps, state, circular) && (found = true)
+        end
+    end
+    state[p] = Int8(2)
+    found && push!(circular, p)
+    return found
+end
+
 function circular_packages(deps::Dict{Base.PkgId, Vector{Base.PkgId}})
     state = Dict{Base.PkgId, Int8}()   # 1 being visited, 2 visited
     circular = Set{Base.PkgId}()
-    function visit(p)
-        s = get(state, p, Int8(0))
-        s == 1 && return true
-        s == 2 && return p in circular
-        state[p] = 1
-        found = false
-        for d in get(deps, p, Base.PkgId[])
-            visit(d) && (found = true)
-        end
-        state[p] = 2
-        found && push!(circular, p)
-        return found
+    for p in keys(deps)
+        _circular_visit!(p, deps, state, circular)
     end
-    foreach(visit, keys(deps))
     return circular
 end
 
@@ -740,23 +747,28 @@ end
 # The jobs in an order where each comes after the jobs it waits for. A wait that closes
 # a cycle, which only setups that name each other make, is dropped: it would wait
 # forever, and Julia refuses to load such setups anyway.
+function _queue_visit!(i::Int, jobs::Vector{QueueJob}, state::Vector{Int8}, order::Vector{Int})
+    state[i] = Int8(1)
+    deps = jobs[i].deps
+    for d in copy(deps)
+        if state[d] == 1
+            idx = findfirst(==(d), deps)
+            idx === nothing || deleteat!(deps, idx)
+            continue
+        end
+        state[d] == 0 && _queue_visit!(d, jobs, state, order)
+    end
+    state[i] = Int8(2)
+    push!(order, i)
+    return nothing
+end
+
 function queue_order!(jobs::Vector{QueueJob})
     state = zeros(Int8, length(jobs))   # 1 being visited, 2 visited
     order = Int[]
-    function visit(i)
-        state[i] = 1
-        deps = jobs[i].deps
-        for d in copy(deps)
-            if state[d] == 1
-                deleteat!(deps, findfirst(==(d), deps))
-                continue
-            end
-            state[d] == 0 && visit(d)
-        end
-        state[i] = 2
-        push!(order, i)
+    for i in eachindex(jobs)
+        state[i] == 0 && _queue_visit!(i, jobs, state, order)
     end
-    foreach(i -> state[i] == 0 && visit(i), eachindex(jobs))
     return order
 end
 

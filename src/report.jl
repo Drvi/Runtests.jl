@@ -1,7 +1,15 @@
 # Human-facing output for plans (`dry_run = true`) and live runs (`RunTestSet`, headers,
 # item lines, failure blocks, and closing summaries).
 
-function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
+function print_plan(@nospecialize(io::IO), p::Plan; show_excluded::Vector{String} = String[])
+    buf = IOBuffer()
+    ctx = IOContext(buf, :color => get(io, :color, false))
+    print_plan_buf(ctx, p, show_excluded)
+    write(io, take!(buf))
+    return nothing
+end
+
+function print_plan_buf(io::IOContext{IOBuffer}, p::Plan, show_excluded::Vector{String})
     order = run_order(p)
     print(io, plan_block(p, order))
     print_plan_table(io, p, order)

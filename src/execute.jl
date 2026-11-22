@@ -926,13 +926,7 @@ function interrupt_slots!(tasks)
     # handing these back would cut short the run's wait for its slots.
     @atomic RuntestsWorkers.INTERRUPT_TARGET.task = nothing
     for t in tasks
-        (t === current_task() || istaskdone(t)) && continue
-        try
-            schedule(t, InterruptException(); error = true)
-        catch
-            # It finished between the two, or was never started: either way there
-            # is nothing left in it to interrupt.
-        end
+        RuntestsWorkers.schedule_interrupt(t, InterruptException())
     end
     return nothing
 end

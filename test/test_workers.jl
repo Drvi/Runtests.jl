@@ -145,6 +145,40 @@ end
         end
     end
 
+    @testset "interrupting a task parked in uv_write waits for the write callback" begin
+        # Calling `schedule(t, InterruptException(); error=true)` while `t` is parked
+        # in `Base.uv_write` (`t.queue === nothing`) races with `uv_writecb_task`,
+        # throwing `schedule: Task not runnable` into whichever task polls libuv.
+        p = Pipe()
+        Base.link_pipe!(p)
+        buf = fill(UInt8(65), 512 * 1024)
+        started = Base.Event()
+        writer = @async begin
+            notify(started)
+            try
+                write(p.in, buf)
+                sleep(60)
+                return :completed
+            catch e
+                return e
+            end
+        end
+        try
+            wait(started)
+            timedwait(() -> istaskdone(writer) || writer.queue === nothing, 5.0)
+            @test !istaskdone(writer) && writer.queue === nothing
+            @test RuntestsWorkers.schedule_interrupt(writer, InterruptException())
+            # Not pre-scheduled while `uv_write` still owns the request pointer.
+            @test writer.queue === nothing
+            # Let `uv_write` finish cleanly; the deferred interrupt then stops `sleep(60)`.
+            @test length(read(p.out, length(buf))) == length(buf)
+            @test fetch(writer) isa InterruptException
+        finally
+            close(p.in)
+            close(p.out)
+        end
+    end
+
     @testset "a held thread runs none of its tasks until it is released" begin
         # What the exit hook does to a run's thread while it closes the run.
         go = Threads.Event()

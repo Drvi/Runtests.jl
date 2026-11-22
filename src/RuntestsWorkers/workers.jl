@@ -476,8 +476,47 @@ function throw_into(t::Task, e::Exception)
     istaskdone(t) && return false
     # Taken by exactly one of the tasks that caught the same Ctrl-C.
     (@atomicreplace INTERRUPT_TARGET.task t => nothing).success || return false
-    schedule(t, e; error=true)
-    return true
+    return schedule_interrupt(t, e)
+end
+
+# Throw `e` into a task stuck to the current thread, without colliding with libuv's
+# `uv_writecb_task` / `uv_shutdowncb_task`. Those callbacks hold a raw pointer to a
+# task parked in bare `wait()` (`t.queue === nothing`) and call `schedule(t, status)`
+# without `error=true`, which throws `schedule: Task not runnable` into whichever task
+# is polling libuv if `t` was already queued onto a workqueue before its `finally`
+# cleared `uv_req_data`. When a started task has `t.queue === nothing`, wait on this
+# same thread for the callback to finish and re-enqueue `t` before throwing `e`.
+function _deferred_interrupt(t::Task, e::Exception)
+    deadline = time() + 30.0
+    step = 0
+    while !istaskdone(t) && t.queue === nothing && time() < deadline
+        try
+            sleep(step < 250 ? 0.002 : 0.02)
+        catch
+        end
+        step += 1
+    end
+    (istaskdone(t) || t.queue === nothing) && return nothing
+    try
+        schedule(t, e; error=true)
+    catch
+    end
+    return nothing
+end
+
+function schedule_interrupt(t::Task, e::Exception)::Bool
+    (t === current_task() || istaskdone(t)) && return false
+    if t.queue === nothing
+        istaskstarted(t) || return false
+        @async _deferred_interrupt(t, e)
+        return true
+    end
+    try
+        schedule(t, e; error=true)
+        return true
+    catch
+        return false
+    end
 end
 
 # `f` in a task stuck to thread `tid`, as `@async` sticks a task to the thread that

@@ -164,6 +164,9 @@ mutable struct Monitor
     # Something else owns the terminal for a moment; sampling carries on, drawing
     # does not.
     @atomic quiet::Bool
+    # Whether the status line has been drawn at least once on this run (once up during
+    # setup, e.g. for precompilation, subsequent lines must keep erasing it).
+    @atomic shown::Bool
     @atomic phase::RunPhase
     const interval::Float64
     const print_interval::Float64
@@ -256,7 +259,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     return Monitor(
         run, stats, Sample(),
         Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
-        nothing, false, false,
+        nothing, false, false, false,
         PHASE_SETUP, interval, print_interval, tty, terminal_columns(tty),
         zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n),
         Int32[], Dict{Int32, Int64}(), Dict{Int32, Int64}(),
@@ -641,11 +644,12 @@ function print_status_line(io::IO, m::Monitor)
             col != 0 && (collecting = col)
         end
     end
+    phase = @atomic m.phase
     if queued > 0
         # No test worker runs yet: the workers are the queue's helpers, if it has any.
         helpers = @atomic QUEUE_PROGRESS.helpers
         helpers > 0 && print_workers(io, @atomic(QUEUE_PROGRESS.live), helpers)
-    elseif !solo && (@atomic m.phase) !== PHASE_SETUP
+    elseif !solo && phase !== PHASE_SETUP
         # The test workers, from the stage that starts them on.
         print_workers(io, live_workers, length(run.slots))
     end
@@ -690,8 +694,9 @@ function print_status_line(io::IO, m::Monitor)
     end
     # The stage and its age, then the oldest running item: last, because it is the
     # only field that changes width.
-    print(io, " · ", phase_name(s.phase), " ")
-    print_age(io, run.t0 + Float64(s.t) - r.phase_entered)
+    print(io, " · ", phase_name(phase), " ")
+    phase_entered = phase === s.phase ? r.phase_entered : (@atomic phase_stats(m.stats, phase).entered)
+    print_age(io, run.t0 + Float64(s.t) - phase_entered)
     oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], RUNNING_WIDTH))
     # A producer that takes long is not an item that hangs, and is said apart from one.
     collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
@@ -890,10 +895,25 @@ end
 progress_due(done::Integer, reported::Integer, now::Float64, last_print::Float64) =
     done - reported >= PROGRESS_ITEMS && now - last_print >= PROGRESS_GAP_S
 
+# Do not flash a `setup 0s` status line while a warm run is only checking caches and
+# about to print the run header. Draw during setup once precompilation actually starts
+# (`QUEUE_PROGRESS.total > 0`), once a line has already been drawn, or once setup has
+# lasted at least this long.
+const SETUP_STATUS_DELAY_S = 2.0
+
+function setup_quiet(m::Monitor, now::Float64 = time())
+    (@atomic m.shown) && return false
+    (@atomic m.phase) === PHASE_SETUP || return false
+    (@atomic QUEUE_PROGRESS.total) > 0 && return false
+    return now - (@atomic phase_stats(m.stats, PHASE_SETUP).entered) < SETUP_STATUS_DELAY_S
+end
+
 function maybe_print(m::Monitor)
     now = time()
     s = m.last_sample
+    quiet = setup_quiet(m, now)
     if m.tty
+        quiet && return nothing
         now - m.last_print < 0.5 && return nothing
         m.last_print = now
         @lock run_of(m).printer redraw_status(m)
@@ -904,17 +924,18 @@ function maybe_print(m::Monitor)
     # respect `min(PROGRESS_GAP_S, m.print_interval)` and item-progress reports respect
     # `PROGRESS_GAP_S` so two routine lines do not land seconds apart; threshold
     # crossings fire immediately (with their own 30s cooldown).
-    phase_changed = s.phase !== m.last_phase_printed
+    phase_changed = s.phase !== m.last_phase_printed && !quiet
     pressure = s.machine_total > 0 ? 100 * s.machine_used / s.machine_total : 0.0
     near_oom = crossed_memory_mark!(m, pressure, now) != 0
     high_cpu = crossed_cpu_mark!(m, cpu_load_pct(s), now)
     due = now >= m.next_print
     due && (m.next_print = max(now, m.next_print) + m.print_interval)
-    clock_due = due && (now - m.last_print >= min(PROGRESS_GAP_S, m.print_interval))
+    clock_due = due && !quiet && (now - m.last_print >= min(PROGRESS_GAP_S, m.print_interval))
     done = @atomic run_of(m).ndone
     prog_due = progress_due(done, m.done_reported, now, m.last_print)
     (clock_due || prog_due || phase_changed || near_oom || high_cpu) || return nothing
     m.last_print = now
+    @atomic m.shown = true
     m.done_reported = done
     m.last_phase_printed = s.phase
     printline(run_of(m), status_line(m))
@@ -945,6 +966,7 @@ status line again, assembled whole and written once. Written as three pieces, a
 run that prints fast mostly shows a half-erased status line.
 """
 function status_update!(m::Monitor, text::AbstractString)
+    @atomic m.shown = true
     truncate(m.linebuf, 0)
     print(m.lineio, "\r\e[2K", text)
     endswith(text, "\n") || print(m.lineio, "\n")
@@ -974,10 +996,11 @@ function with_status_line_off(f, m::Union{Nothing, Monitor})
 end
 
 # Whether the status line may be drawn at all right now.
-drawing(m::Monitor) = m.tty && !m.stop && !(@atomic m.quiet)
+drawing(m::Monitor) = m.tty && !m.stop && !(@atomic m.quiet) && !setup_quiet(m)
 
 function redraw_status(m::Union{Nothing, Monitor})
     (m === nothing || !drawing(m)) && return nothing
+    @atomic m.shown = true
     # Assembled in the monitor's buffer and written once. Safe to share: every
     # caller holds the printer lock.
     truncate(m.linebuf, 0)

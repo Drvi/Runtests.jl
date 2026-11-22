@@ -159,9 +159,17 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
     on_event === nothing || hasmethod(on_event, Tuple{TestItemEvent}) || throw(ArgumentError(
         "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got $(repr(on_event))"
     ))
+    return runtests_impl(Any[args...], name, tags, dry_run, on_event, kwargs_dict(kwargs))
+end
+
+# Monomorphic entry behind `runtests`: packs every keyword combination into one compiled
+# body so first-call JIT never delays the opening "reading test files..." line.
+function runtests_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags),
+                       dry_run::Bool, @nospecialize(on_event), opts::Dict{Symbol, Any})
     return exclusively() do
         # A dry run says what it found in its own block, with the plan.
-        p, target = prepare(args; name, tags, announce = !dry_run, dry_run, kwargs...)
+        p, target = prepare_impl(args, name, tags, nothing, nothing, !dry_run, dry_run, true, false,
+                                 nothing, nothing, opts)
         if dry_run
             print_plan(stdout, p)
             return nothing
@@ -183,10 +191,25 @@ end
 function prepare(args; name = nothing, tags = nothing, group = nothing, replay = nothing, announce::Bool = true,
                  dry_run::Bool = false, expansions::Bool = true, allow_unknown_names::Bool = false,
                  worker_init = nothing, test_end = nothing, kwargs...)
+    return prepare_impl(
+        Any[args...], name, tags, group, replay, announce, dry_run, expansions, allow_unknown_names,
+        worker_init, test_end, kwargs_dict(kwargs)
+    )
+end
+
+function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags), @nospecialize(group),
+                      @nospecialize(replay), announce::Bool, dry_run::Bool, expansions::Bool,
+                      allow_unknown_names::Bool, @nospecialize(worker_init), @nospecialize(test_end),
+                      opts::Dict{Symbol, Any})
+    kwargs = copy(opts)
+    group === nothing && (group = pop!(kwargs, :group, nothing))
+    replay === nothing && (replay = pop!(kwargs, :replay, nothing))
+    worker_init === nothing && (worker_init = pop!(kwargs, :worker_init, nothing))
+    test_end === nothing && (test_end = pop!(kwargs, :test_end, nothing))
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     named = name !== nothing   # by the caller, not by a replay
-    call_kwargs = kwargs
+    call_kwargs = copy(kwargs)
     # A seed the caller gives is every item's; otherwise a failure runs again with the
     # seed it failed with, and a replayed item with the one it was recorded with.
     seeded = haskey(kwargs, :seed)
@@ -209,23 +232,29 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
             isempty(recorded) && throw(NoTestsError("none of the $(plural(length(rs.items), "test item")) the run state " *
                                                     "recorded matches the name given"))
         end
-        kwargs = merge(recorded_settings(rs), kwargs)
+        for (k, v) in pairs(recorded_settings(rs))
+            haskey(kwargs, k) || (kwargs[k] = v)
+        end
     end
     # Read before the test files: the group decides what is selected from them.
-    config_path, toml = config_toml(target.testdir, get(kwargs, :config, nothing))
+    config_arg = get(kwargs, :config, nothing)
+    config_path, toml = config_toml(target.testdir, config_arg === nothing ? nothing : String(config_arg))
     selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
     filter = Filter(; name, tags, paths = target.paths, line = target.line,
                     group = select_group(read_groups(config_path, toml), config_path, group, selected))
-    setups = setup_modules(target.testdir)
-    # Printed directly: there is no printer yet, and nothing else writes this early.
-    # How many of the failing items on record the suite has is known once it is read.
-    announce && println(
-        stdout, label_prefix(), "reading test files under ",
-        joinpath(relpath_or_path(target.testdir, target.root), ""),
-        name isa FailingItems ? " for the items failing on record" :
-            is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
-    )
+    # Printed and flushed directly: there is no printer yet, and nothing else writes this
+    # early. How many of the failing items on record the suite has is known once it is read.
+    if announce
+        println(
+            stdout, label_prefix(), "reading test files under ",
+            joinpath(relpath_or_path(target.testdir, target.root), ""),
+            name isa FailingItems ? " for the items failing on record" :
+                is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
+        )
+        flush(stdout)
+    end
     t_files = time()
+    setups = setup_modules(target.testdir)
     files, strays, templates, environments = walk_test_dir(target.testdir)
     warn_packages(environments)
     if isempty(files)
@@ -262,18 +291,27 @@ function prepare(args; name = nothing, tags = nothing, group = nothing, replay =
     end
     gone = recorded === nothing ? String[] : String[repr(n) for n in sort!(collect(setdiff(recorded, suite_names)))]
     changed = rs === nothing ? String[] : String[repr(n) for n in changed_since(rs, items)]
-    announce && println(
-        stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
-        plural(length(unique(i -> i.file, items)), "file"),
-        length(files) == length(unique(i -> i.file, items)) ? "" :
-            string(" of ", length(files), " searched"),
-        " in ", fmt_seconds(time() - t_files)
-    )
+    if announce
+        println(
+            stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
+            plural(length(unique(i -> i.file, items)), "file"),
+            length(files) == length(unique(i -> i.file, items)) ? "" :
+                string(" of ", length(files), " searched"),
+            " in ", fmt_seconds(time() - t_files)
+        )
+        flush(stdout)
+    end
     files_seconds = time() - t_files
     t_plan = time()
     hist = history(target.root; base = rs)
     peak_worker_mb, rss_coverage = estimate_worker_rss(items, History[hist])
-    cfg = read_config(target.testdir, peak_worker_mb, rss_coverage; nunits = length(items), kwargs...)
+    cfg_opts = copy(kwargs)
+    cfg_file = pop!(cfg_opts, :config, nothing)
+    cfg_opts[:nunits] = length(items)
+    cfg = read_config_impl(
+        target.testdir, peak_worker_mb, rss_coverage,
+        cfg_file === nothing ? nothing : String(cfg_file), cfg_opts
+    )
     naming = naming_root(target.root)
     check_skip_environment(cfg.skip_environment, String[rel_slash(dir, naming) for dir in environments], naming,
                            get(kwargs, :skip_environment, nothing) === nothing ? ConfigError : ArgumentError)
@@ -437,8 +475,14 @@ function runtests_mono(args...; packages = nothing, name = nothing, tags = nothi
     on_event === nothing || hasmethod(on_event, Tuple{TestItemEvent}) || throw(ArgumentError(
         "`on_event` must be a function that takes a `Runtests.TestItemEvent`, got $(repr(on_event))"
     ))
+    return runtests_mono_impl(Any[args...], packages, name, tags, dry_run, on_event, kwargs_dict(kwargs))
+end
+
+function runtests_mono_impl(args::Vector{Any}, @nospecialize(packages), @nospecialize(name), @nospecialize(tags),
+                            dry_run::Bool, @nospecialize(on_event), opts::Dict{Symbol, Any})
     return exclusively() do
-        r = prepare_mono(args; packages, name, tags, announce = !dry_run, dry_run, kwargs...)
+        r = prepare_mono_impl(args, packages, name, tags, nothing, nothing, nothing, nothing,
+                              !dry_run, dry_run, true, nothing, nothing, opts)
         p = r.plan
         # One process holds one test environment.
         p.cfg.workers == 0 && length(p.packages) > 1 && throw(ArgumentError(
@@ -574,14 +618,16 @@ function resolve_target(args)
     any(a -> a isa Module, args) && throw(ArgumentError(
         "a module stands for its package's whole suite, so it is given on its own: got $(join(map(repr, args), ", "))"
     ))
-    paths = String[]; line = Int32(0); line_arg = ""
+    paths = String[]; orig = String[]; line = Int32(0); line_arg = ""
     for a in args
         a isa AbstractString || throw(ArgumentError("Runtests.runtests takes paths or a module, got $(repr(a))"))
-        path, ln = split_line_suffix(String(a))
-        ln == 0 || (line = ln; line_arg = String(a))
+        s = String(a)
+        path, ln = split_line_suffix(s)
+        ln == 0 || (line = ln; line_arg = s)
+        push!(orig, s)
         push!(paths, abspath(path))
     end
-    for (a, path) in zip(args, paths)
+    for (a, path) in zip(orig, paths)
         # A name given where a path goes is the likeliest slip: `debug` takes either.
         named = !occursin(r"[/\\]|\.jl", a)
         ispath(path) || throw(ArgumentError(string(
@@ -766,7 +812,20 @@ using PrecompileTools: @setup_workload, @compile_workload
 const PRECOMPILE_SIGNATURES = (
     (test_env, (Target,)),
     (resolve_target, (Tuple{String},)),
+    (resolve_target, (Vector{Any},)),
+    (runtests, ()),
+    (runtests, (String,)),
+    (runtests_impl, (Vector{Any}, Any, Any, Bool, Any, Dict{Symbol, Any})),
     (prepare, (Tuple{String},)),
+    (prepare_impl, (Vector{Any}, Any, Any, Any, Any, Bool, Bool, Bool, Bool, Any, Any, Dict{Symbol, Any})),
+    (runtests_mono, ()),
+    (runtests_mono, (String,)),
+    (runtests_mono_impl, (Vector{Any}, Any, Any, Any, Bool, Any, Dict{Symbol, Any})),
+    (prepare_mono_impl, (Vector{Any}, Any, Any, Any, Any, Any, Nothing, Nothing,
+                         Bool, Bool, Bool, Any, Any, Dict{Symbol, Any})),
+    (read_config_impl, (String, Float64, Float64, Nothing, Dict{Symbol, Any})),
+    (build_config_impl, (String, Dict{String, Any}, Float64, Float64, Int, String, String,
+                         Nothing, Nothing, Dict{Symbol, Any})),
     (execute, (Plan, Target)),
     (report, (Run,)),
     (run_on_workers, (Run,)),
@@ -819,6 +878,16 @@ const PRECOMPILE_SIGNATURES = (
         p = plan(items, cfg; history = history(dir), root = dir)
         print_plan(devnull, p)
         Queues(p); Statuses(nitems(p))
+        # Exercise the opening `prepare_impl` path so the first log line prints
+        # without first-call compilation delay.
+        withenv("RUNTESTS_RUNSTATE_DIR" => dir) do
+            redirect_stdout(devnull) do
+                prepare_impl(Any[dir], nothing, nothing, nothing, nothing, true, false, true, false,
+                             nothing, nothing, Dict{Symbol, Any}(:monitor => false))
+                prepare_impl(Any[joinpath(testdir, "precompile_test.jl")], nothing, :a, nothing, nothing,
+                             true, false, true, false, nothing, nothing, Dict{Symbol, Any}(:workers => 2))
+            end
+        end
 
         # The run state, written before the first item starts and read by the run
         # after this one.

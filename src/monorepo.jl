@@ -589,6 +589,23 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
                       item_seeds::Union{Nothing, Dict{Tuple{String, String}, UInt64}} = nothing, announce::Bool = true,
                       dry_run::Bool = false, expansions::Bool = true, worker_init = nothing, test_end = nothing,
                       kwargs...)
+    return prepare_mono_impl(
+        Any[paths...], packages, name, tags, group, replay, item_keys, item_seeds,
+        announce, dry_run, expansions, worker_init, test_end, kwargs_dict(kwargs)
+    )
+end
+
+function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospecialize(name), @nospecialize(tags),
+                           @nospecialize(group), @nospecialize(replay),
+                           item_keys::Union{Nothing, Vector{Tuple{String, String}}},
+                           item_seeds::Union{Nothing, Dict{Tuple{String, String}, UInt64}},
+                           announce::Bool, dry_run::Bool, expansions::Bool,
+                           @nospecialize(worker_init), @nospecialize(test_end), opts::Dict{Symbol, Any})
+    kwargs = copy(opts)
+    group === nothing && (group = pop!(kwargs, :group, nothing))
+    replay === nothing && (replay = pop!(kwargs, :replay, nothing))
+    worker_init === nothing && (worker_init = pop!(kwargs, :worker_init, nothing))
+    test_end === nothing && (test_end = pop!(kwargs, :test_end, nothing))
     haskey(kwargs, :config) && throw(ArgumentError(
         "`config` names a file to read in place of one package's test/TestItems.toml, and a combined run reads " *
             "each package's own"
@@ -611,7 +628,9 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     if replayed !== nothing
         # The run's settings as recorded, under the call's.
         recorded = recorded_settings(replayed.given)
-        kwargs = merge(NamedTuple(k => v for (k, v) in pairs(recorded) if k in RUN_WIDE_KEYS), kwargs)
+        for (k, v) in pairs(recorded)
+            k in RUN_WIDE_KEYS && !haskey(kwargs, k) && (kwargs[k] = v)
+        end
     end
 
     configs = [config_toml(joinpath(ps.root[k], "test"), nothing) for k in 1:n]
@@ -640,11 +659,14 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     unselected = [names isa AbstractSet && isempty(names) for names in package_names]
     filters = [Filter(; name = unselected[k] ? nothing : package_names[k], tags, paths = narrowing[k],
                       line = isempty(narrowing[k]) ? 0 : line, group = gsel[k]) for k in 1:n]
-    setups = [setup_modules(joinpath(ps.root[k], "test")) for k in 1:n]
 
-    announce && println(stdout, label_prefix(), "reading the test files of ", plural(n, "package"), " under ",
-                        joinpath(workspace, ""))
+    if announce
+        println(stdout, label_prefix(), "reading the test files of ", plural(n, "package"), " under ",
+                joinpath(workspace, ""))
+        flush(stdout)
+    end
     t_files = time()
+    setups = [setup_modules(joinpath(ps.root[k], "test")) for k in 1:n]
     items, errors, all_tags = RawItem[], ScanError[], Set{Symbol}()
     suite_names = [String[] for _ in 1:n]
     # Each package's environment directories, as `skip_environment` names them: by their
@@ -724,8 +746,11 @@ function prepare_mono(paths = (); packages = nothing, name = nothing, tags = not
     kept = [k for k in 1:n if reasons[k] === nothing]
     renumber = zeros(Int32, n); renumber[kept] = 1:length(kept)
     items = RawItem[with_package(it, renumber[it.package]) for it in items]
-    announce && println(stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
-                        plural(length(kept), "package"), " in ", fmt_seconds(files_seconds))
+    if announce
+        println(stdout, label_prefix(), "found ", plural(length(items), "test item"), " in ",
+                plural(length(kept), "package"), " in ", fmt_seconds(files_seconds))
+        flush(stdout)
+    end
 
     t_plan = time()
     histories = History[history(ps.root[k]) for k in kept]
@@ -981,7 +1006,7 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
         run_kwargs[:workers] = auto_workers(string(per_worker), nunits; peak_worker_mb,
                                             coverage = rss_coverage, memory_threshold = mt)
     end
-    run = build_config(root_path, root_toml; nunits, shared, run_kwargs...)
+    run = build_config_impl(root_path, root_toml, 0.0, 1.0, nunits, "", dirname(root_path), shared, nothing, run_kwargs)
     package_kwargs = Dict{Symbol, Any}(k => v for (k, v) in pairs(kwargs) if k in PACKAGE_KEYS)
     cfgs = RunConfig[]
     for (n, k) in enumerate(kept)
@@ -994,9 +1019,12 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
                 (toml = merge(toml, Dict("run" => Dict(key => v for (key, v) in rt if !(key in dropped)))))
         end
         given = merge(overrides[n], package_kwargs)
-        push!(cfgs, build_config(path, toml; given..., shared, profiles = pkg_profiles[n],
-                                 workers = run.workers, failfast = run.failfast,
-                                 seed = run.seed, logs = run.logs, coverage = false))
+        given[:workers] = run.workers
+        given[:failfast] = run.failfast
+        given[:seed] = run.seed
+        given[:logs] = run.logs
+        given[:coverage] = false
+        push!(cfgs, build_config_impl(path, toml, 0.0, 1.0, nunits, "", dirname(path), shared, pkg_profiles[n], given))
     end
     return run, cfgs
 end

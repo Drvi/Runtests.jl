@@ -494,9 +494,11 @@ function run_testing(run::Run, p::Plan, setup_paths::Vector{String}, testing::Re
         # From the start of the run, as the monitor's setup stage is, so the
         # header and the closing block give the same figure.
         p.startup.setup = time() - run.t0
+        # Enter `PHASE_TEST` before printing the header so the pinned status line
+        # appears beneath it as `testing 0s` without flashing `setup 0s` first.
+        set_phase!(run.monitor, PHASE_TEST)
         # Printed once setup is done, so it can say what setup cost.
         print_run_header(run)
-        set_phase!(run.monitor, PHASE_TEST)
         cfg.workers == 0 && init_in_process!(run)
         interrupted = false
         ensure_exit_report()

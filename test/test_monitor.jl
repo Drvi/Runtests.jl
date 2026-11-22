@@ -1092,6 +1092,7 @@ end
         _, out = capture_run() do
             with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
+                set_phase!(m, PHASE_TEST)
                 # Every machine has more than a thousandth of its memory in use, so
                 # the first sample warns.
                 start_monitor!(m)
@@ -1121,6 +1122,7 @@ end
         _, out = capture_run() do
             with(Runtests.Private.TTY_OVERRIDE => true) do
                 m = run.monitor = Monitor(run)
+                set_phase!(m, PHASE_TEST)
                 start_monitor!(m)
                 timedwait(() -> m.last_print > 0, 30.0)   # the line is up
                 writer = Threads.@spawn begin
@@ -1153,6 +1155,7 @@ end
                 # what is under test is what the printing path does.
                 run.monitor = Monitor(run)
                 run.monitor.tty || error("the override did not reach the monitor")
+                set_phase!(run.monitor, PHASE_TEST)
                 printline(run, "OUTSIDE")
                 with_status_line_off(run.monitor) do
                     printline(run, "INSIDE")
@@ -1167,6 +1170,45 @@ end
         after_inside = out[findfirst("INSIDE", out).stop:end]
         @test occursin(Runtests.Private.MARK_INFO, after_outside)
         @test !occursin(Runtests.Private.MARK_INFO, after_inside)
+    end
+
+    @testset "brief setup stays quiet until precompiling starts, setup runs long, or testing begins" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.scratch; force=true, recursive=true)
+        P = Runtests.Private
+        _, out = capture_run() do
+            with(P.TTY_OVERRIDE => true) do
+                m = run.monitor = Monitor(run)
+                # Right after start in PHASE_SETUP with no precompile queue: suppressed.
+                P.maybe_print(m)
+                @test m.last_print == 0.0
+                @test !P.drawing(m)
+                printline(run, "DURING_FAST_SETUP")
+                # Once precompilation actually starts, drawing turns on immediately.
+                P.queue_started!(3, 0)
+                try
+                    @test P.drawing(m)
+                    printline(run, "DURING_QUEUE")
+                finally
+                    P.queue_ended!()
+                end
+                # Once drawn during setup, subsequent lines keep erasing/redrawing it.
+                @test P.drawing(m)
+
+                # Fresh monitor: once SETUP_STATUS_DELAY_S elapses, setup draws on its own.
+                m2 = run.monitor = Monitor(run)
+                @atomic phase_stats(m2.stats, PHASE_SETUP).entered = time() - P.SETUP_STATUS_DELAY_S - 0.5
+                @test P.drawing(m2)
+                P.maybe_print(m2)
+                @test m2.last_print > 0.0
+            end
+        end
+        fast = out[findfirst("DURING_FAST_SETUP", out).stop:findfirst("DURING_QUEUE", out).start]
+        @test !occursin(P.MARK_INFO, fast)
+        @test !occursin(P.PRECOMPILE_MARK_INFO, fast)
+        after_queue = out[findfirst("DURING_QUEUE", out).stop:end]
+        @test occursin(P.PRECOMPILE_MARK_INFO, after_queue)
     end
 
     @testset "off-TTY cadence skips clock lines within 5s but fires immediately on memory or CPU thresholds" begin

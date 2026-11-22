@@ -289,12 +289,33 @@ directory; named, it has to exist, where `test/TestItems.toml` may be absent. Fo
 workspace member, profiles marked `monorepo_default = true` in the workspace root's
 file are also available; unrelated root profiles and run settings do not apply.
 """
+function kwargs_dict(kwargs)
+    d = Dict{Symbol, Any}()
+    for (k, v) in pairs(kwargs)
+        d[k] = v
+    end
+    return d
+end
+
 function read_config(testdir::AbstractString, peak_worker_mb::Real = 0.0, rss_coverage::Real = 1.0;
                      config::Union{Nothing, AbstractString} = nothing, kwargs...)
+    return read_config_impl(
+        String(testdir), Float64(peak_worker_mb), Float64(rss_coverage),
+        config === nothing ? nothing : String(config), kwargs_dict(kwargs)
+    )
+end
+
+function read_config_impl(testdir::String, peak_worker_mb::Float64, rss_coverage::Float64,
+                          config::Union{Nothing, String}, opts::Dict{Symbol, Any})
     path, toml = config_toml(testdir, config)
     # The code of the profiles is the suite's, wherever the file that `config` names is.
-    return build_config(path, toml, peak_worker_mb, rss_coverage; config_file = config === nothing ? "" : path, testdir,
-                        shared = package_shared_profiles(dirname(abspath(testdir))), kwargs...)
+    nunits = Int(get(opts, :nunits, 0))
+    cfg_opts = haskey(opts, :nunits) ? delete!(copy(opts), :nunits) : opts
+    return build_config_impl(
+        path, toml, peak_worker_mb, rss_coverage, nunits,
+        config === nothing ? "" : path, testdir,
+        package_shared_profiles(dirname(abspath(testdir))), nothing, cfg_opts
+    )
 end
 
 """
@@ -404,6 +425,17 @@ function build_config(path, toml, peak_worker_mb::Real = 0.0, rss_coverage::Real
                       config_file::AbstractString = "", testdir::AbstractString = dirname(path),
                       shared::Union{Nothing, SharedProfiles} = nothing,
                       profiles::Union{Nothing, Dict{Symbol, Profile}} = nothing, kwargs...)
+    return build_config_impl(
+        String(path), toml, Float64(peak_worker_mb), Float64(rss_coverage), Int(nunits),
+        String(config_file), String(testdir), shared, profiles, kwargs_dict(kwargs)
+    )
+end
+
+function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb::Float64, rss_coverage::Float64,
+                           nunits::Int, config_file::String, testdir::String,
+                           shared::Union{Nothing, SharedProfiles},
+                           profiles::Union{Nothing, Dict{Symbol, Profile}},
+                           kwargs::Dict{Symbol, Any})
     for k in keys(kwargs)
         k in RUN_KEYS || throw(unknown_keyword(k))
     end

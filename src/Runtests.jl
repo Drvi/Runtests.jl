@@ -861,8 +861,12 @@ const PRECOMPILE_SIGNATURES = (
     (complete_attempt!, (Run, Slot, ItemIdx, Int8, Int, RuntestsWorkers.ItemSpec, RuntestsWorkers.ItemResult,
                          RuntestsWorkers.Worker, Float32, Int32, SlotIdx)),
     (report, (Run,)),
-    (Test.print_test_results, (Base.TTY, Test.DefaultTestSet, Int)),
-    (Test.print_test_results, (Base.PipeEndpoint, Test.DefaultTestSet, Int)),
+    (hasmethod(Test.print_test_results, Tuple{Base.TTY, Test.DefaultTestSet, Int}) ? (
+        (Test.print_test_results, (Base.TTY, Test.DefaultTestSet, Int)),
+        (Test.print_test_results, (Base.PipeEndpoint, Test.DefaultTestSet, Int)),
+    ) : (
+        (Test.print_test_results, (Test.DefaultTestSet, Int)),
+    ))...,
     (run_on_workers, (Run,)),
     (run_slot, (Run, Slot)),
     (logs, (String,)),

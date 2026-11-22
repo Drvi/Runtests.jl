@@ -260,7 +260,7 @@ end
 function validate_run_setting(k::Symbol, @nospecialize(v); prefix::AbstractString = "")
     v === nothing && return nothing
     if k === :workers
-        ((is_whole_number(v) && 0 <= v <= typemax(SlotIdx)) || v == "auto") || throw(ArgumentError(string(
+        ((is_whole_number(v) && 0 <= v <= typemax(SlotIdx)) || (v isa AbstractString && v == "auto")) || throw(ArgumentError(string(
             prefix, "`workers` must be \"auto\" or an integer from 0 to ", typemax(SlotIdx), ", got ", repr(v)
         )))
     elseif k === :threads
@@ -282,7 +282,14 @@ function validate_run_setting(k::Symbol, @nospecialize(v); prefix::AbstractStrin
             prefix, "`memory_threshold` must be in (0, 1], got ", repr(v)
         )))
     elseif k === :logs
-        ok = (v isa Symbol || v isa AbstractString) && Symbol(v) in LOG_MODES
+        ok = if v isa Symbol
+            any(m -> m === v, LOG_MODES)
+        elseif v isa AbstractString
+            s = Symbol(v)::Symbol
+            any(m -> m === s, LOG_MODES)
+        else
+            false
+        end
         ok || throw(ArgumentError(string(
             prefix, "`logs` must be one of ", LOG_MODES, ", got ", repr(v)
         )))
@@ -403,7 +410,8 @@ function validate_run_kwargs(opts::Dict{Symbol, Any}; mono::Bool = false, allow_
             throw(unknown_keyword(k; mono, prefix))
         end
     end
-    if get(opts, :coverage, nothing) === true && get(opts, :workers, nothing) == 0
+    w = get(opts, :workers, nothing)
+    if get(opts, :coverage, nothing) === true && is_whole_number(w) && w == 0
         throw(ArgumentError(string(
             prefix, "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
                 "whose coverage was fixed when it started; use one worker or more"

@@ -518,6 +518,32 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
                 # An editor's listing says so too, where a run would refuse to start.
                 @test any(m -> occursin(said, m), limit_errors(ws))
             end
+            # Packages must also agree on `warmup`.
+            ws_warm = make_workspace(
+                "A" => ["test/a_test.jl" => item_text("a1"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => "[throttle]\npc = { limit = 2, warmup = true }\n"],
+                "B" => ["test/b_test.jl" => item_text("b1"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => "[throttle]\npc = { limit = 2, warmup = true }\n"];
+                root = nothing,
+            )
+            pw = mono(ws_warm).plan
+            @test pw.gate_limit == [2] && pw.gate_warmup == [true]
+            for k in 1:2
+                @test Dict(Runtests.Private.run_meta(Runtests.Private.package_plan(pw, k)))["throttle"] == "pc=2,warmup"
+            end
+            @test isempty(limit_errors(ws_warm))
+            ws_mismatch = make_workspace(
+                "A" => ["test/a_test.jl" => item_text("a1"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => "[throttle]\npc = { limit = 2, warmup = true }\n"],
+                "B" => ["test/b_test.jl" => item_text("b1"; opts = "throttle=:pc"),
+                        "test/TestItems.toml" => "[throttle]\npc = 2\n"];
+                root = nothing,
+            )
+            err = try; mono(ws_mismatch); nothing; catch e; e; end
+            @test err isa ConfigError
+            @test occursin("A's TestItems.toml 2 (warmup)", sprint(showerror, err))
+            @test occursin("B's TestItems.toml 2", sprint(showerror, err))
+            @test any(m -> occursin("2 (warmup)", m), limit_errors(ws_mismatch))
         end
 
         @testset "each package's [order] stays one block, the longest first" begin

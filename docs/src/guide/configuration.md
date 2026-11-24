@@ -51,7 +51,8 @@ gpu = "gpu"
 quick = "fast && !slow"
 
 [throttle]
-gpu = 2                        # at most two items with `throttle = :gpu` at the same time
+gpu = 2                              # at most two items with `throttle = :gpu` at the same time
+pc = { limit = 2, warmup = true }    # warm up with 1 item first, then up to 2 at once
 
 [profiles.bounds]
 julia_args = ["--check-bounds=yes"]   # for items with `profile = :bounds`

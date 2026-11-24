@@ -320,14 +320,24 @@ end
     end
 
     @testset "[throttle] gives a throttle the number of its items that may run at once" begin
+        T = Runtests.Private.Throttle
         with_toml("[throttle]\ngpu = 2\ndb = 1\n") do dir
-            @test read_config(dir).throttle == Dict(:gpu => 2, :db => 1)
+            @test read_config(dir).throttle == Dict(:gpu => T(2, false), :db => T(1, false))
         end
         @test isempty(read_config(mktempdir()).throttle)
+        # Table form (inline and subtable) configures `limit` and optional `warmup`.
+        with_toml("[throttle]\npc = { limit = 2, warmup = true }\ngpu = { limit = 3 }\none = { limit = 1, warmup = true }\n[throttle.db]\nlimit = 4\nwarmup = false\n") do dir
+            @test read_config(dir).throttle == Dict(
+                :pc => T(2, true),
+                :gpu => T(3, false),
+                :one => T(1, true),
+                :db => T(4, false),
+            )
+        end
         # A key is the name Julia reads from `:name`: the micro sign is Greek mu, an
         # accent written apart is composed with its letter.
         with_toml("[throttle]\n\"\u00b5\" = 2\n\"e\u0301x\" = 3\n") do dir
-            @test read_config(dir).throttle == Dict(Symbol("\u03bc") => 2, Symbol("\u00e9x") => 3)
+            @test read_config(dir).throttle == Dict(Symbol("\u03bc") => T(2, false), Symbol("\u00e9x") => T(3, false))
         end
         with_toml("[throttle]\n\"\u00b5\" = 2\n\"\u03bc\" = 3\n") do dir
             err = try; read_config(dir); nothing; catch e; e; end
@@ -335,7 +345,11 @@ end
         end
         for (toml, said) in (("[throttle]\ngpu = 0\n", "an integer from 1"), ("[throttle]\ngpu = 1.5\n", "an integer from 1"),
                              ("[throttle]\ngpu = \"2\"\n", "an integer from 1"),
-                             ("[throttle]\n\"two words\" = 2\n", "a Julia identifier"), ("throttle = 2\n", "must be a table"))
+                             ("[throttle]\n\"two words\" = 2\n", "a Julia identifier"), ("throttle = 2\n", "must be a table"),
+                             ("[throttle]\npc = { warmup = true }\n", "must set `limit`"),
+                             ("[throttle]\npc = { limit = 0, warmup = true }\n", "an integer from 1"),
+                             ("[throttle]\npc = { limit = 2, warmup = \"yes\" }\n", "must be true or false"),
+                             ("[throttle]\npc = { limit = 2, bogus = 1 }\n", "unknown key"))
             with_toml(toml) do dir
                 err = try; read_config(dir); nothing; catch e; e; end
                 @test err isa ConfigError && occursin(said, sprint(showerror, err))

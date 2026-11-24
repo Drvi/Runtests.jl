@@ -251,14 +251,17 @@ function tenths_text(s::Real)
     return string(div(tenths, 10), ".", rem(tenths, 10), "s")
 end
 
+throttle_text(limit::Integer, warmup::Bool) =
+    warmup ? string(limit, " at a time (warmup)") : string(limit, " at a time")
+
 """
-    why_text(p, u, work = gate_work(p)) -> String
+    why_text(p, u, floors = gate_floors(p)) -> String
 
 Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
-worker's stretch, where file order put it. `work` is each gate's, which a caller
-with many rows sums once.
+worker's stretch, where file order put it. `floors` is each gate's floor wall time,
+which a caller with many rows computes once.
 """
-function why_text(p::Plan, i::Integer, work::Vector{Float64} = gate_work(p))
+function why_text(p::Plan, i::Integer, floors::Vector{Float64} = gate_floors(p))
     it = p.items
     why = it.why[i]
     throttle = it.throttle[i]
@@ -267,11 +270,11 @@ function why_text(p::Plan, i::Integer, work::Vector{Float64} = gate_work(p))
     why === SANDBOXED && return "sandbox"
     if why === LONG
         g = it.gate[i]
-        # A gate's item is as long as its own estimate or its gate's work over its
-        # limit, whichever is longer (`order_pool!`).
-        floor = g == 0 ? 0.0 : work[g] / p.gate_limit[g]
+        # A gate's item is as long as its own estimate or its gate's floor wall time,
+        # whichever is longer (`order_pool!`).
+        floor = g == 0 ? 0.0 : floors[g]
         it.est_s[i] < floor && return string("long: throttle `", throttle, "` est ", est_text(floor), ", ",
-                                             p.gate_limit[g], " at a time")
+                                             throttle_text(p.gate_limit[g], p.gate_warmup[g]))
         return string("long: est ", est_text(it.est_s[i]),
                       throttle === NO_THROTTLE ? "" : string(" (throttle: `", throttle, "`)"))
     end
@@ -283,13 +286,20 @@ function why_text(p::Plan, i::Integer, work::Vector{Float64} = gate_work(p))
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
-# Each gate's recorded work: its items' estimates, summed.
-function gate_work(p::Plan)
-    work = zeros(length(p.gate_limit))
+# Each gate's floor wall time from its items' recorded estimates (`gate_floor_s`).
+function gate_floors(p::Plan)
+    ng = length(p.gate_limit)
+    ng == 0 && return Float64[]
+    work = zeros(ng)
+    longest = zeros(ng)
     for (i, g) in pairs(p.items.gate)
-        g == 0 || (work[g] += p.items.est_s[i])
+        if g != 0
+            e = p.items.est_s[i]
+            work[g] += e
+            e > longest[g] && (longest[g] = e)
+        end
     end
-    return work
+    return Float64[gate_floor_s(work[g], longest[g], p.gate_limit[g], p.gate_warmup[g]) for g in 1:ng]
 end
 
 # What an item row says about the item itself: the keywords it was declared with,
@@ -298,7 +308,7 @@ function details_text(p::Plan, i::Integer)
     it = p.items
     parts = String[]
     g = it.gate[i]
-    g == 0 || push!(parts, string("throttle `", it.throttle[i], "`, ", p.gate_limit[g], " at a time"))
+    g == 0 || push!(parts, string("throttle `", it.throttle[i], "`, ", throttle_text(p.gate_limit[g], p.gate_warmup[g])))
     # A sandbox is the reason it goes early, unless something else put it there.
     it.exclusive[i] && it.why[i] !== SANDBOXED && push!(parts, "sandbox")
     prof = p.profiles[it.profile[i]]
@@ -414,8 +424,8 @@ function print_plan_table(io::IO, p::Plan, order)
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
-    work = gate_work(p)
-    whys = [why_text(p, i, work) for i in rows]
+    floors = gate_floors(p)
+    whys = [why_text(p, i, floors) for i in rows]
     details = [details_text(p, i) for i in rows]
     columns = Tuple{String, Vector{String}}[]
     push!(columns, ("#", [string(i) for i in 1:n]))

@@ -1051,7 +1051,7 @@ function run_slot(run::Run, slot::Slot)
         try
             run_item!(run, slot, claim.item)
         finally
-            item_ended!(run.queues, claim.item)
+            item_ended!(run.queues, claim.item; warmed = run.statuses.state[claim.item] !== SKIPPED)
         end
     end
     stop_worker!(run, slot)

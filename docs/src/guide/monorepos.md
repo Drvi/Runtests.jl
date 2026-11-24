@@ -91,7 +91,7 @@ These problems stop a combined run before a worker starts:
 4. Two packages that declare one dependency name with two different UUIDs.
 5. Two packages whose `test/LocalPreferences.toml` set one preference to two different values.
 6. Two participating packages with the same package name. An editor and a combined run identify an item by its package name and item name.
-7. Two participating packages that assign different `[throttle]` limits to the same throttle name (including one setting a limit above 1 while another omits `[throttle]`, which defaults to 1).
+7. Two participating packages that assign different `[throttle]` settings (`limit` or `warmup`) to the same throttle name (including one setting a limit above 1 or `warmup = true` while another omits `[throttle]`, which defaults to limit 1 and `warmup = false`).
 
 To fix 4 or 5 for a package that cannot change, put the package in `isolated`.
 

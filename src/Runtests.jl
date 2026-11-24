@@ -429,13 +429,15 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
                        replayed_manifest = recorded_manifest(rs), replayed_from = rs.path)
 end
 
-# `name=limit` lines, as `run_meta` writes `[throttle]`.
+# `name=limit` or `name=limit,warmup` lines, as `run_meta` writes `[throttle]`.
 function recorded_throttle(text::AbstractString)
-    limits = Dict{Symbol, Int}()
+    limits = Dict{Symbol, Throttle}()
     for line in split(text, '\n'; keepempty = false)
-        m = match(r"^([^=]+)=([1-9][0-9]{0,9})$", line)
+        m = match(r"^([^=]+)=([1-9][0-9]{0,9})(?:,(warmup))?$", line)
         m === nothing && throw(ConfigError("the run state's `throttle` is unreadable: $(repr(line))"))
-        limits[Symbol(m[1]::AbstractString)] = parse(Int, m[2]::AbstractString)
+        lim = parse(Int, m[2]::AbstractString)
+        1 <= lim <= typemax(Int32) || throw(ConfigError("the run state's `throttle` is unreadable: $(repr(line))"))
+        limits[Symbol(m[1]::AbstractString)] = Throttle(lim, m[3] !== nothing)
     end
     return limits
 end

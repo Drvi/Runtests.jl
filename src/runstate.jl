@@ -381,7 +381,11 @@ function run_meta(p::Plan)
     end
     push!(meta, "order_first" => join(cfg.order_first, '\n'), "order_last" => join(cfg.order_last, '\n'))
     # Always written, empty for no `[throttle]`: a record without it predates throttles.
-    push!(meta, "throttle" => join((string(n, '=', l) for (n, l) in sort_by!(collect(cfg.throttle), first)), '\n'))
+    push!(meta, "throttle" => join(
+        (t.warmup ? string(n, '=', t.limit, ",warmup") : string(n, '=', t.limit)
+         for (n, t) in sort_by!(collect(cfg.throttle), first)),
+        '\n',
+    ))
     # The slots the plan made, which `idle_worker_seconds` counts against. A package's
     # part of a run of several packages has none (`package_plan`): the run's slots
     # served every package, and its record holds only the package's own attempts.

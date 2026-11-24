@@ -192,7 +192,7 @@ The table lists the items in the expected order of the run (or the exact recorde
 | `est` | The newest recorded duration, in seconds with one decimal. The column shows when earlier runs recorded durations. |
 | `tags` | The tags of the item. |
 | `why here` | The rule that placed the item, when the rule is not file order. |
-| `details` | The keywords and setups of the item. For an item of a throttle, its limit, for example ``throttle `gpu`, 2 at a time``. |
+| `details` | The keywords and setups of the item. For an item of a throttle, its limit (and `(warmup)` when enabled), for example ``throttle `gpu`, 2 at a time``. |
 
 ## The output of chores
 

@@ -79,12 +79,15 @@ A throttle is a name that items share with the `throttle` keyword. It limits how
 
 ```toml
 [throttle]
-gpu = 2    # at most two items with `throttle = :gpu` run at the same time
+gpu = 2                              # at most two items with `throttle = :gpu` run at the same time
+pc = { limit = 2, warmup = true }    # run one `:pc` item to completion first, then up to two at once
 ```
 
 A throttle limits the use of a resource, such as memory, a GPU or a license. It does not order the items, and it does not make them share a process. Each item of a throttle runs on any worker, in any order, and retries alone. While the limit is reached, the run holds the other items of the throttle back and runs other items. The items of a throttle can use different profiles and environments, and `sandbox = true`.
 
-In a combined run, all packages that use the name of a throttle share it, because the throttle limits what the machine runs at the same time. Each of these packages must give the throttle the same limit. A package that does not name the throttle in its `[throttle]` gives it the limit 1.
+Use `warmup = true` when the first item builds a shared cache (for example a `PackageCompiler` base sysimage) that the remaining items reuse: one non-skipped item of the throttle runs alone to completion while other workers run non-gated items, and the throttle then opens up to `limit`. Combine with `[order] first` if you want a particular item to run first.
+
+In a combined run, all packages that use the name of a throttle share it, because the throttle limits what the machine runs at the same time. Each of these packages must give the throttle the same setting (both `limit` and `warmup`). A package that does not name the throttle in its `[throttle]` gives it limit 1 and `warmup = false`.
 
 ### Retries and sandboxes
 

@@ -214,6 +214,77 @@ timed_item(name; opts="", before="") = journal_item(name; opts, body=before * ""
         @test any(((a, _),) -> under_way(a) == 2, spans)
     end
 
+    @testset "a warmup throttle finishes one item alone while other items run, then overlaps up to limit" begin
+        gated = ["warm $k" for k in 1:4]
+        plain = ["plain 1", "plain 2"]
+        # Wait until 1 gated item and both plain items have started, so the warmup item is
+        # provably running alongside plain items while gated 2..4 are held back.
+        warmup_wait = """
+            let dir = ENV["RUNTESTS_JOURNAL"], deadline = time() + 30
+                started() = count(readdir(dir; join=true)) do f
+                    endswith(f, ".tmp") && return false
+                    r = try
+                        split(strip(read(f, String)), '\\t')
+                    catch
+                        return false
+                    end
+                    length(r) == 3 && !endswith(r[1], " end")
+                end
+                while started() < 3
+                    time() > deadline && (touch(joinpath(dir, "gave-up")); break)
+                    sleep(0.05)
+                end
+            end
+            """
+        # Once warmup ends, items 2..4 hold until 2 post-warmup gated items are active at once.
+        post_warmup_wait = """
+            let dir = ENV["RUNTESTS_JOURNAL"], deadline = time() + 30
+                started_gated() = count(readdir(dir; join=true)) do f
+                    endswith(f, ".tmp") && return false
+                    r = try
+                        split(strip(read(f, String)), '\\t')
+                    catch
+                        return false
+                    end
+                    length(r) == 3 && startswith(r[1], "warm ") && !endswith(r[1], " end")
+                end
+                while started_gated() < 3
+                    time() > deadline && (touch(joinpath(dir, "gave-up-post")); break)
+                    sleep(0.05)
+                end
+            end
+            """
+        dir = make_pkg(
+            "ThrottledWarmup",
+            "test/t_test.jl" =>
+                timed_item("warm 1"; opts="throttle=:g", before=warmup_wait * "sleep(0.2)\n") *
+                join(timed_item(n; opts="throttle=:g", before=post_warmup_wait * "sleep(0.1)\n") for n in gated[2:end]) *
+                join(journal_item(n; body=warmup_wait * "sleep(0.1)\n@test true") for n in plain),
+            "test/TestItems.toml" => "[throttle]\ng = { limit = 2, warmup = true }\n[order]\nfirst = $(repr(gated))\n",
+        )
+        at, gave_up, gave_up_post, states = with_journal() do path
+            states, _, _ = run_states(dir; workers=3, logs=:issues, monitor=false)
+            at = Dict{String, Float64}()
+            for f in readdir(path; join=true)
+                r = split(strip(read(f, String)), '\t')
+                length(r) == 3 || continue
+                at[r[1]] = parse(Float64, r[3])
+            end
+            at, isfile(joinpath(path, "gave-up")), isfile(joinpath(path, "gave-up-post")), states
+        end
+        @test all(==(PASSED), values(states))
+        @test !gave_up && !gave_up_post
+        # Both plain items started before warm 1 ended (non-gated work ran during warmup).
+        @test at["plain 1"] < at["warm 1 end"] && at["plain 2"] < at["warm 1 end"]
+        # No other gated item started before warm 1 ended.
+        @test all(n -> at[n] >= at["warm 1 end"], gated[2:end])
+        # After warmup, at most 2 ran concurrently, and 2 actually overlapped.
+        spans = [(at[n], at[n * " end"]) for n in gated]
+        under_way(a) = count(((b, e),) -> b <= a < e, spans)
+        @test all(((a, _),) -> under_way(a) <= 2, spans)
+        @test any(((a, _),) -> under_way(a) == 2, spans)
+    end
+
     @testset "an idle slot never runs work belonging to another profile in its own process" begin
         # One quick item in the default pool and three slow ones in a pool with
         # different julia flags: the default slot drains first and goes looking for

@@ -76,6 +76,17 @@ end
 
 const NO_SHARED_PROFILES = SharedProfiles("", Dict{Symbol, Profile}())
 
+# A `[throttle]` entry: at most `limit` items of the throttle run at once; when `warmup`
+# is true, one non-skipped item runs to completion alone first before opening to `limit`.
+struct Throttle
+    limit::Int
+    warmup::Bool
+end
+Throttle(limit::Integer) = Throttle(Int(limit), false)
+
+const DEFAULT_THROTTLE = Throttle(1, false)
+const THROTTLE_KEYS = (:limit, :warmup)
+
 Base.@kwdef struct RunConfig
     workers::Int
     threads::String = DEFAULT_THREADS
@@ -113,9 +124,10 @@ Base.@kwdef struct RunConfig
     groups::Dict{String, TagExpr} = Dict{String, TagExpr}()
     order_first::Vector{String} = String[]
     order_last::Vector{String} = String[]
-    # The `[throttle]` table: how many items of each throttle may run at once. A
-    # throttle it does not name has a limit of 1.
-    throttle::Dict{Symbol, Int} = Dict{Symbol, Int}()
+    # The `[throttle]` table: how many items of each throttle may run at once, and
+    # whether one item warms up alone first. A throttle it does not name has limit 1
+    # and `warmup = false`.
+    throttle::Dict{Symbol, Throttle} = Dict{Symbol, Throttle}()
     # Every item's random numbers start from this and its name, so a run with the
     # same seed draws the same numbers in each item, whatever ran before it.
     seed::UInt64 = 0
@@ -167,7 +179,7 @@ with_config(
     groups::Dict{String, TagExpr} = cfg.groups,
     order_first::Vector{String} = cfg.order_first,
     order_last::Vector{String} = cfg.order_last,
-    throttle::Dict{Symbol, Int} = cfg.throttle,
+    throttle::Dict{Symbol, Throttle} = cfg.throttle,
     seed::UInt64 = cfg.seed,
     item_seeds::Dict{String, UInt64} = cfg.item_seeds,
     julia_flags::Vector{String} = cfg.julia_flags,
@@ -1188,31 +1200,53 @@ function read_groups(path, toml)
 end
 
 """
-    read_throttle(path, toml) -> Dict{Symbol, Int}
+    read_throttle(path, toml) -> Dict{Symbol, Throttle}
 
-The `[throttle]` table: for a throttle name, as `throttle = :name` gives it, the most
-items of that throttle that run at once, an integer from 1 to $(typemax(Int32)).
+The `[throttle]` table: for a throttle name, as `throttle = :name` gives it, either the
+most items of that throttle that run at once (an integer from 1 to $(typemax(Int32))), or
+a table `{ limit = N, warmup = true|false }` where `limit` is required and `warmup`
+defaults to `false`.
 """
 function read_throttle(path, toml)
     tbl = table_section(path, toml, "throttle")
-    limits = Dict{Symbol, Int}()
+    limits = Dict{Symbol, Throttle}()
     for (key, value) in tbl
         name = String(key)::String   # a TOML key
         what = "throttle `$name` of [throttle] in $(relpath_or_path(path))"
         Base.isidentifier(name) || throw(ConfigError(
             "$what: a throttle name is what `throttle = :name` gives, a Julia identifier"
         ))
-        (is_whole_number(value) && 1 <= value <= typemax(Int32)) || throw(ConfigError(
-            "$what must be the number of its items that may run at once, an integer from 1 to $(typemax(Int32)), " *
-                "got $(repr(value))"
-        ))
+        spec = if value isa AbstractDict
+            label = "throttle.$name"
+            check_keys(path, value, THROTTLE_KEYS, label)
+            haskey(value, "limit") || throw(ConfigError(
+                "$what: table form must set `limit`, an integer from 1 to $(typemax(Int32))"
+            ))
+            lim = value["limit"]
+            (is_whole_number(lim) && 1 <= lim <= typemax(Int32)) || throw(ConfigError(
+                "`limit` of [$label] in $(relpath_or_path(path)) must be the number of its items that may run " *
+                    "at once, an integer from 1 to $(typemax(Int32)), got $(repr(lim))"
+            ))
+            warm = get(value, "warmup", false)
+            warm isa Bool || throw(ConfigError(
+                "`warmup` of [$label] in $(relpath_or_path(path)) must be true or false, got $(repr(warm))"
+            ))
+            Throttle(Int(lim), warm)
+        elseif is_whole_number(value) && 1 <= value <= typemax(Int32)
+            Throttle(Int(value), false)
+        else
+            throw(ConfigError(
+                "$what must be the number of its items that may run at once, an integer from 1 to " *
+                    "$(typemax(Int32)), or a table `{ limit = ..., warmup = ... }`, got $(repr(value))"
+            ))
+        end
         # The name as Julia reads `:name`, which composes accents and maps lookalikes
         # (the micro sign to μ) where TOML keeps the key as written.
         sym = Meta.parse(name)::Symbol
         haskey(limits, sym) && throw(ConfigError(
             "$what: Julia reads it as `:$sym`, as it reads another key of [throttle]; keep one"
         ))
-        limits[sym] = Int(value)
+        limits[sym] = spec
     end
     return limits
 end

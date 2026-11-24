@@ -191,6 +191,7 @@ struct Plan
     slot_items::Vector{UnitRange{ItemIdx}}   # slot -> its stretch of its pool's body
     pending::Vector{Int32}                   # pools with no slot yet, in pickup order
     gate_limit::Vector{Int32}                # per gate (`Items`): how many of its items run at once
+    gate_warmup::Vector{Bool}                # per gate: whether one non-skipped item runs alone first
     cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
@@ -213,13 +214,13 @@ with_replay(p::Plan, replay::Union{Nothing, ReplayDiff};
             slot_pool::Vector{Int32} = p.slot_pool,
             slot_items::Vector{UnitRange{ItemIdx}} = p.slot_items) = Plan(
     p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, slot_pool,
-    slot_items, p.pending, p.gate_limit, p.cold, p.setups, p.cfg, p.packages, p.root,
+    slot_items, p.pending, p.gate_limit, p.gate_warmup, p.cold, p.setups, p.cfg, p.packages, p.root,
     p.startup, p.selection, p.suite_names, p.notes, replay, replay_slots
 )
 
 with_plan_cfg(p::Plan, cfg::RunConfig) = Plan(
     p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, p.slot_pool,
-    p.slot_items, p.pending, p.gate_limit, p.cold, p.setups, cfg, p.packages, p.root,
+    p.slot_items, p.pending, p.gate_limit, p.gate_warmup, p.cold, p.setups, cfg, p.packages, p.root,
     p.startup, p.selection, p.suite_names, p.notes, p.replay, p.replay_slots
 )
 
@@ -312,25 +313,31 @@ function plan(
     validate_order(raw, packages)
 
     profiles, profile_package, profile_idx = profile_table(packages, raw)
-    draft, gate_limit = build_draft(raw, profile_idx, histories, packages)
+    draft, gate_limit, gate_warmup = build_draft(raw, profile_idx, histories, packages)
     # Pools in order of estimated completion, the latest first: the order they get
     # their first workers in, and the pickup order of those left without one.
     raw_pools, raw_min_prof = pool_units(draft.profile, profiles, profile_package, packages)
     cold = combined_cold(histories)
-    estimate = pool_estimate(raw_pools, draft, gate_limit, cold)
+    estimate = pool_estimate(raw_pools, draft, gate_limit, gate_warmup, cold)
     order = sortperm_by(eachindex(raw_pools), k -> (-estimate(k, 1), raw_min_prof[k]))
     pools = raw_pools[order]
     min_prof = raw_min_prof[order]
     slots = count_slots(pools, (k, n) -> estimate(order[k], n), cfg)
-    # What a unit of a gate counts as when ordered: its gate's work over its limit.
+    # What a unit of a gate counts as when ordered: its gate's floor wall time.
     gate_floor = Float64[]
     if !isempty(gate_limit)
-        gate_floor = zeros(length(gate_limit))
+        ng = length(gate_limit)
+        gate_work = zeros(ng)
+        gate_max = zeros(ng)
         for u in eachindex(raw)
             g = draft.gate[u]
-            g == 0 || (gate_floor[g] += draft.est_s[u])
+            if g != 0
+                e = draft.est_s[u]
+                gate_work[g] += e
+                e > gate_max[g] && (gate_max[g] = e)
+            end
         end
-        gate_floor ./= gate_limit
+        gate_floor = Float64[gate_floor_s(gate_work[g], gate_max[g], gate_limit[g], gate_warmup[g]) for g in 1:ng]
     end
     has_order = any(c -> !isempty(c.order_first) || !isempty(c.order_last), packages.cfg)
     pin = has_order ? build_pins(packages) : nothing
@@ -338,7 +345,7 @@ function plan(
         order_pool!(pool, raw, draft, slots[k], histories, gate_floor, pin)
     end
     return materialize(raw, draft, pools, min_prof, slots, profiles, profile_package, cfg, packages, root, selection,
-                       sort(suite_names), cold, gate_limit)
+                       sort(suite_names), cold, gate_limit, gate_warmup)
 end
 
 # The file the settings came from, as a message names it.
@@ -489,6 +496,7 @@ function build_draft(raw::Vector{RawItem}, profile_idx, histories::Vector{Histor
     end
     gate = Dict{Symbol, Int32}()
     gate_limit = Int32[]
+    gate_warmup = Bool[]
     if !isempty(uses)
         sort!(unique!(uses))
         seen = check_shared_limits(uses, [cfg.throttle for cfg in packages.cfg],
@@ -496,9 +504,12 @@ function build_draft(raw::Vector{RawItem}, profile_idx, histories::Vector{Histor
         names = sort!(collect(keys(seen)))
         sizehint!(gate, length(names))
         gate_limit = Vector{Int32}(undef, length(names))
+        gate_warmup = Vector{Bool}(undef, length(names))
         for (g, name) in enumerate(names)
             gate[name] = Int32(g)
-            gate_limit[g] = Int32(seen[name])
+            t = seen[name]
+            gate_limit[g] = Int32(t.limit)
+            gate_warmup[g] = t.warmup
         end
     end
 
@@ -524,27 +535,33 @@ function build_draft(raw::Vector{RawItem}, profile_idx, histories::Vector{Histor
         Vector{Tuple{Int8, Int, Float64, Float64, Int32, Int32}}(undef, n),
         fill(IN_FILE_ORDER, n), fill(Int32(-1), n), falses(n), falses(n), falses(n)
     )
-    return draft, gate_limit
+    return draft, gate_limit, gate_warmup
 end
+
+# Minimum wall time for a gate's work: with `warmup`, one item (the longest, which
+# `order_pool!` puts first) runs alone before the remaining work runs at `limit`.
+gate_floor_s(work::Float64, longest::Float64, limit::Int32, warmup::Bool) =
+    warmup ? longest + (work - longest) / limit : work / limit
 
 """
     check_shared_limits(uses, limits, names)
 
-That the packages of a run give each throttle they share one limit, 1 where
-`[throttle]` names none: a throttle is one for all of them. `uses` holds the package
-and name of each throttle an item names, `limits` each package's `[throttle]` and
-`names` how a message names each package's configuration file.
+That the packages of a run give each throttle they share the same setting (limit 1 and
+`warmup = false` where `[throttle]` names none): a throttle is one for all of them.
+`uses` holds the package and name of each throttle an item names, `limits` each package's
+`[throttle]` and `names` how a message names each package's configuration file.
 """
-function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol, Int}}, names::AbstractVector{<:AbstractString})
-    seen = Dict{Symbol, Int}()
+function check_shared_limits(uses, limits::AbstractVector{<:AbstractDict{Symbol, Throttle}}, names::AbstractVector{<:AbstractString})
+    seen = Dict{Symbol, Throttle}()
     for (k, name) in uses
-        l = get(limits[k], name, 1)
-        get!(seen, name, l) == l && continue
+        t = get(limits[k], name, DEFAULT_THROTTLE)
+        get!(seen, name, t) == t && continue
         ks = sort!(unique!([k for (k, n) in uses if n === name]))
-        said(k) = string(names[k], " ", haskey(limits[k], name) ? limits[k][name] : "1, by not naming it in [throttle]")
+        fmt(x::Throttle) = x.warmup ? string(x.limit, " (warmup)") : string(x.limit)
+        said(k) = string(names[k], " ", haskey(limits[k], name) ? fmt(limits[k][name]) : "1, by not naming it in [throttle]")
         throw(ConfigError(string(
-            "throttle `:", name, "` is one for every package that names it, and they give it different limits: ",
-            join(map(said, ks), "; "), ". Give it the same limit in each"
+            "throttle `:", name, "` is one for every package that names it, and they give it different settings: ",
+            join(map(said, ks), "; "), ". Give it the same setting in each"
         )))
     end
     return seen
@@ -605,17 +622,18 @@ end
 const WORKER_COMPILE_OVERHEAD = 0.20
 
 """
-    pool_estimate(pools, draft, gate_limit, cold) -> completion(k, n)
+    pool_estimate(pools, draft, gate_limit, gate_warmup, cold) -> completion(k, n)
 
 The estimated completion of pool `k` with `n` workers, in seconds: the time a worker
 takes to be ready for its first item, as earlier runs measured it, plus each additional
 worker's marginal start and duplicated-compilation cost (`cold.start_s` plus
 `WORKER_COMPILE_OVERHEAD` of the pool's per-worker compile time), plus the larger of
-the pool's work shared among its workers, its longest unit and each gate's work in it
-over the gate's limit, which no number of workers shortens. An item without a
+the pool's work shared among its workers, its longest unit and each gate's floor wall
+time in it (`gate_floor_s`), which no number of workers shortens. An item without a
 recorded duration counts as the typical item.
 """
-function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit::Vector{Int32}, cold::ColdCost)
+function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit::Vector{Int32},
+                       gate_warmup::Vector{Bool}, cold::ColdCost)
     typical = typical_estimate(draft.est_s)
     est(u) = (s = draft.est_s[u]; s > 0 ? s : typical)
     np = length(pools)
@@ -625,12 +643,16 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
     throttled = zeros(Float64, np)
     has_gates = !isempty(gate_limit)
     gate_work = has_gates ? Vector{Float64}(undef, length(gate_limit)) : Float64[]
+    gate_max = has_gates ? Vector{Float64}(undef, length(gate_limit)) : Float64[]
     for k in 1:np
         pool = pools[k]
         w = 0.0
         c = 0.0
         l = 0.0
-        has_gates && fill!(gate_work, 0.0)
+        if has_gates
+            fill!(gate_work, 0.0)
+            fill!(gate_max, 0.0)
+        end
         for u in pool
             e = est(u)
             w += e
@@ -638,7 +660,10 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
             e > l && (l = e)
             if has_gates
                 g = draft.gate[u]
-                g == 0 || (gate_work[g] += e)
+                if g != 0
+                    gate_work[g] += e
+                    e > gate_max[g] && (gate_max[g] = e)
+                end
             end
         end
         work[k] = w
@@ -650,7 +675,7 @@ function pool_estimate(pools::Vector{Vector{Int}}, draft::PlanDraft, gate_limit:
         if has_gates
             t = 0.0
             for g in eachindex(gate_limit)
-                v = gate_work[g] / gate_limit[g]
+                v = gate_floor_s(gate_work[g], gate_max[g], gate_limit[g], gate_warmup[g])
                 v > t && (t = v)
             end
             throttled[k] = t
@@ -895,7 +920,7 @@ function materialize(
         raw::Vector{RawItem}, draft::PlanDraft, pools::Vector{Vector{Int}}, min_prof::Vector{ProfileIdx},
         slots::Vector{Int}, profiles::Vector{Profile}, profile_package::Vector{Int32}, cfg::RunConfig,
         packages::Packages, root::AbstractString, selection::AbstractString, suite_names::Vector{String},
-        cold::ColdCost, gate_limit::Vector{Int32}
+        cold::ColdCost, gate_limit::Vector{Int32}, gate_warmup::Vector{Bool}
     )
     # Pool by pool, in the order each hands out its items: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -970,7 +995,7 @@ function materialize(
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
         items, files, relfiles,
-        profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, cold,
+        profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, gate_warmup, cold,
         sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[], nothing, Vector{ItemIdx}[]
     )
 end

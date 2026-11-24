@@ -425,6 +425,103 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test maximum(t + p.items.est_s[i] for (t, _, i) in order.items) == 30.0
     end
 
+    @testset "a warmup throttle runs one item to completion alone, then opens to its limit" begin
+        P = Runtests.Private
+        dir = make_pkg("GateWarmup",
+            "test/a_test.jl" => declared("g1", "g2", "g3", "g4"; opts = "throttle=:g") *
+                                declared("p1", "p2"),
+            "test/TestItems.toml" => "[throttle]\ng = { limit = 2, warmup = true }\n")
+        h = History(Dict("g1" => 10.0, "g2" => 10.0, "g3" => 10.0, "g4" => 10.0, "p1" => 10.0, "p2" => 10.0),
+                    Dict{String, Int}())
+        p = plan_dir(dir; history = h, workers = 3)
+        @test p.gate_limit == [2] && p.gate_warmup == [true] && nslots(p) == 3
+        g1 = findfirst(==("g1"), p.items.name)
+        # Floor is 10 + (40 - 10) / 2 = 25.0s.
+        @test occursin("throttle `g` est 25.0s, 2 at a time (warmup)", P.why_text(p, g1))
+        @test occursin("throttle `g`, 2 at a time (warmup)", P.details_text(p, g1))
+        # Dry-run schedule: at t=0 only 1 gated item starts while workers 2 & 3 take plain items;
+        # after g1 ends at t=10, two gated items start concurrently at t=10, and the 4th at t=20.
+        order = P.run_order(p)
+        start(n) = only(t for (t, _, i) in order.items if p.items.name[i] == n)
+        @test start("g1") == 0.0
+        @test start("p1") == 0.0 && start("p2") == 0.0
+        @test sort([start("g2"), start("g3"), start("g4")]) == [10.0, 10.0, 20.0]
+
+        # A skipped first item does not satisfy warmup: the next gated item still runs alone.
+        q = P.Queues(p)
+        c1 = @lock q.lock P.claim_now!(q, 1)
+        @test c1.kind === :item && p.items.gate[c1.item] == 1 && q.gate_warming == [true]
+        # Second slot cannot start another gated item while warming, so it takes a plain item.
+        c2 = @lock q.lock P.claim_now!(q, 2)
+        @test c2.kind === :item && p.items.gate[c2.item] == 0
+        # c1 ends as skipped (`warmed = false`): gate stays warming!
+        P.item_ended!(q, c1.item; warmed = false)
+        @test q.gate_warming == [true] && q.gate_running == [0]
+        c3 = @lock q.lock P.claim_now!(q, 1)
+        @test c3.kind === :item && p.items.gate[c3.item] == 1 && q.gate_running == [1]
+        # Still capped at 1 while c3 runs.
+        c4 = @lock q.lock P.claim_now!(q, 3)
+        @test c4.kind === :item && p.items.gate[c4.item] == 0
+        # c3 ends normally (`warmed = true`): gate opens to limit 2.
+        P.item_ended!(q, c3.item; warmed = true)
+        @test q.gate_warming == [false]
+        c5 = @lock q.lock P.claim_now!(q, 1)
+        c6 = @lock q.lock P.claim_now!(q, 2)
+        @test c5.kind === :item && c6.kind === :item
+        @test p.items.gate[c5.item] == 1 && p.items.gate[c6.item] == 1 && q.gate_running == [2]
+
+        # Randomized turn-order invariant check: at most 1 before the first gated item ends,
+        # at most `limit` thereafter, and every item handed out once without deadlock.
+        for workers in (1, 2, 3, 5)
+            pw = plan_dir(dir; history = h, workers)
+            wrong = String[]
+            for seed in 1:100
+                rng = Xoshiro(seed)
+                qw = P.Queues(pw)
+                current = zeros(Int32, nslots(pw))
+                handed = zeros(Int, nitems(pw))
+                live = collect(1:nslots(pw))
+                warmed_done = false
+                steps = 0
+                while !isempty(live) && (steps += 1) < 100_000
+                    s = rand(rng, live)
+                    if current[s] != 0
+                        pw.items.gate[current[s]] == 1 && (warmed_done = true)
+                        P.item_ended!(qw, current[s])
+                        current[s] = 0
+                        continue
+                    end
+                    c = @lock qw.lock P.claim_now!(qw, s)
+                    if c.kind === :done
+                        filter!(!=(s), live)
+                    elseif c.kind === :wait
+                        any(i -> i != 0 && pw.items.gate[i] != 0, current) ||
+                            push!(wrong, "seed $seed: slot $s waits with nothing running in a gate")
+                    elseif c.kind === :item
+                        current[s] = c.item
+                        handed[c.item] += 1
+                        if pw.items.gate[c.item] == 1
+                            running = count(i -> i != 0 && pw.items.gate[i] == 1, current)
+                            cap = warmed_done ? 2 : 1
+                            running <= cap || push!(wrong, "seed $seed: $running gated items ran at once (cap $cap)")
+                        end
+                    end
+                end
+                steps < 100_000 || push!(wrong, "seed $seed: stalled")
+                all(==(1), handed) || push!(wrong, "seed $seed: handed $(handed)")
+            end
+            @test isempty(wrong)
+        end
+
+        # `limit = 1, warmup = true` stays serialized cleanly.
+        write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ng = { limit = 1, warmup = true }\n")
+        p1 = plan_dir(dir; history = h, workers = 3)
+        @test p1.gate_limit == [1] && p1.gate_warmup == [true]
+        order1 = P.run_order(p1)
+        gstarts = sort([t for (t, _, i) in order1.items if p1.items.gate[i] == 1])
+        @test gstarts == [0.0, 10.0, 20.0, 30.0]
+    end
+
     @testset "pools start in order of estimated completion, an item no run timed at the typical duration" begin
         # `slow` has three items of five seconds; `many` has ten that no run has timed,
         # which count as the typical duration, five seconds, rather than one.

@@ -1592,6 +1592,7 @@ end
     end
 
     @testset "a replay keeps the recorded throttle limits, and a record from before them the checkout's" begin
+        T = Runtests.Private.Throttle
         dir = make_pkg("RecordedThrottle",
             "test/a_test.jl" => "@testitem \"s\" throttle=:db sandbox=true begin\n    @test true\nend\n" *
                                 "@testitem \"t\" throttle=:db begin\n    @test true\nend\n",
@@ -1605,18 +1606,27 @@ end
             # Deleted since: the recorded limit of two, where this checkout gives 1.
             write(joinpath(dir, "test", "TestItems.toml"), "")
             r = replayed()
-            @test r.cfg.throttle == Dict(:db => 2) && r.gate_limit == [2] && nitems(r) == 2
+            @test r.cfg.throttle == Dict(:db => T(2, false)) && r.gate_limit == [2] && r.gate_warmup == [false] && nitems(r) == 2
             # Changed since: the recorded limit still.
-            write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ndb = 5\n")
-            @test replayed().gate_limit == [2]
+            write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ndb = { limit = 5, warmup = true }\n")
+            @test replayed().gate_limit == [2] && replayed().gate_warmup == [false]
             # A record without the field predates throttles, and runs with this checkout's.
             rs = read_run_state(path)
             delete!(rs.meta, "throttle")
             cfg = Runtests.Private.replayed_config(Runtests.Private.read_config(joinpath(dir, "test")), rs, dir)
-            @test cfg.throttle == Dict(:db => 5)
+            @test cfg.throttle == Dict(:db => T(5, true))
             # A record of no [throttle] says so, rather than leaving the field out.
             @test Dict(Runtests.Private.run_meta(p))["throttle"] == "db=2"
             @test Dict(Runtests.Private.run_meta(a_plan()))["throttle"] == ""
+            # Warmup round-trips through run state metadata and replay.
+            pw, _ = prepare((dir,); announce = false)
+            @test Dict(Runtests.Private.run_meta(pw))["throttle"] == "db=5,warmup"
+            wpath = joinpath(mktempdir(), "warm.runstate")
+            wrsf = init_run_state(wpath, pw)
+            finish_run_state!(wrsf)
+            write(joinpath(dir, "test", "TestItems.toml"), "[throttle]\ndb = 2\n")
+            rw = first(first(capture_run(() -> prepare((dir,); replay = wpath))))
+            @test rw.cfg.throttle == Dict(:db => T(5, true)) && rw.gate_limit == [5] && rw.gate_warmup == [true]
         end
     end
 

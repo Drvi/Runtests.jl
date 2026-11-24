@@ -96,9 +96,16 @@ Each key is the name of a group, and each value is a [tag expression](@ref tag-e
 
 ### [throttle]
 
-Each key is the name of a throttle, as the `throttle` keyword gives it. Each value is the limit of the throttle: the most items of the throttle that run at the same time, an integer from 1 to 2147483647. A throttle that the table does not name has the limit 1. A key must be a Julia identifier. Julia reads the key as it reads `:name`, so `"µ"` (the micro sign) and `"μ"` are the same key. In a combined run, the packages that use a throttle share it, and must give it the same limit. [Throttles](@ref throttles) explains the limits.
+Each key is the name of a throttle, as the `throttle` keyword gives it. Each value is either an integer limit from 1 to 2147483647, or a table with:
 
-For example, three packages each have one item with `throttle = :db`, and the run has three workers. With `db = 2` in each package, two of the items start together, and the third starts when one of these ends. With `db = 1` in each package, or with no `[throttle]` in any of them, the items run one at a time. With `db = 2` in one package and no `[throttle]` in the others, the run stops with an error that names the different limits.
+| Key | Default | Value |
+|:----|:--------|:------|
+| `limit` | required | The most items of the throttle that run at the same time, an integer from 1 to 2147483647. |
+| `warmup` | `false` | `true` or `false`. When `true`, one non-skipped item of the throttle runs to completion alone before the throttle opens up to `limit`. |
+
+A throttle that the table does not name has limit 1 and `warmup = false`. A key must be a Julia identifier. Julia reads the key as it reads `:name`, so `"µ"` (the micro sign) and `"μ"` are the same key. In a combined run, the packages that use a throttle share it, and must give it the same setting (both `limit` and `warmup`). [Throttles](@ref throttles) explains the limits and warmup.
+
+For example, three packages each have one item with `throttle = :db`, and the run has three workers. With `db = 2` in each package, two of the items start together, and the third starts when one of these ends. With `db = { limit = 2, warmup = true }`, one item runs to completion alone while the other workers run non-gated items, and once that first item ends, up to two items of `:db` run at once. With `db = 1` in each package, or with no `[throttle]` in any of them, the items run one at a time. With `db = 2` in one package and no `[throttle]` in the others, the run stops with an error that names the different settings.
 
 ### [monorepo]
 

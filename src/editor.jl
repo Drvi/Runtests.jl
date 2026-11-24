@@ -169,7 +169,7 @@ function list_items_mono(root::AbstractString)
     raw_items, owner = RawItem[], Int[]
     setups = Vector{Dict{Symbol, String}}(undef, length(ps.root))
     profiles = Vector{Dict{Symbol, Profile}}(undef, length(ps.root))
-    limits = Vector{Dict{Symbol, Int}}(undef, length(ps.root))
+    limits = Vector{Dict{Symbol, Throttle}}(undef, length(ps.root))
     for (k, r) in enumerate(ps.root)
         scanned = scan_package_listing(r; shared)
         l = scanned.listing
@@ -177,7 +177,7 @@ function list_items_mono(root::AbstractString)
         foreach(it -> it.throttle === nothing || push!(uses, (k, Symbol(it.throttle))), l.items)
         setups[k] = scanned.setups
         profiles[k] = scanned.cfg === nothing ? Dict{Symbol, Profile}() : scanned.cfg.profiles
-        limits[k] = scanned.cfg === nothing ? Dict{Symbol, Int}() : scanned.cfg.throttle
+        limits[k] = scanned.cfg === nothing ? Dict{Symbol, Throttle}() : scanned.cfg.throttle
         append!(raw_items, scanned.raw_items)
         append!(owner, fill(k, length(scanned.raw_items)))
     end

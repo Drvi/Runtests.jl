@@ -65,6 +65,7 @@ mutable struct Queues
     const prior::ColdCost            # what a fresh worker cost in earlier runs
     const gate::Vector{Int32}        # per item: its gate, 0 for none
     const gate_limit::Vector{Int32}  # per gate: how many of its items run at once
+    const gate_warming::Vector{Bool} # per gate: true while waiting for the first non-skipped item to finish
     const gate_running::Vector{Int32}    # per gate: how many of its items are handed out and not ended
     const set_aside::Vector{Vector{ItemIdx}}  # per pool: items passed while their gate was full, in order
     # Per pool: `gate_ends` when its set-aside items were last found all held back. Only
@@ -102,7 +103,7 @@ Queues(lock::ReentrantLock, room::Threads.Condition, p::Plan) = Queues(
     copy(p.slot_pool), copy(p.pending), Int32[], falses(nitems(p)),
     [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
     p.items.est_s, typical_estimate(p.items.est_s),
-    [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, zeros(Int32, length(p.gate_limit)),
+    [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, copy(p.gate_warmup), zeros(Int32, length(p.gate_limit)),
     [ItemIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0,
     p.replay_slots, ones(Int, length(p.replay_slots)), pool_of_items(p),
     false, false
@@ -115,7 +116,8 @@ struct Claim
 end
 Claim(kind::Symbol) = Claim(kind, ItemIdx(0), Int32(0))
 
-gate_full(q::Queues, i::Integer) = (g = q.gate[i]; g != 0 && q.gate_running[g] >= q.gate_limit[g])
+gate_effective_limit(q::Queues, g::Integer) = q.gate_warming[g] ? Int32(1) : q.gate_limit[g]
+gate_full(q::Queues, i::Integer) = (g = q.gate[i]; g != 0 && q.gate_running[g] >= gate_effective_limit(q, g))
 
 # Item `i`, handed out. Every item is handed out exactly once; a second time is a
 # scheduling bug, stopped here rather than run twice.
@@ -294,12 +296,14 @@ end
 startable(q::Queues, j::Integer) =
     any(u -> !q.claimed[u] && !gate_full(q, u), first(q.pools[j].head):last(q.pools[j].tail))
 
-# Item `i` ended, with all its attempts: its gate can run another.
-function item_ended!(q::Queues, i::ItemIdx)
+# Item `i` ended, with all its attempts: its gate can run another. When `warmed` is true
+# (any non-skipped outcome), a warming gate opens to its full `gate_limit`.
+function item_ended!(q::Queues, i::ItemIdx; warmed::Bool = true)
     g = q.gate[i]
     g == 0 && return nothing
     @lock q.lock begin
         q.gate_running[g] -= Int32(1)
+        warmed && (q.gate_warming[g] = false)
         q.gate_ends += 1
         notify(q.room)
     end
@@ -364,6 +368,7 @@ function gated_work(q::Queues, j::Integer)
     isempty(q.gate_limit) && return 0.0, false
     seconds = item_seconds(q, j)
     work = zeros(length(q.gate_limit))
+    longest = zeros(length(q.gate_limit))
     saturated = true
     pool = q.pools[j]
     for i in first(pool.head):last(pool.tail)
@@ -372,13 +377,16 @@ function gated_work(q::Queues, j::Integer)
         if g == 0
             saturated = false
         else
-            work[g] += seconds(i)
+            e = seconds(i)
+            work[g] += e
+            e > longest[g] && (longest[g] = e)
             saturated &= q.gate_limit[g] <= q.serving[j]
         end
     end
     best = 0.0
     for g in eachindex(work)
-        v = work[g] / q.gate_limit[g]
+        warmup_unclaimed = q.gate_warming[g] && q.gate_running[g] == 0
+        v = gate_floor_s(work[g], longest[g], q.gate_limit[g], warmup_unclaimed)
         v > best && (best = v)
     end
     return best, saturated

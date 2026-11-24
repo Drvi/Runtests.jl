@@ -36,15 +36,29 @@ using Runtests: RuntestsWorkers
         @test length(dones) == 6
         # Blue while it runs, then the colour of how it went — every item in this
         # fixture passes.
+        run_num_by_name = Dict{String, Int}()
+        run_nums = Int[]
         for l in starts
-            @test occursin(
+            m = match(
                 Regex("^$(Runtests.Private.MARK_RUNNING) w\\d+ · " *
-                      "\\d\\d:\\d\\d:\\d\\d · RUN  · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
+                      "\\d\\d:\\d\\d:\\d\\d · RUN  · (\\d+)/6 · \"(.+?)\"\\s+· at \\S+:\\d+\$"), l)
+            @test m !== nothing
+            if m !== nothing
+                k = parse(Int, m.captures[1])
+                push!(run_nums, k)
+                run_num_by_name[String(m.captures[2])] = k
+            end
         end
+        # First-attempt RUN lines are numbered strictly in start order (1..N).
+        @test run_nums == collect(1:6)
         for l in dones
-            @test occursin(
+            m = match(
                 Regex("^$(Runtests.Private.MARK_PASSED) w\\d+ · " *
-                      "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
+                      "\\d\\d:\\d\\d:\\d\\d · DONE · (\\d+)/6 · \"(.+?)\"\\s+· PASS · "), l)
+            @test m !== nothing
+            if m !== nothing
+                @test parse(Int, m.captures[1]) == run_num_by_name[String(m.captures[2])]
+            end
             # The worker with what it started, or its own `maxrss` before a sample saw it.
             @test occursin(r" · (tree max|maxrss) \d", l)
         end
@@ -415,5 +429,69 @@ using Runtests: RuntestsWorkers
         io = IOBuffer()
         Runtests.Private.write_now(io, "anywhere else\n")
         @test String(take!(io)) == "anywhere else\n"
+    end
+
+    @testset "items are numbered in start order across RUN, DONE, retries and failure blocks" begin
+        P = Runtests.Private
+        p, _ = P.prepare((fixture("Basic.jl"),); workers = 2, logs = :issues, monitor = false)
+        n = P.nitems(p)
+        @test n >= 3
+        names, column = P.item_names(p, P.run_name_width(p))
+        scratch = mktempdir()
+        run = P.Run(
+            p, P.Queues(p), P.Statuses(n), P.Slot[], "Basic", "testrun", scratch, scratch, "",
+            String[scratch], String[joinpath(scratch, "item_")], String[joinpath(scratch, "art_")],
+            P.ItemIdx[P.ItemIdx(i) for i in 1:n], String[], falses(length(p.profiles)), Int32(0), column, names,
+            ReentrantLock(), time(), nothing, nothing, Dict{P.ProfileIdx, String}(), zeros(Int32, n), 0, 0, 0,
+            0.0, false, Task[], RuntestsWorkers.Worker[],
+            Vector{Union{Nothing, RuntestsWorkers.WorkerProcess}}(nothing, P.nslots(p)), ReentrantLock(),
+            Set{Int32}(), Tuple{P.ItemIdx, Int8}[], nothing, nothing, nothing, ReentrantLock(), Threads.threadid(),
+        )
+        # Start items out of plan order: plan item n starts first, then 1, then 2.
+        fail_how = (; state = P.FAILED, elapsed_ns = UInt64(1), compile_ns = UInt64(0), maxrss = UInt64(1))
+        pass_how = (; state = P.PASSED, elapsed_ns = UInt64(1), compile_ns = UInt64(0), maxrss = UInt64(1))
+        captured = mktemp() do path, io
+            redirect_stdout(io) do
+                P.print_item_line(run, 1, n, 1, nothing)       # start #1 (plan index n)
+                P.print_item_line(run, 2, 1, 1, nothing)       # start #2 (plan index 1)
+                P.print_item_line(run, 1, n, 1, fail_how)      # DONE #1
+                P.print_item_line(run, 1, n, 2, nothing)       # retry of #1 keeps #1
+                P.print_item_line(run, 2, 1, 1, pass_how)      # DONE #2 finishes before retry of #1
+                P.print_item_line(run, 1, n, 2, fail_how)      # DONE #1 after #2 finished
+                # Failure block for plan item n must carry [1/N], matching its RUN/DONE lines,
+                # even though it is the second finished item (`ndone == 2`).
+                ts = Test.DefaultTestSet(p.items.name[n])
+                Test.record(ts, Test.Fail(:test, "1 == 2", 1, 2, nothing, LineNumberNode(1, :test), false))
+                P.count_done!(run, P.ItemIdx(1))
+                P.count_done!(run, P.ItemIdx(n))
+                o = P.AttemptOutcome(
+                    P.ItemIdx(n), P.SlotIdx(1), Int8(2), P.FAILED, P.FAILED, Int32(1), 0.1,
+                    RuntestsWorkers.PerfStats(), ts, false, 0x00, "", time()
+                )
+                P.report_item!(run, o)
+                # An item that fails before any RUN line prints still gets the next start number (3).
+                ts2 = Test.DefaultTestSet(p.items.name[2])
+                Test.record(ts2, Test.Fail(:test, "false", false, true, nothing, LineNumberNode(1, :test), false))
+                o2 = P.AttemptOutcome(
+                    P.ItemIdx(2), P.SlotIdx(2), Int8(1), P.ERRORED, P.ERRORED, Int32(0), 0.0,
+                    RuntestsWorkers.PerfStats(), ts2, false, 0x00, "", time()
+                )
+                P.report_item!(run, o2)
+            end
+            flush(io)
+            read(path, String)
+        end
+        out_lines = split(captured, '\n')
+        @test occursin("· RUN  · 1/$n · $(names[n])", out_lines[1])
+        @test occursin("· RUN  · 2/$n · $(names[1])", out_lines[2])
+        @test occursin("· DONE · 1/$n · $(names[n])", out_lines[3])
+        @test occursin("· RUN  · 1/$n · $(names[n])", out_lines[4]) && occursin("retry 1 of", out_lines[4])
+        @test occursin("· DONE · 2/$n · $(names[1])", out_lines[5])
+        @test occursin("· DONE · 1/$n · $(names[n])", out_lines[6])
+        @test any(l -> startswith(l, "┌ [1/$n] FAIL $(repr(p.items.name[n]))"), out_lines)
+        @test any(l -> startswith(l, "┌ [3/$n] ERR $(repr(p.items.name[2]))"), out_lines)
+        @test (@atomic run.ndone) == 2
+        @test run.nstarted == 3
+        rm(scratch; force = true, recursive = true)
     end
 end

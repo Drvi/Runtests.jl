@@ -533,7 +533,7 @@ function with_live_run(f; on_event = nothing, events = nothing, thread::Int = Th
         p, P.Queues(p), P.Statuses(P.nitems(p)), slots, "ExitDuring", "testrun", scratch, scratch, "",
         String[scratch], String[joinpath(scratch, "item_")], String[joinpath(scratch, "art_")],
         P.ItemIdx[P.ItemIdx(1), P.ItemIdx(2)], String[], falses(length(p.profiles)), Int32(0), column, names,
-        ReentrantLock(), time(), rsf, nothing, Dict{P.ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
+        ReentrantLock(), time(), rsf, nothing, Dict{P.ProfileIdx, String}(), zeros(Int32, P.nitems(p)), 0, 0, 0, 0.0, false, Task[],
         Runtests.RuntestsWorkers.Worker[],
         Vector{Union{Nothing, Runtests.RuntestsWorkers.WorkerProcess}}(nothing, P.nslots(p)), ReentrantLock(),
         Set{Int32}(), Tuple{P.ItemIdx, Int8}[], nothing, events, on_event, ReentrantLock(), thread,

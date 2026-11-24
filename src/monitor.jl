@@ -263,8 +263,8 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
         PHASE_SETUP, interval, print_interval, tty, terminal_columns(tty),
         zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n),
         Int32[], Dict{Int32, Int64}(), Dict{Int32, Int64}(),
-        linebuf, IOContext(linebuf, :color => color), color, 0, 0.0, 0.0, 0, 0.0,
-        zeros(Float64, length(MEMORY_MARKS)), 0.0, 0.0, PHASE_REPORT, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
+        linebuf, IOContext(linebuf, :color => color), color, 0, 0.0, entered + print_interval, 0, 0.0,
+        zeros(Float64, length(MEMORY_MARKS)), 0.0, 0.0, PHASE_SETUP, 0.0, 0.0, 0.0, (UInt64(0), UInt64(0)), 0.0, -1.0f0
     )
 end
 
@@ -911,9 +911,8 @@ end
 function maybe_print(m::Monitor)
     now = time()
     s = m.last_sample
-    quiet = setup_quiet(m, now)
     if m.tty
-        quiet && return nothing
+        setup_quiet(m, now) && return nothing
         now - m.last_print < 0.5 && return nothing
         m.last_print = now
         @lock run_of(m).printer redraw_status(m)
@@ -924,13 +923,13 @@ function maybe_print(m::Monitor)
     # respect `min(PROGRESS_GAP_S, m.print_interval)` and item-progress reports respect
     # `PROGRESS_GAP_S` so two routine lines do not land seconds apart; threshold
     # crossings fire immediately (with their own 30s cooldown).
-    phase_changed = s.phase !== m.last_phase_printed && !quiet
+    phase_changed = s.phase !== m.last_phase_printed
     pressure = s.machine_total > 0 ? 100 * s.machine_used / s.machine_total : 0.0
     near_oom = crossed_memory_mark!(m, pressure, now) != 0
     high_cpu = crossed_cpu_mark!(m, cpu_load_pct(s), now)
     due = now >= m.next_print
     due && (m.next_print = max(now, m.next_print) + m.print_interval)
-    clock_due = due && !quiet && (now - m.last_print >= min(PROGRESS_GAP_S, m.print_interval))
+    clock_due = due && (now - m.last_print >= min(PROGRESS_GAP_S, m.print_interval))
     done = @atomic run_of(m).ndone
     prog_due = progress_due(done, m.done_reported, now, m.last_print)
     (clock_due || prog_due || phase_changed || near_oom || high_cpu) || return nothing

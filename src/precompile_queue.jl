@@ -873,9 +873,11 @@ function helper_gone(h::QueueHelper)
 end
 
 # The reply of `h` to the build of job `i` of `q`. First `h` is told the cache files of
-# the jobs in `upstream`, all that job `i` waits for, that it was not told already:
-# `paths` holds the fresh file of each job, or `nothing`.
-function build!(h::QueueHelper, q::PrecompileQueue, i::Int, upstream, paths::Vector{Union{Nothing, String}})
+# the worker-pinned dependencies (`env_seeds`) when its config is introduced, and of the
+# jobs in `upstream` that it was not told already: `paths` holds the fresh file of each
+# job, or `nothing`.
+function build!(h::QueueHelper, q::PrecompileQueue, i::Int, upstream, paths::Vector{Union{Nothing, String}},
+                env_seeds::Vector{Pair{Base.PkgId, String}})
     job = q.jobs[i]
     ch = Channel{HelperReply}(1)
     @lock h.lock begin
@@ -884,6 +886,9 @@ function build!(h::QueueHelper, q::PrecompileQueue, i::Int, upstream, paths::Vec
             if !(job.config in h.configs)
                 args, flags = q.configs[job.config]
                 println(h.process.in, join(["config", string(job.config), PrecompileHelper.cache_flags_text(flags), args.exec...], '\t'))
+                for (dep, cp) in env_seeds
+                    println(h.process.in, string("fresh\t", job.config, '\t', PrecompileHelper.pkgid_field(dep), '\t', cp))
+                end
                 push!(h.configs, job.config)
             end
             for d in upstream
@@ -905,13 +910,19 @@ end
 
 # The build of job `i` of `q` in this process, for a job in its own environment, as a
 # helper answers it (`build!`). `caches` holds the cache files that the compiles of each
-# set of flags are held to, which the jobs in `upstream` and the job itself add to.
+# set of flags are held to, seeded with `env_seeds` and updated by `upstream` and the job.
 function build_here!(caches::Dict{Int, Dict{Base.PkgId, Vector{String}}}, q::PrecompileQueue, i::Int, upstream,
-                     paths::Vector{Union{Nothing, String}})::HelperReply
+                     paths::Vector{Union{Nothing, String}}, env_seeds::Vector{Pair{Base.PkgId, String}})::HelperReply
     job = q.jobs[i]
-    cache = get!(Dict{Base.PkgId, Vector{String}}, caches, job.config)
+    cache = get!(caches, job.config) do
+        seeded = Dict{Base.PkgId, Vector{String}}()
+        for (dep, cp) in env_seeds
+            seeded[dep] = String[cp]
+        end
+        seeded
+    end
     for d in upstream
-        paths[d] === nothing || (cache[q.jobs[d].pkg] = [paths[d]])
+        paths[d] === nothing || (cache[q.jobs[d].pkg] = String[paths[d]])
     end
     # Snapshot before yielding into `compile`, so concurrent `@async` jobs never mutate
     # the Dict another job is iterating.
@@ -975,18 +986,82 @@ function upstream_jobs(jobs::Vector{QueueJob}, order::Vector{Int})
 end
 
 """
-    fresh_paths(q, order) -> Vector{Union{Nothing, String}}
+    worker_pinned_caches(flags; solo, found, flag_bytes) -> Vector{Pair{Base.PkgId, String}}
+
+The cache files that `Runtests` itself loads before a worker touches the test project
+(its non-sysimage dependencies in cache-header dependency order, followed by `Runtests`),
+for cache flags `flags`. Without pinning these, `fresh_paths` can pick a newer build of a
+shared dependency (such as `Preferences` or `PrecompileTools`) than the build `Runtests`
+loads into every worker, causing workers to reject and overwrite project-specific caches
+(extensions and test setups) on every run.
+"""
+function worker_pinned_caches(flags::Base.CacheFlags; solo::Bool,
+                              found::Dict{Base.PkgId, Vector{String}},
+                              flag_bytes::Dict{String, Int})::Vector{Pair{Base.PkgId, String}}
+    pinned = Pair{Base.PkgId, String}[]
+    rt_pkg = RuntestsWorkers.PKGID
+    rt_origin = get(Base.pkgorigins, rt_pkg, nothing)
+    rt_src = rt_origin === nothing ? nothing : rt_origin.path
+    rt_path = if solo && flags == Base.CacheFlags() && rt_origin !== nothing &&
+                 rt_origin.cachepath !== nothing && isfile(rt_origin.cachepath)
+        rt_origin.cachepath
+    else
+        PrecompileHelper.freshest_path(rt_pkg, flags; sourcepath = rt_src, found, flag_bytes)
+    end
+    rt_path === nothing && return pinned
+    deps = try
+        Base.parse_cache_header(rt_path)[3]
+    catch e
+        is_interrupt(e) && rethrow()
+        return pinned
+    end
+    requested = Base._cacheflag_to_uint8(flags)
+    for (dep, bid) in deps
+        Base.in_sysimage(dep) && continue
+        dep_origin = get(Base.pkgorigins, dep, nothing)
+        cp = nothing
+        # Fast path: the exact build already loaded in this process (zero disk scan).
+        if dep_origin !== nothing && dep_origin.cachepath !== nothing && isfile(dep_origin.cachepath)
+            mod = get(Base.loaded_modules, dep, nothing)
+            if mod !== nothing && Base.module_build_id(mod) == UInt128(bid)
+                actual = get!(() -> PrecompileHelper.cache_flags_byte(dep_origin.cachepath),
+                              flag_bytes, dep_origin.cachepath)
+                if actual < 0 || ccall(:jl_match_cache_flags, UInt8, (UInt8, UInt8), requested, UInt8(actual)) != 0
+                    cp = dep_origin.cachepath
+                end
+            end
+        end
+        if cp === nothing
+            # Prefer `dep`'s source in the active worker environment (`nothing`); fall back
+            # to the coordinator's loaded path only when the environment cannot locate `dep`.
+            dep_src = PrecompileHelper.package_source(dep) !== nothing ? nothing :
+                      (dep_origin === nothing ? nothing : dep_origin.path)
+            cp = PrecompileHelper.cache_for_build_id(dep, UInt128(bid), flags;
+                                                     sourcepath = dep_src, found, flag_bytes)
+        end
+        cp === nothing || push!(pinned, dep => cp)
+    end
+    push!(pinned, rt_pkg => rt_path)
+    return pinned
+end
+
+"""
+    fresh_paths(q, order; solo = false) -> (paths, seeds)
 
 The fresh cache file of each job of `q`, or `nothing`, asked in this process in the
-order `order`, where each job comes after what it waits for. As in Julia's precompiler,
-each job is held to the files found for the jobs it waits for in the same project and
-under the same flags, so a job that waits for a stale one is stale as well: compiled
-again, that one replaces the build its cache was made against.
+order `order`, where each job comes after what it waits for, together with the validated
+worker-pinned dependency caches (`seeds[(env, config)]`) to pass as `preresolved` when
+compiling stale jobs. As in Julia's precompiler, each job is held to the files found for
+the jobs it waits for in the same project and under the same flags, so a job that waits
+for a stale one is stale as well: compiled again, that one replaces the build its cache
+was made against.
 """
-function fresh_paths(q::PrecompileQueue, order::Vector{Int})
+function fresh_paths(q::PrecompileQueue, order::Vector{Int}; solo::Bool = false)
     paths = Vector{Union{Nothing, String}}(nothing, length(q.jobs))
     caches = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.PkgId, Vector{String}}}()
     verdicts = Dict{Tuple{String, Base.CacheFlags}, Dict{Base.StaleCacheKey, Bool}}()
+    seeded_by_key = Dict{Tuple{String, Base.CacheFlags}, Vector{Pair{Base.PkgId, String}}}()
+    seeds = Dict{Tuple{Int, Int}, Vector{Pair{Base.PkgId, String}}}()
     # The depot's cache files of each package, and the flags each was built for: the
     # same whatever the environment and the flags asked for.
     found, flag_bytes = Dict{Base.PkgId, Vector{String}}(), Dict{String, Int}()
@@ -1010,10 +1085,33 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
             flags = last(q.configs[job.config])
             key = (env.project, flags)
             cache = get!(Dict{Base.PkgId, Vector{String}}, caches, key)
-            path = PrecompileHelper.freshest_path(job.pkg, flags;
-                                                  stale_cache = get!(Dict{Base.StaleCacheKey, Bool}, verdicts, key),
-                                                  cachepath_cache = cache, found, flag_bytes)
-            cache[job.pkg] = path === nothing ? String[] : [path]
+            verdict = get!(Dict{Base.StaleCacheKey, Bool}, verdicts, key)
+            env_seeds = get!(seeded_by_key, key) do
+                out = Pair{Base.PkgId, String}[]
+                # Resolved inside `env` itself: a worker boots directly in `env`'s project
+                # and load path, so `Runtests` loads against `env`'s own package versions.
+                for (dep, cp) in worker_pinned_caches(flags; solo, found, flag_bytes)
+                    PrecompileHelper.package_source(dep) === nothing && continue
+                    ok = PrecompileHelper.freshest_path(dep, flags; stale_cache = verdict,
+                                                        cachepath_cache = cache, found, flag_bytes,
+                                                        cachepaths = String[cp])
+                    ok === nothing && continue
+                    cache[dep] = String[ok]
+                    push!(out, dep => ok)
+                end
+                out
+            end
+            seeds[(job.env, job.config)] = env_seeds
+            # A dependency already validated from `env_seeds` stays pinned to that build.
+            seeded = get(cache, job.pkg, nothing)
+            path = if seeded !== nothing && !isempty(seeded)
+                first(seeded)
+            else
+                PrecompileHelper.freshest_path(job.pkg, flags;
+                                               stale_cache = verdict,
+                                               cachepath_cache = cache, found, flag_bytes)
+            end
+            cache[job.pkg] = path === nothing ? String[] : String[path]
             paths[i] = path
         end
     finally
@@ -1021,7 +1119,7 @@ function fresh_paths(q::PrecompileQueue, order::Vector{Int})
         copy!(LOAD_PATH, original_path)
         Base.set_active_project(original_project)
     end
-    return paths
+    return paths, seeds
 end
 
 # UI metadata (package versions and direct/indirect/testsetup labels), computed lazily
@@ -1065,6 +1163,7 @@ mutable struct QueueRun
     const status::Vector{Symbol}
     const texts::Vector{String}
     const paths::Vector{Union{Nothing, String}}
+    const seeds::Dict{Tuple{Int, Int}, Vector{Pair{Base.PkgId, String}}}
     const upstream::Vector{Set{Int}}
     const waits::Vector{Vector{Int}}
     const done::Vector{Base.Event}
@@ -1178,9 +1277,10 @@ function run_queue_job!(qr::QueueRun, i::Int)
     Base.acquire(qr.limit)
     compiling_started(i, job.name)
     redraw_queue(qr)
+    env_seeds = get(qr.seeds, (job.env, job.config), Pair{Base.PkgId, String}[])
     s, seconds, path, rss, text = try
-        h === nothing ? build_here!(qr.here_caches, q, i, qr.upstream[i], qr.paths) :
-            build!(h, q, i, qr.upstream[i], qr.paths)
+        h === nothing ? build_here!(qr.here_caches, q, i, qr.upstream[i], qr.paths, env_seeds) :
+            build!(h, q, i, qr.upstream[i], qr.paths, env_seeds)
     finally
         compiling_ended(i)
         Base.release(qr.limit)
@@ -1221,7 +1321,7 @@ function run_queue(run::Run, q::PrecompileQueue)
     t0 = time()
     n = length(q.jobs)
     order = queue_order!(q.jobs)
-    paths = fresh_paths(q, order)
+    paths, seeds = fresh_paths(q, order; solo = single_process(run.plan))
     work = BitVector(paths[i] === nothing for i in 1:n)
     status, texts = fill(:fresh, n), fill("", n)
     any(work) || return status, texts
@@ -1262,7 +1362,7 @@ function run_queue(run::Run, q::PrecompileQueue)
         serialized[key] = i
     end
     qr = QueueRun(
-        run, q, work, status, texts, paths, upstream, waits, done, left,
+        run, q, work, status, texts, paths, seeds, upstream, waits, done, left,
         Vector{Union{Nothing, QueueHelper}}(nothing, length(q.envs)),
         Dict{Int, Dict{Base.PkgId, Vector{String}}}(), ReentrantLock(),
         Base.Semaphore(precompile_tasks()), own, total, width, vwidth, pwidth, kwidth,

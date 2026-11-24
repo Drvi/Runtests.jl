@@ -151,7 +151,6 @@ struct AttemptOutcome
     artifacts::UInt8
     note::String
     ended::Float64
-    n::Int
 end
 
 mutable struct Run
@@ -204,6 +203,12 @@ mutable struct Run
     # Only a profile that declares preferences or runs in an environment directory has
     # one; the others use the test environment.
     const profile_projects::Dict{ProfileIdx, String}
+    # Each item's 1-based start-order number as printed on its RUN, DONE and failure
+    # lines (0 until assigned), and how many items have been numbered so far. Both are
+    # read and updated only under `printer`, so first-attempt RUN lines always print
+    # strictly in 1..N order.
+    const start_order::Vector{Int32}
+    nstarted::Int
     @atomic ndone::Int
     # Items whose state does not pass, kept by `set_state!` for the status line,
     # which is drawn from other threads than the one the states are written on.
@@ -368,7 +373,7 @@ function execute_here(p_in::Plan, target, on_event)
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, scratch, scratch, "", logdirs, logprefixes,
         artifacts_prefixes, local_item, String[], skipped_profiles, package_width, column, names,
-        ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), 0, 0, 0.0, false, Task[],
+        ReentrantLock(), time(), nothing, nothing, Dict{ProfileIdx, String}(), zeros(Int32, nitems(p)), 0, 0, 0, 0.0, false, Task[],
         RuntestsWorkers.Worker[], Vector{Union{Nothing, RuntestsWorkers.WorkerProcess}}(nothing, nslots(p)), ReentrantLock(),
         Set{Int32}(), Tuple{ItemIdx, Int8}[], nothing, EVENTS[], on_event, ReentrantLock(), Threads.threadid()
     )
@@ -409,14 +414,9 @@ end
 
 function run_phases(run::Run, p::Plan, target, setup_paths::Vector{String})
     return with_logger(RunLogger(current_logger(), run)) do
-        # Overlap worker process startup with test environment resolution and precompilation
-        # when Runtests itself is already precompiled in this depot. Inside `try` so an
-        # interrupt mid-spawn still reaps every already-launched process in `finally`.
+        # Inside `try` so an interrupt mid-setup still reaps any pre-spawned worker
+        # processes in `finally`.
         try
-            prespawn_workers!(run, p)
-            # Asked of git while the environments are made ready (`worktree_state`), on any
-            # thread: started after `prespawn_workers!` so git's `uv_spawn` does not race
-            # worker process spawn on Windows.
             worktree = Threads.@spawn worktree_state(p.root)
             with_run_env(target, run) do
                 # Before the run state: an environment directory that does not resolve
@@ -490,6 +490,7 @@ function run_testing(run::Run, p::Plan, setup_paths::Vector{String}, testing::Re
     cfg = p.cfg
     check_replayed_environment(run)
     return with_load_path(setup_paths) do
+        prespawn_workers!(run, p)
         precompile_phase(run, p)
         # From the start of the run, as the monitor's setup stage is, so the
         # header and the closing block give the same figure.
@@ -1080,30 +1081,22 @@ const WORKER_START_RETRIES = 2
 const PRESPAWN_CONNECT_TIMEOUT = 600
 
 # Spawn eligible slots' OS worker processes synchronously on the coordinator thread
-# *before* `with_run_env` and `precompile_phase` so Julia boot + `Runtests` load happens
-# in the kernel during environment setup — with zero background tasks racing against
-# `withenv` / `Base.require(Pkg)`. Once setup finishes, `start_worker` connects to the
-# already-ready pipe/socket and switches the worker to its resolved test environment via
-# `remote_activate`.
+# right before `precompile_phase`, using each slot's resolved `worker_project` and
+# `worker_load_path` whenever `Runtests` already has a fresh cache for that environment.
+# Booting in the slot's own environment avoids poisoning workers with the coordinator's
+# package versions (which would force workers to reject and overwrite the test
+# environment's extension and setup caches on every run) while still overlapping Julia
+# boot + `Runtests` load with `precompile_phase`.
 function prespawn_workers!(run::Run, p::Plan)
     (single_process(p) || isempty(run.slots)) && return nothing
     # Julia 1.12 on Windows intermittently aborts with 0xC0000005 when pre-spawned
-    # worker processes sit open across environment setup/precompilation (observed on
-    # 1.12.7 only; 1.11, 1.13, and 1.14 are unaffected). Start workers on demand there.
+    # worker processes sit open across precompilation (observed on 1.12.7 only; 1.11,
+    # 1.13, and 1.14 are unaffected). Start workers on demand there.
     (Sys.iswindows() && v"1.12" <= VERSION < v"1.13") && return nothing
-    # If `Runtests` has no fresh cache in the current depot (e.g. a fresh temp depot),
-    # let `precompile_phase` compile it once instead of N workers racing to compile it.
-    precompiled = try
-        Base.isprecompiled(RuntestsWorkers.PKGID; ignore_loaded = true)
-    catch
-        false
-    end
-    precompiled || return nothing
-    boot_project = Base.active_project()
-    boot_load_path = join(LOAD_PATH, PATHSEP)
-    # Strip any caller `JULIA_PROJECT`/`JULIA_LOAD_PATH` so the worker boots with the
-    # coordinator's actual project and load path, not a stale environment variable.
-    boot_env = Dict{String, String}(k => v for (k, v) in ENV if k != "JULIA_PROJECT" && k != "JULIA_LOAD_PATH")
+    rt_origin = get(Base.pkgorigins, RuntestsWorkers.PKGID, nothing)
+    rt_src = rt_origin === nothing ? nothing : rt_origin.path
+    flags = Base.CacheFlags()
+    fresh_by_profile = Dict{ProfileIdx, Bool}()
     color = get(stdout, :color, false)
     for slot in run.slots
         run.skipped_profiles[slot.profile] && continue
@@ -1112,20 +1105,29 @@ function prespawn_workers!(run::Run, p::Plan)
         # Workers with custom julia flags or coverage may need `precompile_phase` to
         # build a matching cache of `Runtests` first; start them after precompilation.
         isempty(worker_julia_args(run, prof)) || continue
-        extra = Pair{String, String}[
-            "RUNTESTS_RUN_ID" => run.runid,
-            "RUNTESTS_WORKER" => string(slot.id),
-            "JULIA_LOAD_PATH" => boot_load_path,
-        ]
-        append!(extra, prof.env)
+        wproj = worker_project(run, slot.profile)
+        wlp = worker_load_path(run, slot.profile)
+        # Check once per profile whether `Runtests` is already precompiled for this
+        # worker environment; if not, let `precompile_phase` / `start_worker` build it
+        # once rather than N workers racing on boot.
+        ready = get!(fresh_by_profile, slot.profile) do
+            try
+                in_worker_environment(wproj, wlp) do
+                    PrecompileHelper.freshest_path(RuntestsWorkers.PKGID, flags; sourcepath = rt_src) !== nothing
+                end
+            catch e
+                is_interrupt(e) && rethrow()
+                false
+            end
+        end
+        ready || continue
         wp = try
             RuntestsWorkers.spawn_worker_process(;
                 julia_args = String[],
                 threads = prof.threads,
-                env = boot_env,
-                extra_env = extra,
+                extra_env = worker_env(run.runid, slot.id, wproj, prof; load_path = wlp),
                 dir = worker_dir(p, slot.profile),
-                project = boot_project,
+                project = wproj,
                 connect_timeout = PRESPAWN_CONNECT_TIMEOUT,
                 color,
             )
@@ -1172,7 +1174,6 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
         began = time()
         ready = began
         w = nothing
-        from_prespawn = false
         relay_state = RelayState()
         if attempt == 1
             wp = claim_prespawned!(run, slot.id)
@@ -1186,7 +1187,6 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
                         on_output_done = WorkerOutputDone(relay_state),
                     )
                     began = wp.began
-                    from_prespawn = true
                 catch e
                     is_interrupt(e) && rethrow()
                     # Pre-spawn failed or exited during a very long setup; fall through
@@ -1223,13 +1223,6 @@ function start_worker(run::Run, slot::Slot, exclusive::Bool = false)
         append_event!(run.runstate, EVENT_WORKER_UP, 0, slot.id, w.pid, began - run.t0, ready - run.t0)
         init_began = time()
         try
-            if from_prespawn
-                fut = RuntestsWorkers.remote_activate(w, worker_project(run, slot.profile), worker_load_path(run, slot.profile))
-                fetch_within(
-                    fut, 30,
-                    TimeoutException(30, "activating the test environment on worker $(w.pid)", "", "init_timeout")
-                )
-            end
             init_worker!(run, slot, w)
             slot.started_at = time()
             note_start!(run.queues, slot.id, max(0.0, ready - began) + max(0.0, slot.started_at - init_began))
@@ -1389,15 +1382,39 @@ function relay!(run::Run, slot::Slot, state::RelayState, line::AbstractString)
             tree = w === nothing ? Int64(0) : attempt_tree_rss(run.monitor, slot.id, rec.i, rec.attempt, w.pid)
             tree > 0 && (how = (; how..., maxrss = tree, tree = true))
         end
-        return printline(run, item_line(run, slot.id, rec.i, rec.attempt, how))
+        return print_item_line(run, slot.id, rec.i, rec.attempt, how)
     end
     state.within && write_relay_log!(state, line)
     return printline(run, string(state.within ? MARK_ITEM : MARK_WORKER, " ", rpad(string("w", slot.id), SLOT_LABEL_WIDTH[]), FIELD, line))
 end
 
+# An item's 1-based start-order number, assigned once the first time the item is
+# printed (so retries, its DONE line and any failure block reuse the same number).
+# Always accessed under `run.printer`.
+function run_number!(run::Run, i::ItemIdx)::Int
+    @lock run.printer begin
+        n = run.start_order[i]
+        n != 0 && return Int(n)
+        k = run.nstarted + 1
+        k <= nitems(run.plan) || error("Runtests internal error: $k items numbered as started, of $(nitems(run.plan))")
+        run.nstarted = k
+        run.start_order[i] = Int32(k)
+        return k
+    end
+end
+
+# Assign the item's start-order number and write its RUN/DONE line under the same
+# `printer` lock so first-attempt RUN lines always appear in strict 1..N order.
+function print_item_line(run::Run, slot_id, i::Integer, attempt::Integer, how)
+    @lock run.printer begin
+        n = run_number!(run, ItemIdx(i))
+        return printline(run, item_line(run, slot_id, i, n, attempt, how))
+    end
+end
+
 # An item's RUN or DONE line, drawn from what this run knows about the item.
-item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
-    slot_id, i, nitems(run.plan), run.names[i], run.name_width, attempt,
+item_line(run::Run, slot_id, i::Integer, n::Integer, attempt::Integer, how) = item_line(
+    slot_id, n, nitems(run.plan), run.names[i], run.name_width, attempt,
     attempts_for(run.plan, i), something(how, itemlocation(run.plan, i));
     package = is_combined(run.plan) ? run.plan.packages.name[run.plan.items.package[i]] : "",
     package_width = run.package_width
@@ -1934,7 +1951,7 @@ function attempt_skipped!(run::Run, _, i::ItemIdx, attempt::Int8, _)
     Test.record(ts, Test.Broken(:skipped, p.items.name[i]))
     ended = time()
     finished_at!(ts, ended)
-    printline(run, item_line(run, nothing, i, attempt, (; state = SKIPPED, elapsed_ns = 0, compile_ns = 0, maxrss = 0)))
+    print_item_line(run, nothing, i, attempt, (; state = SKIPPED, elapsed_ns = 0, compile_ns = 0, maxrss = 0))
     record!(run, i, SlotIdx(0), attempt, SKIPPED, ts, RuntestsWorkers.PerfStats(), true,
             start_off, Int32(0), Int16(0),
             string("the run skips ", environment_name(p.profiles[p.items.profile[i]].environment)); ended)
@@ -1948,10 +1965,10 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, attempt::Int8, max_atte
     pid = Int32(getpid())
     hold_item!(slot, i, attempt)
     start_off = began!(run, slot, i, slot.id, attempt, pid, Int16(0))
-    printline(run, item_line(run, nothing, i, attempt, nothing))
+    print_item_line(run, nothing, i, attempt, nothing)
     res = try
         r = run_item(spec)
-        printline(run, item_line(run, nothing, i, attempt, outcome(r)))
+        print_item_line(run, nothing, i, attempt, outcome(r))
         r
     catch e
         is_interrupt(e) && rethrow()
@@ -2318,9 +2335,9 @@ function persist_attempt!(
     append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, pid, start_off, ended - run.t0;
                   item = i, attempt, seq, compile, recompile, alloc_mb, peak_rss_mb = rss_mb)
     @atomic run.last_finish = time()
-    n = count_done!(run, i)
+    count_done!(run, i)
     return AttemptOutcome(i, slot, attempt, state, st.state[i], pid, elapsed, stats, testset,
-                          synthetic, artifacts, String(note), ended, n)
+                          synthetic, artifacts, String(note), ended)
 end
 
 """
@@ -2467,11 +2484,11 @@ end
 
 # A retried item is finished once, however many attempts it took.
 function count_done!(run::Run, i::ItemIdx)
-    run.statuses.counted[i] && return @atomic run.ndone
+    run.statuses.counted[i] && return nothing
     run.statuses.counted[i] = true
     n = @atomic run.ndone += 1
     n <= nitems(run.plan) || error("Runtests internal error: $n items counted as finished, of $(nitems(run.plan))")
-    return n
+    return nothing
 end
 
 function finish_quietly(ts::Test.AbstractTestSet)

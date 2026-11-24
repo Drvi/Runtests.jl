@@ -850,3 +850,79 @@ end
     # with the queue all the same, not after them.
     @test findfirst(l -> occursin(r"⬛ w\d+ · \d\d:\d\d:\d\d · UP ", l), lines) < findfirst(l -> occursin("COMP ·", l), lines)
 end
+
+@testset "worker-pinned caches prevent extension and setup recompile ping-pong" begin
+    P = Runtests.Private
+    found, flag_bytes = Dict{Base.PkgId, Vector{String}}(), Dict{String, Int}()
+    pinned = P.worker_pinned_caches(Base.CacheFlags(); solo = false, found, flag_bytes)
+    @test !isempty(pinned)
+    @test last(pinned).first == Runtests.RuntestsWorkers.PKGID
+    @test all(((_, cp),) -> isfile(cp), pinned)
+    @test any(((dep, _),) -> dep.name == "PrecompileTools", pinned)
+
+    # A package with a weak-dep extension and a test setup package: run twice back-to-back
+    # with a worker. The worker boots directly in the test environment (not the coordinator's)
+    # and shares the same Runtests dependency build_ids as `PrecompileQueue`, so the second
+    # run must find every cache fresh (zero COMP lines).
+    u_trig = next_uuid()
+    u_setup = next_uuid()
+    dir = make_pkg(
+        "NoPingPong",
+        "Project.toml" => """
+        name = "NoPingPong"
+        uuid = "$(next_uuid())"
+        version = "0.1.0"
+
+        [weakdeps]
+        TrigPkg = "$u_trig"
+
+        [extensions]
+        NoPingPongTrigExt = "TrigPkg"
+        """,
+        "src/NoPingPong.jl" => "module NoPingPong\nexport ext_val\next_val(x) = 0\nend\n",
+        "ext/NoPingPongTrigExt.jl" => "module NoPingPongTrigExt\nusing NoPingPong, TrigPkg\nNoPingPong.ext_val(x::TrigPkg.Box) = x.v\nend\n",
+        "deps/TrigPkg/Project.toml" => "name = \"TrigPkg\"\nuuid = \"$u_trig\"\nversion = \"0.1.0\"\n",
+        "deps/TrigPkg/src/TrigPkg.jl" => "module TrigPkg\nstruct Box\n    v::Int\nend\nend\n",
+        "test/Project.toml" => """
+        [deps]
+        TrigPkg = "$u_trig"
+        Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+        [sources]
+        TrigPkg = {path = "../deps/TrigPkg"}
+        """,
+        "test/testsetups/PingSetup/Project.toml" => """
+        name = "PingSetup"
+        uuid = "$u_setup"
+        version = "0.1.0"
+
+        [deps]
+        NoPingPong = "$(next_uuid())"
+        """,
+        "test/testsetups/PingSetup/src/PingSetup.jl" => "module PingSetup\nusing NoPingPong, TrigPkg\nexport check_val\ncheck_val() = NoPingPong.ext_val(TrigPkg.Box(42))\nend\n",
+        "test/t_test.jl" => """
+        @testitem "loads ext and setup" begin
+            using PingSetup
+            @test check_val() == 42
+        end
+        """,
+    )
+    # Fix PingSetup's Project.toml to match NoPingPong's actual UUID and declare TrigPkg.
+    pkg_uuid = Base.parsed_toml(joinpath(dir, "Project.toml"))["uuid"]
+    write(joinpath(dir, "test", "testsetups", "PingSetup", "Project.toml"), """
+    name = "PingSetup"
+    uuid = "$u_setup"
+    version = "0.1.0"
+
+    [deps]
+    NoPingPong = "$pkg_uuid"
+    TrigPkg = "$u_trig"
+    """)
+    (states1, _, _), out1 = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states1))
+    @test occursin("COMP ·", out1)
+
+    (states2, _, _), out2 = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
+    @test all(==(PASSED), values(states2))
+    @test !occursin("COMP ·", out2)
+end

@@ -1312,7 +1312,8 @@ function report_item!(run, o)
     end
     isempty(body) && return nothing
     total = nitems(p)
-    label = string("[", lpad(o.n, ndigits(total)), "/", total, "] ", short_state(state))
+    n = run_number!(run, i)
+    label = string("[", lpad(n, ndigits(total)), "/", total, "] ", short_state(state))
     rest = string(repr(p.items.name[i]), isempty(o.note) ? "" : string(" · ", o.note))
     footer = string(
         "@ ", itemfile(p, i), ":", p.items.line[i], on_worker(run, o.slot)

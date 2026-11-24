@@ -119,31 +119,64 @@ function freshest_path(pkg::Base.PkgId, flags::Base.CacheFlags;
                        stale_cache::Dict{Base.StaleCacheKey, Bool} = Dict{Base.StaleCacheKey, Bool}(),
                        cachepath_cache::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}(),
                        found::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}(),
-                       flag_bytes::Dict{String, Int} = Dict{String, Int}())
+                       flag_bytes::Dict{String, Int} = Dict{String, Int}(),
+                       sourcepath::Union{Nothing, String} = nothing,
+                       cachepaths::Union{Nothing, Vector{String}} = nothing)
     # The package's own files from the depot, whatever `cachepath_cache` holds for it,
     # built for `flags`: Julia's check rejects a file of other flags only once it has
     # parsed the whole of its header, most of what a check costs, again for every set
     # of flags a run asks for.
     requested = Base._cacheflag_to_uint8(flags)
-    cachepaths = filter(get!(() -> Base.find_all_in_cache_path(pkg), found, pkg)) do path
+    candidates = cachepaths === nothing ? get!(() -> Base.find_all_in_cache_path(pkg), found, pkg) : cachepaths
+    matching = filter(candidates) do path
         actual = get!(() -> cache_flags_byte(path), flag_bytes, path)
         actual < 0 || ccall(:jl_match_cache_flags, UInt8, (UInt8, UInt8), requested, UInt8(actual)) != 0
     end
-    isempty(cachepaths) && return nothing
+    isempty(matching) && return nothing
+    kw = sourcepath === nothing ? (;) : source_kwarg(sourcepath)
     try
         # 1.13 renamed the function; before, `compilecache_path` takes the same keywords.
         # From 1.13 the checksum of each image file is left out: reading every image is
         # most of the cost of the check, and Julia checks it when a worker loads the image.
         @static if isdefined(Base, :compilecache_freshest_path)
-            return Base.compilecache_freshest_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache, cachepaths, flags,
-                                                   verify_checksums = false)
+            return Base.compilecache_freshest_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache,
+                                                   cachepaths = matching, flags, verify_checksums = false, kw...)
         else
-            return Base.compilecache_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache, cachepaths, flags)
+            return Base.compilecache_path(pkg; ignore_loaded = true, stale_cache, cachepath_cache,
+                                          cachepaths = matching, flags, kw...)
         end
     catch e
         e isa InterruptException && rethrow()
         return nothing
     end
+end
+
+# The cache file of `pkg` providing `build_id` under `flags`, or `nothing`.
+function cache_for_build_id(pkg::Base.PkgId, build_id::UInt128, flags::Base.CacheFlags;
+                            sourcepath::Union{Nothing, String} = nothing,
+                            found::Dict{Base.PkgId, Vector{String}} = Dict{Base.PkgId, Vector{String}}(),
+                            flag_bytes::Dict{String, Int} = Dict{String, Int}())::Union{Nothing, String}
+    build_id == 0 && return nothing
+    src = sourcepath === nothing ? package_source(pkg) : package_source_from(sourcepath)
+    src === nothing && return nothing
+    requested = Base._cacheflag_to_uint8(flags)
+    for path in get!(() -> Base.find_all_in_cache_path(pkg), found, pkg)
+        actual = get!(() -> cache_flags_byte(path), flag_bytes, path)
+        (actual < 0 || ccall(:jl_match_cache_flags, UInt8, (UInt8, UInt8), requested, UInt8(actual)) != 0) || continue
+        ok = try
+            @static if isdefined(Base, :compilecache_freshest_path)
+                Base.stale_cachefile(pkg, build_id, src, path; ignore_loaded = true, requested_flags = flags,
+                                     verify_checksums = false) !== true
+            else
+                Base.stale_cachefile(pkg, build_id, src, path; ignore_loaded = true, requested_flags = flags) !== true
+            end
+        catch e
+            e isa InterruptException && rethrow()
+            false
+        end
+        ok && return path
+    end
+    return nothing
 end
 
 # The flags a cache file was built for: the byte that follows the header Julia checks
@@ -180,8 +213,10 @@ end
     # `LATEST_EDITION` from 1.14.0-beta1, `VERSION_EDITION` in the builds before it.
     const SOURCE_EDITION = isdefined(Base, :LATEST_EDITION) ? Base.LATEST_EDITION : Base.VERSION_EDITION
     source_kwarg(path) = (; sourcespec = Base.PkgLoadSpec(path, SOURCE_EDITION))
+    package_source_from(path::String) = Base.PkgLoadSpec(path, SOURCE_EDITION)
 else
     source_kwarg(path) = (; sourcepath = path)
+    package_source_from(path::String) = path
 end
 
 # The source of `pkg` in the form that the positional `Base.compilecache` takes, or

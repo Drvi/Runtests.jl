@@ -1211,6 +1211,43 @@ end
         @test occursin(P.PRECOMPILE_MARK_INFO, after_queue)
     end
 
+    @testset "off-TTY setup does not print an initial INFO line before print_interval or testing" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.scratch; force=true, recursive=true)
+        P = Runtests.Private
+        Sample = P.Sample
+        _, out = capture_run() do
+            with(P.TTY_OVERRIDE => false) do
+                m = run.monitor = Monitor(run; print_interval = 30.0)
+                m.last_sample = Sample(3.0f0, P.PHASE_SETUP, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(50), Int64(100), 0.1f0, -1.0f0)
+                # Even past SETUP_STATUS_DELAY_S and with precompilation active, no stray
+                # initial `setup` INFO line prints before `print_interval`.
+                @atomic phase_stats(m.stats, P.PHASE_SETUP).entered = time() - P.SETUP_STATUS_DELAY_S - 1.0
+                P.maybe_print(m)
+                @test m.last_print == 0.0
+                P.queue_started!(4, 0)
+                try
+                    P.maybe_print(m)
+                    @test m.last_print == 0.0
+                finally
+                    P.queue_ended!()
+                end
+                # Transitioning to PHASE_TEST prints immediately.
+                P.set_phase!(m, P.PHASE_TEST)
+                m.last_sample = Sample(4.0f0, P.PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                       Int64(50), Int64(100), 0.1f0, -1.0f0)
+                P.maybe_print(m)
+                @test m.last_print > 0.0
+                @test m.last_phase_printed === P.PHASE_TEST
+            end
+        end
+        info_lines = filter(l -> occursin("· INFO ·", l), collect(eachsplit(out, '\n')))
+        @test length(info_lines) == 1
+        @test occursin("testing ", only(info_lines))
+    end
+
     @testset "off-TTY cadence skips clock lines within 5s but fires immediately on memory or CPU thresholds" begin
         p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
         run = execute(p, target)

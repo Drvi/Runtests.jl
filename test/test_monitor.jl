@@ -289,19 +289,42 @@ end
         @test due(57, 47, 200.0, 190.0)
         @test !due(56, 47, 200.0, 190.0)
 
-        # Twelve items on one worker, and a clock that says nothing within the hour:
-        # item 01 pushes elapsed time past the 5 s gate, items 02..10 finish at once,
-        # and item 11 holds long enough for the monitor to sample at 10/12.
-        items = join((begin
-            delay = k == 1 ? "sleep(5.4)\n    " : k == 11 ? "sleep(0.6)\n    " : ""
-            "@testitem \"slow $(lpad(k, 2, '0'))\" begin\n    $(delay)@test true\nend\n"
-        end for k in 1:12), "\n")
+        # Drive `maybe_print` directly on a 12-item run off a terminal with a 1-hour clock:
+        # immune to host CPU/memory threshold crossings during real sleeps, while still
+        # exercising `maybe_print` -> `progress_due` -> `status_line` -> `done_reported`.
+        items = join(("@testitem \"item $(lpad(k, 2, '0'))\" begin\n    @test true\nend\n" for k in 1:12), "\n")
         dir = make_pkg("ProgressLines", "test/a_test.jl" => items)
-        _, out = with(Runtests.Private.TTY_OVERRIDE => false) do
-            capture_run(() -> run_states(dir; workers = 1, monitor = true, monitor_interval = 3600))
+        p, target = prepare((dir,); workers = 0, logs = :issues, monitor = false)
+        run = execute(p, target)
+        rm(run.scratch; force = true, recursive = true)
+        P = Runtests.Private
+        _, out = with(P.TTY_OVERRIDE => false) do
+            capture_run() do
+                m = Monitor(run; print_interval = 3600.0)
+                P.set_phase!(m, P.PHASE_TEST)
+                m.last_phase_printed = P.PHASE_TEST
+                m.last_sample = P.Sample(6.0f0, P.PHASE_TEST, Int16(1), Int16(0), Int64(100), Int64(100), Int32(1),
+                                         Int64(50), Int64(100), 0.1f0, -1.0f0)
+                now = time()
+                @atomic run.ndone = 10
+                m.done_reported = 0
+                # Within the 5s gap: suppressed even at 10 finished items.
+                m.last_print = now - 2.0
+                P.maybe_print(m)
+                @test m.done_reported == 0
+                # Past the 5s gap: emits the 10/12 progress line and advances `done_reported`.
+                m.last_print = now - 6.0
+                P.maybe_print(m)
+                @test m.done_reported == 10
+                # Fewer than 10 more items finished: stays quiet even past the 5s gap.
+                @atomic run.ndone = 12
+                m.last_print = time() - 6.0
+                P.maybe_print(m)
+                @test m.done_reported == 10
+            end
         end
         counts = [parse(Int, m[1]) for m in eachmatch(r"· INFO · +(\d+)/12", out)]
-        @test any(c -> 10 <= c < 12, counts)
+        @test counts == [10]
     end
 
     @testset "an item's memory is its worker's with what the worker started, over the attempt" begin

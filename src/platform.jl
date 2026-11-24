@@ -152,7 +152,6 @@ end
 function children_linux(pid::Integer)
     out = Int32[]
     taskdir = "/proc/$(pid)/task"
-    isdir(taskdir) || return out
     try
         for tid in readdir(taskdir)
             path = joinpath(taskdir, tid, "children")

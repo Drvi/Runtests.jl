@@ -1113,7 +1113,11 @@ function prespawn_workers!(run::Run, p::Plan)
         ready = get!(fresh_by_profile, slot.profile) do
             try
                 in_worker_environment(wproj, wlp) do
-                    PrecompileHelper.freshest_path(RuntestsWorkers.PKGID, flags; sourcepath = rt_src) !== nothing
+                    # Prefer `nothing` so Julia 1.14 uses `locate_package_load_spec` with
+                    # the package's real syntax edition; fall back to `rt_src` only if not
+                    # locatable from `(wproj, wlp)`.
+                    src = PrecompileHelper.package_source(RuntestsWorkers.PKGID) === nothing ? rt_src : nothing
+                    PrecompileHelper.freshest_path(RuntestsWorkers.PKGID, flags; sourcepath = src) !== nothing
                 end
             catch e
                 is_interrupt(e) && rethrow()

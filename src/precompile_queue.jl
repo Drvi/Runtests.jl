@@ -1006,7 +1006,10 @@ function worker_pinned_caches(flags::Base.CacheFlags; solo::Bool,
                  rt_origin.cachepath !== nothing && isfile(rt_origin.cachepath)
         rt_origin.cachepath
     else
-        PrecompileHelper.freshest_path(rt_pkg, flags; sourcepath = rt_src, found, flag_bytes)
+        # Prefer `nothing` so Julia 1.14 resolves the package's true syntax edition via
+        # `locate_package_load_spec`; fall back to `rt_src` only if not locatable here.
+        src = PrecompileHelper.package_source(rt_pkg) === nothing ? rt_src : nothing
+        PrecompileHelper.freshest_path(rt_pkg, flags; sourcepath = src, found, flag_bytes)
     end
     rt_path === nothing && return pinned
     deps = try

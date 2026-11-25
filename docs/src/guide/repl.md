@@ -33,7 +33,7 @@ julia> @testitem "adds numbers" begin
 🔵 16:30:28 · RUN  · "adds numbers" · at REPL[2]:1
 Test Summary: | Pass  Total  Time
 adds numbers  |    1      1  0.0s
-🟢 16:30:28 · DONE · "adds numbers" · PASS ·  0.0s (96% compile) · maxrss 0.6 GiB
+🟢 16:30:28 · DONE · "adds numbers" · PASS ·  0.0s (96% compile) · maxrss 0.6G
 ```
 
 The same parser reads it as reads a test file. Thus a keyword that is an error in a file is an error at the REPL too. The item runs in the same way as in a run. It runs in a new module, with soft scope, and with `Test` and the package in scope, in the root of the package. The session goes back to its own directory after the item. An `include` of a test file runs its items in the same way.

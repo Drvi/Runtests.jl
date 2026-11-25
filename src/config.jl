@@ -1354,9 +1354,9 @@ nondefault_flags(flags) = String[f for f in flags if !(f in DEFAULT_CODE_FLAGS)]
 
 # Unmeasured fallback when no recorded worker RSS exists yet: too many workers risks
 # an OOM kill, and each extra one duplicates compilation. `Int64` avoids 32-bit overflow.
-const ASSUMED_WORKER_RSS = Int64(4) * 2^30
-const MIN_RECORDED_WORKER_RSS = Int64(256) * 2^20   # floor against noisy tiny samples
-const COORDINATOR_MEMORY_RESERVE = Int64(512) * 2^20
+const ASSUMED_WORKER_RSS = Int64(4) * 1_000_000_000
+const MIN_RECORDED_WORKER_RSS = Int64(256) * 1_000_000   # floor against noisy tiny samples
+const COORDINATOR_MEMORY_RESERVE = Int64(512) * 1_000_000
 const WORKER_MEMORY_MARGIN = 1.25                   # 25% headroom over recorded peak worker RSS
 const AUTO_WORKERS_UNMEASURED_CAP = 8
 const AUTO_WORKERS_MEASURED_CAP = 16
@@ -1386,10 +1386,10 @@ function auto_workers(threads::String, nunits::Int;
         usable = Int64(floor(Float64(total_memory) * mt))
         reserve = min(COORDINATOR_MEMORY_RESERVE, usable ÷ 4)
         budget = max(Int64(1), usable - reserve)
-        obs_bytes = max(MIN_RECORDED_WORKER_RSS, Int64(ceil(recorded_mb * 2^20 * WORKER_MEMORY_MARGIN)))
-        # Asymmetric regularization toward the 4 GiB prior when only part of the selection
-        # has recorded worker RSS: low readings pull smoothly upward toward 4 GiB so a tiny
-        # partial run cannot oversubscribe a full run, while readings above 4 GiB count in full.
+        obs_bytes = max(MIN_RECORDED_WORKER_RSS, Int64(ceil(recorded_mb * 1_000_000 * WORKER_MEMORY_MARGIN)))
+        # Asymmetric regularization toward the 4G prior when only part of the selection
+        # has recorded worker RSS: low readings pull smoothly upward toward 4G so a tiny
+        # partial run cannot oversubscribe a full run, while readings above 4G count in full.
         per_worker_bytes = max(obs_bytes, round(Int64, cov * obs_bytes + (1.0 - cov) * ASSUMED_WORKER_RSS))
         by_mem = max(1, Int(budget ÷ per_worker_bytes))
         cap = cov >= AUTO_WORKERS_HIGH_COVERAGE ? AUTO_WORKERS_MEASURED_CAP : AUTO_WORKERS_UNMEASURED_CAP

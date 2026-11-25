@@ -1632,7 +1632,7 @@ function report_job(run::Run, q::PrecompileQueue, i::Int, helper::Integer, statu
         seconds > 0 && (print(io, FIELD); print_1dp(io, round(seconds; digits = 1), TIME_WIDTH - 1); print(io, "s"))
         # The largest a compile of its helper has run, as a worker's DONE line
         # shows its process's: 0 where the platform keeps no rusage.
-        rss > 0 && (print(io, FIELD, "maxrss "); print_1dp(io, round(rss / 2^30; digits = 1)); print(io, " GiB"))
+        rss > 0 && (print(io, FIELD, "maxrss "); print_1dp(io, round(rss / 1.0e9; digits = 1)); write(io, UInt8('G')))
         foreach(f -> print(io, FIELD, f), fields)
     end
     text = strip(text)

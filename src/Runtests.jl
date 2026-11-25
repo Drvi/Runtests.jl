@@ -959,8 +959,8 @@ const PRECOMPILE_SIGNATURES = (
         # The shapes a run prints. The first three run once per field of the
         # progress line, which is redrawn after every line the run writes.
         buf = IOBuffer()
-        print_bytes(buf, 3.5 * 2^30, BYTES_WIDTH)
-        print_bytes(buf, 512 * 2^20, TOTAL_WIDTH)
+        print_bytes(buf, 3.5e9, BYTES_WIDTH)
+        print_bytes(buf, 512.0e6, TOTAL_WIDTH)
         print_1dp(buf, 2.5, 4)
         print_int(buf, 42, 4)
         item_line(1, 1, 2, "\"an item\"", 12, 1, 1, "a_test.jl:1")

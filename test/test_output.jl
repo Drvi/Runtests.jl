@@ -26,7 +26,7 @@ using Runtests: RuntestsWorkers
     @testset "the opening block says what the machine has" begin
         machine = only(filter(l -> occursin("machine: ", l), lines))
         @test occursin("│ machine: $(Sys.CPU_THREADS) CPU threads", machine)
-        @test occursin(r" · \d+\.\d GiB memory, \d+\.\d GiB available$", machine)
+        @test occursin(r" · \d+\.\dG memory, \d+\.\dG available$", machine)
     end
 
     @testset "every item announces its start and its end" begin

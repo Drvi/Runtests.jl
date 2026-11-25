@@ -9,8 +9,8 @@ This page describes the output of a run, in six parts. These are the precompile 
 └ precompiling the env test/qa for 1 profile: default
 ⬛ w1 · 12:09:51 · UP   · pid 80184 · env test/qa
 🟩 w0 · 12:09:52 · COMP · 1/4 · direct · "Helpers"   · v0.2.0 · PASS ·  0.2s
-🟩 w1 · 12:09:52 · COMP · 2/4 · direct · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
-🟩 w1 · 12:09:52 · COMP · 3/4 · direct · "MyPackage" · v0.1.0 · PASS ·  0.2s · maxrss 0.2 GiB · env test/qa
+🟩 w1 · 12:09:52 · COMP · 2/4 · direct · "QaTools"   · v1.0.0 · PASS ·  0.2s · maxrss 0.2G · env test/qa
+🟩 w1 · 12:09:52 · COMP · 3/4 · direct · "MyPackage" · v0.1.0 · PASS ·  0.2s · maxrss 0.2G · env test/qa
 ⬛ w1 · 12:09:52 · EXIT · pid 80184 · 2 compiled · 0.9s
 ┌ [TEST] precompiled 4 stale caches: 3 compiled, 1 reused (8 fresh) in 0.9s
 │ w0 · 1 compiled, 1 reused (8 fresh) · env test
@@ -53,7 +53,7 @@ While the step runs, the progress line has a white square. It counts the stale c
 ```text
 ┌ [TEST] v0.1.0 · julia 1.13.3 · 6 test items in 2 files · seed 0x522fb3b30334cd75 · 2 workers · threads 2,1
 │ env: /var/folders/…/jl_7AEUWb/Project.toml
-│ machine: 18 CPU threads · 64.0 GiB memory, 21.3 GiB available
+│ machine: 18 CPU threads · 68.7G memory, 22.9G available
 └ startup: scan 0.0s · plan 0.1s · setup 1.2s
 ```
 
@@ -72,10 +72,10 @@ Inside the block, conditional lines report what applies to the run:
 Workers, items and the run itself each print lines of one shape:
 
 ```text
-⚪ w0 · 14:52:16 · INFO · 0/6 · 0 failed · 0/2 workers · tree mem 920M (max 920M) · child max 449M · mem 82% · cpu  5.5/18 · testing 0s
+⚪ w0 · 14:52:16 · INFO · 0/6 · 0 failed · 0/2 workers · tree mem 920M (max 920M) · worker max 449M · mem 82% · cpu  5.5/18 · testing 0s
 ⚫ w1 · 14:52:16 · UP   · pid 35898 · threads 2,1
 🔵 w1 · 14:52:16 · RUN  · 1/6 · "slow thing" · at test/sub/b_test.jl:9
-🟢 w1 · 14:52:16 · DONE · 1/6 · "slow thing" · PASS ·  0.0s (94% compile) · tree max 0.3 GiB
+🟢 w1 · 14:52:16 · DONE · 1/6 · "slow thing" · PASS ·  0.0s (94% compile) · tree max 0.3G
 ⚫ w1 · 14:52:16 · EXIT · pid 35898 · 3 items · 0.3s
 ```
 
@@ -120,7 +120,7 @@ While the precompile step runs, the first two values count the stale caches in p
 An item that did not pass gets a block with its results, right after its `DONE` line:
 
 ```text
-🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · tree max 0.3 GiB
+🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · tree max 0.3G
 ┌ [1/1] FAIL "fails"
 │ Test Failed at test/faults_test.jl:6
 │   Expression: 1 == 2
@@ -134,10 +134,10 @@ The block holds the failed tests, the output of the item under `Captured logs`, 
 
 ```text
 ┌ [TEST] ran 6 test items in 2.1s on 2 workers, all passed
-│ setup   · 1.1s · tree max  445M · child max  445M · coordinator
-│ testing · 0.9s · tree max  1.0G · child max  460M · coordinator + 2 workers · 85% compile
+│ setup   · 1.1s · tree max  445M · worker max     - · coordinator
+│ testing · 0.9s · tree max  1.0G · worker max  460M · coordinator + 2 workers · 85% compile
 │ (summed resident sizes over-count pages the processes share)
-│ machine · 52.9G of 64.0G in use at peak
+│ machine · 56.8G of 68.7G in use at peak
 │ cpu · 8% of 18 threads for this run's processes, 24% for the whole machine (averages over the run)
 └ run state: ~/.julia/runtests/runs/MyPackage-8db4f545/1790247276123456-96211.rundata
 ```
@@ -145,7 +145,7 @@ The block holds the failed tests, the output of the item under `Captured logs`, 
 The first line gives the number of items, the time, the workers and the outcome. Then comes one line for each stage of the run, with its time and memory:
 
 - `tree max` is the peak of the summed memory of every process that the run owns. These are the coordinator, the workers, and the processes that they start, for example Pkg or a process that a test starts.
-- `child max` is the largest single process.
+- `worker max` is the peak memory of any single worker together with the processes it started (matching `tree max` on `DONE` lines). All memory figures use base-10 units (`K` = 10³, `M` = 10⁶, `G` = 10⁹ bytes).
 - The list after it says which processes the peak covers, for example `coordinator + 8 workers + 3 spawned`.
 
 The `cpu` line gives two averages over the run, each a fraction of the CPU threads of the machine. The first is the use by the processes of the run. The second is the use by the whole machine. The difference shows how much CPU time other programs used. On Windows, only the use by the whole machine is given, because Windows keeps no total for the children of a process.

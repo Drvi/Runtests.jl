@@ -259,8 +259,8 @@ struct History
     cancelled::Set{String}
     hashes::Dict{String, UInt32}   # each item's source hash in the newest run that ran it
     known::Set{String}             # every item a kept run state records
-    item_rss_mb::Dict{String, Float64}   # newest recorded worker peak RSS (MiB) per item
-    crash_peak_worker_mb::Float64        # peak worker tree RSS (MiB) from recent incomplete/crashed worker runs
+    item_rss_mb::Dict{String, Float64}   # newest recorded worker peak RSS (MB) per item
+    crash_peak_worker_mb::Float64        # peak worker tree RSS (MB) from recent incomplete/crashed worker runs
     compile_s::Dict{String, Float64}     # newest recorded compile time (s) per item
 end
 History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::ColdCost = ColdCost(),
@@ -270,9 +270,9 @@ History(seconds = Dict{String, Float64}(), failed = Dict{String, Int}(); cold::C
     History(seconds, failed, cold, Set{String}(cancelled), hashes, Set{String}(known),
             item_rss_mb, crash_peak_worker_mb, compile_s)
 
-# Estimate per-worker peak RSS (MiB) and observation coverage (`obs_frac` in [0, 1]) for
+# Estimate per-worker peak RSS (MB) and observation coverage (`obs_frac` in [0, 1]) for
 # the selected `items` from `histories`. `auto_workers` regularizes low readings toward
-# `ASSUMED_WORKER_RSS` (4 GiB) whenever `obs_frac < 1`, while high readings or crash
+# `ASSUMED_WORKER_RSS` (4G) whenever `obs_frac < 1`, while high readings or crash
 # peaks (`crash_peak_worker_mb`) are never shrunk downward.
 function estimate_worker_rss(items::Vector{RawItem}, histories::Vector{History})
     n = length(items)

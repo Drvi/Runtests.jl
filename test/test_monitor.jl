@@ -9,12 +9,12 @@ using Runtests.Private: printline, with_status_line_off
 using Runtests.Private.Platform: process_rss, child_pids, process_tree, machine_memory,
                      platform_selfcheck!, ensure_checked!, PER_PROCESS_OK, cpu_ticks, process_cpu_seconds
 
-# `n` MiB of old garbage: it lived through collections, so only a full one frees it,
+# `n` MB of old garbage: it lived through collections, so only a full one frees it,
 # and a run allocates too little to set one off. Made here rather than in the test
 # body, whose frame could keep it reachable. The weak reference says whether it is
 # still there.
 @noinline function leave_old_garbage(n)
-    kept = [fill(UInt8(1), 2^20) for _ in 1:n]
+    kept = [fill(UInt8(1), 1_000_000) for _ in 1:n]
     GC.gc(false); GC.gc(false)
     return WeakRef(kept)
 end
@@ -176,7 +176,7 @@ end
             # Wide enough for the pages that belong to neither side of the split,
             # narrow enough to catch a figure that is answering a different question.
             # The two are read a moment apart while other processes come and go, and
-            # on a 7 GiB CI runner two workers exiting in between are more than the
+            # on a 7G CI runner two workers exiting in between are more than the
             # margin, so a disagreement counts only if it holds on three tries.
             ours, theirs = sample()
             for _ in 2:3
@@ -189,9 +189,9 @@ end
 
     @testset "byte formatting" begin
         @test fmt_bytes(0) == "-"
-        @test endswith(fmt_bytes(5 * 2^10), "K")
-        @test endswith(fmt_bytes(5 * 2^20), "M")
-        @test endswith(fmt_bytes(5 * 2^30), "G")
+        @test endswith(fmt_bytes(5_000), "K")
+        @test endswith(fmt_bytes(5_000_000), "M")
+        @test endswith(fmt_bytes(5_000_000_000), "G")
     end
 end
 
@@ -330,7 +330,7 @@ end
     @testset "an item's memory is its worker's with what the worker started, over the attempt" begin
         dir = make_pkg("TreeMemory", "test/t_test.jl" => """
             @testitem "starts a big process" begin
-                run(`\$(Base.julia_cmd()) --startup-file=no -e 'x = ones(UInt8, 350 * 2^20); sleep(1.2); print(sum(x) > 0)'`)
+                run(`\$(Base.julia_cmd()) --startup-file=no -e 'x = ones(UInt8, 350_000_000); sleep(1.2); print(sum(x) > 0)'`)
                 @test true
             end
             """)
@@ -338,10 +338,19 @@ end
             (states, run, _), out = capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = true))
             @test states["starts a big process"] === Runtests.Private.PASSED
             if Runtests.Private.Platform.PER_PROCESS_OK[]
-                done = match(r"DONE .* tree max +([0-9.]+) GiB", out)
+                done = match(r"DONE .* tree max +([0-9.]+)G", out)
                 @test done !== nothing && parse(Float64, done[1]) >= 0.35
                 rs = Runtests.Private.read_run_state(run.runstate.path)
                 @test only(rs.statuses).peak_rss_mb >= 350
+                # `worker max` in the summary and monitor stats is the worker subtree peak
+                # (worker + spawned child), matching `tree max` on the `DONE` line.
+                @test run.monitor.stats.peak_worker_bytes >= 350_000_000
+                @test round(run.monitor.stats.peak_worker_bytes / 1.0e9; digits = 1) >= parse(Float64, done[1])
+                summary = sprint(io -> print_memory_summary(io, run.monitor))
+                @test occursin(
+                    "worker max " * sprint(io -> print_bytes(io, run.monitor.stats.peak_worker_bytes, Runtests.Private.BYTES_WIDTH)),
+                    summary,
+                )
             end
         end
     end
@@ -358,8 +367,7 @@ end
 
         # Each memory field says which number it is, and is that number. `w0` was
         # none of the three: it labelled the whole tree summed with the name of one
-        # process in it, and `child max` labelled a reading from the newest sample
-        # as a record.
+        # process in it, and `worker max` is the peak of any single worker subtree.
         m = run.monitor
         s = m.last_sample
         if Runtests.Private.Platform.PER_PROCESS_OK[] && s.total_rss > 0
@@ -370,14 +378,17 @@ end
                 "(max " * sprint(io -> print_bytes(io, m.stats.peak_total_bytes)) * ")",
                 line
             )
-            @test occursin(
-                "child max " * sprint(io -> print_bytes(io, m.stats.peak_single_bytes, Runtests.Private.TOTAL_WIDTH)),
-                line
-            )
+            if m.stats.peak_worker_bytes > 0
+                @test occursin(
+                    "worker max " * sprint(io -> print_bytes(io, m.stats.peak_worker_bytes, Runtests.Private.TOTAL_WIDTH)),
+                    line
+                )
+            end
             # A sum is at least its largest term, so the same holds of the peaks,
             # and a peak is at least the reading it was taken from.
             @test s.total_rss >= s.largest_rss
             @test m.stats.peak_total_bytes >= m.stats.peak_single_bytes
+            @test m.stats.peak_total_bytes >= m.stats.peak_worker_bytes
             @test m.stats.peak_total_bytes >= s.total_rss
         end
         @test count("w0", line) == 1        # the speaker, not a field label
@@ -388,9 +399,9 @@ end
         r = saved.sample
         sample = Runtests.Private.Sample(r.t, r.phase, r.nprocs, r.nworkers, r.total_rss, r.largest_rss, r.largest_pid,
                                          r.machine_used, r.machine_total, -1.0f0, 73.4f0)
-        @atomic m.reading = Runtests.Private.Reading(sample, saved.peak_total, saved.peak_single, saved.phase_entered,
-                                                     saved.worker_peak, saved.worker_pid, saved.tree_rss,
-                                                     saved.attempt_peak, saved.attempt_key)
+        @atomic m.reading = Runtests.Private.Reading(sample, saved.peak_total, saved.peak_single, saved.peak_worker,
+                                                     saved.phase_entered, saved.worker_peak, saved.worker_pid,
+                                                     saved.tree_rss, saved.attempt_peak, saved.attempt_key)
         @test occursin(" · cpu  73% · ", status_line(m))
         @test !occursin(r"cpu +\d+\.\d/", status_line(m))
         @atomic m.reading = saved
@@ -470,7 +481,7 @@ end
             @test sprint(io -> print_int(io, n)) == string(n)
             @test sprint(io -> print_int(io, n, 8)) == lpad(string(n), 8)
         end
-        for b in (0, 1, 5 * 2^10, 2^20, 5 * 2^20, 2^30, 3 * 2^30 + 2^29, 123 * 2^30)
+        for b in (0, 1, 5_000, 1_000_000, 5_000_000, 1_000_000_000, 3_500_000_000, 123_000_000_000)
             plain = fmt_bytes(b)
             @test sprint(io -> print_bytes(io, b)) == plain
             # The padding is computed from the digits it is about to write, so the
@@ -481,20 +492,24 @@ end
         # No figure is ever four digits wide: a column that is three digits except
         # occasionally four is a column that moves.
         for b in vcat(
-                [k * 2^10 for k in (1, 500, 999, 1000, 1023)],
-                [k * 2^20 for k in (1, 500, 999, 1000, 1004, 1023)],
-                [k * 2^30 for k in (1, 9, 12, 99)],
-                [7 * 2^30 + 2^29, 64 * 2^30 + 2^28],
+                [k * 1_000 for k in (1, 500, 999, 1000)],
+                [999_499, 999_500],
+                [k * 1_000_000 for k in (1, 500, 999, 1000)],
+                [999_499_999, 999_500_000],
+                [k * 1_000_000_000 for k in (1, 9, 12, 99)],
+                [7_500_000_000, 64_250_000_000],
             )
             text = fmt_bytes(b)
             @test !occursin(r"[0-9]{4}", text)
             @test last(text) in ('K', 'M', 'G')
         end
-        @test fmt_bytes(1004 * 2^20) == "1.0G"     # not "1004M"
-        @test fmt_bytes(999 * 2^20) == "999M"
-        # Binary, as the `GiB` spelled out elsewhere in a run is: 2^30 to the G.
-        @test fmt_bytes(2^30) == "1.0G"
-        @test fmt_bytes(2 * 2^30) == "2.0G"
+        @test fmt_bytes(999_499) == "999K"
+        @test fmt_bytes(999_500) == "1M"            # not "1000K"
+        @test fmt_bytes(999_499_999) == "999M"
+        @test fmt_bytes(999_500_000) == "1.0G"      # not "1000M"
+        # Base-10 throughout: 10^9 bytes to the G.
+        @test fmt_bytes(1_000_000_000) == "1.0G"
+        @test fmt_bytes(2_000_000_000) == "2.0G"
         for x in (0.0, 1.0, 2.75, 17.25, -3.5)
             @test parse(Float64, sprint(io -> print_1dp(io, x))) == round(10x) / 10
             @test length(sprint(io -> print_1dp(io, x, 7))) == 7
@@ -502,10 +517,10 @@ end
         # None of them builds a string on the way: the status line writes three of
         # these on every line a run prints.
         io = IOBuffer()
-        gib() = print_bytes(io, 3.5 * 2^30, 5)
+        gb() = print_bytes(io, 3.5e9, 5)
         dec() = print_1dp(io, 2.75, 5)
         int() = print_int(io, 1234, 6)
-        for f in (gib, dec, int)
+        for f in (gb, dec, int)
             f()
             truncate(io, 0)
             @test @allocated(f()) == 0
@@ -725,10 +740,10 @@ end
         _, run = shared_basic_w1()
         m = Monitor(run)
         r = @atomic m.reading
-        @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
-                                                 [Int64(3) << 30], Int32[4242], [Int64(0)], [Int64(0)], [Int64(0)])
+        @atomic m.reading = Runtests.Private.Reading(r.sample, r.peak_total, r.peak_single, r.peak_worker, r.phase_entered,
+                                                 [Int64(3_000_000_000)], Int32[4242], [Int64(0)], [Int64(0)], [Int64(0)])
         note(pid) = Runtests.Private.memory_note(m, 1, pid)
-        @test occursin("peak rss $(fmt_bytes(Int64(3) << 30))", note(4242))
+        @test occursin("peak rss $(fmt_bytes(Int64(3_000_000_000)))", note(4242))
         # A worker that died before a sample saw it is not given the peak of the
         # one before it in the slot.
         @test !occursin("peak rss", note(4243))
@@ -757,17 +772,20 @@ end
         m = Monitor(run)
         st = m.stats
         for ps in st.phases
-            ps.peak_total = 0; ps.peak_single = 0; ps.nprocs_at_peak = 0; ps.starts = 0
+            ps.peak_total = 0; ps.peak_single = 0; ps.peak_worker = 0; ps.nprocs_at_peak = 0; ps.starts = 0
         end
         sample(phase, total, largest, n, workers = 0) =
             Runtests.Private.Sample(1.0f0, phase, Int16(n), Int16(workers), Int64(total), Int64(largest),
                         Int32(1), Int64(0), Int64(0), 1.0f0, -1.0f0)
-        Runtests.Private.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
-        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8))
-        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4))
+        Runtests.Private.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2), Int64(300))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8), Int64(1100))
+        Runtests.Private.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4), Int64(1400))
         @test phase_peak(st, PHASE_SETUP) == 800
+        @test phase_stats(st, PHASE_SETUP).peak_worker == 300
         @test phase_peak(st, PHASE_TEST) == 3000        # the larger of the two
         @test phase_stats(st, PHASE_TEST).peak_single == 900
+        @test phase_stats(st, PHASE_TEST).peak_worker == 1400
+        @test st.peak_worker_bytes == 1400
         # The count belongs to the sample that set the peak, so that the two read
         # together. A later sample with more processes and a smaller total is a
         # different moment and does not contribute its count to this one.
@@ -825,7 +843,7 @@ end
         @test occursin("setup", summary)
         @test occursin("testing", summary)
         @test occursin("tree max", summary)
-        @test occursin("child max", summary)
+        @test occursin("worker max", summary)
         @test occursin("% compile", summary)
         # Both items hold memory during testing, so it is the expensive stage; pre-spawned
         # workers may already be booting alongside precompilation during setup, so setup can
@@ -896,7 +914,7 @@ end
         @test occursin("rss ", summary)
         # One process, so nothing to total and nothing to compare against.
         @test !occursin("tree max", summary)
-        @test !occursin("child max", summary)
+        @test !occursin("worker max", summary)
         @test !occursin(r"\d+ process", summary)
         @test !occursin("coordinator", summary)
         @test !occursin("over-count", summary)

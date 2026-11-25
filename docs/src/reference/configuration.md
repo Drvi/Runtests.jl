@@ -21,7 +21,7 @@ Each of these keys is a keyword of `runtests` and `runtests_mono`, a key of `[ru
 
 | Key | Default | Value |
 |:----|:--------|:------|
-| `workers` | `"auto"` | The number of workers, or `"auto"`. Auto uses the number of CPUs, the threads of each worker, and either the recorded worker memory for the selected items (with 25% headroom against `memory_threshold`, asymmetrically regularized toward 4 GiB when only part of the selection has worker history, up to 16 workers once at least 80% of selected items are measured) or an assumed 4 GiB per worker (at most 8) when no worker history exists. `0` runs ordinary items in the calling process; sandboxed items, items of a named profile, and items in an environment directory still use workers. See [Run tests](@ref running). |
+| `workers` | `"auto"` | The number of workers, or `"auto"`. Auto uses the number of CPUs, the threads of each worker, and either the recorded worker memory for the selected items (with 25% headroom against `memory_threshold`, asymmetrically regularized toward 4G when only part of the selection has worker history, up to 16 workers once at least 80% of selected items are measured) or an assumed 4G per worker (at most 8) when no worker history exists. `0` runs ordinary items in the calling process; sandboxed items, items of a named profile, and items in an environment directory still use workers. See [Run tests](@ref running). |
 | `threads` | `"2,1"` | The `--threads` value of each worker, for example `"4"`, `"4,1"` or `"auto"`. |
 | `timeout` | `1800` | Seconds for each attempt at an item. |
 | `init_timeout` | `timeout` | Seconds for each `init` expression of a profile. |

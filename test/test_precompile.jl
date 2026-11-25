@@ -48,7 +48,7 @@ using Runtests.Private: PASSED, ConfigError
         @test Runtests.Private.read_run_state(path) !== nothing
 
         buf = IOBuffer()
-        Runtests.Private.print_bytes(buf, 3.5 * 2^30, Runtests.Private.BYTES_WIDTH)
+        Runtests.Private.print_bytes(buf, 3.5e9, Runtests.Private.BYTES_WIDTH)
         Runtests.Private.print_1dp(buf, 2.5, 4)
         Runtests.Private.print_int(buf, 42, 4)
         @test !isempty(String(take!(buf)))
@@ -715,7 +715,7 @@ end
     # A helper's built line carries the resident peak of its compiles, after its time,
     # as a DONE line carries its worker's. The children of the coordinator are its test
     # workers too, so its own lines carry none.
-    @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+ GiB", l), helper)
+    @test Sys.iswindows() || all(l -> occursin(r"· maxrss [\d.]+G", l), helper)
     @test !any(l -> occursin("maxrss", l), here)
 
     # When the queue ends a line accounts for it: the stale caches as the announcement

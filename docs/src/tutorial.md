@@ -79,7 +79,7 @@ The output starts with a header block, then one line for each event of the run. 
 └ startup: scan 0.0s · plan 0.1s · setup 1.1s
 ⚫ w1 · 14:54:35 · UP   · pid 45413 · threads 2,1
 🔵 w1 · 14:54:35 · RUN  · 1/2 · "circle area" · at test/area_tests.jl:1
-🟢 w1 · 14:54:36 · DONE · 1/2 · "circle area" · PASS ·  0.5s (11% compile) · tree max 0.3 GiB
+🟢 w1 · 14:54:36 · DONE · 1/2 · "circle area" · PASS ·  0.5s (11% compile) · tree max 0.3G
 ┌ [TEST] ran 2 test items in 2.4s on 2 workers, all passed
 └ run state: ~/.julia/runtests/runs/Geometry-…/1793973275182436-45262.rundata
 Test Summary:        | Pass  Total  Time
@@ -119,7 +119,7 @@ Change the second test of `"circle area"` so that it fails:
 Run the suite again with `Runtests.runtests()`. The failed item gets a block with its failure, directly after its `DONE` line. For example:
 
 ```text
-🔴 w1 · 12:29:30 · DONE · 1/2 · "circle area" · FAIL ·  0.0s (94% compile) · tree max 0.3 GiB
+🔴 w1 · 12:29:30 · DONE · 1/2 · "circle area" · FAIL ·  0.0s (94% compile) · tree max 0.3G
 ┌ [1/2] FAIL "circle area"
 │ Test Failed at test/area_tests.jl:3
 │   Expression: circle_area(2) ≈ 2π

@@ -44,6 +44,7 @@ mutable struct PhaseStats
     @atomic entered::Float64   # when the run entered this stage, 0 if it never did
     peak_total::Int64          # summed resident size over our processes
     peak_single::Int64
+    peak_worker::Int64         # largest worker subtree (worker + spawned children) in this stage
     # Processes alive at the sample that set `peak_total`, not the most ever alive:
     # maxima from different instants, printed side by side, contradict each other.
     nprocs_at_peak::Int
@@ -54,9 +55,9 @@ mutable struct PhaseStats
     starts::Int
 end
 
-PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, nprocs_at_peak = 0, workers_at_peak = 0,
+PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, peak_worker = 0, nprocs_at_peak = 0, workers_at_peak = 0,
            nprocs_peak = 0, starts = 0) =
-    PhaseStats(entered, peak_total, peak_single, nprocs_at_peak, workers_at_peak, nprocs_peak, starts)
+    PhaseStats(entered, peak_total, peak_single, peak_worker, nprocs_at_peak, workers_at_peak, nprocs_peak, starts)
 
 """
     CpuReading
@@ -139,7 +140,8 @@ is built from stay the monitor's own.
 struct Reading
     sample::Sample
     peak_total::Int64            # the run's peak, summed over its processes
-    peak_single::Int64           # the largest any one of them has been
+    peak_single::Int64           # the largest any one process has been
+    peak_worker::Int64           # the largest any worker subtree (worker + children) has been
     phase_entered::Float64       # when the sample's stage began
     worker_peak::Vector{Int64}   # per slot, the largest its worker was sampled at; a copy
     worker_pid::Vector{Int32}    # and whose peak that is; a copy
@@ -258,7 +260,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     n = nslots(run.plan)
     return Monitor(
         run, stats, Sample(),
-        Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
+        Reading(Sample(), 0, 0, 0, entered, zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n)),
         nothing, false, false, false,
         PHASE_SETUP, interval, print_interval, tty, terminal_columns(tty),
         zeros(Int64, n), zeros(Int32, n), zeros(Int64, n), zeros(Int64, n), zeros(Int64, n),
@@ -429,6 +431,10 @@ function sample!(m::Monitor)
             total_rss += rss
             rss > largest && ((largest, largest_pid) = (rss, Int32(pid)))
         end
+        coord_pid = first(roots)
+        for (root, tree) in tree_of
+            root != coord_pid && tree > worker_tree_max && (worker_tree_max = tree)
+        end
         for slot in run_of(m).slots
             w = @atomic slot.worker
             if w === nothing
@@ -446,7 +452,6 @@ function sample!(m::Monitor)
             # is what running it took.
             tree = get(tree_of, pid, Int64(0))
             m.tree_rss[slot.id] = tree
-            tree > worker_tree_max && (worker_tree_max = tree)
             key = attempt_key(@atomic(slot.current), @atomic(slot.attempt))
             if key != m.attempt_key[slot.id]
                 m.attempt_key[slot.id] = key
@@ -461,7 +466,8 @@ function sample!(m::Monitor)
     m.last_sample = s
     update_stats!(m, s, worker_tree_max)
     st = m.stats
-    @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes,
+    peak_worker = phase === PHASE_SETUP ? phase_stats(st, PHASE_SETUP).peak_worker : st.peak_worker_bytes
+    @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes, peak_worker,
                                 (@atomic phase_stats(st, phase).entered), copy(m.worker_peak), copy(m.worker_pid),
                                 copy(m.tree_rss), copy(m.attempt_peak), copy(m.attempt_key))
     return s
@@ -497,6 +503,7 @@ function update_stats!(m::Monitor, s::Sample, worker_tree_max::Int64 = Int64(0))
         ps.workers_at_peak = Int(s.nworkers)
     end
     s.largest_rss > ps.peak_single && (ps.peak_single = s.largest_rss)
+    worker_tree_max > ps.peak_worker && (ps.peak_worker = worker_tree_max)
     s.nprocs > ps.nprocs_peak && (ps.nprocs_peak = Int(s.nprocs))
     return nothing
 end
@@ -506,30 +513,31 @@ run_of(m::Monitor) = m.run::Run
 
 ### Printing ###############################################################
 
-# The unit changes over at a thousand of the smaller one, not at 1024, so that no
-# figure is four digits wide.
-const BYTES_PER_UNIT = 1000
+# Base-10 memory units (`K` = 10^3, `M` = 10^6, `G` = 10^9). Thresholds switch at 999.5
+# of the smaller unit so rounding never produces a four-digit `1000K` or `1000M`.
+const BYTES_PER_K = 1_000
+const BYTES_PER_M = 1_000_000
+const BYTES_PER_G = 1_000_000_000
 
 """
     print_bytes(io, b, width = 0)
 
-Write `b` in one binary unit (`K`, `M` and `G` are 2^10, 2^20 and 2^30, as in
-`du -h`), gibibytes to a decimal and the others whole, right-aligned in `width`
-columns; 1000 to 1023 MiB reads `1.0G`. Padded here from the digits about to be
-written, and without building strings: the status line writes three of these on
-every redraw.
+Write `b` in one decimal unit (`K`, `M` and `G` are 10^3, 10^6 and 10^9), gigabytes to
+one decimal and the others whole, right-aligned in `width` columns. Padded here from
+the digits about to be written, and without building strings: the status line writes
+three of these on every redraw.
 """
 function print_bytes(io::IO, b::Real, width::Integer = 0)
     if b <= 0
         pad_to(io, width, 1)
         write(io, UInt8('-'))
-    elseif b >= BYTES_PER_UNIT * 2^20
-        print_1dp(io, b / 2^30, width - 1)
+    elseif b >= 999_500_000
+        print_1dp(io, b / BYTES_PER_G, width - 1)
         write(io, UInt8('G'))
     else
-        mib = b >= BYTES_PER_UNIT * 2^10
-        print_int(io, round(Int, b / (mib ? 2^20 : 2^10)), width - 1)
-        write(io, UInt8(mib ? 'M' : 'K'))
+        mb = b >= 999_500
+        print_int(io, round(Int, b / (mb ? BYTES_PER_M : BYTES_PER_K)), width - 1)
+        write(io, UInt8(mb ? 'M' : 'K'))
     end
     return nothing
 end
@@ -669,10 +677,12 @@ function print_status_line(io::IO, m::Monitor)
             print(io, " (max ")
             print_bytes(io, r.peak_total)
             write(io, UInt8(')'))
-            # The largest any one process has been, not the largest now: a current
-            # reading moves with whichever worker is mid-item.
-            print(io, " · child max ")
-            print_bytes(io, r.peak_single, TOTAL_WIDTH)
+            # The largest any one worker subtree (worker + spawned children) has been,
+            # matching the `tree max` figure printed on DONE lines.
+            if r.peak_worker > 0
+                print(io, " · worker max ")
+                print_bytes(io, r.peak_worker, TOTAL_WIDTH)
+            end
         end
     end
     if s.machine_total > 0
@@ -1047,8 +1057,8 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
                 print(io, FIELD, solo ? "rss " : "tree max ")
                 print_bytes(io, ps.peak_total, BYTES_WIDTH)
                 if !solo
-                    print(io, FIELD, "child max ")
-                    print_bytes(io, ps.peak_single, BYTES_WIDTH)
+                    print(io, FIELD, "worker max ")
+                    print_bytes(io, ps.peak_worker, BYTES_WIDTH)
                     print(io, FIELD, row.procs)
                     more_follows && pad_to(io, procs_width, length(row.procs))
                 end

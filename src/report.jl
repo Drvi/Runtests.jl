@@ -508,7 +508,7 @@ const GUTTER = "  "
 # Worker lifecycle, test items and the run's own report share one line shape:
 #     ⚫ w1 · 16:30:28 · UP   · pid 48123 · threads 2,1
 #     🔵 w1 · 16:30:28 · RUN  ·  1/11 · "passes" · at test/basics_test.jl:1
-#     🟢 w1 · 16:30:29 · DONE ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
+#     🟢 w1 · 16:30:29 · DONE ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4G
 #     ⚪ w0 · 16:30:29 · INFO ·  3/11 · 0 failed · 2/2 workers · tree mem 1.1G (max 1.2G) · …
 #        w1 · whatever a test item printed for itself
 #
@@ -538,9 +538,9 @@ const WORKER_STATE_WIDTH = 4   # "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" a
 const STATE_WIDTH = 4          # "PASS"; the rarer outcomes are longer and may push the line
 const TIME_WIDTH = 5           # "99.9s"
 
-# One unit each, always: a column that switches between ms and s, or MiB and GiB,
-# cannot be compared down the page at a glance.
-fmt_gib(b::Real) = string(round(b / 2^30; digits = 1), " GiB")
+# One unit each, always: a column that switches between ms and s, or M and G,
+# cannot be compared down the page at a glance. Base-10 gigabytes (10^9 bytes).
+fmt_gb(b::Real) = string(round(b / 1.0e9; digits = 1), "G")
 
 # Four columns for the common outcomes; the rare ones are spelled out and may push
 # the line.
@@ -773,7 +773,7 @@ function _item_line(slot_id::Union{Nothing, Int}, i::Int, total::Int, shown::Str
         # `tree max`: the worker with what it started, over the attempt; `maxrss`: one
         # process, since it started.
         print(io, FIELD, get(how, :tree, false) ? "tree max " : "maxrss ")
-        print_1dp(io, how.maxrss / 2^30); print(io, " GiB")
+        print_1dp(io, how.maxrss / 1.0e9); write(io, UInt8('G'))
     else
         print(io, "at ")
         print_bold(io, how)
@@ -879,7 +879,7 @@ end
 function print_machine(io::IO)
     used, total = Platform.machine_memory()
     print(io, "machine: ", Platform.cpu_count(), " CPU threads")
-    total > 0 && print(io, " · ", fmt_gib(total), " memory, ", fmt_gib(total - used), " available")
+    total > 0 && print(io, " · ", fmt_gb(total), " memory, ", fmt_gb(total - used), " available")
     println(io)
     return nothing
 end

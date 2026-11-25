@@ -7,7 +7,7 @@ This page tells you how to find out why an item failed. You can read its report 
 An item that did not pass gets a block with its results right after its `DONE` line:
 
 ```text
-🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · tree max 0.3 GiB
+🔴 w1 · 12:55:14 · DONE · 1/1 · "fails" · FAIL ·  0.0s (92% compile) · tree max 0.3G
 ┌ [1/1] FAIL "fails"
 │ Test Failed at test/faults_test.jl:6
 │   Expression: 1 == 2

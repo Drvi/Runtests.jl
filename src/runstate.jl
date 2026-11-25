@@ -721,10 +721,10 @@ function write_memory!(rsf::Union{Nothing, RunStateFile}, m)
     rsf === nothing && return nothing
     update!(rsf, rsf.off_memory) do io
         rsf.memory_ref[] = MemoryRecord(
-            Float32(m.peak_total_bytes / 2^20), Float32(m.peak_total_at), Float32(m.peak_single_bytes / 2^20),
-            Int32(m.peak_single_pid), Float32(phase_peak(m, PHASE_SETUP) / 2^20),
-            Float32(phase_peak(m, PHASE_TEST) / 2^20), Int32(m.nprocs_peak),
-            Float32(m.peak_worker_bytes / 2^20)
+            Float32(m.peak_total_bytes / 1.0e6), Float32(m.peak_total_at), Float32(m.peak_single_bytes / 1.0e6),
+            Int32(m.peak_single_pid), Float32(phase_peak(m, PHASE_SETUP) / 1.0e6),
+            Float32(phase_peak(m, PHASE_TEST) / 1.0e6), Int32(m.nprocs_peak),
+            Float32(m.peak_worker_bytes / 1.0e6)
         )
         write_record(io, rsf.memory_ref)
     end
@@ -1397,7 +1397,7 @@ function Base.show(io::IO, ::MIME"text/plain", rs::RunStateRecord)
     started = abs(rs.start_unix) < 1.0e12 ? Libc.strftime("%Y-%m-%d %H:%M:%S", rs.start_unix) : string(rs.start_unix)
     println(io, "  started ", started, took, rs.complete ? string(", ", ending_word(rs.ending)) : "")
     println(io, "  julia ", m("julia"), " (", first(m("julia_commit"), 10), ") · ", m("machine"), " · ",
-        m("cpu_threads"), " CPU threads · ", fmt_gib(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
+        m("cpu_threads"), " CPU threads · ", fmt_gb(something(tryparse(Int64, m("memory_bytes")), 0)), " · host ", m("host"))
     println(io, "  project ", m("project_id"), isempty(m("revision")) ? "" : string(" · rev ", first(m("revision"), 10)),
         m("worktree") == "dirty" ? " with uncommitted changes" : "",
         " · Runtests ", m("runtests"), isempty(m("runtests_revision")) ? "" : string(" (", first(m("runtests_revision"), 10), ")"))
@@ -1780,7 +1780,7 @@ struct ItemFacts
     hash::UInt32           # the source hash in the newest run that ran it; 0 for unknown
     selected_at::Float64   # when the newest run that is over and selected it started
     unreached::Bool        # whether that run stopped before the item ended
-    peak_rss_mb::Float64   # newest worker peak RSS (MiB) recorded for this item; 0 for none
+    peak_rss_mb::Float64   # newest worker peak RSS (MB) recorded for this item; 0 for none
     compile_s::Float64     # newest recorded compile time (s) for this item; 0 for none
 end
 const NO_FACTS = ItemFacts(Int8(-1), UNSEEN, 0.0, 0.0f0, UInt64(0), 0.0, UInt32(0), 0.0, false, 0.0, 0.0)
@@ -2196,7 +2196,7 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS, base::Union{No
                    item_rss, recorded_crash_peak_worker_mb(recent), compile_s)
 end
 
-# Largest worker-tree peak RSS (MiB) recorded by the monitor across recent worker runs
+# Largest worker-tree peak RSS (MB) recorded by the monitor across recent worker runs
 # where at least one item crashed, timed out, or was left running without recording a
 # status RSS (e.g. OOM before the item could finish). Skips `workers = 0` runs.
 function recorded_crash_peak_worker_mb(runs::Vector{RunStateRecord})

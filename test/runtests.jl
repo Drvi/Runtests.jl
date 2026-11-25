@@ -91,7 +91,7 @@ end
 # Where the suite ran, for a CI log read by someone who was not there.
 print_environment() = println(
     "[tests] julia ", VERSION, " (", Base.GIT_VERSION_INFO.commit_short, ") · ", Sys.MACHINE, " · ",
-    Sys.CPU_THREADS, " CPU threads · ", round(Sys.total_memory() / 2^30; digits = 1), " GiB · threads ",
+    Sys.CPU_THREADS, " CPU threads · ", round(Sys.total_memory() / 1.0e9; digits = 1), "G · threads ",
     Threads.nthreads(:default), ",", Threads.nthreads(:interactive), " · ", default_jobs(), " files at a time",
     get(ENV, "CI", "") == "true" ? " · CI" : ""
 )

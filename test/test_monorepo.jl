@@ -700,7 +700,7 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             p = mono(ws; workers = 8).plan
             P = Runtests.Private
             P.SLOT_LABEL_WIDTH[] = P.slot_label_width(P.nslots(p))
-            done = (; state = PASSED, elapsed_ns = 1.0e9, compile_ns = 0.0, maxrss = 2^30)
+            done = (; state = PASSED, elapsed_ns = 1.0e9, compile_ns = 0.0, maxrss = 1_000_000_000)
             for columns in (80, 120)
                 shown, column = P.item_names(p, P.name_width(p.items.name; columns, reserved = P.line_reserved(p)))
                 for i in 1:nitems(p)

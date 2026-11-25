@@ -112,7 +112,7 @@ struct Statuses
     testsets::Vector{Union{Nothing, Test.AbstractTestSet}}
     # What its committed attempt left of evidence, as `ItemResult.artifacts` says it.
     artifacts::Vector{UInt8}
-    # The rest of its status row: recompile seconds, MiB allocated and peak resident MiB:
+    # The rest of its status row: recompile seconds, MB allocated and peak resident MB:
     # of its worker and the processes under it during the attempt, as the monitor
     # sampled them, or else the process's largest so far (`maxrss`).
     recompile::Vector{Float32}
@@ -2308,8 +2308,8 @@ function persist_attempt!(
     elapsed = synthetic ? max(0.0, ended - run.t0 - start_off) : stats.elapsed_ns / 1.0e9
     compile = Float32(stats.compile_ns / 1.0e9)
     recompile = Float32(stats.recompile_ns / 1.0e9)
-    alloc_mb = Float32(stats.bytes / 2^20)
-    rss_mb = Float32(something(peak_rss, Int64(stats.maxrss)) / 2^20)
+    alloc_mb = Float32(stats.bytes / 1.0e6)
+    rss_mb = Float32(something(peak_rss, Int64(stats.maxrss)) / 1.0e6)
     # What the run prints of a failure, kept beside the item's output for whoever
     # reads the run state later; a cancel or a skip has nothing of its own to say.
     is_non_pass(state) && state !== CANCELLED && write_failure_report(run, i, attempt, testset)

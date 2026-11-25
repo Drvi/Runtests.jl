@@ -357,3 +357,35 @@ end
     end
     @test err isa ArgumentError && !occursin("name =", err.msg)
 end
+
+@testset "no-test-files error names the real directory and hints when pwd() has a test/ project" begin
+    # Simulates starting `julia` without `--project` (active project is an empty global env)
+    # while `pwd()` is a package checkout that has `test/`.
+    empty_env = mktempdir()
+    write(joinpath(empty_env, "Project.toml"), "[deps]\n")
+    pkg = make_pkg("HerePkg", "test/a_test.jl" => "@testitem \"ok\" begin\n    @test true\nend\n")
+    orig_proj = Base.active_project()
+    try
+        Base.set_active_project(joinpath(empty_env, "Project.toml"))
+        err, out = cd(pkg) do
+            err_ref = Ref{Any}(nothing)
+            _, printed = capture_run() do
+                try
+                    prepare(())
+                catch e
+                    err_ref[] = e
+                end
+            end
+            err_ref[], printed
+        end
+        @test err isa NoTestsError
+        msg = sprint(showerror, err)
+        @test occursin(Base.contractuser(joinpath(empty_env, "test")), out)
+        @test occursin(Base.contractuser(joinpath(empty_env, "test")), msg)
+        @test occursin("from the active project", msg)
+        @test occursin("has a project with a `test/` directory", msg)
+        @test occursin("runtests(\".\")", msg)
+    finally
+        Base.set_active_project(orig_proj)
+    end
+end

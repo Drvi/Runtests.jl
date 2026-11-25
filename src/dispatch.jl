@@ -223,7 +223,7 @@ function runtests_dispatch(root::Union{AbstractString, Module}, selected, varian
         errors = copy(strays)
         append!(errors, expansion_errors(files, templates))
         isempty(errors) || throw(ScanFailure(errors))
-        throw(NoTestsError("no test files found under $(joinpath(relpath_or_path(target.testdir), ""))"))
+        throw(no_test_files_error(target; from_default = false))
     end
     setups = setup_modules(target.testdir)
     all_items = scan(files, Filter(), setups; strays, templates, expansions = true, environments)

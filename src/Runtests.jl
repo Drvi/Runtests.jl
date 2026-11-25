@@ -257,9 +257,11 @@ function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags
     # Printed and flushed directly: there is no printer yet, and nothing else writes this
     # early. How many of the failing items on record the suite has is known once it is read.
     if announce
+        shown_dir = (isempty(args) && !same_dir(target.root, pwd())) ?
+            joinpath(Base.contractuser(target.testdir), "") :
+            joinpath(relpath_or_path(target.testdir, target.root), "")
         println(
-            stdout, label_prefix(), "reading test files under ",
-            joinpath(relpath_or_path(target.testdir, target.root), ""),
+            stdout, label_prefix(), "reading test files under ", shown_dir,
             name isa FailingItems ? " for the items failing on record" :
                 is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
         )
@@ -275,12 +277,7 @@ function prepare_impl(args::Vector{Any}, @nospecialize(name), @nospecialize(tags
         errors = copy(strays)
         expansions && append!(errors, expansion_errors(files, templates))
         isempty(errors) || throw(ScanFailure(errors))
-        throw(
-            NoTestsError(
-                "no test files found under $(joinpath(relpath_or_path(target.testdir), "")); test files are " *
-                    "named `*_test.jl` or `*_tests.jl` and live under `test/`"
-            )
-        )
+        throw(no_test_files_error(target; from_default = isempty(args)))
     end
     # Every file, whatever the selection: a broken suite is broken, not smaller.
     suite_names = String[]
@@ -703,6 +700,32 @@ function check_target_line(file::AbstractString, line::Integer, arg::AbstractStr
 end
 
 rstrip_path(p::AbstractString) = rstrip(p, PATH_SEPARATORS)
+
+same_dir(a::AbstractString, b::AbstractString) =
+    (isdir(a) && isdir(b) && samefile(a, b)) || rstrip_path(abspath(a)) == rstrip_path(abspath(b))
+
+function no_test_files_error(target::Target; from_default::Bool = false)
+    cwd = pwd()
+    same_root = same_dir(target.root, cwd)
+    shown = same_root ? joinpath(relpath_or_path(target.testdir), "") :
+        joinpath(Base.contractuser(target.testdir), "")
+    from_active = (!same_root && from_default) ?
+        " (from the active project $(Base.contractuser(target.project)))" : ""
+    hint = ""
+    if !same_root && from_default
+        pwd_proj = find_project(cwd)
+        if pwd_proj !== nothing
+            pwd_root = dirname(pwd_proj)
+            if !same_dir(pwd_root, target.root) && isdir(joinpath(pwd_root, "test"))
+                hint = "\nThe current directory ($(Base.contractuser(cwd))) has a project with a `test/` " *
+                       "directory — pass `runtests(\".\")` or activate it first (`Pkg.activate(\".\")` or `julia --project=.`)."
+            end
+        end
+    end
+    return NoTestsError(
+        "no test files found under $(shown)$(from_active); test files are named `*_test.jl` or `*_tests.jl` and live under `test/`$(hint)"
+    )
+end
 
 function _pkgdir(m::Module)
     dir = pkgdir(m)

@@ -91,6 +91,7 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
             ("removable_runs", P.removable_runs, (Vector{Pair{String, P.RunStateRecord}}, Vector{String})),
             ("idle_worker_seconds", P.idle_worker_seconds, (P.RunStateRecord,)),
             ("bytes_within", P.bytes_within, (Vector{UInt8}, Int, Int, Int)),
+            ("display_width_bytes", P.display_width_bytes, (Vector{UInt8}, Int, Int)),
             ("print_status_line", P.print_status_line, (IOBuffer, P.Monitor)),
             ("sample!", P.sample!, (P.Monitor,)),
             ("Platform.process_rss", P.Platform.process_rss, (Int32,)),
@@ -116,6 +117,7 @@ const OURS = (P, W, P.Platform, P.PrecompileHelper, P.Expander)
     @testset "AllocCheck: nothing allocated in $name" for (name, f, types) in (
             ("parse_record", P.parse_record, (String,)),
             ("bytes_within", P.bytes_within, (Vector{UInt8}, Int, Int, Int)),
+            ("display_width_bytes", P.display_width_bytes, (Vector{UInt8}, Int, Int)),
             ("header_field", W.header_field, (Vector{UInt8}, Type{UInt64}, Int)),
             ("verdict", P.verdict, (P.RunStateRecord, Int)),
             ("gate_full", P.gate_full, (P.Queues, P.ItemIdx)),

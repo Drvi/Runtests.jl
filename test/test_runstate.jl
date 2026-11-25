@@ -1114,9 +1114,9 @@ end
             capture_run(() -> run_states(pkg; workers = 0, logs = :issues, monitor = false))
             # A name keeps the failing items it matches, and nothing that is not failing.
             _, out = capture_run(() -> Runtests.runtestsf(pkg; name = "fails", dry_run = true))
-            @test occursin("1 test item in 1 file · ", out) && occursin("selection: 1 failing item", out)
+            @test occursin("items: 1 test item in 1 file", out) && occursin("selection: 1 failing item", out)
             _, out = capture_run(() -> Runtests.runtestsf(pkg; name = r"s$", dry_run = true))
-            @test occursin("2 test items in 1 file · ", out) && occursin("selection: 2 failing items", out)
+            @test occursin("items: 2 test items in 1 file", out) && occursin("selection: 2 failing items", out)
             msg = said(() -> capture_run(() -> Runtests.runtestsf(pkg; name = "passes", dry_run = true)))
             @test occursin("none of the 2 failing items matches name = \"passes\": \"errors\", \"fails\"", msg)
             # Tags narrow them too, and a selection that leaves none says so before

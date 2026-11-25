@@ -184,21 +184,39 @@ end
 # `done = false` what it would do, and `indent` before each.
 function print_setup_changes(io::IO, plans::Vector{SetupPackage}, dir::String; done::Bool, indent = "")
     width = maximum(p -> textwidth(p.name), plans) + 3
+    cont = " "^(textwidth(indent) + width + 1)
     for p in plans
-        print(io, indent, rpad(string('`', p.name, "`:"), width), " ")
+        lead = string(indent, rpad(string('`', p.name, "`:"), width), " ")
         if moves(p)
-            print(io, done ? "moved to " : "would move to ")
-            printstyled(io, relpath(p.entry, dir); color = :light_black)
-            p.rewritten > 0 && print(io, " · `@__DIR__` rewritten ", p.rewritten, "×")
-            isempty(p.imported) || print(io, " · `import ", p.imported, "` added")
-            println(io, " · deps: ", isempty(p.deps) ? "none" : join(p.deps, ", "))
+            rel = relpath(p.entry, dir)
+            mid = string(p.rewritten > 0 ? string(" · `@__DIR__` rewritten ", p.rewritten, "×") : "",
+                         isempty(p.imported) ? "" : string(" · `import ", p.imported, "` added"),
+                         " · deps: ")
+            plain_w = textwidth(lead) + textwidth(done ? "moved to " : "would move to ") +
+                      textwidth(rel) + textwidth(mid)
+            prefix = sprint() do pio
+                pctx = io_context_like(pio, io)
+                print(pctx, lead, done ? "moved to " : "would move to ")
+                printstyled(pctx, rel; color = :light_black)
+                print(pctx, mid)
+            end
+            if isempty(p.deps)
+                println(io, prefix, "none")
+            else
+                print_wrapped_list(io, prefix, p.deps; indent = cont, prefix_width = plain_w)
+            end
         elseif !p.changed
-            println(io, "up to date")
+            println(io, lead, "up to date")
         elseif isempty(p.added)
-            println(io, done ? "project written" : "project to write", " · deps: ",
-                    isempty(p.deps) ? "none" : join(p.deps, ", "))
+            prefix = string(lead, done ? "project written" : "project to write", " · deps: ")
+            if isempty(p.deps)
+                println(io, prefix, "none")
+            else
+                print_wrapped_list(io, prefix, p.deps; indent = cont)
+            end
         else
-            println(io, done ? "added to deps: " : "to add to deps: ", join(p.added, ", "))
+            prefix = string(lead, done ? "added to deps: " : "to add to deps: ")
+            print_wrapped_list(io, prefix, p.added; indent = cont)
         end
     end
     return nothing

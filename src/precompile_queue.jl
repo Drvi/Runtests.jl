@@ -1302,7 +1302,15 @@ function watch_precompile_reminder(qr::QueueRun)
         qr.watching || break
         if !qr.reminded && !qr.cancelled && time() - qr.last_report > qr.run.plan.cfg.monitor_interval
             names = compiling_names()
-            isempty(names) || (say(qr.run, "still precompiling ", join(names, ", ")); qr.reminded = true)
+            if !isempty(names)
+                prefix = "still precompiling "
+                gutter = length(label_prefix())
+                w = wrap_columns(stdout; gutter)
+                cont = " "^(gutter + (textwidth(prefix) <= max(w ÷ 2, 24) ? textwidth(prefix) : 2))
+                msg = sprint(io -> print_wrapped_list(io, prefix, names; width = w, indent = cont))
+                say(qr.run, chomp(msg))
+                qr.reminded = true
+            end
         end
     end
     return nothing
@@ -1343,10 +1351,12 @@ function run_queue(run::Run, q::PrecompileQueue)
         rethrow()
     end
     versions, kinds = stale_metadata(run, q, work)
-    width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]])
     vwidth = maximum((textwidth(version_text(versions[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
     pwidth = maximum((textwidth(requesters_text(q.jobs[i])) for i in eachindex(q.jobs) if work[i]); init = 0)
     kwidth = maximum((textwidth(kinds[i]) for i in eachindex(q.jobs) if work[i]); init = 0)
+    comp_reserved = comp_line_reserved(nhelpers, total, pwidth, kwidth, vwidth)
+    width = name_width([q.jobs[i].name for i in eachindex(q.jobs) if work[i]];
+                       columns = explicit_columns(stdout), reserved = comp_reserved)
     upstream = upstream_jobs(q.jobs, order)
     done = [Base.Event() for _ in 1:n]
     foreach(i -> work[i] || notify(done[i]), 1:n)
@@ -1468,24 +1478,32 @@ end
 # compiles run at once: the single semaphore (`run_queue`) that bounds the compiles of
 # this process and of every helper, of which there are `nhelpers`.
 function announce(run::Run, q::PrecompileQueue, work::BitVector, nhelpers::Int)
-    lines, setups = String[], String[]
-    for (g, group) in pairs(q.groups)
-        mine = [i for i in eachindex(q.jobs) if work[i] && q.jobs[i].group == g]
-        isempty(mine) && continue
-        if group.kind === :setups
-            append!(setups, (q.jobs[i].name for i in mine))
-            continue
+    body = sprint() do io
+        w = wrap_columns(stdout; gutter = 2)
+        setups = String[]
+        for (g, group) in pairs(q.groups)
+            mine = [i for i in eachindex(q.jobs) if work[i] && q.jobs[i].group == g]
+            isempty(mine) && continue
+            if group.kind === :setups
+                append!(setups, (q.jobs[i].name for i in mine))
+                continue
+            end
+            if isempty(group.profiles)
+                group.kind === :test || println(io, "precompiling ", group_name(group))
+            else
+                prefix = string("precompiling ", group_name(group), " for ",
+                                plural(length(group.profiles), "profile"), ": ")
+                print_wrapped_list(io, prefix, sort!(collect(group.profiles)); width = w)
+            end
         end
-        text = group_text(group)
-        text === nothing || push!(lines, string("precompiling ", text))
+        isempty(setups) || print_wrapped_list(io, "precompiling ", unique!(setups); width = w)
     end
-    isempty(setups) || push!(lines, string("precompiling ", join(unique!(setups), ", ")))
     fresh = length(q.jobs) - count(work)
     head = string("precompiling ", plural(count(work), "stale cache"),
                   fresh == 0 ? "" : string(" (", fresh, " fresh)"),
                   nhelpers == 0 ? "" : string(" with ", plural(nhelpers, "worker")),
                   ", at most ", precompile_tasks(), " at once")
-    print_label_block(run, head, join(lines, '\n'))
+    print_label_block(run, head, body)
     return nothing
 end
 
@@ -1529,6 +1547,17 @@ function requesters_text(job::QueueJob)
 end
 
 version_text(v::AbstractString) = isempty(v) ? "" : "v" * v
+
+# Fixed columns of a COMP line besides its name, up through its outcome word.
+function comp_line_reserved(nhelpers::Integer, total::Integer, pwidth::Integer, kwidth::Integer, vwidth::Integer)
+    worker = slot_label_width(max(nhelpers, 1)) + length(FIELD)
+    count = 2 * ndigits(total) + 1 + length(FIELD)
+    pkg = pwidth > 0 ? pwidth + length(FIELD) : 0
+    kind = kwidth + length(FIELD)
+    ver = vwidth > 0 ? length(FIELD) + vwidth : 0
+    return 3 + worker + 8 + length(FIELD) + WORKER_STATE_WIDTH + length(FIELD) + count + pkg + kind + ver +
+           length(FIELD) + STATE_WIDTH
+end
 
 # What a line shows for each printed status of a compile, as a test item's line shows
 # its outcome: a module that cannot be precompiled is set aside, and loads from its

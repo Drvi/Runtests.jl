@@ -227,6 +227,53 @@ only on a terminal, and a test suite's output is a pipe.
 """
 const TTY_OVERRIDE = ScopedValue{Union{Nothing, Bool}}(nothing)
 
+# Default column target for wrapped lists off a terminal when `COLUMNS` is unset,
+# and the floor below which wrapping refuses to squeeze.
+const DEFAULT_WRAP_COLUMNS = 100
+const MIN_WRAP_COLUMNS = 40
+
+# Positive column count from `ENV["COLUMNS"]`, or `0` when unset or invalid.
+function env_columns()::Int
+    raw = get(ENV, "COLUMNS", "")
+    isempty(raw) && return 0
+    n = tryparse(Int, strip(raw))
+    return n !== nothing && n > 0 ? n : 0
+end
+
+# Known display width for `io`, or `0` when `io` is not a terminal and carries neither
+# an explicit `:displaysize` nor a positive `COLUMNS` environment variable.
+function explicit_columns(@nospecialize(io::IO = stdout))::Int
+    if io isa IOContext && haskey(io, :displaysize)
+        return Int(displaysize(io)[2])
+    elseif io isa Base.TTY
+        return Int(displaysize(io)[2])
+    elseif io === stdout && TTY_OVERRIDE[] === true
+        return Int(displaysize()[2])
+    end
+    return env_columns()
+end
+
+# Column budget for wrapped lines written to `io`, subtracting `gutter` (e.g. 2 for `│ `).
+# Off a terminal without `COLUMNS`, wraps at `DEFAULT_WRAP_COLUMNS`.
+function wrap_columns(@nospecialize(io::IO = stdout); gutter::Int = 0)::Int
+    cols = explicit_columns(io)
+    base = cols > 0 ? cols : DEFAULT_WRAP_COLUMNS
+    return max(base - gutter, MIN_WRAP_COLUMNS)
+end
+
+# Forward `:color` and `:displaysize` (when explicitly known) from `src` onto `buf`.
+function io_context_like(buf::IOBuffer, @nospecialize(src::IO = stdout))::IOContext{IOBuffer}
+    color = get(src, :color, false)::Bool
+    if src isa IOContext && haskey(src, :displaysize)
+        return IOContext(buf, :color => color, :displaysize => displaysize(src))
+    elseif src isa Base.TTY
+        return IOContext(buf, :color => color, :displaysize => displaysize(src))
+    end
+    cols = env_columns()
+    cols > 0 && return IOContext(buf, :color => color, :displaysize => (displaysize()[1], cols))
+    return IOContext(buf, :color => color)
+end
+
 # `displaysize` falls back to `COLUMNS` when the stream is not a terminal, which is
 # how a test says how wide to pretend the screen is.
 function terminal_columns(tty::Bool)
@@ -600,6 +647,22 @@ function print_workers(io::IO, up::Integer, all::Integer)
     return nothing
 end
 
+@inline status_buffer(io::IOBuffer) = io
+@inline status_buffer(io::IOContext{IOBuffer}) = io.io
+@inline status_buffer(::IO) = nothing
+
+# Remaining columns on the status line for a trailing item/compile name. On a terminal,
+# expands past `RUNNING_WIDTH` when room allows and clips cleanly with `…` when space is
+# tight (>= 4 cols left); off a terminal or when less than 4 cols remain, falls back to
+# `RUNNING_WIDTH` (and `clip_status!` caps TTY output to `m.columns`).
+@inline function suffix_width(m::Monitor, buf::IOBuffer, start_pos::Int, label_width::Int)
+    m.columns > 0 || return RUNNING_WIDTH
+    used = display_width_bytes(buf.data, start_pos + 1, position(buf))
+    avail = m.columns - used - label_width
+    return avail >= 4 ? avail : RUNNING_WIDTH
+end
+@inline suffix_width(::Monitor, ::Nothing, ::Int, ::Int) = RUNNING_WIDTH
+
 """
     print_status_line(io, m)
 
@@ -609,6 +672,8 @@ It is rebuilt after every line the run prints, so nothing formats through a
 temporary string.
 """
 function print_status_line(io::IO, m::Monitor)
+    buf = status_buffer(io)
+    start_pos = buf === nothing ? 0 : position(buf)
     # Drawn by whichever task prints, on any thread: what the monitor measured
     # comes from its published reading, and the run's own counts are atomic.
     r = @atomic m.reading
@@ -707,13 +772,14 @@ function print_status_line(io::IO, m::Monitor)
     print(io, " · ", phase_name(phase), " ")
     phase_entered = phase === s.phase ? r.phase_entered : (@atomic phase_stats(m.stats, phase).entered)
     print_age(io, run.t0 + Float64(s.t) - phase_entered)
-    oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], RUNNING_WIDTH))
+    oldest == 0 || (print(io, " · "); print_clipped(io, run.plan.items.name[oldest], suffix_width(m, buf, start_pos, 3)))
     # A producer that takes long is not an item that hangs, and is said apart from one.
-    collecting == 0 || (print(io, " · collecting artifacts of "); print_clipped(io, run.plan.items.name[collecting], RUNNING_WIDTH))
+    collecting == 0 || (print(io, " · collecting artifacts of ");
+                        print_clipped(io, run.plan.items.name[collecting], suffix_width(m, buf, start_pos, 27)))
     if queued > 0
         compiling = oldest_compiling()
         isempty(compiling) ||
-            (print(io, " · precompiling "); print_clipped(io, compiling, RUNNING_WIDTH))
+            (print(io, " · precompiling "); print_clipped(io, compiling, suffix_width(m, buf, start_pos, 16)))
     end
     return nothing
 end
@@ -820,6 +886,43 @@ function bytes_within(data::AbstractVector{UInt8}, from::Int, to::Int, columns::
         i += n
     end
     return i - from
+end
+
+# Display width in terminal columns of `data[from:to]`, skipping ANSI escapes.
+function display_width_bytes(data::AbstractVector{UInt8}, from::Int, to::Int)
+    col = 0
+    i = from
+    while i <= to
+        b = data[i]
+        if b == 0x1b
+            if i + 1 <= to && data[i + 1] == UInt8('[')
+                j = i + 2
+                while j <= to && !(0x40 <= data[j] <= 0x7e)
+                    j += 1
+                end
+                i = j + 1
+            else
+                i += 2
+            end
+            continue
+        end
+        n = b < 0x80 ? 1 : b < 0xe0 ? 2 : b < 0xf0 ? 3 : 4
+        i + n - 1 > to && break
+        cp = if n == 1
+            UInt32(b)
+        elseif n == 2
+            (UInt32(b & 0x1f) << 6) | UInt32(data[i + 1] & 0x3f)
+        elseif n == 3
+            (UInt32(b & 0x0f) << 12) | (UInt32(data[i + 1] & 0x3f) << 6) |
+                UInt32(data[i + 2] & 0x3f)
+        else
+            (UInt32(b & 0x07) << 18) | (UInt32(data[i + 1] & 0x3f) << 12) |
+                (UInt32(data[i + 2] & 0x3f) << 6) | UInt32(data[i + 3] & 0x3f)
+        end
+        col += textwidth(Char(cp))
+        i += n
+    end
+    return col
 end
 
 status_line(m::Monitor) =

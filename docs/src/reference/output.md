@@ -51,21 +51,25 @@ While the step runs, the progress line has a white square. It counts the stale c
 ## The opening block
 
 ```text
-┌ [TEST] v0.1.0 · julia 1.13.3 · 6 test items in 2 files · seed 0x522fb3b30334cd75 · 2 workers · threads 2,1
+┌ [TEST] v0.1.0 · julia 1.13.3 · 2 workers · threads 2,1
+│ items: 6 test items in 2 files
+│ seed: 0x522fb3b30334cd75
 │ env: /var/folders/…/jl_7AEUWb/Project.toml
 │ machine: 18 CPU threads · 68.7G memory, 22.9G available
 └ startup: scan 0.0s · plan 0.1s · setup 1.2s
 ```
 
-The first line gives the versions of Runtests and Julia, the number of selected items and files, the git revision (in a checkout), the seed (plus per-item seed counts when replaying failures), the number of workers and their threads, and any non-default Julia flags (for example `--check-bounds=yes -O1`).
+The first line gives the versions of Runtests and Julia, the git revision (in a checkout), the number of workers and their threads, and any non-default Julia flags (for example `--check-bounds=yes -O1`).
 
-Inside the block, conditional lines report what applies to the run:
+Inside the block, `items` gives the count of selected items and files, `seed` gives the run's seed (plus per-item seed counts when replaying failures), and conditional lines report what applies to the run:
 
 - `selection` (for example `tags = [:fast]`, or a group with its tags and what asked for it),
 - `packages` (in a combined run), `profile` details, and `env dir(s)`,
 - `set by the environment` (environment variables overriding defaults or `TestItems.toml`),
 - `coverage` (and its source),
 - `env` (path of the test environment), `machine` (CPU threads and available/total memory, respecting container limits), and `startup` (`scan`, `plan`, and `setup` timings).
+
+Long comma- or `·`-separated lists in header blocks (such as `setups`, `packages`, `env dirs`, and precompile lists) wrap across continuation lines to fit the terminal width (or `COLUMNS`, defaulting to 100 columns off a terminal).
 
 ## The lines of the run
 
@@ -164,7 +168,8 @@ After the block, `Test` prints its usual summary.
 ## The plan of a dry run
 
 ```text
-┌ [TEST] dry run · v0.1.0 · julia 1.13.3 · 6 test items in 2 files · 2 workers · threads 2,1
+┌ [TEST] dry run · v0.1.0 · julia 1.13.3 · 2 workers · threads 2,1
+│ items: 6 test items in 2 files
 │ startup: scan 0.0s
 │ setups: `BasicSetup`
 │ timeout: 1800s · retries: 0 · failfast: false · logs: issues · memory_threshold: 0.9

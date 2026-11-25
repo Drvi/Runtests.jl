@@ -910,7 +910,13 @@ function check_replayed_environment(run::Run)
     end
     by_path = sort!(unique!(reduce(vcat, (e.by_path for e in diff.envs); init = String[])))
     # Its path is the recording machine's, and its source may differ under the same one.
-    isempty(by_path) || say(run, "tracked by path, so not compared with the recorded run: ", join(by_path, ", "))
+    if !isempty(by_path)
+        prefix = "tracked by path, so not compared with the recorded run: "
+        msg = sprint(io -> print_wrapped_list(io, prefix, by_path;
+                                              width = wrap_columns(stdout; gutter = length(label_prefix())),
+                                              indent = " "^(length(label_prefix()) + 2)))
+        say(run, chomp(msg))
+    end
     if !isempty(recorded) && !any(has_env_diff, diff.envs)
         say(run, "the test environment matches the one the run state was recorded in")
     end

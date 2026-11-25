@@ -74,7 +74,9 @@ Pkg.test()
 The output starts with a header block, then one line for each event of the run. The abbreviated output below illustrates the format; worker counts, assignments, paths, seeds and timings depend on your run.
 
 ```text
-┌ [TEST] v0.1.0 · julia 1.13.3 · 2 test items in 1 file · seed 0xdd9c0263775e72e7 · 2 workers · threads 2,1
+┌ [TEST] v0.1.0 · julia 1.13.3 · 2 workers · threads 2,1
+│ items: 2 test items in 1 file
+│ seed: 0xdd9c0263775e72e7
 │ env: /tmp/jl_4JWcNy/Project.toml
 └ startup: scan 0.0s · plan 0.1s · setup 1.1s
 ⚫ w1 · 14:54:35 · UP   · pid 45413 · threads 2,1

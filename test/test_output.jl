@@ -23,7 +23,12 @@ using Runtests: RuntestsWorkers
     @test ok
     lines = split(log, '\n')
 
-    @testset "the opening block says what the machine has" begin
+    @testset "the opening block says what the machine has, and puts items and seed on their own lines" begin
+        head = only(filter(l -> startswith(l, "┌ [TEST] v"), lines))
+        @test !occursin("test items in", head)
+        @test !occursin("seed ", head)
+        @test any(l -> startswith(l, "│ items: 6 test items in 2 files"), lines)
+        @test any(l -> occursin(r"^│ seed: 0x[0-9a-f]{16}", l), lines)
         machine = only(filter(l -> occursin("machine: ", l), lines))
         @test occursin("│ machine: $(Sys.CPU_THREADS) CPU threads", machine)
         @test occursin(r" · \d+\.\dG memory, \d+\.\dG available$", machine)
@@ -493,5 +498,82 @@ using Runtests: RuntestsWorkers
         @test (@atomic run.ndone) == 2
         @test run.nstarted == 3
         rm(scratch; force = true, recursive = true)
+    end
+
+    @testset "display-width helpers and wrapped lists" begin
+        P = Runtests.Private
+        # Short lists stay on one line with no trailing space.
+        short = sprint(io -> P.print_wrapped_list(io, "setups: ", ["`Alpha`", "`Beta`"]; width = 80))
+        @test short == "setups: `Alpha`, `Beta`\n"
+
+        # Long comma lists wrap cleanly with aligned continuation indent and no trailing spaces.
+        setups = ["`SetupModuleNumber$i`" for i in 1:8]
+        wrapped = sprint(io -> P.print_wrapped_list(io, "setups: ", setups; width = 60))
+        wlines = split(chomp(wrapped), '\n')
+        @test length(wlines) >= 3
+        @test all(l -> textwidth(l) <= 60, wlines)
+        @test all(l -> l == rstrip(l), wlines)
+        @test all(l -> startswith(l, "        "), wlines[2:end])
+        @test all(l -> endswith(l, ","), wlines[1:(end - 1)])
+        @test !endswith(wlines[end], ",")
+
+        # ` · `-separated lists break cleanly between items without dangling separators.
+        est = ["w$i 12.3s" for i in 1:10]
+        dot_wrapped = sprint(io -> P.print_wrapped_list(io, "estimated work: ", est; sep = " · ", width = 50))
+        dlines = split(chomp(dot_wrapped), '\n')
+        @test length(dlines) >= 2
+        @test all(l -> textwidth(l) <= 50, dlines)
+        @test all(l -> l == rstrip(l) && !endswith(l, "·"), dlines)
+
+        # Inside a bracket, every continuation line and any blank line carries the `│` / `└` gutter.
+        blk = P.bracket(wrapped * "\nnext: ok\n", "[TEST]", "head", "", :default)
+        blines = split(chomp(blk), '\n')
+        @test startswith(blines[1], "┌ [TEST] head")
+        @test all(l -> startswith(l, "│"), blines[2:(end - 1)])
+        @test startswith(blines[end], "└ ")
+        @test all(l -> l == rstrip(l), blines)
+
+        # `explicit_columns` and `wrap_columns` respect `IOContext(:displaysize)` and `COLUMNS`,
+        # and off-TTY defaults to `DEFAULT_WRAP_COLUMNS` for lists while staying `0` for `explicit_columns`.
+        withenv("COLUMNS" => nothing) do
+            buf = IOBuffer()
+            @test P.explicit_columns(buf) == 0
+            @test P.wrap_columns(buf; gutter = 2) == P.DEFAULT_WRAP_COLUMNS - 2
+            ctx = IOContext(buf, :displaysize => (24, 72))
+            @test P.explicit_columns(ctx) == 72
+            @test P.wrap_columns(ctx; gutter = 2) == 70
+            fwd = P.io_context_like(IOBuffer(), ctx)
+            @test displaysize(fwd) == (24, 72)
+        end
+        withenv("COLUMNS" => "90") do
+            buf = IOBuffer()
+            @test P.explicit_columns(buf) == 90
+            @test P.wrap_columns(buf; gutter = 2) == 88
+            fwd = P.io_context_like(IOBuffer(), buf)
+            @test displaysize(fwd)[2] == 90
+        end
+
+        # `print_plan` forwards `io`'s `:displaysize` to both wrapped header lists and the plan table.
+        dir = make_pkg("WidePlan")
+        mkpath(joinpath(dir, "test", "testsetups"))
+        snames = ["WideSetupModuleNumber$i" for i in 1:6]
+        for s in snames
+            write(joinpath(dir, "test", "testsetups", "$s.jl"), "module $s end\n")
+        end
+        write(joinpath(dir, "test", "w_test.jl"),
+              string("@testitem \"a considerably longer item name for width budgeting\" begin\n",
+                     join(("    using $s\n" for s in snames)),
+                     "    @test true\nend\n"))
+        p, _ = Runtests.Private.prepare((dir,); workers = 1, monitor = false)
+        narrow = sprint(io -> P.print_plan(IOContext(io, :displaysize => (24, 64)), p))
+        nlines = split(chomp(narrow), '\n')
+        setup_idx = findfirst(l -> occursin("setups: ", l), nlines)
+        @test setup_idx !== nothing
+        @test startswith(nlines[setup_idx + 1], "│         ")
+        @test all(l -> textwidth(l) <= 64, nlines[setup_idx:(setup_idx + 2)])
+        @test any(l -> startswith(l, "│ items: 1 test item in 1 file"), nlines)
+
+        # `comp_line_reserved` accounts for package, kind, and version columns.
+        @test P.comp_line_reserved(2, 10, 12, 9, 6) > P.comp_line_reserved(0, 10, 0, 6, 0)
     end
 end

@@ -452,6 +452,24 @@ end
             @test endswith(status_line(m), named(2))
             @atomic run.slots[2].current = ItemIdx(0)
             @test !occursin(p.items.name[2], status_line(m))
+
+            # Wide terminals let the trailing item name expand past `RUNNING_WIDTH`.
+            long_name = "a_very_long_test_item_name_exceeding_twenty_eight_chars_easily"
+            saved_name = p.items.name[1]
+            saved_cols = m.columns
+            try
+                p.items.name[1] = long_name
+                @atomic run.slots[1].current = ItemIdx(1)
+                m.columns = 0
+                off_tty = status_line(m)
+                @test occursin("…", off_tty) && !occursin(long_name, off_tty)
+                m.columns = 220
+                wide = status_line(m)
+                @test occursin(long_name, wide)
+            finally
+                p.items.name[1] = saved_name
+                m.columns = saved_cols
+            end
         finally
             foreach(sl -> (@atomic sl.current = ItemIdx(0)), run.slots)
             run.statuses.start[1], run.statuses.start[2] = saved_starts

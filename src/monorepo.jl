@@ -1409,7 +1409,7 @@ function print_worker_groups(io::IO, ps::Participants, root_path::String, root_t
         end
     end
     isempty(environments) ||
-        println(io, "  items in an environment directory, with workers of their own: ", join(environments, ", "))
+        print_wrapped_list(io, "  items in an environment directory, with workers of their own: ", environments)
     return nothing
 end
 

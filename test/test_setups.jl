@@ -436,10 +436,11 @@ end
                 "deps: Random, SetupPkgs",
             out
         )
+        unwrapped = replace(out, r"\n[│└] +" => " ")
         @test occursin(
             "`Uses`:    moved to $(joinpath("Uses", "src", "Uses.jl")) · `@__DIR__` rewritten 1× · " *
                 "`import SetupPkgs` added · deps: Dates, Helpers, SetupPkgs",
-            out
+            unwrapped
         )
         # A package, and so a cache filed under its UUID.
         Runtests.Private.with_load_path(setups) do

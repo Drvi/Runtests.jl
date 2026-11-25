@@ -687,9 +687,13 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             # and what the run precompiles for its workers.
             ws = make_workspace(tuned("Alpha", "precompile = []", profile_files("tuned"; init = "x = 1")...),
                                 tuned("Beta", "", profile_files("tuned"; init = "x = 2")...); root = nothing)
-            out = slashed(sprint(Runtests.Private.print_profiles, mono(ws).plan))
+            p2 = mono(ws).plan
+            out = slashed(sprint(Runtests.Private.print_profiles, p2))
+            @test occursin("profile `tuned` of Alpha: init expression of lib/Alpha/test/testconfigs/tuned/worker_init.jl\n" *
+                           "                          precompiles nothing\n", out)
+            wide = slashed(sprint(io -> Runtests.Private.print_profiles(IOContext(io, :displaysize => (24, 160)), p2)))
             @test occursin("profile `tuned` of Alpha: init expression of lib/Alpha/test/testconfigs/tuned/worker_init.jl" *
-                           " · precompiles nothing\n", out)
+                           " · precompiles nothing\n", wide)
             @test occursin("profile `tuned` of Beta: init expression of lib/Beta/test/testconfigs/tuned/worker_init.jl\n", out)
         end
 

@@ -3,7 +3,7 @@
 
 function print_plan(@nospecialize(io::IO), p::Plan; show_excluded::Vector{String} = String[])
     buf = IOBuffer()
-    ctx = IOContext(buf, :color => get(io, :color, false))
+    ctx = io_context_like(buf, io)
     print_plan_buf(ctx, p, show_excluded)
     write(io, take!(buf))
     return nothing
@@ -11,7 +11,7 @@ end
 
 function print_plan_buf(io::IOContext{IOBuffer}, p::Plan, show_excluded::Vector{String})
     order = run_order(p)
-    print(io, plan_block(p, order))
+    print(io, plan_block(io, p, order))
     print_plan_table(io, p, order)
     if !isempty(show_excluded)
         println(io)
@@ -23,53 +23,150 @@ function print_plan_buf(io::IOContext{IOBuffer}, p::Plan, show_excluded::Vector{
     return nothing
 end
 
+"""
+    print_wrapped_list(io, prefix, items; sep = ", ", width = wrap_columns(io; gutter = 2),
+                       indent = nothing, prefix_width = textwidth(prefix))
+
+Write `prefix` followed by `items` separated by `sep`, wrapping onto aligned continuation
+lines so rows stay within `width` columns. Short lists stay on one line. Wrapped lines
+carry no trailing spaces, and inside a `bracket(...)` every continuation line inherits the
+left `│` gutter.
+"""
+function print_wrapped_list(
+    io::IO, prefix::AbstractString, items;
+    sep::AbstractString = ", ",
+    width::Integer = wrap_columns(io; gutter = 2),
+    indent::Union{Nothing, AbstractString} = nothing,
+    prefix_width::Integer = textwidth(prefix),
+)
+    list = String[x isa String ? x : string(x) for x in items]
+    print(io, prefix)
+    isempty(list) && (println(io); return nothing)
+    cont = if indent !== nothing
+        String(indent)
+    elseif prefix_width <= max(width ÷ 2, 24)
+        " "^prefix_width
+    else
+        lead = 0
+        for c in prefix
+            c == ' ' ? (lead += 1) : break
+        end
+        " "^(lead + 2)
+    end
+    cont_w = textwidth(cont)
+    sep_w = textwidth(sep)
+    comma_style = sep == ", "
+    col = Int(prefix_width)
+    first_on_line = true
+    n = length(list)
+    for (idx, item) in enumerate(list)
+        item_w = textwidth(item)
+        if !first_on_line
+            extra = (comma_style && idx < n) ? 1 : 0
+            if col + sep_w + item_w + extra > width
+                comma_style && write(io, UInt8(','))
+                println(io)
+                print(io, cont)
+                col = cont_w
+                first_on_line = true
+            else
+                print(io, sep)
+                col += sep_w
+            end
+        end
+        print(io, item)
+        col += item_w
+        first_on_line = false
+    end
+    println(io)
+    return nothing
+end
+
+# Wrap a single pre-formatted `"prefix: a, b, c"` note when it exceeds `io`'s wrap width.
+function print_wrapped_note(io::IO, note::AbstractString)
+    w = wrap_columns(io; gutter = 2)
+    if textwidth(note) <= w
+        println(io, note)
+        return nothing
+    end
+    sep = findfirst(": ", note)
+    if sep === nothing
+        println(io, note)
+        return nothing
+    end
+    prefix = String(SubString(note, 1, last(sep)))
+    rest = SubString(note, nextind(note, last(sep)))
+    if startswith(rest, "no run state of ") && endswith(rest, " is left from the replayed run")
+        mid = SubString(rest, ncodeunits("no run state of ") + 1,
+                        ncodeunits(rest) - ncodeunits(" is left from the replayed run"))
+        parts = String[String(s) for s in eachsplit(mid, ", ")]
+        isempty(parts) || (parts[end] = string(parts[end], " is left from the replayed run"))
+        print_wrapped_list(io, prefix * "no run state of ", parts; width = w)
+        return nothing
+    end
+    print_wrapped_list(io, prefix, String[String(s) for s in eachsplit(rest, ", ")]; width = w)
+    return nothing
+end
+
 # What the plan is for and what it was made from, in the bracket a run's header is
 # drawn in: the table below it is the plan.
-function plan_block(p::Plan, order)
+function plan_block(out_io::IO, p::Plan, order)
     cfg = p.cfg
     head = sprint() do io
         print(io, "dry run · ")
         print_work(io, p, single_process(p) ? 0 : nslots(p))
     end
-    body = sprint() do io
-        print_selection(io, p)
-        print_packages(io, p)
-        p.replay === nothing || print_replay_diff(io, p.replay)
-        print_startup(io, p.startup)
-        isempty(p.setups) || println(io, "setups: ", join(("`$s`" for s in p.setups), ", "))
-        println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
-                " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
-        print_profiles(io, p)
-        print_env_settings(io, p.cfg)
-        print_coverage_setting(io, p.cfg)
-        estimated = any(>(0), p.items.est_s)
-        if !single_process(p)
-            estimated && println(io, "estimated work: ",
-                                 join(("w$s $(est_text(w))" for (s, w) in enumerate(order.work)), " · "))
-            println(io, "order and workers: predicted ",
-                    estimated ? "from the recorded durations, an item without one counting as a typical one" :
-                        "as if every item took as long, since no durations are recorded yet")
-        end
+    body_buf = IOBuffer()
+    body_io = io_context_like(body_buf, out_io)
+    print_work_details(body_io, p)
+    print_selection(body_io, p)
+    print_packages(body_io, p)
+    p.replay === nothing || print_replay_diff(body_io, p.replay)
+    print_startup(body_io, p.startup)
+    isempty(p.setups) || print_wrapped_list(body_io, "setups: ", ("`$s`" for s in p.setups))
+    println(body_io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
+            " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
+    print_profiles(body_io, p)
+    print_env_settings(body_io, p.cfg)
+    print_coverage_setting(body_io, p.cfg)
+    estimated = any(>(0), p.items.est_s)
+    if !single_process(p)
+        estimated && print_wrapped_list(body_io, "estimated work: ",
+                                        ("w$s $(est_text(w))" for (s, w) in enumerate(order.work)); sep = " · ")
+        println(body_io, "order and workers: predicted ",
+                estimated ? "from the recorded durations, an item without one counting as a typical one" :
+                    "as if every item took as long, since no durations are recorded yet")
     end
-    return bracket(body, "[TEST]", head, "", :default)
+    return bracket(String(take!(body_buf)), "[TEST]", head, "", :default)
 end
+plan_block(p::Plan, order) = plan_block(stdout, p, order)
 
-# The opening words of a run's header and of a dry run's: which Runtests and Julia, how
-# much work, and on how many processes.
-function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UInt64} = nothing)
-    print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
-          " in ", plural(length(p.files), "file"))
+# The opening words of a run's header and of a dry run's: which Runtests and Julia,
+# revision, processes, and non-default Julia flags.
+function print_work(io::IO, p::Plan, nworkers::Integer)
+    print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION)
     # The commit, so a CI log says what to check out to reproduce this run.
     rev = project_revision(p.root)
     isempty(rev) || print(io, " · rev ", first(rev, 10))
-    seed === nothing || print(io, " · seed ", seed_text(seed))
-    own = count(i -> haskey(item_cfg(p, i).item_seeds, p.items.name[i]), 1:nitems(p))
-    own == 0 || print(io, " · ", plural(own, "item"), " with ", own == 1 ? "its" : "their", " own seed")
     p.cfg.workers == 0 ? print(io, " · in this process") :
         print(io, " · ", plural(nworkers, "worker"), " · threads ", p.profiles[1].threads)
     # What a plain `julia` would not do, for whoever compares this run with another.
     flags = nondefault_flags(run_code_flags(p.cfg))
     isempty(flags) || print(io, " · ", join(flags, " "))
+    return nothing
+end
+
+# The work count and RNG seed, each on its own line in the header bracket.
+function print_work_details(io::IO, p::Plan; seed::Union{Nothing, UInt64} = nothing)
+    println(io, "items: ", plural(nitems(p), "test item"), " in ", plural(length(p.files), "file"))
+    own = count(i -> haskey(item_cfg(p, i).item_seeds, p.items.name[i]), 1:nitems(p))
+    if seed !== nothing
+        print(io, "seed: ", seed_text(seed))
+        own == 0 || print(io, " · ", plural(own, "item"), " with ", own == 1 ? "its" : "their", " own seed")
+        println(io)
+    elseif own > 0
+        println(io, "seed: ", plural(own, "item"), " with ", own == 1 ? "its" : "their", " own seed")
+    end
     return nothing
 end
 
@@ -86,9 +183,12 @@ function print_replay_diff(io::IO, d::ReplayDiff)
     println(io, "replay: ", d.from)
     g = git_diff_text(d)
     isempty(g) || println(io, "  revision: ", g)
-    isempty(d.gone) || println(io, "  missing items (", length(d.gone), ", skipped): ", listed(d.gone))
-    isempty(d.changed) || println(io, "  changed items (", length(d.changed), ", running as the checkout has ",
-                                  length(d.changed) == 1 ? "it" : "them", "): ", listed(d.changed))
+    isempty(d.gone) || print_wrapped_list(io, string("  missing items (", length(d.gone), ", skipped): "),
+                                          listed_items(d.gone))
+    isempty(d.changed) || print_wrapped_list(io, string("  changed items (", length(d.changed),
+                                                        ", running as the checkout has ",
+                                                        length(d.changed) == 1 ? "it" : "them", "): "),
+                                             listed_items(d.changed))
     if !isempty(d.env_moved)
         println(io, "  moved environments (", length(d.env_moved), "):")
         for m in first(d.env_moved, 20)
@@ -116,9 +216,13 @@ function print_replay_diff(io::IO, d::ReplayDiff)
         length(e.diffs) > 40 && println(io, "    … (", length(e.diffs) - 40, " more)")
     end
     by_path = sort!(unique!(reduce(vcat, (e.by_path for e in d.envs); init = String[])))
-    isempty(by_path) || println(io, "  tracked by path (not compared): ", join(by_path, ", "))
+    isempty(by_path) || print_wrapped_list(io, "  tracked by path (not compared): ", by_path)
     return nothing
 end
+
+listed_items(names) = length(names) > 20 ?
+    String[String[string(x) for x in first(names, 20)]; string("and ", length(names) - 20, " more")] :
+    String[string(x) for x in names]
 
 # What a profile sets, each said briefly; `threads` is what a profile that sets none
 # runs with, which is not said. A preferences file is named from `root`. With `detail`,
@@ -168,18 +272,25 @@ function print_profiles(io::IO, p::Plan)
         same = groups[name]
         if length(same) == 1
             parts = profile_parts(p.profiles[only(same)[2]], threads, p.root)
-            isempty(parts) || println(io, "profile `", name, "`: ", join(parts, " · "))
+            isempty(parts) || print_wrapped_list(io, string("profile `", name, "`: "), parts; sep = " · ")
             continue
         end
         for (_, j, packages) in same
             parts = profile_parts(p.profiles[j], threads, p.root; detail = true)
-            println(io, "profile `", name, "` of ", join(packages, ", "), ": ",
-                    isempty(parts) ? "nothing of its own" : join(parts, " · "))
+            if length(packages) == 1
+                prefix = string("profile `", name, "` of ", packages[1], ": ")
+                isempty(parts) ? println(io, prefix, "nothing of its own") :
+                    print_wrapped_list(io, prefix, parts; sep = " · ")
+            else
+                desc = isempty(parts) ? "nothing of its own" : join(parts, " · ")
+                items = [packages[1:(end - 1)]; string(packages[end], ": ", desc)]
+                print_wrapped_list(io, string("profile `", name, "` of "), items)
+            end
         end
     end
     envs = unique!(String[string(relpath_or_path(prof.environment, p.root), skips_environment(p, j) ? " (skipped)" : "")
                           for (j, prof) in pairs(p.profiles) if !isempty(prof.environment)])
-    isempty(envs) || println(io, length(envs) == 1 ? "env dir: " : "env dirs: ", join(envs, ", "))
+    isempty(envs) || print_wrapped_list(io, length(envs) == 1 ? "env dir: " : "env dirs: ", envs)
     return nothing
 end
 
@@ -425,15 +536,26 @@ Columns are separated as the fields of the run's lines are, and each is as wide 
 the widest thing in it; a column nothing fills is left out. The names are written
 as the run's lines write them (see [`item_names`](@ref)).
 """
+# Fixed columns of the dry-run plan table besides `test item`, up through `at`.
+function plan_table_reserved(p::Plan, solo::Bool, locations::Vector{String}, workers::Vector{String})
+    num_w = max(1, ndigits(nitems(p))) + length(FIELD)
+    worker_w = solo ? 0 : max(length("worker"), maximum(textwidth, workers; init = 0)) + length(FIELD)
+    pkg_w = is_combined(p) ? max(length("package"), maximum(textwidth, p.packages.name; init = 0)) + length(FIELD) : 0
+    loc_w = max(length("at"), maximum(textwidth, locations; init = 0)) + length(FIELD)
+    return length(GUTTER) + num_w + worker_w + pkg_w + loc_w
+end
+
 function print_plan_table(io::IO, p::Plan, order)
     it = p.items
     n = nitems(p)
     solo = single_process(p)
     rows = [i for (_, _, i) in order.items]
     workers = [string("w", s) for (_, s, _) in order.items]
-    shown, column = item_names(p, run_name_width(p))
-    names = [shown[i] for i in rows]
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
+    table_name_w = name_width(p.items.name; columns = explicit_columns(io),
+                              reserved = plan_table_reserved(p, solo, locations, workers))
+    shown, column = item_names(p, table_name_w)
+    names = [shown[i] for i in rows]
     ests = [it.est_s[i] > 0 ? tenths_text(it.est_s[i]) : "" for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     floors = gate_floors(p)
@@ -621,9 +743,9 @@ function line_reserved(p::Plan)
            length(FIELD) + STATE_WIDTH
 end
 
-# The name column of plan `p`'s lines, and of its plan as a dry run prints it, for the
-# terminal the run writes to.
-run_name_width(p::Plan) = name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY), reserved = line_reserved(p))
+# The name column of plan `p`'s lines for the terminal (or `COLUMNS`) the run writes to.
+run_name_width(p::Plan; @nospecialize(io::IO = stdout)) =
+    name_width(p.items.name; columns = explicit_columns(io), reserved = line_reserved(p))
 
 # The wall clock as lines write it, formatted once a second: `strftime` builds a
 # string per call, and there are two lines for every item. Lines come from several
@@ -703,7 +825,7 @@ end
 const LINE_BYTES = 160
 function styled(@nospecialize(f))::String
     buf = IOBuffer(; sizehint = LINE_BYTES)
-    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
+    io = io_context_like(buf, stdout)
     f(io)
     return String(take!(buf))
 end
@@ -841,9 +963,10 @@ function print_packages(io::IO, p::Plan)
     is_combined(p) || return nothing
     counts = zeros(Int, length(p.packages))
     foreach(k -> counts[k] += 1, p.items.package)
-    println(io, "packages: ", join((string(p.packages.name[k], " (", plural(counts[k], "item"),
-                                          p.packages.isolated[k] ? ", isolated" : "", ")") for k in eachindex(counts)), ", "))
-    foreach(note -> println(io, note), p.notes)
+    items = [string(p.packages.name[k], " (", plural(counts[k], "item"),
+                    p.packages.isolated[k] ? ", isolated" : "", ")") for k in eachindex(counts)]
+    print_wrapped_list(io, "packages: ", items)
+    foreach(note -> print_wrapped_note(io, note), p.notes)
     return nothing
 end
 
@@ -855,14 +978,15 @@ processes with what given to them, and the environment it resolved to.
 """
 function print_run_header(run)
     p = run.plan
-    head = sprint(io -> print_work(io, p, length(run.slots); seed = p.cfg.seed))
-    body = sprint() do io
+    head = sprint(io -> print_work(io, p, length(run.slots)))
+    body = styled() do io
+        print_work_details(io, p; seed = p.cfg.seed)
         print_selection(io, p)
         # The project's path in the run-state path's colour, as the log paths are.
         env = something(Base.active_project(), "none")
-        env_buf = IOBuffer(; sizehint = LINE_BYTES)
-        printstyled(IOContext(env_buf, :color => get(stdout, :color, false)::Bool), env; color = :light_black)
-        println(io, "env: ", String(take!(env_buf)))
+        print(io, "env: ")
+        printstyled(io, env; color = :light_black)
+        println(io)
         print_machine(io)
         print_packages(io, p)
         print_startup(io, p.startup)
@@ -1039,9 +1163,14 @@ function conclusion_text(run, ended::Symbol = :finished)
         elseif rs isa RunStateSet
             ks = unique!([p.items.package[i] for i in 1:nitems(p) if failing(i) && rs.files[p.items.package[i]] !== nothing])
             if !isempty(ks)
-                print(io, "run the failing items again: ")
-                printstyled(io, "Runtests.runtestsf()"; bold = true)
-                println(io, " in ", join((rel_slash(p.packages.root[k], p.root) for k in sort!(ks)), ", "))
+                prefix = styled() do pio
+                    print(pio, "run the failing items again: ")
+                    printstyled(pio, "Runtests.runtestsf()"; bold = true)
+                    print(pio, " in ")
+                end
+                prefix_w = textwidth("run the failing items again: Runtests.runtestsf() in ")
+                print_wrapped_list(io, prefix, [rel_slash(p.packages.root[k], p.root) for k in sort!(ks)];
+                                   prefix_width = prefix_w)
             end
         end
     end
@@ -1366,7 +1495,7 @@ function bracket(
         # when there is one, and otherwise the final line of the body.
         tail = isempty(footer) && !isempty(lines) ? pop!(lines) : nothing
         for line in lines
-            printstyled(io, "│ "; color, bold = true)
+            printstyled(io, isempty(line) ? "│" : "│ "; color, bold = true)
             println(io, line)
         end
         printstyled(io, isempty(footer) && tail === nothing ? "└" : "└ "; color, bold = true)

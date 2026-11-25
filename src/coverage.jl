@@ -177,7 +177,7 @@ is_call_signature(s) =
 function print_env_settings(io::IO, cfg)
     vars = [v for v in cfg.env_settings if first(v) != "RUNTESTS_COVERAGE"]
     isempty(vars) && return nothing
-    println(io, "set by the environment: ", join((string(n, "=", v) for (n, v) in vars), " · "))
+    print_wrapped_list(io, "set by the environment: ", (string(n, "=", v) for (n, v) in vars); sep = " · ")
     return nothing
 end
 

@@ -50,7 +50,7 @@ function logs(run = nothing; name = nothing, failed::Bool = false,
     attempt === nothing || attempt >= 1 ||
         throw(ArgumentError("`attempt` must be >= 1, got $(repr(attempt))"))
     buf = IOBuffer()
-    ctx = IOContext(buf, :color => get(io, :color, false))
+    ctx = io_context_like(buf, io)
     logs_impl(ctx, run, name, failed, attempt === nothing ? 0 : Int(attempt))
     write(io, take!(buf))
     return nothing

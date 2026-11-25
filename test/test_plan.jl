@@ -436,9 +436,13 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         p = plan_dir(dir; history = h, workers = 3)
         @test p.gate_limit == [2] && p.gate_warmup == [true] && nslots(p) == 3
         g1 = findfirst(==("g1"), p.items.name)
+        g2 = findfirst(==("g2"), p.items.name)
+        @test p.gate_warmup_item == [Runtests.Private.ItemIdx(g1)]
         # Floor is 10 + (40 - 10) / 2 = 25.0s.
         @test occursin("throttle `g` est 25.0s, 2 at a time (warmup)", P.why_text(p, g1))
-        @test occursin("throttle `g`, 2 at a time (warmup)", P.details_text(p, g1))
+        @test occursin("throttle `g`, 2 at a time (warmup item)", P.details_text(p, g1))
+        @test occursin("throttle `g`, 2 at a time (warmup)", P.details_text(p, g2))
+        @test !occursin("warmup item", P.details_text(p, g2))
         # Dry-run schedule: at t=0 only 1 gated item starts while workers 2 & 3 take plain items;
         # after g1 ends at t=10, two gated items start concurrently at t=10, and the 4th at t=20.
         order = P.run_order(p)
@@ -520,6 +524,55 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         order1 = P.run_order(p1)
         gstarts = sort([t for (t, _, i) in order1.items if p1.items.gate[i] == 1])
         @test gstarts == [0.0, 10.0, 20.0, 30.0]
+
+        # Warmup item follows schedule priority: failed item beats longer passed items,
+        # even across different pools; `[order] first` beats failed items.
+        dir2 = make_pkg("GateWarmupPriority",
+            "test/a_test.jl" => declared("g_long", "g_mid"; opts = "throttle=:g") * declared("p1", "p2"),
+            "test/b_test.jl" => declared("g_fail"; opts = "throttle=:g profile=:bounds") * declared("b1"; opts = "profile=:bounds"),
+            "test/TestItems.toml" => "[throttle]\ng = { limit = 2, warmup = true }\n" *
+                                     "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+        h_fail = History(
+            Dict("g_long" => 30.0, "g_mid" => 20.0, "g_fail" => 10.0, "p1" => 10.0, "p2" => 10.0, "b1" => 10.0),
+            Dict("g_fail" => 0);
+            known = Set(["g_long", "g_mid", "g_fail", "p1", "p2", "b1"]),
+        )
+        pf = plan_dir(dir2; history = h_fail, workers = 3)
+        @test pf.items.name[pf.gate_warmup_item[1]] == "g_fail"
+        of = P.run_order(pf)
+        sf(n) = only(t for (t, _, i) in of.items if pf.items.name[i] == n)
+        @test sf("g_fail") == 0.0
+        @test sf("g_long") >= 10.0 && sf("g_mid") >= 10.0
+
+        # `[order] first` takes priority over the failed item as the warmup item.
+        write(joinpath(dir2, "test", "TestItems.toml"),
+              "[throttle]\ng = { limit = 2, warmup = true }\n" *
+              "[order]\nfirst = [\"g_mid\"]\n" *
+              "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
+        pp = plan_dir(dir2; history = h_fail, workers = 3)
+        @test pp.items.name[pp.gate_warmup_item[1]] == "g_mid"
+        op = P.run_order(pp)
+        sp(n) = only(t for (t, _, i) in op.items if pp.items.name[i] == n)
+        @test sp("g_mid") == 0.0
+        @test sp("g_fail") >= 20.0 && sp("g_long") >= 20.0
+
+        # Even when gated items land in the body (`IN_FILE_ORDER`, split across worker
+        # stretches), the earliest one warms up first rather than a later stretch stealing it.
+        dir3 = make_pkg("GateWarmupBody",
+            "test/a_test.jl" => declared("a1") * declared("g1"; opts = "throttle=:g"),
+            "test/b_test.jl" => declared("g2", "g3"; opts = "throttle=:g"),
+            "test/c_test.jl" => declared("c1", "c2"),
+            "test/TestItems.toml" => "[throttle]\ng = { limit = 2, warmup = true }\n")
+        h_body = History(
+            Dict("a1" => 1.0, "g1" => 1.0, "g2" => 1.0, "g3" => 1.0, "c1" => 1.0, "c2" => 1.0),
+            Dict{String, Int}();
+            known = Set(["a1", "g1", "g2", "g3", "c1", "c2"]),
+        )
+        pb = plan_dir(dir3; history = h_body, workers = 3)
+        @test pb.items.name[pb.gate_warmup_item[1]] == "g1"
+        ob = P.run_order(pb)
+        sb(n) = only(t for (t, _, i) in ob.items if pb.items.name[i] == n)
+        @test sb("g2") >= sb("g1") + 1.0 && sb("g3") >= sb("g1") + 1.0
     end
 
     @testset "pools start in order of estimated completion, an item no run timed at the typical duration" begin

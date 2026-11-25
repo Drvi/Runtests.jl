@@ -66,6 +66,7 @@ mutable struct Queues
     const gate::Vector{Int32}        # per item: its gate, 0 for none
     const gate_limit::Vector{Int32}  # per gate: how many of its items run at once
     const gate_warming::Vector{Bool} # per gate: true while waiting for the first non-skipped item to finish
+    const gate_warmup_item::Vector{ItemIdx}  # per gate: designated warmup item while warming (0 if any may warm up)
     const gate_running::Vector{Int32}    # per gate: how many of its items are handed out and not ended
     const set_aside::Vector{Vector{ItemIdx}}  # per pool: items passed while their gate was full, in order
     # Per pool: `gate_ends` when its set-aside items were last found all held back. Only
@@ -103,7 +104,9 @@ Queues(lock::ReentrantLock, room::Threads.Condition, p::Plan) = Queues(
     copy(p.slot_pool), copy(p.pending), Int32[], falses(nitems(p)),
     [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
     p.items.est_s, typical_estimate(p.items.est_s),
-    [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, copy(p.gate_warmup), zeros(Int32, length(p.gate_limit)),
+    [PoolStats() for _ in p.pools], p.cold, p.items.gate, p.gate_limit, copy(p.gate_warmup),
+    isempty(p.replay_slots) ? copy(p.gate_warmup_item) : zeros(ItemIdx, length(p.gate_limit)),
+    zeros(Int32, length(p.gate_limit)),
     [ItemIdx[] for _ in p.pools], fill(-1, length(p.pools)), 0,
     p.replay_slots, ones(Int, length(p.replay_slots)), pool_of_items(p),
     false, false
@@ -117,7 +120,17 @@ end
 Claim(kind::Symbol) = Claim(kind, ItemIdx(0), Int32(0))
 
 gate_effective_limit(q::Queues, g::Integer) = q.gate_warming[g] ? Int32(1) : q.gate_limit[g]
-gate_full(q::Queues, i::Integer) = (g = q.gate[i]; g != 0 && q.gate_running[g] >= gate_effective_limit(q, g))
+
+function gate_full(q::Queues, i::Integer)
+    g = q.gate[i]
+    g == 0 && return false
+    if q.gate_warming[g]
+        w = q.gate_warmup_item[g]
+        (w != 0 && w != i) && return true
+        return q.gate_running[g] >= Int32(1)
+    end
+    return q.gate_running[g] >= q.gate_limit[g]
+end
 
 # Item `i`, handed out. Every item is handed out exactly once; a second time is a
 # scheduling bug, stopped here rather than run twice.
@@ -303,7 +316,13 @@ function item_ended!(q::Queues, i::ItemIdx; warmed::Bool = true)
     g == 0 && return nothing
     @lock q.lock begin
         q.gate_running[g] -= Int32(1)
-        warmed && (q.gate_warming[g] = false)
+        if warmed
+            q.gate_warming[g] = false
+            q.gate_warmup_item[g] = ItemIdx(0)
+        elseif q.gate_warmup_item[g] == i
+            # Designated warmup item was skipped: let the next gated item warm up alone.
+            q.gate_warmup_item[g] = ItemIdx(0)
+        end
         q.gate_ends += 1
         notify(q.room)
     end

@@ -374,6 +374,28 @@ end
 
 const EXPANDER_FILE = joinpath(@__DIR__, "expander.jl")
 
+# Precompile the active test environment in parallel before launching the single
+# expander process, which would otherwise compile stale dependencies serially on
+# `using` (hiding progress and counting against `init_timeout_s`). Warm environments
+# return immediately with no output. Non-interrupt failures are not fatal here: if a
+# template actually imports a broken package, the expander surfaces the error with the
+# template's file and line.
+function precompile_template_env(project::Union{Nothing, String}, paths::Vector{String})
+    project === nothing && return nothing
+    try
+        in_worker_environment(project, paths) do
+            Base.Precompilation.precompilepkgs(; io = stdout, ignore_loaded = true,
+                                               warn_loaded = false, strict = false)
+        end
+    catch e
+        is_interrupt(e) && rethrow()
+        println(stdout, label_prefix(),
+                "precompilation of the test environment did not finish cleanly; continuing to expand templates")
+        flush(stdout)
+    end
+    return nothing
+end
+
 """
     expand_templates(target, templates) -> Union{String, Vector{Dict{String,Any}}}
 
@@ -400,8 +422,10 @@ function expand_templates(target, templates::Vector{String})
                 # The process's own `TOML` is a standard library, which a load path such
                 # as `Pkg.test` gives a package's tests leaves out.
                 paths = "@stdlib" in LOAD_PATH ? LOAD_PATH : [LOAD_PATH; "@stdlib"]
+                active = Base.active_project()
+                precompile_template_env(active, paths)
                 env = ["JULIA_LOAD_PATH" => join(paths, PATHSEP)]
-                Base.active_project() === nothing || push!(env, "JULIA_PROJECT" => Base.active_project())
+                active === nothing || push!(env, "JULIA_PROJECT" => active)
                 # Without colour, whatever this process's own: what it says goes to a
                 # file, and from there into the report.
                 cmd = `$(Base.julia_cmd()) --startup-file=no --history-file=no --color=no

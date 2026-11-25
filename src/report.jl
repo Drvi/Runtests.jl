@@ -222,9 +222,19 @@ function run_order(p::Plan)
         filter!(((t, _),) -> t > free[s], gated)
         claim = @lock q.lock claim_now!(q, s)
         if claim.kind === :wait
-            # It waits for the first of the gates' items to end.
-            isempty(gated) && error("Runtests internal error: a worker waits for a gate that runs nothing")
-            t = minimum(first, gated)
+            # Wait for the first running gate item to end, or if a warming gate's
+            # warmup item is queued behind non-gated work on another worker, wait for
+            # the earliest other busy worker to finish and claim it.
+            t = if !isempty(gated)
+                minimum(first, gated)
+            else
+                next_t = Inf
+                for k in 1:nslots(p)
+                    (!done[k] && free[k] > free[s] && free[k] < next_t) && (next_t = free[k])
+                end
+                isfinite(next_t) || error("Runtests internal error: a worker waits for a gate that runs nothing")
+                next_t
+            end
             waited[s] += t - free[s]
             free[s] = t
             continue
@@ -251,8 +261,9 @@ function tenths_text(s::Real)
     return string(div(tenths, 10), ".", rem(tenths, 10), "s")
 end
 
-throttle_text(limit::Integer, warmup::Bool) =
-    warmup ? string(limit, " at a time (warmup)") : string(limit, " at a time")
+throttle_text(limit::Integer, warmup::Bool, is_warmup_item::Bool = false) =
+    !warmup ? string(limit, " at a time") :
+    is_warmup_item ? string(limit, " at a time (warmup item)") : string(limit, " at a time (warmup)")
 
 """
     why_text(p, u, floors = gate_floors(p)) -> String
@@ -308,7 +319,8 @@ function details_text(p::Plan, i::Integer)
     it = p.items
     parts = String[]
     g = it.gate[i]
-    g == 0 || push!(parts, string("throttle `", it.throttle[i], "`, ", throttle_text(p.gate_limit[g], p.gate_warmup[g])))
+    g == 0 || push!(parts, string("throttle `", it.throttle[i], "`, ",
+                                  throttle_text(p.gate_limit[g], p.gate_warmup[g], p.gate_warmup_item[g] == i)))
     # A sandbox is the reason it goes early, unless something else put it there.
     it.exclusive[i] && it.why[i] !== SANDBOXED && push!(parts, "sandbox")
     prof = p.profiles[it.profile[i]]

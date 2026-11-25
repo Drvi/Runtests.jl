@@ -192,6 +192,7 @@ struct Plan
     pending::Vector{Int32}                   # pools with no slot yet, in pickup order
     gate_limit::Vector{Int32}                # per gate (`Items`): how many of its items run at once
     gate_warmup::Vector{Bool}                # per gate: whether one non-skipped item runs alone first
+    gate_warmup_item::Vector{ItemIdx}        # per gate: highest-priority item chosen to warm up first (0 if none)
     cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
@@ -214,13 +215,13 @@ with_replay(p::Plan, replay::Union{Nothing, ReplayDiff};
             slot_pool::Vector{Int32} = p.slot_pool,
             slot_items::Vector{UnitRange{ItemIdx}} = p.slot_items) = Plan(
     p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, slot_pool,
-    slot_items, p.pending, p.gate_limit, p.gate_warmup, p.cold, p.setups, p.cfg, p.packages, p.root,
+    slot_items, p.pending, p.gate_limit, p.gate_warmup, p.gate_warmup_item, p.cold, p.setups, p.cfg, p.packages, p.root,
     p.startup, p.selection, p.suite_names, p.notes, replay, replay_slots
 )
 
 with_plan_cfg(p::Plan, cfg::RunConfig) = Plan(
     p.items, p.files, p.relfiles, p.profiles, p.profile_package, p.pools, p.slot_pool,
-    p.slot_items, p.pending, p.gate_limit, p.gate_warmup, p.cold, p.setups, cfg, p.packages, p.root,
+    p.slot_items, p.pending, p.gate_limit, p.gate_warmup, p.gate_warmup_item, p.cold, p.setups, cfg, p.packages, p.root,
     p.startup, p.selection, p.suite_names, p.notes, p.replay, p.replay_slots
 )
 
@@ -941,6 +942,11 @@ function materialize(
     all_setups = Set{Symbol}()
     ps = Vector{Pool}(undef, length(pools))
     slot_pool = Int32[]; slot_items = UnitRange{ItemIdx}[]; pending = Int32[]
+    ng = length(gate_limit)
+    gate_warmup_item = zeros(ItemIdx, ng)
+    # Track best (schedule key, pool index) per warmup gate so the highest-priority item
+    # according to `order_pool!` (e.g. `[order] first`, failed/new/edited, longest) warms up first.
+    best_warmup_key = Vector{Union{Nothing, Tuple{Tuple{Int8, Int, Float64, Float64, Int32, Int32}, Int}}}(nothing, ng)
     pos = 0
     for (k, pool) in enumerate(pools)
         start = pos
@@ -962,7 +968,16 @@ function materialize(
             failfast[pos] = it.failfast
             est[pos] = draft.est_s[u]
             profile[pos] = draft.profile[u]; exclusive[pos] = it.exclusive
-            throttle[pos] = it.throttle; gate[pos] = draft.gate[u]
+            g = draft.gate[u]
+            throttle[pos] = it.throttle; gate[pos] = g
+            if g != 0 && gate_warmup[g]
+                cand = (draft.key[u], k)
+                prev = best_warmup_key[g]
+                if prev === nothing || cand < prev
+                    best_warmup_key[g] = cand
+                    gate_warmup_item[g] = ItemIdx(pos)
+                end
+            end
             cls = draft.key[u][1]
             cls in HEAD_CLASSES && (nhead += 1)
             cls == TAIL_CLASS && (ntail += 1)
@@ -995,7 +1010,7 @@ function materialize(
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
         items, files, relfiles,
-        profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, gate_warmup, cold,
+        profiles, profile_package, ps, slot_pool, slot_items, pending, gate_limit, gate_warmup, gate_warmup_item, cold,
         sort!(collect(all_setups)), cfg, packages, String(root), Startup(), String(selection), suite_names, String[], nothing, Vector{ItemIdx}[]
     )
 end

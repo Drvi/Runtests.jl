@@ -475,23 +475,21 @@ const PLAIN_ITEM = "@testitem \"plain\" begin\n    @test true\nend\n"
     end
 
     @testset "chores precompiles the test environment before expanding templates" begin
-        dep = make_pkg("ExtraTemplateDep")
-        dep_uuid = Base.UUID(TOML.parsefile(joinpath(dep, "Project.toml"))["uuid"])
+        dep_uuid = Base.UUID(rand(UInt128))
         pkg = make_pkg("PrecompTemplates",
+            "deps/ExtraTemplateDep/Project.toml" => "name = \"ExtraTemplateDep\"\nuuid = \"$dep_uuid\"\nversion = \"0.1.0\"\n",
+            "deps/ExtraTemplateDep/src/ExtraTemplateDep.jl" => "module ExtraTemplateDep\nval() = 1\nend\n",
+            "test/Project.toml" => "[deps]\nExtraTemplateDep = \"$dep_uuid\"\n\n[sources]\nExtraTemplateDep = {path = \"../deps/ExtraTemplateDep\"}\n",
             "test/other_test.jl" => PLAIN_ITEM,
-            "test/Project.toml" => "[deps]\nExtraTemplateDep = \"$dep_uuid\"\nTest = \"8dfed614-e22c-5e08-85e1-65c5234f0b40\"\n",
             "test/testtemplates/p_tests_template.jl" => "@testtemplate \"p \$n\" for n in 1:2\n    @test \$n > 0\nend\n")
-        # Resolve `test/Project.toml` against the local `dep` and `pkg` without precompiling.
-        Runtests.Private.with_pkg_isolated("test setup failed: ") do Pkg, _
-            Pkg.activate(joinpath(pkg, "test"); io = devnull)
-            Pkg.develop([Pkg.PackageSpec(path = pkg), Pkg.PackageSpec(path = dep)]; io = devnull)
-        end
         dep_id = Base.PkgId(dep_uuid, "ExtraTemplateDep")
-        check_compiled() = Runtests.Private.in_worker_environment(joinpath(pkg, "test", "Project.toml"), copy(LOAD_PATH)) do
-            Base.isprecompiled(dep_id; ignore_loaded = true)
-        end
-        @test !check_compiled()
         withenv("RUNTESTS_RUNSTATE_DIR" => mktempdir()) do
+            target = Runtests.Private.resolve_target((pkg,))
+            env = Runtests.Private.test_env(target)
+            check_compiled() = Runtests.Private.in_worker_environment(env, copy(LOAD_PATH)) do
+                Base.isprecompiled(dep_id; ignore_loaded = true)
+            end
+            @test !check_compiled()
             ok, out = template_chores(pkg)
             @test ok === true || (println(out); false)
             # `ExtraTemplateDep` is not imported by the template, so it is only compiled

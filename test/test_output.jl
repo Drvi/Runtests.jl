@@ -526,7 +526,8 @@ using Runtests: RuntestsWorkers
         @test all(l -> l == rstrip(l) && !endswith(l, "·"), dlines)
 
         # Inside a bracket, every continuation line and any blank line carries the `│` / `└` gutter.
-        blk = P.bracket(wrapped * "\nnext: ok\n", "[TEST]", "head", "", :default)
+        plain(s) = replace(s, r"\e\[[0-9;]*m" => "")
+        blk = plain(P.bracket(wrapped * "\nnext: ok\n", "[TEST]", "head", "", :default))
         blines = split(chomp(blk), '\n')
         @test startswith(blines[1], "┌ [TEST] head")
         @test all(l -> startswith(l, "│"), blines[2:(end - 1)])
@@ -566,6 +567,7 @@ using Runtests: RuntestsWorkers
                      "    @test true\nend\n"))
         p, _ = Runtests.Private.prepare((dir,); workers = 1, monitor = false)
         narrow = sprint(io -> P.print_plan(IOContext(io, :displaysize => (24, 64)), p))
+        @test !occursin('\e', narrow)   # `print_plan` respects `io`'s `:color => false` even under `--color=yes`
         nlines = split(chomp(narrow), '\n')
         setup_idx = findfirst(l -> occursin("setups: ", l), nlines)
         @test setup_idx !== nothing

@@ -137,7 +137,7 @@ function plan_block(out_io::IO, p::Plan, order)
                 estimated ? "from the recorded durations, an item without one counting as a typical one" :
                     "as if every item took as long, since no durations are recorded yet")
     end
-    return bracket(String(take!(body_buf)), "[TEST]", head, "", :default)
+    return bracket(String(take!(body_buf)), "[TEST]", head, "", :default; io = out_io)
 end
 plan_block(p::Plan, order) = plan_block(stdout, p, order)
 
@@ -1482,26 +1482,27 @@ end
 """
 function bracket(
         body::AbstractString, label::AbstractString, rest::AbstractString,
-        footer::AbstractString, color
+        footer::AbstractString, color; @nospecialize(io::IO = stdout)
     )
     # Coloured like a log record: the gutter and the label carry the colour, what
     # follows is ordinary text, and the location at the bottom is dimmed.
-    return styled() do io
-        printstyled(io, "┌ ", label; color, bold = true)
-        isempty(rest) || print(io, " ", rest)
-        println(io)
-        lines = collect(eachsplit(chomp(body), '\n'))
-        # `└` carries the last thing there is, as a log record's does: the location
-        # when there is one, and otherwise the final line of the body.
-        tail = isempty(footer) && !isempty(lines) ? pop!(lines) : nothing
-        for line in lines
-            printstyled(io, isempty(line) ? "│" : "│ "; color, bold = true)
-            println(io, line)
-        end
-        printstyled(io, isempty(footer) && tail === nothing ? "└" : "└ "; color, bold = true)
-        tail === nothing ? (isempty(footer) || printstyled(io, footer; color = :light_black)) : print(io, tail)
-        println(io)
+    buf = IOBuffer(; sizehint = LINE_BYTES)
+    ctx = io_context_like(buf, io)
+    printstyled(ctx, "┌ ", label; color, bold = true)
+    isempty(rest) || print(ctx, " ", rest)
+    println(ctx)
+    lines = collect(eachsplit(chomp(body), '\n'))
+    # `└` carries the last thing there is, as a log record's does: the location
+    # when there is one, and otherwise the final line of the body.
+    tail = isempty(footer) && !isempty(lines) ? pop!(lines) : nothing
+    for line in lines
+        printstyled(ctx, isempty(line) ? "│" : "│ "; color, bold = true)
+        println(ctx, line)
     end
+    printstyled(ctx, isempty(footer) && tail === nothing ? "└" : "└ "; color, bold = true)
+    tail === nothing ? (isempty(footer) || printstyled(ctx, footer; color = :light_black)) : print(ctx, tail)
+    println(ctx)
+    return String(take!(buf))
 end
 
 """

@@ -465,8 +465,9 @@ function run_for_editor(s::Session, id, p::Plan, target)
         release_process!()
     end
     run === nothing || (s.scratch = run.scratch)
-    emit_run_finished(s.stream, id, run, ended)
     s.stream.run, s.stream.run_id = nothing, nothing
+    s.task = nothing
+    emit_run_finished(s.stream, id, run, ended)
     return nothing
 end
 

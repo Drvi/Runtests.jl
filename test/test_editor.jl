@@ -3,32 +3,63 @@
 
 using Runtests.Private: write_json, read_json, json, list_items, PROTOCOL_VERSION
 
+# Thread-safe line-oriented IO for in-process `serve` tests: `Base.BufferStream`'s
+# `readline`/`copyuntil` reads `s.buffer` without locking `s.cond`, which races
+# with cross-thread `write` from `in_default_pool`.
+struct EventSink <: IO
+    lock::ReentrantLock
+    buf::IOBuffer
+    events::Channel{Any}
+end
+EventSink(events::Channel{Any}) = EventSink(ReentrantLock(), IOBuffer(), events)
+function Base.unsafe_write(io::EventSink, p::Ptr{UInt8}, n::UInt)
+    @lock io.lock begin
+        try
+            unsafe_write(io.buf, p, n)
+            data = take!(io.buf)
+            start = 1
+            for i in eachindex(data)
+                if data[i] == UInt8('\n')
+                    stop = (i > start && data[i - 1] == UInt8('\r')) ? i - 2 : i - 1
+                    put!(io.events, read_json(String(data[start:stop])))
+                    start = i + 1
+                end
+            end
+            start <= length(data) && write(io.buf, @view data[start:end])
+        catch e
+            close(io.events, e)
+            rethrow()
+        end
+    end
+    return n
+end
+Base.flush(::EventSink) = nothing
+Base.close(io::EventSink) = close(io.events)
+
 # A server in this process, over two streams, with its events arriving on a channel.
 struct EditorSession
     input::Base.BufferStream
-    output::Base.BufferStream
+    output::EventSink
     events::Channel{Any}
     task::Task
 end
 
-function open_session(dir; config = nothing)
-    input, output = Base.BufferStream(), Base.BufferStream()
-    task = @async Runtests.serve(dir; config, input, output)
+function open_session(dir; config = nothing, mono::Bool = false)
+    input = Base.BufferStream()
     events = Channel{Any}(Inf)
-    @async begin
-        for line in eachline(output)
-            put!(events, read_json(line))
-        end
-        close(events)
-    end
+    output = EventSink(events)
+    task = @async (mono ? Runtests.serve_mono(dir; input, output) : Runtests.serve(dir; config, input, output))
     return EditorSession(input, output, events, task)
 end
 
 send(s::EditorSession, x) = println(s.input, json(x))
 send(s::EditorSession, x::AbstractString) = println(s.input, x)
 # Bounded: a server that stops answering fails the test rather than holding it.
-function next_event(s::EditorSession; timeout = 120)
-    t = Timer(_ -> close(s.events, ErrorException("no event from the server in $(timeout)s")), timeout)
+function next_event(s::EditorSession; timeout = 120, seen = nothing)
+    t = Timer(timeout) do _
+        extra = seen === nothing ? "" : " (seen: $([get(e, "event", "?") for e in seen]))"
+        close(s.events, ErrorException("no event from the server in $(timeout)s$extra"))
+    end
     try
         return take!(s.events)
     finally
@@ -39,7 +70,7 @@ end
 function events_until(pred, s::EditorSession; timeout = 120)
     seen = Any[]
     while true
-        e = next_event(s; timeout)
+        e = next_event(s; timeout, seen)
         push!(seen, e)
         pred(e) && return seen
     end
@@ -515,11 +546,7 @@ item(name, body = "@test true"; opts = "") = "@testitem \"$name\" $opts begin\n 
             end
             write(joinpath(ws, "Project.toml"), "[workspace]\nprojects = [" * join(repr.(members), ", ") * "]\n")
             with_runstate_dir() do _
-                input, output = Base.BufferStream(), Base.BufferStream()
-                task = @async Runtests.serve_mono(ws; input, output)
-                events = Channel{Any}(Inf)
-                @async (for line in eachline(output); put!(events, read_json(line)); end; close(events))
-                s = EditorSession(input, output, events, task)
+                s = open_session(ws; mono = true)
                 hello = next_event(s; timeout = 300)
                 @test hello["protocol"] == PROTOCOL_VERSION && hello["combined"] == true
                 @test [p["name"] for p in hello["packages"]] == ["A", "B"]

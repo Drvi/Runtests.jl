@@ -1573,7 +1573,7 @@ end
 # Distinguish a blocked/deadlocked worker from one actively computing at the moment of
 # a timeout. Samples CPU time over a short window before `inspect!` signals the worker;
 # returns "" if the OS does not expose per-process CPU time.
-const TIMEOUT_CPU_PROBE_S = 0.15
+const TIMEOUT_CPU_PROBE_S = 0.25
 
 function worker_activity_note(pid::Integer; probe_s::Float64 = TIMEOUT_CPU_PROBE_S)
     c0 = Platform.tree_cpu_time(pid)

@@ -305,16 +305,20 @@ end
                 sleep(60)
                 @test true
             end
-            @testitem "busy spin" timeout=2 begin
-                x = 0.0
-                while true
-                    x += sin(x + 1.0)
+            @testitem "busy spin" timeout=3 begin
+                # Compiled local loop: spins at 100% CPU with zero allocations/GC pauses
+                # even on a loaded 3-core CI runner.
+                spin() = let x = 0.0
+                    while true
+                        x += sin(x + 1.0)
+                    end
+                    x
                 end
-                @test x > 0
+                @test spin() > 0
             end
             """)
         (states, _, _), out = with_fast_inspect() do
-            capture_run(() -> run_states(dir; workers = 2, logs = :issues, monitor = false))
+            capture_run(() -> run_states(dir; workers = 1, logs = :issues, monitor = false))
         end
         @test states["blocked sleep"] === TIMEDOUT
         @test states["busy spin"] === TIMEDOUT

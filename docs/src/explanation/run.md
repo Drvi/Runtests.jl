@@ -70,7 +70,7 @@ A worker starts with the flags, threads, environment variables and preferences o
 
 Each item runs in a new module. A worker can reuse compiled code from earlier items, though new method specializations or invalidations can still require compilation. Items on one worker also share the state of the process. [Write test items](@ref writing) explains what this means for a test.
 
-A worker that goes past the timeout of its item is stopped. Before signalling it for stack traces and killing it, Runtests samples the worker process tree's CPU usage briefly (~0.15 s) and reports whether the worker was idle (`likely blocked or deadlocked`, `< 5%` CPU) or active (`<N>% CPU; slow or looping`). The item is recorded as timed out, and the run starts a new worker in its place.
+A worker that goes past the timeout of its item is stopped. Before signalling it for stack traces and killing it, Runtests samples the worker process tree's CPU usage briefly (~0.25 s) and reports whether the worker was idle (`likely blocked or deadlocked`, `< 5%` CPU) or active (`<N>% CPU; slow or looping`). The item is recorded as timed out, and the run starts a new worker in its place.
 
 ## [Memory](@id memory)
 

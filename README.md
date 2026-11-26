@@ -5,8 +5,7 @@
 
 Runtests.jl runs the tests of a Julia package as independent test items, on several worker processes. It plans each run from the runs before it -- failing, edited and new items go first, then long items, and the other items run in file order, so that a worker reuses the code that it compiled. Each run keeps a record. With it, you can run the failures again with the seeds that they failed with, or replay the whole run.
 
-Runtests requires Julia 1.11 or later. Runtests is a vibe-coded package: its code was
-written with an AI coding assistant. It is available under the MIT license.
+Runtests requires Julia 1.11 or later and is available under the MIT license. It was developed with agentic coding under the author's design supervision, and verified with an extensive test suite across Linux, macOS, and Windows as well as on real package suites.
 
 The [documentation](https://drvi.github.io/Runtests.jl/dev/) has a tutorial, guides, explanations and a reference.
 

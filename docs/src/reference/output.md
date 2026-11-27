@@ -65,7 +65,8 @@ Inside the block, `items` gives the count of selected items and files, `seed` gi
 
 - `selection` (for example `tags = [:fast]`, or a group with its tags and what asked for it),
 - `packages` (in a combined run), `profile` details, and `env dir(s)`,
-- `set by the environment` (environment variables overriding defaults or `TestItems.toml`),
+- `set by the environment` (environment variables overriding defaults or configuration files),
+- `set by test/LocalTestItems.toml` (effective local overrides from gitignored `LocalTestItems.toml` files),
 - `coverage` (and its source),
 - `env` (path of the test environment), `machine` (CPU threads and available/total memory, respecting container limits), and `startup` (`scan`, `plan`, and `setup` timings).
 

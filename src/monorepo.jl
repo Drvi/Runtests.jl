@@ -1285,7 +1285,9 @@ two UUIDs, and two packages that set one preference differently. Then it does ea
 package's chores in turn, and the run states of checkouts that are gone
 once. After them, the report says which items can share a worker: the groups of
 profiles whose workers are alike, a profile that the workspace shares
-(`monorepo_default`) with the packages that use it, and each package's own. It checks
+(`monorepo_default`) with the packages that use it, and each package's own. When the
+workspace root's `test/TestItems.toml` declares `[monorepo.order]`, it validates those
+entries across all participating packages and lists any items missing from `exact`. It checks
 each `using` and `import` written in the items, setups and profiles of each package
 that shares workers against that package's own test environment, once the setups'
 packages have their new dependencies. And it says of a package whose

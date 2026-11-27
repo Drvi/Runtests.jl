@@ -102,6 +102,12 @@ isempty(group) || group == "all" ? Runtests.runtestsd() : Runtests.runtests(; gr
 Without the `GROUP` variable, `runtests.jl` is `using Runtests; Runtests.runtestsd()`.
 It runs `default`, or the group that `RUNTESTS_GROUP` names on CI.
 
+When CI splits a suite across multiple jobs (`GROUP` slices or separate paths), prefer
+`Runtests.runtests_dispatch(key, variants; exclude = ...)` (or `runtests_dispatch_mono`
+for a workspace) in `test/runtests.jl` so Runtests verifies before starting workers that
+every test item is covered by at least one slice (and optionally that slices do not
+overlap).
+
 Some groups build an environment of their own: `Pkg.activate` and `Pkg.develop` in
 `runtests.jl`, often for downstream or QA tests. The converter leaves the files of a
 directory with a `Project.toml` of its own where they are, and lists them. To run

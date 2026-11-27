@@ -56,4 +56,7 @@ Ways to split:
 
 After splitting, check parity again and compare repeated runs under matching
 conditions. Keep a split when measured run time improves or when the user wants
-failures to name their case.
+failures to name their case. When a user wants complete manual control over dispatch
+order (overriding history-based scheduling), `[order] exact` in `test/TestItems.toml`
+(or `[monorepo.order]` in the workspace root for combined runs) enforces a strict order
+and checks that every item is listed.

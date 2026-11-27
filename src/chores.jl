@@ -7,9 +7,11 @@
 
 Look after a package's suite: do what needs no person, then say what does.
 
-- test items and `test/TestItems.toml`: everything a run would refuse to start on,
-  such as a syntax error, a name declared twice, a setting it does not accept, an
-  `[order]` entry naming no item or an unknown profile. Reported, never changed.
+- test items, `test/TestItems.toml`, and (when present) `test/LocalTestItems.toml`:
+  everything a run would refuse to start on, such as a syntax error, a name declared
+  twice, a setting it does not accept, an `[order]` entry naming no item, items missing
+  from `[order] exact`, `[monorepo]` outside a workspace root, or an unknown profile.
+  Reported, never changed.
 - config files given as `config`, a path or several, relative to the current
   directory: each checked as a run given it would check it, as well as
   `test/TestItems.toml`.

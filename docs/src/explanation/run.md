@@ -38,7 +38,7 @@ A failure of another module does not stop the run. An example is the extension o
 
 Before it starts the items, the coordinator plans the order in which it gives them out. It uses the durations that earlier runs recorded. A run gives out the items in this order:
 
-1. the items that `[order] first` names,
+1. the items that `[order] first` (or `[order] exact`) names,
 2. sandboxed items, while each process is still new,
 3. items that need a new result:
    - items whose latest result is a failure,
@@ -47,6 +47,8 @@ Before it starts the items, the coordinator plans the order in which it gives th
 4. items that set the length of the run: at least 3 seconds, and more than a quarter of the share of work of one worker,
 5. all other items, in file order,
 6. the items that `[order] last` names.
+
+When `[order] exact` is set, every item in the suite is placed in step 1 in exact listed order (disabling steps 2–6 within each pool). In a combined workspace run, `[monorepo.order]` in the workspace root's `test/TestItems.toml` overrides per-package `[order]` and interleaves pinned items across packages in listed order.
 
 Within step 3, new or edited items and failures from the newest run come first, then older failures from newest to oldest. Within each urgency level, the long items go first and the rest follow file order. An item of a throttle counts as long as its throttle's floor wall time (its work divided by its limit, or with `warmup = true`, its longest item plus the remaining work divided by its limit), when that is longer. Thus the items of such a throttle start early, and together.
 

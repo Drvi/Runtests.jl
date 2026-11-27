@@ -23,7 +23,8 @@ test/
   sub/parser_tests.jl
   testsetups/MySetup.jl     code that items share: a module, loaded with `using MySetup`
   testtemplates/            loops that generate items
-  TestItems.toml            optional: workers, threads, timeouts, groups, profiles
+  TestItems.toml            optional: workers, threads, timeouts, groups, order, profiles
+  LocalTestItems.toml       optional, gitignored: per-machine [run] and [throttle] overrides
   testconfigs/              optional: profile `worker_init.jl` and `test_end.jl` files
   testfixtures/             input for the tests (packages, projects, data), never read as tests
   .scripts/                 Julia files that tests run or read, out of Runtests' way

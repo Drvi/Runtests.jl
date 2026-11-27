@@ -1,4 +1,5 @@
-# Run configuration: `runtests` keywords over `test/TestItems.toml` over defaults.
+# Run configuration: `runtests` keywords over `RUNTESTS_*` over `test/LocalTestItems.toml`
+# over `test/TestItems.toml` over defaults.
 #
 # Nothing here is evaluated: `init` and `test_end` are only parsed, so a syntax
 # error surfaces before any worker starts.
@@ -532,10 +533,12 @@ end
 """
     read_config(testdir; config = nothing, kwargs...) -> RunConfig
 
-Merge `test/TestItems.toml` with explicit keyword arguments. An unknown key is an
-error, not a no-op: a misspelled option would otherwise be ignored in silence.
-`config` names another file to read in its place, relative to the current
-directory; named, it has to exist, where `test/TestItems.toml` may be absent. For a
+Merge `test/TestItems.toml`, optional `test/LocalTestItems.toml` (`[run]` and `[throttle]`
+overrides when `config === nothing`), `RUNTESTS_*` environment variables, and explicit
+keyword arguments. An unknown key is an error, not a no-op: a misspelled option would
+otherwise be ignored in silence. `config` names another file to read in place of
+`test/TestItems.toml`, relative to the current directory; named, it has to exist (where
+`test/TestItems.toml` may be absent) and does not load `test/LocalTestItems.toml`. For a
 workspace member, profiles marked `monorepo_default = true` in the workspace root's
 file are also available; unrelated root profiles and run settings do not apply.
 """

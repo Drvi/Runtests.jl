@@ -150,12 +150,17 @@ so a slow function slows the run. A call that throws is reported, the function i
 called again, and the tests carry on.
 
 The execution and output settings can also be set under `[run]` in
-`test/TestItems.toml`, which also declares profiles, groups and forced ordering, and
-by a variable `RUNTESTS_<SETTING>` (`RUNTESTS_WORKERS`, say), which the run's header
-names: a keyword wins over the variable, and the variable over the file. `config` names another file to read in its place, relative to the
-current directory, which has to exist; nothing but this keyword makes a run read
-one. A mistake in the call, such as a misspelled keyword or a value out of range, is
-an `ArgumentError`; one in a file or an environment variable is a `ConfigError`.
+`test/TestItems.toml` (which also declares profiles, groups, throttles, and forced
+ordering with `first`/`last` or `exact`), overridden locally for `[run]` and `[throttle]`
+by a gitignored `test/LocalTestItems.toml`, and overridden by a variable
+`RUNTESTS_<SETTING>` (`RUNTESTS_WORKERS`, say): a keyword wins over the variable, the
+variable over `test/LocalTestItems.toml`, and `test/LocalTestItems.toml` over
+`test/TestItems.toml`. The run's header names every variable and local override that
+took effect. `config` names another file to read in place of `test/TestItems.toml`,
+relative to the current directory, which has to exist and does not load
+`test/LocalTestItems.toml`. A mistake in the call, such as a misspelled keyword or a
+value out of range, is an `ArgumentError`; one in a file or an environment variable is a
+`ConfigError`.
 """
 function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, on_event = nothing, kwargs...)
     on_event === nothing || hasmethod(on_event, Tuple{TestItemEvent}) || throw(ArgumentError(
@@ -453,7 +458,10 @@ their profiles start workers the same way. Julia 1.12 or later.
 The packages are the workspace's members that have a suite, or those that
 `packages` of a `[monorepo]` table in `test/TestItems.toml` of the workspace root
 lists, by directory or glob, and `isolated` there lists those that run in their own
-test environment, on workers of their own. The keyword `packages` narrows them by
+test environment, on workers of their own. `[monorepo.order]` there may set cross-package
+`first`/`last` or `exact` ordering as `["Package", "item name"]` pairs (overriding
+per-package `[order]` in combined runs). `[monorepo]` is only allowed in the workspace
+root's `test/TestItems.toml`. The keyword `packages` narrows them by
 name or directory relative to the workspace root. Each package's test project has
 to be a member of the workspace. With no `paths`, use the workspace of the active
 project, or of `test/runtests.jl` under `Pkg.test`. A path selects within the
@@ -463,10 +471,11 @@ all of it.
 Each package's items run under its own profiles, setups and settings. The settings
 of the run itself (`workers`, `memory_threshold`, `logs`, `verbose`, `monitor`,
 `monitor_interval`, `full_stacktraces`, `full_names`, `testset_name`, `coverage`,
-`seed`, `failfast`) come from the call, the `RUNTESTS_` variables and `[run]` of the
-workspace root's `test/TestItems.toml`; one in another package's `[run]` has no
-effect. The others are each package's own: a keyword or a
-variable gives every package its value. `name`, `tags` and `group` select within each
+`seed`, `failfast`) come from the call, the `RUNTESTS_` variables, the workspace root's
+`test/LocalTestItems.toml`, and `[run]` of the workspace root's `test/TestItems.toml`;
+one in another package's `[run]` has no effect. The others are each package's own
+(including its `test/LocalTestItems.toml` overrides for package keys and `[throttle]`):
+a keyword or a variable gives every package its value. `name`, `tags` and `group` select within each
 package; a group or tag only some packages have is no error. `config` is an error.
 `worker_init` and `test_end` are the code of the default profile of every package, and
 the `init` runs in the workspace root, as the `init` of a profile that the workspace

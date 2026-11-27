@@ -1201,4 +1201,75 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                      history = History(secs, Dict{String, Int}(); cold = ColdCost(0.5, 0.0, 10.0), compile_s = comps))
         @test nslots(p_mod) == 2
     end
+
+    @testset "[order] exact enforces complete dispatch order and reports missing items" begin
+        dir = make_pkg(
+            "ExactOrder",
+            "test/a_test.jl" => """
+            @testitem "alpha" tags=[:fast] begin
+                @test true
+            end
+            @testitem "beta" sandbox=true begin
+                @test true
+            end
+            @testitem "gamma" tags=[:fast] begin
+                @test true
+            end
+            """,
+        )
+        cfg_path = joinpath(dir, "test", "TestItems.toml")
+        prep(; kw...) = Runtests.Private.prepare((dir,); announce = false, kw...)
+        err_msg(f) = (err = try; f(); nothing; catch e; e; end; err isa ConfigError ? sprint(showerror, err) : "")
+
+        # Complete exact order puts every item in `pool.head` in exact listed order, beating sandbox/failures/duration.
+        write(cfg_path, "[order]\nexact = [\"gamma\", \"alpha\", \"beta\"]\n")
+        p, _ = prep(; workers = 2)
+        @test [p.items.name[i] for i in p.pools[1].head] == ["gamma", "alpha", "beta"]
+        @test isempty(p.pools[1].body) && isempty(p.pools[1].tail)
+
+        # Even with history marking "alpha" as newly failing and "beta" as long, exact order stands.
+        raw = Runtests.Private.scan(Runtests.Private.walk_test_dir(joinpath(dir, "test")).tests,
+                                    Runtests.Private.Filter(), Dict{Symbol, String}())
+        hist = History(Dict("beta" => 100.0), Dict("alpha" => 0))
+        p_hist = plan(raw, Runtests.Private.read_config(joinpath(dir, "test"); workers = 2); history = hist)
+        @test [p_hist.items.name[i] for i in p_hist.pools[1].head] == ["gamma", "alpha", "beta"]
+
+        # Filtered run validates against the whole suite and orders the selected subset accordingly.
+        p_fast, _ = prep(; workers = 2, tags = :fast)
+        @test [p_fast.items.name[i] for i in p_fast.pools[1].head] == ["gamma", "alpha"]
+
+        # Missing items fail loudly in runs and in `chores`, naming every omitted item.
+        write(cfg_path, "[order]\nexact = [\"gamma\"]\n")
+        msg = err_msg(() -> prep())
+        @test occursin("missing 2 test items", msg) && occursin("\"alpha\"", msg) && occursin("\"beta\"", msg)
+        msg_fast = err_msg(() -> prep(; tags = :fast))
+        @test occursin("missing 2 test items", msg_fast) && occursin("\"alpha\"", msg_fast) && occursin("\"beta\"", msg_fast)
+        ok, chores_out = capture_run(() -> Runtests.chores(dir; dry_run = true))
+        @test !ok && occursin("missing 2 test items", chores_out) &&
+              occursin("\"alpha\"", chores_out) && occursin("\"beta\"", chores_out)
+
+        # Empty `exact = []` fails as missing every item.
+        write(cfg_path, "[order]\nexact = []\n")
+        msg_empty = err_msg(() -> prep())
+        @test occursin("missing 3 test items", msg_empty)
+
+        # Duplicates, unknown items, and combining `exact` with `first`/`last` all fail loudly.
+        write(cfg_path, "[order]\nexact = [\"alpha\", \"beta\", \"gamma\", \"alpha\"]\n")
+        @test occursin("duplicate", err_msg(() -> prep()))
+
+        write(cfg_path, "[order]\nexact = [\"alpha\", \"beta\", \"gammo\"]\n")
+        msg_typo = err_msg(() -> prep())
+        @test occursin("do not exist", msg_typo) && occursin("gamma", msg_typo)
+
+        write(cfg_path, "[order]\nexact = [\"alpha\", \"beta\", \"gamma\"]\nfirst = [\"alpha\"]\n")
+        @test occursin("cannot be combined", err_msg(() -> prep()))
+
+        write(cfg_path, "[order]\nexact = [\"alpha\", \"beta\", \"gamma\"]\nlast = [\"gamma\"]\n")
+        @test occursin("cannot be combined", err_msg(() -> prep()))
+
+        # `[monorepo]` is rejected outside a workspace.
+        write(cfg_path, "[monorepo]\npackages = [\".\"]\n")
+        msg_mono = err_msg(() -> prep())
+        @test occursin("workspace root", msg_mono)
+    end
 end

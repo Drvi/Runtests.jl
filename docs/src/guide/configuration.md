@@ -8,10 +8,11 @@ A run takes each configuration value from the first of these sources that sets i
 
 1. a keyword of `runtests`, for example `runtests(workers = 4)`,
 2. an environment variable `RUNTESTS_<KEY>`, for example `RUNTESTS_WORKERS=4`,
-3. the `[run]` table of `test/TestItems.toml`,
-4. the default.
+3. `test/LocalTestItems.toml` (gitignored per-machine overrides for `[run]` and `[throttle]`),
+4. the `[run]` table of `test/TestItems.toml`,
+5. the default.
 
-The header of the run names each environment variable that set a value. CI can thus set the configuration of a job without a change to the project.
+The header of the run names each environment variable and each `test/LocalTestItems.toml` key that set a value. CI can thus set the configuration of a job without a change to the project, and a developer can tune a local machine without editing `test/TestItems.toml`.
 
 In a [combined workspace run](@ref monorepos), run-wide values come from the workspace root's file. Each package's other settings come from its own file, with any [shared profile defaults](@ref shared-profiles) from the workspace root. A keyword or environment variable still takes precedence for every package.
 
@@ -60,7 +61,23 @@ julia_args = ["--check-bounds=yes"]   # for items with `profile = :bounds`
 
 `[throttle]` limits how many items of a throttle run at the same time. [Throttles](@ref throttles) tells you how to use it. `[profiles]` declares worker profiles. [Profiles and environments](profiles.md) tells you how to use them.
 
-To read another file in place of `test/TestItems.toml`, give the `config` keyword: `runtests(config = "ci.toml")`. The path is relative to the current directory, and the file must exist. Only the `config` keyword selects another file. No environment variable and no file next to it do that.
+To read another file in place of `test/TestItems.toml`, give the `config` keyword: `runtests(config = "ci.toml")`. The path is relative to the current directory, and the file must exist. An explicit `config` file does not load `test/LocalTestItems.toml`.
+
+## Local overrides (`test/LocalTestItems.toml`)
+
+Add `test/LocalTestItems.toml` to `.gitignore` to keep per-machine overrides (such as higher `workers` on a large workstation, `failfast = true`, or a higher `[throttle]` limit) out of version control:
+
+```toml
+# test/LocalTestItems.toml (gitignored)
+[run]
+workers = 8
+failfast = true
+
+[throttle]
+gpu = 4
+```
+
+`test/LocalTestItems.toml` overlays `[run]` and `[throttle]` on top of `test/TestItems.toml` (and works even when `test/TestItems.toml` does not exist). Suite definitions (`[profiles]`, `[groups]`, `[order]`, `[monorepo]`) are not allowed there and belong in `test/TestItems.toml`. Every override that takes effect is printed in the run header so local runs never diverge silently. In a combined workspace run, the workspace root's `test/LocalTestItems.toml` supplies run-wide keys and each package's `test/LocalTestItems.toml` supplies its package keys and `[throttle]`.
 
 ## Workers and threads
 
@@ -131,7 +148,20 @@ first = ["smoke test"]
 last  = ["large simulation"]
 ```
 
-On a run of the whole suite, `[order]` must name items that exist. A run of a part of the suite accepts names of items outside the selection.
+To enforce a strict, complete dispatch order for every item in the suite (disabling history/failure/edit/file-order heuristics within each pool), use `exact` in place of `first` and `last`:
+
+```toml
+[order]
+exact = [
+    "smoke test",
+    "heavy solver",
+    "fast unit",
+]
+```
+
+`exact` cannot be combined with `first` or `last`, must not contain duplicates, and must list every test item in the suite — runs and `Runtests.chores()` fail loudly and list any missing items. On a filtered run, `[order]` still validates against the whole suite and orders the selected items accordingly.
+
+In a monorepo, the workspace root's `test/TestItems.toml` can declare `[monorepo.order]` with `["Package", "item name"]` pairs (`first`, `last`, or `exact`) to control cross-package order in combined runs. `[monorepo]` (including `[monorepo.order]`) is only allowed in the workspace root's `test/TestItems.toml`.
 
 !!! warning
     Do not use `[order]` to keep items from running at the same time. Items of different profiles or environments, and sandboxed items, can run at the same time. Give such items the same `throttle`. Items with the same `throttle` and the limit 1 run one at a time, in any order and on any worker. Nothing makes an item use the state that another item left.

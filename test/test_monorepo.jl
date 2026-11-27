@@ -1718,5 +1718,95 @@ root_rel(ps) = [slashed(relpath(r, ps.workspace)) for r in ps.root]
             err = try Runtests.runtests_mono(joinpath(ws, "does_not_exist"); workers = -1); nothing catch e; e end
             @test err isa ArgumentError && occursin("workers", sprint(showerror, err))
         end
+
+        @testset "[monorepo] is root-only and [monorepo.order] enforces cross-package order" begin
+            ws = e2e_workspace(
+                "A" => ["test/a_test.jl" => item_text("a1") * item_text("a2")],
+                "B" => ["test/b_test.jl" => item_text("b1") * item_text("b2")],
+            )
+            root_cfg = joinpath(ws, "test", "TestItems.toml")
+            a_cfg = joinpath(ws, "lib", "A", "test", "TestItems.toml")
+            err_msg(f) = (err = try; f(); nothing; catch e; e; end; err isa ConfigError ? sprint(showerror, err) : "")
+
+            # `[monorepo]` (including `[monorepo.order]`) is forbidden in a member package.
+            write(a_cfg, "[monorepo]\nisolated = [\"lib/A\"]\n")
+            @test occursin("workspace root", err_msg(() -> mono(ws)))
+            @test occursin("workspace root", err_msg(() -> Runtests.Private.prepare((joinpath(ws, "lib", "A"),); announce = false)))
+            write(a_cfg, "[monorepo.order]\nexact = [[\"A\", \"a1\"], [\"A\", \"a2\"]]\n")
+            @test occursin("workspace root", err_msg(() -> mono(ws)))
+            rm(a_cfg)
+
+            # `[monorepo.order] exact` interleaves items across packages in exact listed order.
+            write(root_cfg, """
+            [monorepo.order]
+            exact = [
+                ["B", "b2"],
+                ["A", "a1"],
+                ["B", "b1"],
+                ["A", "a2"],
+            ]
+            """)
+            r = mono(ws; workers = 2)
+            p = r.plan
+            ordered = [(p.packages.name[p.items.package[i]], p.items.name[i]) for i in p.pools[1].head]
+            @test ordered == [("B", "b2"), ("A", "a1"), ("B", "b1"), ("A", "a2")]
+            @test isempty(p.pools[1].body) && isempty(p.pools[1].tail)
+
+            # Narrowed `packages = ["A"]` still validates `[monorepo.order]` without rejecting B and keeps A's order.
+            r_a = mono(ws; workers = 2, packages = ["A"])
+            pa = r_a.plan
+            @test [(pa.packages.name[pa.items.package[i]], pa.items.name[i]) for i in pa.pools[1].head] ==
+                  [("A", "a1"), ("A", "a2")]
+
+            # `chores_mono` reports valid exact monorepo order.
+            ok, chores_ok = capture_run(() -> Runtests.chores_mono(ws; dry_run = true))
+            @test ok && occursin("monorepo order: exact (4 test items), valid", chores_ok)
+
+            # Missing items in `[monorepo.order] exact` fail loudly in `runtests_mono`, `chores_mono`, and `list_items_mono`.
+            write(root_cfg, """
+            [monorepo.order]
+            exact = [
+                ["B", "b2"],
+                ["A", "a1"],
+            ]
+            """)
+            msg_miss = err_msg(() -> mono(ws))
+            @test occursin("missing 2 test items", msg_miss) &&
+                  occursin("[\"A\", \"a2\"]", msg_miss) && occursin("[\"B\", \"b1\"]", msg_miss)
+            ok_bad, chores_bad = capture_run(() -> Runtests.chores_mono(ws; dry_run = true))
+            @test !ok_bad && occursin("missing 2 test items", chores_bad) &&
+                  occursin("[\"A\", \"a2\"]", chores_bad) && occursin("[\"B\", \"b1\"]", chores_bad)
+            listing = Runtests.Private.list_items_mono(ws)
+            @test any(e -> occursin("missing 2 test items", e.message), listing.errors)
+
+            # Duplicate, unknown package, unknown item, bad pair shape, and mixing exact with first/last fail loudly.
+            write(root_cfg, "[monorepo.order]\nexact = [[\"A\", \"a1\"], [\"A\", \"a1\"], [\"A\", \"a2\"], [\"B\", \"b1\"], [\"B\", \"b2\"]]\n")
+            @test occursin("duplicate", err_msg(() -> mono(ws)))
+
+            write(root_cfg, "[monorepo.order]\nfirst = [[\"C\", \"c1\"]]\n")
+            @test occursin("do not take part", err_msg(() -> mono(ws)))
+
+            write(root_cfg, "[monorepo.order]\nfirst = [[\"A\", \"a9\"]]\n")
+            @test occursin("do not exist", err_msg(() -> mono(ws)))
+
+            write(root_cfg, "[monorepo.order]\nfirst = [\"a1\"]\n")
+            @test occursin("pairs", err_msg(() -> mono(ws)))
+
+            write(root_cfg, "[monorepo.order]\nexact = [[\"A\", \"a1\"]]\nlast = [[\"B\", \"b2\"]]\n")
+            @test occursin("cannot be combined", err_msg(() -> mono(ws)))
+
+            # Partial `[monorepo.order]` with `first` and `last` interleaves pinned items across packages.
+            write(root_cfg, """
+            [monorepo.order]
+            first = [["B", "b2"], ["A", "a2"]]
+            last = [["A", "a1"]]
+            """)
+            r_part = mono(ws; workers = 2)
+            pp = r_part.plan
+            @test [(pp.packages.name[pp.items.package[i]], pp.items.name[i]) for i in pp.pools[1].head[1:2]] ==
+                  [("B", "b2"), ("A", "a2")]
+            @test [(pp.packages.name[pp.items.package[i]], pp.items.name[i]) for i in pp.pools[1].tail] ==
+                  [("A", "a1")]
+        end
     end
 end

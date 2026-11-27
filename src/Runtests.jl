@@ -422,7 +422,11 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord, root::AbstractStrin
             profiles[name] = with_profile(prof; julia_args = [julia_flags; prof.julia_args])
         end
     end
-    return with_config(cfg; profiles, julia_flags, order_first, order_last, throttle,
+    local_settings = haskey(rs.meta, "throttle") ?
+        Pair{String, String}[p for p in cfg.local_settings if !startswith(first(p), "throttle.")] : cfg.local_settings
+    local_config_file = isempty(local_settings) ? "" : cfg.local_config_file
+    return with_config(cfg; profiles, julia_flags, order_first, order_last, order_exact = false, throttle,
+                       local_config_file, local_settings,
                        replayed_manifest = recorded_manifest(rs), replayed_from = rs.path)
 end
 

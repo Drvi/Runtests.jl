@@ -50,7 +50,16 @@ By default, every package of the workspace that has a suite takes part. A table 
 [monorepo]
 packages = ["lib/*", "."]
 isolated = ["lib/Legacy"]
+
+[monorepo.order]
+exact = [
+    ["A", "heavy solver"],
+    ["B", "integration"],
+    ["A", "unit"],
+]
 ```
+
+`[monorepo]` (including `[monorepo.order]`) is only allowed in the workspace root's `test/TestItems.toml`; putting it in a member package or outside a workspace is an error. `[monorepo.order]` takes `first`, `last`, or `exact` (mutually exclusive with `first`/`last`), with `["Package", "item name"]` pairs, and overrides per-package `[order]` in combined runs so items from different packages can be interleaved in exact dispatch order. With `exact`, `runtests_mono()` and `chores_mono()` check that every item of every participating package is listed and report any missing ones.
 
 `packages` lists the packages that take part, as directories or globs relative to the root. `isolated` lists packages that run in their own test environment, on workers of their own. If two workspace members have the same package name, use `packages` to leave one out. A combined run cannot identify both by name. This is also true for two names that differ only in case, because `RUNTESTS_ARTIFACT_DIR` gets a directory for each package, and macOS and Windows do not tell such directory names apart. The header of the run lists the packages, names the isolated ones, and says why each other package of the workspace does not take part.
 

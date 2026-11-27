@@ -519,6 +519,150 @@ end
         @test auto_workers("2", 100; peak_worker_mb = -50.0, total_memory = mem_16g) ==
               auto_workers("2", 100; total_memory = mem_16g)
     end
+
+    @testset "LocalTestItems.toml overlays [run] and [throttle]" begin
+        with_clean_runtests_env() do
+            # LocalTestItems.toml overrides [run] and merges [throttle] over TestItems.toml.
+            with_toml("""
+            [run]
+            workers = 2
+            timeout = 300
+            retries = 1
+            failfast = false
+
+            [throttle]
+            db = 1
+            gpu = 1
+
+            [groups]
+            fast = "fast"
+            """) do dir
+                write(joinpath(dir, "LocalTestItems.toml"), """
+                [run]
+                workers = 6
+                failfast = true
+                verbose = true
+
+                [throttle]
+                gpu = { limit = 4, warmup = true }
+                """)
+                cfg = read_config(dir)
+                @test cfg.workers == 6
+                @test cfg.timeout_s == 300        # kept from TestItems.toml
+                @test cfg.retries == 1            # kept from TestItems.toml
+                @test cfg.failfast && cfg.verbose
+                @test haskey(cfg.groups, "fast")  # kept from TestItems.toml
+                @test cfg.throttle[:db] == Runtests.Private.Throttle(1, false)
+                @test cfg.throttle[:gpu] == Runtests.Private.Throttle(4, true)
+                @test endswith(cfg.local_config_file, "LocalTestItems.toml")
+                @test ("workers" => "6") in cfg.local_settings
+                @test ("failfast" => "true") in cfg.local_settings
+                @test ("verbose" => "true") in cfg.local_settings
+                @test ("throttle.gpu" => "{limit=4, warmup=true}") in cfg.local_settings
+                @test !any(((k, _),) -> k == "timeout", cfg.local_settings)
+
+                # Precedence: keyword > RUNTESTS_<KEY> > LocalTestItems.toml > TestItems.toml.
+                withenv("RUNTESTS_WORKERS" => "3") do
+                    c_env = read_config(dir)
+                    @test c_env.workers == 3
+                    @test !any(((k, _),) -> k == "workers", c_env.local_settings)
+                    @test ("failfast" => "true") in c_env.local_settings
+                    c_kw = read_config(dir; workers = 5, failfast = false)
+                    @test c_kw.workers == 5 && !c_kw.failfast
+                    @test !any(((k, _),) -> k in ("workers", "failfast"), c_kw.local_settings)
+                end
+
+                # Explicit `config = ...` replaces TestItems.toml and ignores LocalTestItems.toml.
+                other = joinpath(mktempdir(), "ci.toml")
+                write(other, "[run]\nworkers = 2\n")
+                c_other = read_config(dir; config = other)
+                @test c_other.workers == 2 && !c_other.failfast && isempty(c_other.local_config_file)
+            end
+
+            # Works without a committed TestItems.toml, and attributes coverage to LocalTestItems.toml.
+            solo = mktempdir()
+            write(joinpath(solo, "LocalTestItems.toml"), "[run]\nworkers = 4\ncoverage = true\n")
+            cfg = read_config(solo)
+            @test cfg.workers == 4 && cfg.coverage
+            @test endswith(cfg.coverage_source, "LocalTestItems.toml")
+            @test endswith(cfg.local_config_file, "LocalTestItems.toml")
+
+            # Suite-only sections and bad keys/values in LocalTestItems.toml fail loudly naming it.
+            for (bad, needle) in (
+                "[profiles.fast]\njulia_args = [\"--threads=1\"]\n" => "allow only [run] and [throttle]",
+                "[groups]\nfast = \"fast\"\n" => "allow only [run] and [throttle]",
+                "[order]\nfirst = [\"a\"]\n" => "allow only [run] and [throttle]",
+                "[monorepo]\npackages = [\".\"]\n" => "allow only [run] and [throttle]",
+                "[bogus]\nx = 1\n" => "unknown key `bogus`",
+                "[run]\nskip_environment = [\"test/qa\"]\n" => "LocalTestItems.toml",
+                "[run]\nworkers = -1\n" => "LocalTestItems.toml",
+                "[throttle]\ndb = 0\n" => "LocalTestItems.toml",
+            )
+                d = mktempdir()
+                write(joinpath(d, "LocalTestItems.toml"), bad)
+                err = try; read_config(d); nothing; catch e; e; end
+                @test err isa ConfigError
+                msg = sprint(showerror, err)
+                @test occursin("LocalTestItems.toml", msg) && occursin(needle, msg)
+            end
+
+            # Dry-run plan block and `chores` announce effective LocalTestItems.toml overrides.
+            pkg = make_pkg(
+                "LocalPkg",
+                "test/a_test.jl" => "@testitem \"ok\" begin\n    @test true\nend\n",
+                "test/TestItems.toml" => "[run]\nworkers = 2\n",
+                "test/LocalTestItems.toml" => "[run]\nworkers = 4\nfailfast = true\n",
+            )
+            _, out = capture_run(() -> Runtests.runtests(pkg; dry_run = true))
+            @test occursin("set by", out) && occursin("LocalTestItems.toml", out)
+            @test occursin("workers=4", out) && occursin("failfast=true", out)
+            # A keyword overriding all local keys leaves no `set by ... LocalTestItems.toml` line.
+            _, out_kw = capture_run(() -> Runtests.runtests(pkg; dry_run = true, workers = 1, failfast = false))
+            @test !occursin("LocalTestItems.toml", out_kw)
+            # `chores` validates LocalTestItems.toml (with and without TestItems.toml).
+            _, chores_out = capture_run(() -> Runtests.chores(pkg; dry_run = true))
+            @test occursin("LocalTestItems.toml", chores_out) && occursin("valid", chores_out)
+            rm(joinpath(pkg, "test", "TestItems.toml"))
+            _, chores_solo = capture_run(() -> Runtests.chores(pkg; dry_run = true))
+            @test occursin("LocalTestItems.toml", chores_solo) && occursin("valid", chores_solo)
+
+            # Monorepo: root LocalTestItems.toml supplies run-wide keys; member supplies package keys and [throttle].
+            if VERSION >= v"1.12"
+                ws = realpath(mktempdir())
+                a = joinpath(ws, "lib", "A")
+                uuid = next_uuid()
+                mkpath(joinpath(a, "src")); mkpath(joinpath(a, "test")); mkpath(joinpath(ws, "test"))
+                write(joinpath(ws, "Project.toml"), "[workspace]\nprojects = [\"lib/A\", \"lib/A/test\"]\n")
+                write(joinpath(a, "Project.toml"), "name = \"A\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n")
+                write(joinpath(a, "src", "A.jl"), "module A\nend\n")
+                write(joinpath(a, "test", "Project.toml"), """
+                    [deps]
+                    A = "$uuid"
+                    Runtests = "632efd68-cd41-4e05-bd25-b86dc2150078"
+                    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+                    [sources]
+                    A = {path = ".."}
+                    Runtests = {path = $(repr(pkgdir(Runtests)))}
+                    """)
+                write(joinpath(a, "test", "a_test.jl"), "@testitem \"one\" throttle=:db begin\n    @test true\nend\n")
+                write(joinpath(ws, "test", "TestItems.toml"), "[run]\nworkers = 2\n")
+                write(joinpath(ws, "test", "LocalTestItems.toml"), "[run]\nworkers = 4\nfailfast = true\n")
+                write(joinpath(a, "test", "LocalTestItems.toml"), "[run]\ntimeout = 123\nworkers = 9\n[throttle]\ndb = 2\n")
+                r = Runtests.Private.prepare_mono((ws,); announce = false)
+                @test r.plan.cfg.workers == 4 && r.plan.cfg.failfast
+                @test r.plan.packages.cfg[1].timeout_s == 123
+                @test r.plan.packages.cfg[1].throttle[:db] == Runtests.Private.Throttle(2, false)
+                # Non-root member's run-wide `workers = 9` was dropped and not reported as active.
+                @test !any(((k, _),) -> k == "workers", r.plan.packages.cfg[1].local_settings)
+                @test ("timeout" => "123") in r.plan.packages.cfg[1].local_settings
+                @test ("throttle.db" => "2") in r.plan.packages.cfg[1].local_settings
+                _, mono_out = capture_run(() -> Runtests.runtests_mono(ws; dry_run = true))
+                @test occursin("test/LocalTestItems.toml", mono_out) && occursin("workers=4", mono_out)
+                @test occursin("lib/A/test/LocalTestItems.toml", mono_out) && occursin("timeout=123", mono_out)
+            end
+        end
+    end
 end
 
 @testset "the default logging style" begin

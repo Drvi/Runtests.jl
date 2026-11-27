@@ -60,9 +60,13 @@ function under_run_settings(own::RunConfig, run::RunConfig)::RunConfig
         groups = own.groups,
         order_first = own.order_first,
         order_last = own.order_last,
+        order_exact = own.order_exact,
+        mono_order = NO_MONO_ORDER,
         throttle = own.throttle,
         item_seeds = own.item_seeds,
         config_file = own.config_file,
+        local_config_file = own.local_config_file,
+        local_settings = own.local_settings,
     )
 end
 
@@ -347,7 +351,8 @@ function replayed_configs(run::RunConfig, cfgs::Vector{RunConfig}, records::Vect
     end
     flags = split(get(given.meta, "julia_flags", ""), ' '; keepempty = false)
     julia_flags = isempty(flags) || flags == code_flags() ? String[] : String.(flags)
-    return with_config(run; julia_flags, replayed_manifest = recorded_manifest(given),
+    return with_config(run; julia_flags, mono_order = NO_MONO_ORDER,
+                       replayed_manifest = recorded_manifest(given),
                        replayed_from = given.path), replayed
 end
 

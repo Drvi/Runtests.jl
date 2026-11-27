@@ -8,8 +8,9 @@ With `runtests`, each value comes from the first source that sets it, in this or
 
 1. the keyword of `runtests`,
 2. the environment variable `RUNTESTS_<KEY>`,
-3. the `[run]` table of `test/TestItems.toml`, or of the file that `config` names,
-4. the default.
+3. the `[run]` table of `test/LocalTestItems.toml` (when `config` is not given),
+4. the `[run]` table of `test/TestItems.toml`, or of the file that `config` names,
+5. the default.
 
 An unknown key, an unknown keyword or an incorrect value is an error before any item runs. A mistake in the call is an `ArgumentError`. A mistake in a file or in an environment variable is a `Runtests.ConfigError`.
 
@@ -77,6 +78,8 @@ These keywords of `runtests` are not configuration keys and cannot go in `[run]`
 
 `test/TestItems.toml` is optional. It has these tables, and no others. A file that `config` names has the same form. Only a combined run reads `[monorepo]`, from the file of the workspace root.
 
+When `config` is not given, an optional sibling `test/LocalTestItems.toml` (intended to be gitignored) may override keys of `[run]` and `[throttle]` on top of `test/TestItems.toml`. Any other top-level table (`[profiles]`, `[groups]`, `[order]`, `[monorepo]`) in `test/LocalTestItems.toml` is a `ConfigError`. Effective overrides from `test/LocalTestItems.toml` are printed in the run header and dry-run plan.
+
 ### [run]
 
 The `[run]` table takes the [run keys](@ref run-keys) above. Write each key as the keyword, for example `timeout = 600`. Write a symbol as a string, for example `logs = "quiet"`.
@@ -87,8 +90,9 @@ The `[run]` table takes the [run keys](@ref run-keys) above. Write each key as t
 |:----|:------|
 | `first` | A vector of exact item names. These items start first. |
 | `last` | A vector of exact item names. These items start last. |
+| `exact` | A vector of exact item names giving the complete dispatch order of the entire suite. Mutually exclusive with `first` and `last`. Must list every test item in the suite once (with no duplicates); runs and `chores` fail and list any missing items. |
 
-Every name in `[order]` must exist in the suite (even on a filtered run, which accepts existing items outside the current selection). Replays ignore recorded `[order]` names that have since been renamed or deleted.
+Every name in `[order]` must exist in the suite (even on a filtered run, which accepts existing items outside the current selection). Replays ignore recorded `[order]` names that have since been renamed or deleted, and do not enforce `exact` completeness against the current checkout.
 
 ### [groups]
 
@@ -109,14 +113,15 @@ For example, three packages each have one item with `throttle = :db`, and the ru
 
 ### [monorepo]
 
-The workspace root's file can have this table. It selects the packages of a [combined run](@ref monorepos).
+Only allowed in the workspace root's `test/TestItems.toml` (putting `[monorepo]` in a member package's `test/TestItems.toml` or outside a workspace is a `ConfigError`). It configures a [combined run](@ref monorepos):
 
 | Key | Default | Value |
 |:----|:--------|:------|
 | `packages` | every package of the workspace with a suite | A vector of directories or globs, relative to the workspace root, for example `["lib/*", "."]`. The packages that take part. |
 | `isolated` | `[]` | A vector of directories or globs. These packages run in their own test environment, on workers of their own. |
+| `order` | none | Optional `[monorepo.order]` subtable with `first`, `last`, or `exact` (mutually exclusive with `first`/`last`), where each entry is a `["Package", "item name"]` pair. Overrides per-package `[order]` in combined runs and interleaves items across packages in exact listed order. With `exact`, every item of every participating package must be listed once; `runtests_mono` and `chores_mono` fail and list any missing items. |
 
-An entry that matches no package, or names a directory outside the workspace, is an error.
+An entry in `packages` or `isolated` that matches no package, or names a directory outside the workspace, is an error.
 
 ### [Profiles](@id profile-keys)
 

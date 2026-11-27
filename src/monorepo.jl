@@ -24,7 +24,6 @@ Base.length(ps::Participants) = length(ps.name)
 
 # Workspaces came with Julia 1.12.
 const MONOREPO_JULIA = v"1.12"
-const MONOREPO_KEYS = (:packages, :isolated)
 
 """
     find_participants(dir = nothing; packages = nothing) -> Participants
@@ -813,10 +812,22 @@ function prepare_mono_impl(paths::Vector{Any}, @nospecialize(packages), @nospeci
                                [c.profiles for c in cfgs], setups[kept])
     isempty(problems) || throw(ScanFailure(problems))
     full = name === nothing && tags === nothing && all(g -> g === nothing, gsel) && isempty(chosen) && item_keys === nothing
+    mono_order_packages = if has_mono_order(run_cfg.mono_order)
+        all_ps = packages === nothing ? ps : find_participants_impl(workspace, nothing)
+        Set{String}(all_ps.name)
+    else
+        nothing
+    end
+    mono_scanned_suites = if mono_order_packages !== nothing
+        Dict{String, Set{String}}(ps.name[k] => Set{String}(suite_names[k]) for k in 1:n if scanned[k])
+    else
+        nothing
+    end
     p = plan(items, run_cfg; histories, root = workspace,
              packages = Packages(ps.name[kept], ps.uuid[kept], ps.root[kept], ps.isolated[kept], cfgs,
                                  [sort(suite_names[k]) for k in kept]),
-             selection = full ? "" : description, suite_names = all_names)
+             selection = full ? "" : description, suite_names = all_names,
+             mono_order_packages, mono_scanned_suites)
     if replayed !== nothing
         p = apply_recorded_replay!(p, replayed.given, kept_records, kwargs;
                                    gone, changed, env_moved, dry_run)
@@ -1031,6 +1042,19 @@ function mono_configs(ps::Participants, configs, kept::Vector{Int}, nunits::Int,
                                             coverage = rss_coverage, memory_threshold = mt)
     end
     run = build_config_impl(root_path, root_toml, 0.0, 1.0, nunits, "", dirname(root_path), shared, nothing, run_kwargs)
+    # If root `LocalTestItems.toml` explicitly set `workers = "auto"`, `run_kwargs[:workers]`
+    # above shadowed it during `build_config_impl`; record it so the header reports it.
+    if !haskey(kwargs, :workers) && isempty(strip(get(ENV, "RUNTESTS_WORKERS", ""))) &&
+       !any(((k, _),) -> k == "workers", run.local_settings)
+        root_local = joinpath(dirname(root_path), LOCAL_CONFIG_FILE)
+        if isfile(root_local)
+            lr = table_section(root_local, parse_local_toml(root_local), "run")
+            if haskey(lr, "workers")
+                ls = Pair{String, String}["workers" => string(lr["workers"]); run.local_settings]
+                run = with_config(run; local_config_file = root_local, local_settings = ls)
+            end
+        end
+    end
     package_kwargs = Dict{Symbol, Any}(k => v for (k, v) in pairs(kwargs) if k in PACKAGE_KEYS)
     cfgs = RunConfig[]
     for (n, k) in enumerate(kept)
@@ -1314,6 +1338,7 @@ function chores_mono(root::Union{Nothing, AbstractString} = nothing; dry_run::Bo
             pkg_profiles = [try read_profiles(p, t; shared) catch e; e isa ConfigError || rethrow(); Dict{Symbol, Profile}() end
                             for (p, t) in pkg_configs]
             print_worker_groups(io, ps, root_path, root_toml, shared, pkg_walks, pkg_configs, pkg_profiles)
+            problems += check_monorepo_order!(io, ps, root_path, root_toml, pkg_walks)
             imports = written_import_problems(ps; walks = pkg_walks, profiles = pkg_profiles)
             if isempty(imports)
                 println(io, "imports: each loads in the test environment of its own package")
@@ -1411,6 +1436,49 @@ function print_worker_groups(io::IO, ps::Participants, root_path::String, root_t
     isempty(environments) ||
         print_wrapped_list(io, "  items in an environment directory, with workers of their own: ", environments)
     return nothing
+end
+
+# Validate `[monorepo.order]` in the workspace root's `test/TestItems.toml` against every
+# participating package's test items, listing any missing items when `exact` is set.
+function check_monorepo_order!(io::IO, ps::Participants, root_path::String, root_toml::Dict{String, Any}, pkg_walks)
+    mo = try
+        read_monorepo_order(root_path, root_toml)
+    catch e
+        e isa ConfigError || rethrow()
+        return print_problem(io, "monorepo order", e.msg)
+    end
+    has_mono_order(mo) || return 0
+    scanned_suites = Dict{String, Set{String}}()
+    unreadable = String[]
+    for k in eachindex(ps.root)
+        testdir = joinpath(ps.root[k], "test")
+        w = pkg_walks[k]
+        s = setup_modules(testdir)
+        snames = String[]
+        try
+            scan(w.tests, Filter(), s; strays = w.strays, templates = w.templates,
+                 expansions = false, suite_names = snames, environments = w.environments)
+            scanned_suites[ps.name[k]] = Set{String}(snames)
+        catch e
+            (e isa ScanFailure || e isa ConfigError) || rethrow()
+            push!(unreadable, ps.name[k])
+        end
+    end
+    try
+        validate_mono_order(mo, relpath_or_path(root_path, ps.workspace), Set{String}(ps.name), scanned_suites)
+    catch e
+        e isa ConfigError || rethrow()
+        return print_problem(io, "monorepo order", e.msg)
+    end
+    if !isempty(unreadable)
+        println(io, "monorepo order: checked for readable packages; skipped ", join(unreadable, ", "),
+                " until their test items read")
+    elseif mo.exact
+        println(io, "monorepo order: exact (", plural(length(mo.first), "test item"), "), valid")
+    else
+        println(io, "monorepo order: valid")
+    end
+    return 0
 end
 
 # Whether two profiles declare the same runtime settings.

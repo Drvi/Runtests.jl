@@ -163,13 +163,15 @@ names and written imports that a package's own test environment cannot load.
 """
 function list_items_mono(root::AbstractString)
     ps = find_participants(root)
-    shared = shared_profiles(config_toml(joinpath(ps.workspace, "test"), nothing)..., ps.workspace)
+    root_path, root_toml = config_toml(joinpath(ps.workspace, "test"), nothing)
+    shared = shared_profiles(root_path, root_toml, ps.workspace)
     items, errors, failed = Any[], Any[], Any[]
     uses = Tuple{Int, Symbol}[]   # each package and throttle an item of it names
     raw_items, owner = RawItem[], Int[]
     setups = Vector{Dict{Symbol, String}}(undef, length(ps.root))
     profiles = Vector{Dict{Symbol, Profile}}(undef, length(ps.root))
     limits = Vector{Dict{Symbol, Throttle}}(undef, length(ps.root))
+    scanned_suites = Dict{String, Set{String}}()
     for (k, r) in enumerate(ps.root)
         scanned = scan_package_listing(r; shared)
         l = scanned.listing
@@ -180,6 +182,14 @@ function list_items_mono(root::AbstractString)
         limits[k] = scanned.cfg === nothing ? Dict{Symbol, Throttle}() : scanned.cfg.throttle
         append!(raw_items, scanned.raw_items)
         append!(owner, fill(k, length(scanned.raw_items)))
+        isempty(scanned.raw_items) || (scanned_suites[ps.name[k]] = Set{String}(it.name for it in scanned.raw_items))
+    end
+    try
+        mo = read_monorepo_order(root_path, root_toml)
+        validate_mono_order(mo, relpath_or_path(root_path, ps.workspace), Set{String}(ps.name), scanned_suites)
+    catch e
+        e isa ConfigError || rethrow()
+        push!(errors, (; file = root_path, line = 0, message = e.msg))
     end
     try
         check_setup_names(ps, setups)

@@ -87,6 +87,16 @@ Throttle(limit::Integer) = Throttle(Int(limit), false)
 const DEFAULT_THROTTLE = Throttle(1, false)
 const THROTTLE_KEYS = (:limit, :warmup)
 
+# Cross-package ordering from `[monorepo.order]` in the workspace root's `test/TestItems.toml`.
+# When `exact` is true, `first` holds the complete list of `(package, item_name)` pairs and `last` is empty.
+struct MonoOrder
+    first::Vector{Tuple{String, String}}
+    last::Vector{Tuple{String, String}}
+    exact::Bool
+end
+const NO_MONO_ORDER = MonoOrder(Tuple{String, String}[], Tuple{String, String}[], false)
+has_mono_order(o::MonoOrder) = o.exact || !isempty(o.first) || !isempty(o.last)
+
 Base.@kwdef struct RunConfig
     workers::Int
     threads::String = DEFAULT_THREADS
@@ -117,6 +127,10 @@ Base.@kwdef struct RunConfig
     # The `RUNTESTS_<KEY>` variables that set something, with their values, for the
     # run to say: nothing else in the project shows them.
     env_settings::Vector{Pair{String, String}} = Pair{String, String}[]
+    # The gitignored `test/LocalTestItems.toml` that overrode something, and which
+    # keys took effect from it, for the run to say.
+    local_config_file::String = ""
+    local_settings::Vector{Pair{String, String}} = Pair{String, String}[]
     monitor::Bool = true
     monitor_interval::Int = 30
     profiles::Dict{Symbol, Profile} = Dict(DEFAULT_PROFILE => Profile(DEFAULT_PROFILE))
@@ -124,6 +138,10 @@ Base.@kwdef struct RunConfig
     groups::Dict{String, TagExpr} = Dict{String, TagExpr}()
     order_first::Vector{String} = String[]
     order_last::Vector{String} = String[]
+    # When true, `order_first` came from `[order] exact` and must name every item in the suite once.
+    order_exact::Bool = false
+    # Cross-package order from `[monorepo.order]` in the workspace root's `test/TestItems.toml`.
+    mono_order::MonoOrder = NO_MONO_ORDER
     # The `[throttle]` table: how many items of each throttle may run at once, and
     # whether one item warms up alone first. A throttle it does not name has limit 1
     # and `warmup = false`.
@@ -173,12 +191,16 @@ with_config(
     coverage::Bool = cfg.coverage,
     coverage_source::String = cfg.coverage_source,
     env_settings::Vector{Pair{String, String}} = cfg.env_settings,
+    local_config_file::String = cfg.local_config_file,
+    local_settings::Vector{Pair{String, String}} = cfg.local_settings,
     monitor::Bool = cfg.monitor,
     monitor_interval::Int = cfg.monitor_interval,
     profiles::Dict{Symbol, Profile} = cfg.profiles,
     groups::Dict{String, TagExpr} = cfg.groups,
     order_first::Vector{String} = cfg.order_first,
     order_last::Vector{String} = cfg.order_last,
+    order_exact::Bool = cfg.order_exact,
+    mono_order::MonoOrder = cfg.mono_order,
     throttle::Dict{Symbol, Throttle} = cfg.throttle,
     seed::UInt64 = cfg.seed,
     item_seeds::Dict{String, UInt64} = cfg.item_seeds,
@@ -190,8 +212,8 @@ with_config(
 ) = RunConfig(
     workers, threads, timeout_s, init_timeout_s, test_end_timeout_s, artifacts_timeout_s,
     retries, failfast, item_failfast, logs, verbose, memory_threshold, full_stacktraces,
-    full_names, testset_name, coverage, coverage_source, env_settings, monitor,
-    monitor_interval, profiles, groups, order_first, order_last, throttle, seed,
+    full_names, testset_name, coverage, coverage_source, env_settings, local_config_file, local_settings, monitor,
+    monitor_interval, profiles, groups, order_first, order_last, order_exact, mono_order, throttle, seed,
     item_seeds, julia_flags, replayed_manifest, replayed_from, config_file, skip_environment,
 )
 
@@ -432,9 +454,12 @@ function validate_run_kwargs(opts::Dict{Symbol, Any}; mono::Bool = false, allow_
     return nothing
 end
 
-const ORDER_KEYS = (:first, :last)
+const ORDER_KEYS = (:first, :last, :exact)
+const MONOREPO_KEYS = (:packages, :isolated, :order)
 const PROFILE_KEYS = (:julia_args, :env, :preferences, :monorepo_default, :precompile)
 const TOP_KEYS = (:run, :order, :profiles, :groups, :throttle, :monorepo)
+const LOCAL_CONFIG_FILE = "LocalTestItems.toml"
+const LOCAL_TOP_KEYS = (:run, :throttle)
 const LOG_MODES = (:eager, :batched, :issues, :quiet)
 
 ### Names that become paths ###################################################
@@ -542,22 +567,79 @@ function read_config_impl(testdir::String, peak_worker_mb::Float64, rss_coverage
 end
 
 """
+    parse_local_toml(local_path) -> Dict{String, Any}
+
+Parse and validate a gitignored `test/LocalTestItems.toml` override file. Only `[run]`
+and `[throttle]` are allowed; suite definitions (`[profiles]`, `[groups]`, `[order]`,
+`[monorepo]`) belong in `test/TestItems.toml`.
+"""
+function parse_local_toml(local_path::AbstractString)::Dict{String, Any}
+    toml = try
+        TOML.parsefile(local_path)
+    catch e
+        throw(ConfigError("could not parse $(relpath_or_path(local_path)): $(sprint(showerror, e))"))
+    end
+    ks = String[k isa String ? k : string(k)::String for k in keys(toml)]
+    for k in sort!(ks)
+        sym = Symbol(k)
+        sym in LOCAL_TOP_KEYS && continue
+        if sym in TOP_KEYS
+            throw(ConfigError(
+                "`$k` of $(relpath_or_path(local_path)): local overrides allow only [run] and [throttle]; " *
+                    "define [$k] in TestItems.toml"
+            ))
+        end
+        throw(ConfigError(
+            "unknown key `$k` of $(relpath_or_path(local_path)); allowed here: $(join(LOCAL_TOP_KEYS, ", "))"
+        ))
+    end
+    local_run = section(local_path, toml, "run", RUN_KEYS)
+    haskey(local_run, "skip_environment") && throw(ConfigError(
+        "`skip_environment` of [run] in $(relpath_or_path(local_path)): a configuration file skips no environment. " *
+            "Give the names to the call, as `test/runtests.jl` can compute them from `VERSION`, or in " *
+            "`RUNTESTS_SKIP_ENVIRONMENT`"
+    ))
+    read_throttle(local_path, toml)
+    return toml
+end
+
+format_local_throttle(t::Throttle) = t.warmup ? "{limit=$(t.limit), warmup=true}" : string(t.limit)
+
+"""
     config_toml(testdir, config) -> (path, toml)
 
 The config file a run reads, `test/TestItems.toml` or the file `config` names, and
-what it holds: an empty table for a `TestItems.toml` that is not there.
+what it holds: an empty table for a `TestItems.toml` that is not there. When `config`
+is `nothing`, a sibling `test/LocalTestItems.toml` (if present) overlays `[run]` and
+`[throttle]` on top of `test/TestItems.toml`.
 """
 function config_toml(testdir::AbstractString, config::Union{Nothing, AbstractString})
     path = config === nothing ? joinpath(testdir, "TestItems.toml") : abspath(config)
     config === nothing || isfile(path) ||
         throw(ConfigError("the config file $(relpath_or_path(path)) does not exist"))
-    isfile(path) || return path, Dict{String, Any}()
-    toml = try
-        TOML.parsefile(path)
-    catch e
-        throw(ConfigError("could not parse $(relpath_or_path(path)): $(sprint(showerror, e))"))
+    toml = if isfile(path)
+        t = try
+            TOML.parsefile(path)
+        catch e
+            throw(ConfigError("could not parse $(relpath_or_path(path)): $(sprint(showerror, e))"))
+        end
+        check_keys(path, t, TOP_KEYS, "")
+        t
+    else
+        Dict{String, Any}()
     end
-    check_keys(path, toml, TOP_KEYS, "")
+    if config === nothing
+        local_path = joinpath(testdir, LOCAL_CONFIG_FILE)
+        if isfile(local_path)
+            local_toml = parse_local_toml(local_path)
+            for key in ("run", "throttle")
+                if haskey(local_toml, key)
+                    base = table_section(path, toml, key)
+                    toml[key] = merge(base, local_toml[key]::Dict{String, Any})
+                end
+            end
+        end
+    end
     return path, toml
 end
 
@@ -627,6 +709,90 @@ function string_list(path, table::AbstractDict, key::AbstractString, label::Abst
     return out
 end
 
+# `key` of the table labelled `label`, a list of `["Package", "item name"]` pairs,
+# empty when absent.
+function pair_list(path, table::AbstractDict, key::AbstractString, label::AbstractString)::Vector{Tuple{String, String}}
+    v = get(table, key, nothing)
+    v === nothing && return Tuple{String, String}[]
+    out = Tuple{String, String}[]
+    ok = v isa AbstractVector
+    if ok
+        for x in v
+            if !(x isa AbstractVector && length(x) == 2)
+                ok = false
+                break
+            end
+            a, b = x[1], x[2]
+            if !(a isa AbstractString && b isa AbstractString && !isempty(a) && !isempty(b))
+                ok = false
+                break
+            end
+            push!(out, (a isa String ? a : String(a)::String, b isa String ? b : String(b)::String))
+        end
+    end
+    ok || throw(ConfigError(
+        "`$key` of [$label] in $(relpath_or_path(path)) must be a list of `[\"Package\", \"item name\"]` pairs, " *
+            "got $(repr(v))"
+    ))
+    return out
+end
+
+function read_order_section(path, toml::Dict{String, Any})
+    order = section(path, toml, "order", ORDER_KEYS)
+    has_exact = haskey(order, "exact")
+    if has_exact && (haskey(order, "first") || haskey(order, "last"))
+        throw(ConfigError("[order] of $(relpath_or_path(path)): `exact` cannot be combined with `first` or `last`"))
+    end
+    if has_exact
+        return string_list(path, order, "exact", "order"), String[], true
+    end
+    return string_list(path, order, "first", "order"), string_list(path, order, "last", "order"), false
+end
+
+function read_monorepo_order(path, toml::Dict{String, Any})::MonoOrder
+    haskey(toml, "monorepo") || return NO_MONO_ORDER
+    m = section(path, toml, "monorepo", MONOREPO_KEYS)
+    haskey(m, "order") || return NO_MONO_ORDER
+    ord = section(path, m, "order", ORDER_KEYS, "monorepo.order")
+    has_exact = haskey(ord, "exact")
+    if has_exact && (haskey(ord, "first") || haskey(ord, "last"))
+        throw(ConfigError("[monorepo.order] of $(relpath_or_path(path)): `exact` cannot be combined with `first` or `last`"))
+    end
+    if has_exact
+        return MonoOrder(pair_list(path, ord, "exact", "monorepo.order"), Tuple{String, String}[], true)
+    end
+    return MonoOrder(pair_list(path, ord, "first", "monorepo.order"),
+                     pair_list(path, ord, "last", "monorepo.order"), false)
+end
+
+# Validate that `[monorepo]` (including `[monorepo.order]`) appears only in the
+# workspace root's `test/TestItems.toml`, never in a member package or outside a workspace.
+function read_monorepo_section(path::String, toml::Dict{String, Any}, shared::Union{Nothing, SharedProfiles},
+                               testdir::String, config_file::String)::MonoOrder
+    haskey(toml, "monorepo") || return NO_MONO_ORDER
+    allowed = if shared !== nothing
+        !isempty(shared.path) && same_file(path, shared.path)
+    else
+        proj = isempty(config_file) ? project_file(dirname(abspath(testdir))) : nothing
+        proj !== nothing && haskey(parse_project(proj), "workspace")
+    end
+    if !allowed
+        where_ = if shared === nothing || isempty(shared.path)
+            ", and this package is in no workspace"
+        else
+            string(", here ", relpath_or_path(shared.path))
+        end
+        throw(ConfigError(string(
+            "[monorepo] in ", relpath_or_path(path),
+            ": `[monorepo]` is only allowed in the workspace root's test/TestItems.toml", where_
+        )))
+    end
+    m = section(path, toml, "monorepo", MONOREPO_KEYS)
+    string_list(path, m, "packages", "monorepo")
+    string_list(path, m, "isolated", "monorepo")
+    return read_monorepo_order(path, toml)
+end
+
 # `true` or `false` from an environment variable, or `nothing` when it is unset or empty.
 function env_flag(name::AbstractString)
     v = lowercase(strip(get(ENV, name, "")))
@@ -694,17 +860,40 @@ function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb
             "Give the names to the call, as `test/runtests.jl` can compute them from `VERSION`, or in " *
             "`RUNTESTS_SKIP_ENVIRONMENT`"
     ))
-    # A keyword wins over the environment, the environment over the file, and the file
-    # over the default: CI sets a job's settings without editing the project. A
-    # variable is read only when no keyword decides, so a bad value there fails only a
+    # A keyword wins over the environment, the environment over `LocalTestItems.toml`,
+    # `LocalTestItems.toml` over `TestItems.toml`, and `TestItems.toml` over the default.
+    # A variable is read only when no keyword decides, so a bad value there fails only a
     # run it would have set.
+    local_path = isempty(config_file) ? joinpath(testdir, LOCAL_CONFIG_FILE) : ""
+    local_toml = (!isempty(local_path) && isfile(local_path)) ? parse_local_toml(local_path) : nothing
+    local_run = local_toml === nothing ? Dict{String, Any}() : table_section(local_path, local_toml, "run")
+    local_throttle = local_toml === nothing ? Dict{Symbol, Throttle}() : read_throttle(local_path, local_toml)
     from_env = Pair{String, String}[]
-    pick(key, default) = pick_run_setting(key, default, kwargs, run, from_env)
-    # A value from a variable is said with its variable, which is all that shows it.
+    from_local = Pair{String, String}[]
+    function pick(key::Symbol, default)
+        v = get(kwargs, key, nothing)
+        v === nothing || return v
+        name = env_setting_name(key)
+        text = String(strip(get(ENV, name, "")))
+        if !isempty(text)
+            push!(from_env, name => text)
+            return env_setting(key, name, text)
+        end
+        sk = string(key)
+        if haskey(run, sk)
+            val = run[sk]
+            haskey(local_run, sk) && push!(from_local, sk => string(val))
+            return val
+        end
+        return default
+    end
+    # A value from a variable or local override is said with its source, which is all that shows it.
     function bad(msg, keys...)
         given(keys...) && return ArgumentError(msg)
         vars = [n for k in keys for (n, _) in from_env if n == env_setting_name(k)]
-        return ConfigError(isempty(vars) ? msg : string(msg, " (from `", join(vars, "`, `"), "`)"))
+        isempty(vars) || return ConfigError(string(msg, " (from `", join(vars, "`, `"), "`)"))
+        from_loc = !isempty(local_path) && any(k -> haskey(run, string(k)) && haskey(local_run, string(k)), keys)
+        return ConfigError(from_loc ? string(msg, " (from ", relpath_or_path(local_path), ")") : msg)
     end
     seconds(key, x)::Int = (is_number(x) && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(bad("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))", key))
@@ -739,11 +928,12 @@ function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb
     (seed === nothing || (is_whole_number(seed) && 0 <= seed <= typemax(UInt64))) ||
         throw(bad("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))", :seed))
     seed_u = (seed === nothing ? rand(RandomDevice(), UInt64) : UInt64(seed))::UInt64
-    order = section(path, toml, "order", ORDER_KEYS)
+    order_first, order_last, order_exact = read_order_section(path, toml)
+    mono_order = read_monorepo_section(path, toml, shared, testdir, config_file)
     coverage = flag(:coverage, false)
     coverage_source = given(:coverage) ? "the `coverage` keyword" :
         any(((n, _),) -> n == "RUNTESTS_COVERAGE", from_env) ? "`RUNTESTS_COVERAGE`" :
-        haskey(run, "coverage") ? relpath_or_path(path) : ""
+        haskey(run, "coverage") ? relpath_or_path(haskey(local_run, "coverage") ? local_path : path) : ""
     coverage && workers == 0 && throw((given(:coverage, :workers) ? ArgumentError : ConfigError)(
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
             "whose coverage was fixed when it started; use one worker or more"
@@ -766,23 +956,36 @@ function build_config_impl(path::String, toml::Dict{String, Any}, peak_worker_mb
     unique!(skip_env)
     cfg_file_s = config_file isa String ? config_file : String(config_file)::String
 
+    init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout))
+    test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout))
+    artifacts_timeout_s = seconds(:artifacts_timeout, pick(:artifacts_timeout, timeout))
+    item_failfast = flag(:item_failfast, failfast)
+    verbose = flag(:verbose, false)
+    monitor = flag(:monitor, true)
+    full_stacktraces = flag(:full_stacktraces, false)
+    full_names = flag(:full_names, false)
+    monitor_interval = interval(pick(:monitor_interval, 30))
+    throttle = read_throttle(path, toml)
+    for sym in sort_by!(collect(keys(local_throttle)), String)
+        push!(from_local, string("throttle.", sym) => format_local_throttle(local_throttle[sym]))
+    end
+    local_cfg_file = isempty(from_local) ? "" : local_path
+
     return RunConfig(;
         workers, threads, timeout_s = timeout,
-        init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout)),
-        test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout)),
-        artifacts_timeout_s = seconds(:artifacts_timeout, pick(:artifacts_timeout, timeout)),
-        retries = retries_i, failfast, item_failfast = flag(:item_failfast, failfast), logs,
-        verbose = flag(:verbose, false),
-        memory_threshold = mt_f, monitor = flag(:monitor, true),
-        full_stacktraces = flag(:full_stacktraces, false),
-        full_names = flag(:full_names, false),
+        init_timeout_s, test_end_timeout_s, artifacts_timeout_s,
+        retries = retries_i, failfast, item_failfast, logs, verbose,
+        memory_threshold = mt_f, monitor, full_stacktraces, full_names,
         testset_name = testset_name_s, coverage, coverage_source, env_settings = from_env,
-        monitor_interval = interval(pick(:monitor_interval, 30)),
+        local_config_file = local_cfg_file, local_settings = from_local,
+        monitor_interval,
         profiles = profiles === nothing ? read_profiles(path, toml; shared, testdir) : profiles,
         groups = read_groups(path, toml),
-        order_first = string_list(path, order, "first", "order"),
-        order_last = string_list(path, order, "last", "order"),
-        throttle = read_throttle(path, toml),
+        order_first,
+        order_last,
+        order_exact,
+        mono_order,
+        throttle,
         seed = seed_u,
         config_file = cfg_file_s,
         # With `/` between the directories, whatever the system writes.

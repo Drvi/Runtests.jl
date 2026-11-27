@@ -181,6 +181,25 @@ function print_env_settings(io::IO, cfg)
     return nothing
 end
 
+# Effective overrides from gitignored `test/LocalTestItems.toml` (excluding `coverage`,
+# which reports its source on its own line).
+function print_local_settings(io::IO, p::Plan)
+    function emit_one(cfg, root)
+        isempty(cfg.local_config_file) && return nothing
+        vars = [v for v in cfg.local_settings if first(v) != "coverage"]
+        isempty(vars) && return nothing
+        label = string("set by ", relpath_or_path(cfg.local_config_file, root), ": ")
+        print_wrapped_list(io, label, (string(n, "=", v) for (n, v) in vars); sep = " · ")
+        return nothing
+    end
+    emit_one(p.cfg, p.root)
+    for k in eachindex(p.packages.root)
+        p.packages.root[k] == p.root && continue
+        emit_one(p.packages.cfg[k], p.root)
+    end
+    return nothing
+end
+
 # Whether the run counts coverage and what decided it, when something did.
 function print_coverage_setting(io::IO, cfg)
     isempty(cfg.coverage_source) && return nothing

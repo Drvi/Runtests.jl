@@ -306,12 +306,15 @@ its own configuration, and `histories` holds what earlier runs of each measured.
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(), histories::Vector{History} = [history],
         root::AbstractString = "", selection::AbstractString = "",
-        suite_names::Vector{String} = String[it.name for it in raw], packages::Packages = single_package(cfg, root, suite_names)
+        suite_names::Vector{String} = String[it.name for it in raw], packages::Packages = single_package(cfg, root, suite_names),
+        mono_order_packages::Union{Nothing, Set{String}} = nothing,
+        mono_scanned_suites::Union{Nothing, Dict{String, Set{String}}} = nothing,
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
     length(histories) == length(packages) || throw(DimensionMismatch("one history per package"))
     validate_profiles(raw, packages)
-    validate_order(raw, packages)
+    use_mono_order = mono_order_packages !== nothing && has_mono_order(cfg.mono_order)
+    validate_order(raw, packages, cfg; use_mono_order, mono_order_packages, mono_scanned_suites)
 
     profiles, profile_package, profile_idx = profile_table(packages, raw)
     draft, gate_limit, gate_warmup = build_draft(raw, profile_idx, histories, packages)
@@ -340,10 +343,10 @@ function plan(
         end
         gate_floor = Float64[gate_floor_s(gate_work[g], gate_max[g], gate_limit[g], gate_warmup[g]) for g in 1:ng]
     end
-    has_order = any(c -> !isempty(c.order_first) || !isempty(c.order_last), packages.cfg)
-    pin = has_order ? build_pins(packages) : nothing
+    has_order = use_mono_order || any(c -> c.order_exact || !isempty(c.order_first) || !isempty(c.order_last), packages.cfg)
+    pin = has_order ? build_pins(packages, use_mono_order ? cfg.mono_order : NO_MONO_ORDER) : nothing
     for (k, pool) in enumerate(pools)
-        order_pool!(pool, raw, draft, slots[k], histories, gate_floor, pin)
+        order_pool!(pool, raw, draft, slots[k], histories, gate_floor, pin; block_by_package = !use_mono_order)
     end
     return materialize(raw, draft, pools, min_prof, slots, profiles, profile_package, cfg, packages, root, selection,
                        sort(suite_names), cold, gate_limit, gate_warmup)
@@ -380,33 +383,141 @@ function validate_profiles(raw, packages::Packages)
     end))
 end
 
+function duplicate_entries(list::AbstractVector{T}) where {T}
+    seen = Set{T}()
+    dups = T[]
+    for x in list
+        if x in seen
+            x in dups || push!(dups, x)
+        else
+            push!(seen, x)
+        end
+    end
+    return dups
+end
+
+function validate_mono_order(mo::MonoOrder, cfg_label::AbstractString, all_pkg_names::AbstractSet{String},
+                             scanned_suites::Dict{String, Set{String}}; replayed::Bool = false)
+    has_mono_order(mo) || return nothing
+    if !mo.exact
+        last_ = Set(mo.last)
+        both = [(pkg, n) for (pkg, n) in mo.first if (pkg, n) in last_]
+        isempty(both) || throw(ConfigError(
+            "[monorepo.order] of $cfg_label puts these both first and last:\n" *
+                join(("  [$(repr(pkg)), $(repr(n))]" for (pkg, n) in both), "\n")
+        ))
+    elseif !replayed
+        dups = duplicate_entries(mo.first)
+        isempty(dups) || throw(ConfigError(
+            "`exact` of [monorepo.order] in $cfg_label lists duplicate test items:\n" *
+                join(("  [$(repr(pkg)), $(repr(n))]" for (pkg, n) in dups), "\n")
+        ))
+    end
+    unknown_pkgs = String[]
+    unknown_items = Tuple{String, String}[]
+    for (pkg, n) in Iterators.flatten((mo.first, mo.last))
+        if !(pkg in all_pkg_names)
+            pkg in unknown_pkgs || push!(unknown_pkgs, pkg)
+        elseif haskey(scanned_suites, pkg) && !(n in scanned_suites[pkg])
+            push!(unknown_items, (pkg, n))
+        end
+    end
+    if !isempty(unknown_pkgs)
+        throw(ConfigError(sprint() do io
+            println(io, "[monorepo.order] of ", cfg_label, " names packages that do not take part:")
+            for pkg in unknown_pkgs
+                near = nearest(pkg, all_pkg_names)
+                println(io, "  ", repr(pkg), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+            end
+        end))
+    end
+    if !isempty(unknown_items)
+        throw(ConfigError(sprint() do io
+            println(io, "[monorepo.order] of ", cfg_label, " names test items that do not exist:")
+            for (pkg, n) in unknown_items
+                near = nearest(n, scanned_suites[pkg])
+                println(io, "  [", repr(pkg), ", ", repr(n), "]",
+                        isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+            end
+        end))
+    end
+    if mo.exact && !replayed
+        listed = Set(mo.first)
+        omitted = Tuple{String, String}[]
+        for pkg in sort!(collect(keys(scanned_suites)))
+            for n in sort!(collect(scanned_suites[pkg]))
+                (pkg, n) in listed || push!(omitted, (pkg, n))
+            end
+        end
+        isempty(omitted) || throw(ConfigError(sprint() do io
+            println(io, "`exact` of [monorepo.order] in ", cfg_label, " is missing ", plural(length(omitted), "test item"), ":")
+            for (pkg, n) in omitted
+                println(io, "  [", repr(pkg), ", ", repr(n), "]")
+            end
+        end))
+    end
+    return nothing
+end
+
 # Each package's `[order]` names items of its own suite, which a selection that leaves
-# them out does not make a mistake: those that run are put in order.
-function validate_order(raw, packages::Packages)
+# them out does not make a mistake: those that run are put in order. When `exact` is set,
+# every item in the suite must be listed once. In a combined run with `[monorepo.order]`,
+# the workspace root's `[monorepo.order]` is validated instead.
+function validate_order(raw, packages::Packages, cfg::RunConfig = packages.cfg[1];
+                        use_mono_order::Bool = false,
+                        mono_order_packages::Union{Nothing, Set{String}} = nothing,
+                        mono_scanned_suites::Union{Nothing, Dict{String, Set{String}}} = nothing)
+    if use_mono_order
+        scanned = mono_scanned_suites === nothing ?
+            Dict(packages.name[k] => union!(Set(packages.suite_names[k]), (it.name for it in raw if it.package == k))
+                 for k in eachindex(packages.name)) : mono_scanned_suites
+        all_pkgs = mono_order_packages === nothing ? Set(packages.name) : mono_order_packages
+        return validate_mono_order(cfg.mono_order, config_name(cfg), all_pkgs, scanned; replayed = !isempty(cfg.replayed_from))
+    end
     for k in eachindex(packages.name)
-        cfg = packages.cfg[k]
-        isempty(cfg.order_first) && isempty(cfg.order_last) && continue
+        pcfg = packages.cfg[k]
+        !pcfg.order_exact && isempty(pcfg.order_first) && isempty(pcfg.order_last) && continue
         names = union!(Set(packages.suite_names[k]), (it.name for it in raw if it.package == k))
         # A replay hands its items out in the order the recording did, which can name
         # items renamed or deleted since: the replay says which, and the order applies
         # to those still here. The checkout's own `[order]` does not apply to it.
-        if !isempty(cfg.replayed_from)
-            filter!(in(names), cfg.order_first)
-            filter!(in(names), cfg.order_last)
+        if !isempty(pcfg.replayed_from)
+            filter!(in(names), pcfg.order_first)
+            filter!(in(names), pcfg.order_last)
         end
         missing_ = String[]
-        for n in Iterators.flatten((cfg.order_first, cfg.order_last))
+        for n in Iterators.flatten((pcfg.order_first, pcfg.order_last))
             n in names || push!(missing_, n)
         end
-        check_order_conflicts(cfg)
-        isempty(missing_) && continue
-        throw(ConfigError(sprint() do io
-            println(io, "[order] of ", config_name(packages, k), " names test items that do not exist:")
-            for n in missing_
-                near = nearest(n, names)
-                println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
-            end
-        end))
+        if !pcfg.order_exact
+            check_order_conflicts(pcfg)
+        elseif isempty(pcfg.replayed_from)
+            dups = duplicate_entries(pcfg.order_first)
+            isempty(dups) || throw(ConfigError(
+                "`exact` of [order] in $(config_name(packages, k)) lists duplicate test items:\n" *
+                    join(("  " * repr(n) for n in dups), "\n")
+            ))
+        end
+        if !isempty(missing_)
+            what = pcfg.order_exact ? "`exact` of [order] in " : "[order] of "
+            throw(ConfigError(sprint() do io
+                println(io, what, config_name(packages, k), " names test items that do not exist:")
+                for n in missing_
+                    near = nearest(n, names)
+                    println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+                end
+            end))
+        end
+        if pcfg.order_exact && isempty(pcfg.replayed_from)
+            listed = Set(pcfg.order_first)
+            omitted = sort!(String[n for n in names if !(n in listed)])
+            isempty(omitted) || throw(ConfigError(sprint() do io
+                println(io, "`exact` of [order] in ", config_name(packages, k), " is missing ", plural(length(omitted), "test item"), ":")
+                for n in omitted
+                    println(io, "  ", repr(n))
+                end
+            end))
+        end
     end
     return nothing
 end
@@ -731,8 +842,21 @@ const TAIL_CLASS = Int8(PINNED_LAST)
 # ends the run a moment later, and a suite of quick items would otherwise be all head.
 const LONG_FLOOR_S = 3.0
 
-function build_pins(packages::Packages)
+function build_pins(packages::Packages, mono_order::MonoOrder = NO_MONO_ORDER)
     pin = [Dict{String, Int}() for _ in eachindex(packages.name)]
+    if has_mono_order(mono_order)
+        pkg_idx = Dict(packages.name[k] => k for k in eachindex(packages.name))
+        nfirst = length(mono_order.first)
+        for (i, (pkg, n)) in enumerate(mono_order.first)
+            k = get(pkg_idx, pkg, 0)
+            k == 0 || (pin[k][n] = i - nfirst - 1)
+        end
+        for (i, (pkg, n)) in enumerate(mono_order.last)
+            k = get(pkg_idx, pkg, 0)
+            k == 0 || (pin[k][n] = i)
+        end
+        return pin
+    end
     for (k, cfg) in enumerate(packages.cfg)
         for (i, n) in enumerate(cfg.order_first)
             pin[k][n] = i - length(cfg.order_first) - 1
@@ -773,7 +897,7 @@ that serves several packages, see [`order_blocks!`](@ref).
 """
 function order_pool!(pool::Vector{Int}, raw::Vector{RawItem}, draft::PlanDraft, nslots::Int,
                      histories::Vector{History}, gate_floor::Vector{Float64},
-                     pin::Union{Nothing, Vector{Dict{String, Int}}})
+                     pin::Union{Nothing, Vector{Dict{String, Int}}}; block_by_package::Bool = true)
     pinned = nothing
     if pin !== nothing
         pinned = Dict{Int, Int}()
@@ -782,7 +906,11 @@ function order_pool!(pool::Vector{Int}, raw::Vector{RawItem}, draft::PlanDraft, 
             p = get(pin[it.package], it.name, 0)
             p == 0 || (pinned[u] = p)
         end
-        isempty(pinned) ? (pinned = nothing) : order_blocks!(pinned, pool, raw, draft.est_s)
+        if isempty(pinned)
+            pinned = nothing
+        elseif block_by_package
+            order_blocks!(pinned, pool, raw, draft.est_s)
+        end
     end
     share = sum(u -> draft.est_s[u], pool; init = 0.0) / max(nslots, 1)
     for u in pool

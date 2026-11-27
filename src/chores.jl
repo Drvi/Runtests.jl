@@ -186,18 +186,29 @@ function check_config_entry!(io::IO, target, config::Union{Nothing, AbstractStri
         return print_problem(io, "config", e.msg)
     end
     path = config === nothing ? default_path : abspath(config)
-    if config === nothing && !isfile(path)
+    local_path = config === nothing ? joinpath(target.testdir, LOCAL_CONFIG_FILE) : ""
+    has_local = !isempty(local_path) && isfile(local_path)
+    if config === nothing && !isfile(path) && !has_local
         items === nothing || println(io, "config: none")
         return 0
     end
     print(io, "config: ")
-    printstyled(io, relpath_or_path(path); color = :light_black)
+    if isfile(path)
+        printstyled(io, relpath_or_path(path); color = :light_black)
+        if has_local
+            print(io, " (with ")
+            printstyled(io, relpath_or_path(local_path); color = :light_black)
+            print(io, ")")
+        end
+    else
+        printstyled(io, relpath_or_path(local_path); color = :light_black)
+    end
     if items === nothing
         println(io, " reads; the items it names are checked once the test items read")
         return 0
     end
     println(io, ", valid")
-    return check_groups!(io, path, cfg.groups, items, suite_tags)
+    return isfile(path) ? check_groups!(io, path, cfg.groups, items, suite_tags) : 0
 end
 
 # Every group of `[groups]` checked in memory against the already-scanned items and

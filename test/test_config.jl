@@ -658,8 +658,9 @@ end
                 @test ("timeout" => "123") in r.plan.packages.cfg[1].local_settings
                 @test ("throttle.db" => "2") in r.plan.packages.cfg[1].local_settings
                 _, mono_out = capture_run(() -> Runtests.runtests_mono(ws; dry_run = true))
-                @test occursin("test/LocalTestItems.toml", mono_out) && occursin("workers=4", mono_out)
-                @test occursin("lib/A/test/LocalTestItems.toml", mono_out) && occursin("timeout=123", mono_out)
+                mono_slashed = replace(mono_out, '\\' => '/')
+                @test occursin("test/LocalTestItems.toml", mono_slashed) && occursin("workers=4", mono_slashed)
+                @test occursin("lib/A/test/LocalTestItems.toml", mono_slashed) && occursin("timeout=123", mono_slashed)
             end
         end
     end
